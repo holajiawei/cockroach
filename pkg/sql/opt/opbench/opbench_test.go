@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/opbench"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/opttester"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 var pgurl = flag.String("url", "postgresql://localhost:26257/tpch?sslmode=disable&user=root", "the url to connect to")
@@ -353,7 +353,7 @@ var HashJoinSpec = &opbench.Spec{
 		case "supplier_rows":
 			return fmt.Sprintf("%d", int(config["supplier_rows"]))
 		}
-		panic(fmt.Sprintf("can't handle %q", paramName))
+		panic(errors.AssertionFailedf("can't handle %q", paramName))
 	},
 }
 
@@ -403,7 +403,7 @@ var MergeJoinSpec = &opbench.Spec{
 		case "supplier_rows":
 			return fmt.Sprintf("%d", int(config["supplier_rows"]))
 		}
-		panic(fmt.Sprintf("can't handle %q", paramName))
+		panic(errors.AssertionFailedf("can't handle %q", paramName))
 	},
 }
 
@@ -445,7 +445,7 @@ var LookupJoinSpec = &opbench.Spec{
 		case "supplier_rows":
 			return fmt.Sprintf("%d", int(config["supplier_rows"]))
 		}
-		panic(fmt.Sprintf("can't handle %q", paramName))
+		panic(errors.AssertionFailedf("can't handle %q", paramName))
 	},
 }
 
@@ -491,7 +491,7 @@ func makeScanSpec(
 			case "cols":
 				return colPrefix(colNames, int(config["num_cols"]))
 			}
-			panic(fmt.Sprintf("can't handle %q", paramName))
+			panic(errors.AssertionFailedf("can't handle %q", paramName))
 		},
 	}
 }
@@ -562,7 +562,7 @@ func makeSortSpec(
 			case "cols":
 				return colPrefix(colNames, int(config["num_cols"]))
 			}
-			panic(fmt.Sprintf("can't handle %q", paramName))
+			panic(errors.AssertionFailedf("can't handle %q", paramName))
 		},
 	}
 }

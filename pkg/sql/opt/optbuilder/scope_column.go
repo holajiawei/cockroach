@@ -11,7 +11,10 @@
 package optbuilder
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
@@ -32,14 +35,18 @@ type scopeColumn struct {
 	// columns in the query.
 	id opt.ColumnID
 
-	// hidden is true if the column is not selected by a '*' wildcard operator.
-	// The column must be explicitly referenced by name, or otherwise is not
-	// included.
-	hidden bool
+	visibility cat.ColumnVisibility
+
+	// tableOrdinal is set to the table ordinal corresponding to this column, if
+	// this is a column from a scan.
+	tableOrdinal int
 
 	// mutation is true if the column is in the process of being dropped or added
 	// to the table. It should not be visible to variable references.
 	mutation bool
+
+	// kind of the table column, if this is a column from a scan.
+	kind cat.ColumnKind
 
 	// descending indicates whether this column is sorted in descending order.
 	// This field is only used for ordering columns.
@@ -66,7 +73,7 @@ func (c *scopeColumn) clearName() {
 	c.table = tree.TableName{}
 }
 
-// getExpr returns the the expression that this column refers to, or the column
+// getExpr returns the expression that this column refers to, or the column
 // itself if the column does not refer to an expression.
 func (c *scopeColumn) getExpr() tree.TypedExpr {
 	if c.expr == nil {
@@ -103,7 +110,7 @@ func (c *scopeColumn) Format(ctx *tree.FmtCtx) {
 		return
 	}
 
-	if ctx.HasFlags(tree.FmtShowTableAliases) && c.table.TableName != "" {
+	if ctx.HasFlags(tree.FmtShowTableAliases) && c.table.ObjectName != "" {
 		if c.table.ExplicitSchema && c.table.SchemaName != "" {
 			if c.table.ExplicitCatalog && c.table.CatalogName != "" {
 				ctx.FormatNode(&c.table.CatalogName)
@@ -113,7 +120,7 @@ func (c *scopeColumn) Format(ctx *tree.FmtCtx) {
 			ctx.WriteByte('.')
 		}
 
-		ctx.FormatNode(&c.table.TableName)
+		ctx.FormatNode(&c.table.ObjectName)
 		ctx.WriteByte('.')
 	}
 	ctx.FormatNode(&c.name)
@@ -125,7 +132,9 @@ func (c *scopeColumn) Walk(v tree.Visitor) tree.Expr {
 }
 
 // TypeCheck is part of the tree.Expr interface.
-func (c *scopeColumn) TypeCheck(_ *tree.SemaContext, desired *types.T) (tree.TypedExpr, error) {
+func (c *scopeColumn) TypeCheck(
+	_ context.Context, _ *tree.SemaContext, desired *types.T,
+) (tree.TypedExpr, error) {
 	return c, nil
 }
 

@@ -18,10 +18,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // InboundStreamHandler is a handler of an inbound stream.
@@ -161,7 +161,7 @@ func processInboundStreamHelper(
 	// goroutine.
 	select {
 	case <-f.GetCtxDone():
-		return sqlbase.QueryCanceledError
+		return cancelchecker.QueryCanceledError
 	case err := <-errChan:
 		return err
 	}
@@ -194,11 +194,14 @@ func processProducerMessage(
 	if err != nil {
 		return processMessageResult{
 			err: errors.Wrapf(err, "%s",
-				log.MakeMessage(ctx, "decoding error", nil /* args */)),
+				// TODO(knz): Instead of pre-formatting the string here, use
+				// errors.WithContextTags() here and let the error formatter
+				// show the tags later.
+				log.FormatWithContextTags(ctx, "decoding error")),
 			consumerClosed: false,
 		}
 	}
-	var types []types.T
+	var types []*types.T
 	for {
 		row, meta, err := sd.GetRow(nil /* rowBuf */)
 		if err != nil {

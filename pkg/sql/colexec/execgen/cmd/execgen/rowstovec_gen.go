@@ -11,97 +11,183 @@
 package main
 
 import (
+	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-// Width is used when a type family has a width that has an associated distinct
-// ExecType. One or more of these structs is used as a special case when
-// multiple widths need to be associated with one type family in a
-// columnConversion struct.
-type Width struct {
-	Width    int32
-	ExecType coltypes.T
+type rowsToVecTmplInfo struct {
+	// TypeFamily contains the type family this struct is handling, with
+	// "types." prefix.
+	TypeFamily string
+	// Widths contains all of the type widths that this struct is handling.
+	// Note that the entry with 'anyWidth' width must be last in the slice.
+	Widths []rowsToVecWidthTmplInfo
 }
 
-// columnConversion defines a conversion from a coltypes.ColumnType to an
-// exec.ColVec.
-type columnConversion struct {
-	// Family is the type family of the ColumnType.
-	Family string
-
-	// Widths is set if this type family has several widths to special-case. If
-	// set, only the ExecType and GoType in the Widths is used.
-	Widths []Width
-
-	// ExecType is the exec.T to which we're converting. It should correspond to
-	// a method name on exec.ColVec.
-	ExecType coltypes.T
+type rowsToVecWidthTmplInfo struct {
+	canonicalTypeFamily types.Family
+	Width               int32
+	VecMethod           string
+	GoType              string
+	// ConversionTmpl is a "format string" for the conversion template. It has
+	// the same "signature" as Convert, meaning that it should use %[1]s for
+	// a datum variable to be converted to physical representation.
+	// NOTE: this template must be a single line, any necessary setup needs to
+	// happen in PreludeTmpl.
+	ConversionTmpl string
+	PreludeTmpl    string
 }
 
-func genRowsToVec(wr io.Writer) error {
-	f, err := ioutil.ReadFile("pkg/sql/colexec/rowstovec_tmpl.go")
-	if err != nil {
-		return err
+// Prelude returns a string that performs necessary setup before a conversion
+// of datum can be done.
+func (i rowsToVecWidthTmplInfo) Prelude(datum string) string {
+	if i.PreludeTmpl == "" {
+		return ""
 	}
+	return fmt.Sprintf(i.PreludeTmpl, datum)
+}
 
-	s := string(f)
+// Convert returns a string that performs a conversion of datum to its
+// physical equivalent and assigns the result to target.
+func (i rowsToVecWidthTmplInfo) Convert(datum string) string {
+	return fmt.Sprintf(i.ConversionTmpl, datum)
+}
 
-	// Replace the template variables.
-	s = strings.Replace(s, "_TemplateType", "{{.ExecType.String}}", -1)
-	s = strings.Replace(s, "_GOTYPE", "{{.ExecType.GoTypeName}}", -1)
-	s = strings.Replace(s, "_FAMILY", "types.{{.Family}}", -1)
-	s = strings.Replace(s, "_WIDTH", "{{.Width}}", -1)
+func (i rowsToVecWidthTmplInfo) Set(col, idx, castV string) string {
+	return set(i.canonicalTypeFamily, col, idx, castV)
+}
 
-	rowsToVecRe := makeFunctionRegex("_ROWS_TO_COL_VEC", 4)
-	s = rowsToVecRe.ReplaceAllString(s, `{{ template "rowsToColVec" . }}`)
+func (i rowsToVecWidthTmplInfo) Sliceable() bool {
+	return sliceable(i.canonicalTypeFamily)
+}
 
-	s = replaceManipulationFuncs(".ExecType", s)
+// Remove unused warnings.
+var _ = rowsToVecWidthTmplInfo{}.Prelude
+var _ = rowsToVecWidthTmplInfo{}.Convert
+var _ = rowsToVecWidthTmplInfo{}.Set
+var _ = rowsToVecWidthTmplInfo{}.Sliceable
 
-	// Build the list of supported column conversions.
-	conversionsMap := make(map[types.Family]*columnConversion)
-	for _, ct := range types.OidToType {
-		t := typeconv.FromColumnType(ct)
-		if t == coltypes.Unhandled {
-			continue
-		}
+type familyWidthPair struct {
+	family types.Family
+	width  int32
+}
 
-		var conversion *columnConversion
-		var ok bool
-		if conversion, ok = conversionsMap[ct.Family()]; !ok {
-			conversion = &columnConversion{
-				Family: ct.Family().String(),
-			}
-			conversionsMap[ct.Family()] = conversion
-		}
+var rowsToVecPreludeTmpls = map[familyWidthPair]string{
+	{types.StringFamily, anyWidth}: `// Handle other STRING-related OID types, like oid.T_name.
+												 wrapper, ok := %[1]s.(*tree.DOidWrapper)
+												 if ok {
+												     %[1]s = wrapper.Wrapped
+												 }`,
+}
 
-		if ct.Width() != 0 {
-			conversion.Widths = append(
-				conversion.Widths, Width{Width: ct.Width(), ExecType: t},
-			)
-		} else {
-			conversion.ExecType = t
-		}
-	}
+// rowsToVecConversionTmpls maps the type families to the corresponding
+// "format" strings (see comment above for details).
+var rowsToVecConversionTmpls = map[familyWidthPair]string{
+	{types.BoolFamily, anyWidth}:                     `bool(*%[1]s.(*tree.DBool))`,
+	{types.BytesFamily, anyWidth}:                    `encoding.UnsafeConvertStringToBytes(string(*%[1]s.(*tree.DBytes)))`,
+	{types.IntFamily, 16}:                            `int16(*%[1]s.(*tree.DInt))`,
+	{types.IntFamily, 32}:                            `int32(*%[1]s.(*tree.DInt))`,
+	{types.IntFamily, anyWidth}:                      `int64(*%[1]s.(*tree.DInt))`,
+	{types.DateFamily, anyWidth}:                     `%[1]s.(*tree.DDate).UnixEpochDaysWithOrig()`,
+	{types.FloatFamily, anyWidth}:                    `float64(*%[1]s.(*tree.DFloat))`,
+	{types.StringFamily, anyWidth}:                   `encoding.UnsafeConvertStringToBytes(string(*%[1]s.(*tree.DString)))`,
+	{types.DecimalFamily, anyWidth}:                  `%[1]s.(*tree.DDecimal).Decimal`,
+	{types.UuidFamily, anyWidth}:                     `%[1]s.(*tree.DUuid).UUID.GetBytesMut()`,
+	{types.TimestampFamily, anyWidth}:                `%[1]s.(*tree.DTimestamp).Time`,
+	{types.TimestampTZFamily, anyWidth}:              `%[1]s.(*tree.DTimestampTZ).Time`,
+	{types.IntervalFamily, anyWidth}:                 `%[1]s.(*tree.DInterval).Duration`,
+	{typeconv.DatumVecCanonicalTypeFamily, anyWidth}: `%[1]s`,
+}
+
+const rowsToVecTmpl = "pkg/sql/colexec/rowstovec_tmpl.go"
+
+func genRowsToVec(inputFileContents string, wr io.Writer) error {
+	r := strings.NewReplacer(
+		"_TYPE_FAMILY", "{{.TypeFamily}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"TemplateType", "{{.VecMethod}}",
+		"_GOTYPE", "{{.GoType}}",
+	)
+	s := r.Replace(inputFileContents)
+
+	rowsToVecRe := makeFunctionRegex("_ROWS_TO_COL_VEC", 5)
+	s = rowsToVecRe.ReplaceAllString(s, `{{template "rowsToColVec" .}}`)
+
+	preludeRe := makeFunctionRegex("_PRELUDE", 1)
+	s = preludeRe.ReplaceAllString(s, makeTemplateFunctionCall("Prelude", 1))
+	convertRe := makeFunctionRegex("_CONVERT", 1)
+	s = convertRe.ReplaceAllString(s, makeTemplateFunctionCall("Convert", 1))
+	setRe := makeFunctionRegex("_SET", 3)
+	s = setRe.ReplaceAllString(s, makeTemplateFunctionCall("Set", 3))
 
 	tmpl, err := template.New("rowsToVec").Parse(s)
 	if err != nil {
 		return err
 	}
 
-	columnConversions := make([]columnConversion, 0, len(conversionsMap))
-	for _, conversion := range conversionsMap {
-		columnConversions = append(columnConversions, *conversion)
+	return tmpl.Execute(wr, getRowsToVecTmplInfos())
+}
+
+func getRowsToVecTmplInfos() []rowsToVecTmplInfo {
+	var tmplInfos []rowsToVecTmplInfo
+	for typeFamily := types.Family(0); typeFamily < types.AnyFamily; typeFamily++ {
+		canonicalTypeFamily := typeconv.TypeFamilyToCanonicalTypeFamily(typeFamily)
+		if canonicalTypeFamily == typeconv.DatumVecCanonicalTypeFamily {
+			// Datum-backed type families are handled below.
+			continue
+		}
+		tmplInfo := rowsToVecTmplInfo{TypeFamily: "types." + typeFamily.String()}
+		widths := supportedWidthsByCanonicalTypeFamily[canonicalTypeFamily]
+		if typeFamily != canonicalTypeFamily {
+			// We have a type family that is supported via another's physical
+			// representation (e.g. dates are the same as INT8s), so we
+			// override the widths to use only the default one.
+			widths = []int32{anyWidth}
+		}
+		for _, width := range widths {
+			tmplInfo.Widths = append(tmplInfo.Widths, rowsToVecWidthTmplInfo{
+				canonicalTypeFamily: canonicalTypeFamily,
+				Width:               width,
+				VecMethod:           toVecMethod(canonicalTypeFamily, width),
+				GoType:              toPhysicalRepresentation(canonicalTypeFamily, width),
+				ConversionTmpl:      rowsToVecConversionTmpls[familyWidthPair{typeFamily, width}],
+				PreludeTmpl:         rowsToVecPreludeTmpls[familyWidthPair{typeFamily, width}],
+			})
+		}
+		tmplInfos = append(tmplInfos, tmplInfo)
 	}
-	return tmpl.Execute(wr, columnConversions)
+
+	// Datum-backed types require special handling.
+	tmplInfos = append(tmplInfos, rowsToVecTmplInfo{
+		// This special "type family" value will result in matching all type
+		// families that haven't been matched explicitly, i.e a code like this
+		// will get generated:
+		//   switch typ.Family() {
+		//     case <all types that have optimized physical representation>
+		//       ...
+		//     case typeconv.DatumVecCanonicalTypeFamily:
+		//     default:
+		//       <datum-vec conversion>
+		//   }
+		// Such structure requires that datum-vec tmpl info is added last.
+		TypeFamily: "typeconv.DatumVecCanonicalTypeFamily: default",
+		Widths: []rowsToVecWidthTmplInfo{{
+			canonicalTypeFamily: typeconv.DatumVecCanonicalTypeFamily,
+			Width:               anyWidth,
+			VecMethod:           toVecMethod(typeconv.DatumVecCanonicalTypeFamily, anyWidth),
+			GoType:              "tree.Datum",
+			ConversionTmpl:      rowsToVecConversionTmpls[familyWidthPair{typeconv.DatumVecCanonicalTypeFamily, anyWidth}],
+			PreludeTmpl:         rowsToVecPreludeTmpls[familyWidthPair{typeconv.DatumVecCanonicalTypeFamily, anyWidth}],
+		}},
+	})
+	return tmplInfos
 }
 
 func init() {
-	registerGenerator(genRowsToVec, "rowstovec.eg.go")
+	registerGenerator(genRowsToVec, "rowstovec.eg.go", rowsToVecTmpl)
 }

@@ -15,11 +15,13 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestOperationsFormat(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	tests := []struct {
 		step     Step
@@ -37,7 +39,7 @@ func TestOperationsFormat(t *testing.T) {
 		{
 			step: step(closureTxn(ClosureTxnType_Commit, batch(get(`d`), get(`e`)), put(`f`, `g`))),
 			expected: `
-			db0.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+			db0.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			  {
 			    b := &Batch{}
 			    b.Get(ctx, "d")

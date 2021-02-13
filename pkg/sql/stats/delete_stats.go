@@ -13,9 +13,9 @@ package stats
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -36,9 +36,9 @@ const (
 func DeleteOldStatsForColumns(
 	ctx context.Context,
 	executor sqlutil.InternalExecutor,
-	txn *client.Txn,
-	tableID sqlbase.ID,
-	columnIDs []sqlbase.ColumnID,
+	txn *kv.Txn,
+	tableID descpb.ID,
+	columnIDs []descpb.ColumnID,
 ) error {
 	columnIDsVal := tree.NewDArray(types.Int)
 	for _, c := range columnIDs {

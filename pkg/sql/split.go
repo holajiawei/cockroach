@@ -14,17 +14,22 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type splitNode struct {
 	optColumnsSlot
 
-	tableDesc      *sqlbase.TableDescriptor
-	index          *sqlbase.IndexDescriptor
+	tableDesc      catalog.TableDescriptor
+	index          *descpb.IndexDescriptor
 	rows           planNode
 	run            splitRun
 	expirationTime hlc.Timestamp
@@ -49,12 +54,12 @@ func (n *splitNode) Next(params runParams) (bool, error) {
 		return ok, err
 	}
 
-	rowKey, err := getRowKey(n.tableDesc, n.index, n.rows.Values())
+	rowKey, err := getRowKey(params.ExecCfg().Codec, n.tableDesc, n.index, n.rows.Values())
 	if err != nil {
 		return false, err
 	}
 
-	if err := params.extendedEvalCtx.ExecCfg.DB.AdminSplit(params.ctx, rowKey, rowKey, n.expirationTime); err != nil {
+	if err := params.ExecCfg().DB.AdminSplit(params.ctx, rowKey, n.expirationTime); err != nil {
 		return false, err
 	}
 
@@ -66,12 +71,12 @@ func (n *splitNode) Next(params runParams) (bool, error) {
 
 func (n *splitNode) Values() tree.Datums {
 	splitEnforcedUntil := tree.DNull
-	if (n.run.lastExpirationTime != hlc.Timestamp{}) {
+	if !n.run.lastExpirationTime.IsEmpty() {
 		splitEnforcedUntil = tree.TimestampToInexactDTimestamp(n.run.lastExpirationTime)
 	}
 	return tree.Datums{
 		tree.NewDBytes(tree.DBytes(n.run.lastSplitKey)),
-		tree.NewDString(keys.PrettyPrint(nil /* valDirs */, n.run.lastSplitKey)),
+		tree.NewDString(catalogkeys.PrettyKey(nil /* valDirs */, n.run.lastSplitKey, 2)),
 		splitEnforcedUntil,
 	}
 }
@@ -83,14 +88,20 @@ func (n *splitNode) Close(ctx context.Context) {
 // getRowKey generates a key that corresponds to a row (or prefix of a row) in a table or index.
 // Both tableDesc and index are required (index can be the primary index).
 func getRowKey(
-	tableDesc *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor, values []tree.Datum,
+	codec keys.SQLCodec,
+	tableDesc catalog.TableDescriptor,
+	index *descpb.IndexDescriptor,
+	values []tree.Datum,
 ) ([]byte, error) {
-	colMap := make(map[sqlbase.ColumnID]int)
-	for i := range values {
-		colMap[index.ColumnIDs[i]] = i
+	if len(index.ColumnIDs) < len(values) {
+		return nil, pgerror.Newf(pgcode.Syntax, "excessive number of values provided: expected %d, got %d", len(index.ColumnIDs), len(values))
 	}
-	prefix := sqlbase.MakeIndexKeyPrefix(tableDesc, index.ID)
-	key, _, err := sqlbase.EncodePartialIndexKey(
+	var colMap catalog.TableColMap
+	for i := range values {
+		colMap.Set(index.ColumnIDs[i], i)
+	}
+	prefix := rowenc.MakeIndexKeyPrefix(codec, tableDesc, index.ID)
+	key, _, err := rowenc.EncodePartialIndexKey(
 		tableDesc, index, len(values), colMap, values, prefix,
 	)
 	if err != nil {

@@ -13,10 +13,10 @@ INSERT INTO t VALUES (1,1,1)
 statement ok
 CREATE INDEX foo ON t (b)
 
-statement error column b is of type int and thus is not indexable with an inverted index.*\nHINT.*\n.*35730
+statement error column b of type int is not allowed as the last column in an inverted index\nHINT: see the documentation for more information about inverted indexes
 CREATE INVERTED INDEX foo_inv ON t(b)
 
-statement error column b is of type int and thus is not indexable with an inverted index.*\nHINT.*\n.*35730
+statement error column b of type int is not allowed as the last column in an inverted index\nHINT: see the documentation for more information about inverted indexes
 CREATE INDEX foo_inv2 ON t USING GIN (b)
 
 statement error pq: inverted indexes can't be unique
@@ -36,7 +36,7 @@ CREATE TABLE c (
 query TT
 SHOW CREATE TABLE c
 ----
-c  CREATE TABLE c (
+c  CREATE TABLE public.c (
    id INT8 NOT NULL,
    foo JSONB NULL,
    "bAr" JSONB NULL,
@@ -52,7 +52,7 @@ c  CREATE TABLE c (
 statement ok
 CREATE INVERTED INDEX ON c("qUuX")
 
-statement error indexing more than one column with an inverted index is not supported
+statement error column foo of type jsonb is only allowed as the last column in an inverted index\nHINT: see the documentation for more information about inverted indexes
 CREATE TABLE d (
   id INT PRIMARY KEY,
   foo JSONB,
@@ -60,7 +60,7 @@ CREATE TABLE d (
   INVERTED INDEX (foo, bar)
 )
 
-statement error column foo is of type int and thus is not indexable with an inverted index.*\nHINT.*\n.*35730
+statement error column foo of type int is not allowed as the last column in an inverted index\nHINT: see the documentation for more information about inverted indexes
 CREATE TABLE d (
   id INT PRIMARY KEY,
   foo INT,
@@ -474,6 +474,29 @@ SELECT * from d where b @> '[{"a": {"b": [[2]]}}, "d"]'
 ----
 16  [{"a": {"b": [1, [2]]}}, "d"]
 
+# Filter with a fully-specified array.
+query IT
+SELECT * FROM d WHERE b @> '[1, 2]' ORDER BY a
+----
+2   [1, 2, 3, 4, "foo"]
+22  [1, 2, 3, 1]
+
+# Combine predicates with AND. Should have the same rows as b @> '[1, 2]'.
+query I
+SELECT a FROM d WHERE b @> '[1]' AND b @> '[2]' ORDER BY a
+----
+2
+22
+
+statement ok
+INSERT INTO d VALUES (32, '[[1, 2]]');
+INSERT INTO d VALUES (33, '[[1], [2]]')
+
+# Filter with a nested array. This index expression is not tight.
+query IT
+SELECT * FROM d WHERE b @> '[[1, 2]]' ORDER BY a
+----
+32  [[1, 2]]
 
 statement ok
 CREATE TABLE users (
@@ -672,7 +695,7 @@ SELECT * from update_cascade_test ORDER BY update_cascade;
 2  {"a": "b", "c": "d"}
 3  ["b", "c"]
 
-statement error pq: foreign key violation: values \[1\] in columns \[i\] referenced in table "del_cascade_test"
+statement error pq: update on table "update_test" violates foreign key constraint "fk_delete_cascade_ref_update_test" on table "del_cascade_test"\nDETAIL: Key \(i\)=\(1\) is still referenced from table "del_cascade_test"\.
 UPDATE update_test SET (i,j)  = (5, '{"a":"b", "a":"b"}') WHERE i = 1;
 
 statement ok
@@ -701,3 +724,182 @@ CREATE INVERTED INDEX ON table_with_nulls (a)
 
 statement ok
 DROP TABLE table_with_nulls
+
+statement ok
+DROP TABLE c
+
+subtest json_fetch_val
+
+statement ok
+CREATE TABLE f (
+  k INT PRIMARY KEY,
+  j JSON,
+  INVERTED INDEX i (j)
+)
+
+statement ok
+INSERT INTO f VALUES
+  (0, '{"a": 1}'),
+  (1, '{"a": 10}'),
+  (2, '{"b": 2}'),
+  (3, '{"b": 2, "a": 1}'),
+  (4, '{"a": 1, "c": 3}'),
+  (5, '{"a": [1, 2]}'),
+  (6, '{"a": {"b": 1}}'),
+  (7, '{"a": {"b": 1, "d": 2}}'),
+  (8, '{"a": {"d": 2}}'),
+  (9, '{"a": {"b": [1, 2]}}'),
+  (10, '{"a": {"b": {"c": 1}}}'),
+  (11, '{"a": {"b": {"c": 1, "d": 2}}}}'),
+  (12, '{"a": {"b": {"d": 2}}}}'),
+  (13, '{"a": {"b": {"c": [1, 2]}}}')
+
+query T
+SELECT j FROM f@i WHERE j->'a' = '1' ORDER BY k
+----
+{"a": 1}
+{"a": 1, "b": 2}
+{"a": 1, "c": 3}
+
+query T
+SELECT j FROM f@i WHERE j->'a' = '1' OR j->'b' = '2' ORDER BY k
+----
+{"a": 1}
+{"b": 2}
+{"a": 1, "b": 2}
+{"a": 1, "c": 3}
+
+query T
+SELECT j FROM f@i WHERE j->'a' = '1' OR j @> '{"b": 2}' ORDER BY k
+----
+{"a": 1}
+{"b": 2}
+{"a": 1, "b": 2}
+{"a": 1, "c": 3}
+
+query T
+SELECT j FROM f@i WHERE j->'a'->'b' = '1' ORDER BY k
+----
+{"a": {"b": 1}}
+{"a": {"b": 1, "d": 2}}
+
+query T
+SELECT j FROM f@i WHERE j->'a'->'b'->'c' = '1' ORDER BY k
+----
+{"a": {"b": {"c": 1}}}
+{"a": {"b": {"c": 1, "d": 2}}}
+
+subtest arrays
+
+statement ok
+CREATE TABLE c (
+  id INT PRIMARY KEY,
+  foo INT[],
+  bar STRING[],
+  INVERTED INDEX (foo),
+  FAMILY "primary" (id, foo, bar)
+)
+
+statement ok
+INSERT INTO c VALUES(0, NULL, NULL)
+
+statement ok
+INSERT INTO c VALUES(1, ARRAY[], ARRAY['foo', 'bar', 'baz'])
+
+statement ok
+CREATE INDEX ON c USING GIN (bar)
+
+query TT
+SHOW CREATE TABLE c
+----
+c  CREATE TABLE public.c (
+   id INT8 NOT NULL,
+   foo INT8[] NULL,
+   bar STRING[] NULL,
+   CONSTRAINT "primary" PRIMARY KEY (id ASC),
+   INVERTED INDEX c_foo_idx (foo),
+   INVERTED INDEX c_bar_idx (bar),
+   FAMILY "primary" (id, foo, bar)
+)
+
+query ITT
+SELECT * from c WHERE bar @> ARRAY['foo']
+----
+1  {}  {foo,bar,baz}
+
+query ITT
+SELECT * from c WHERE bar @> ARRAY['bar', 'baz']
+----
+1  {}  {foo,bar,baz}
+
+query ITT
+SELECT * from c WHERE bar @> ARRAY['bar', 'qux']
+----
+
+statement ok
+INSERT INTO c VALUES(2, NULL, NULL)
+
+statement ok
+INSERT INTO c VALUES(3, ARRAY[0,1,NULL], ARRAY['a',NULL,'b',NULL])
+
+statement ok
+INSERT INTO c VALUES(4, ARRAY[1,2,3], ARRAY['b',NULL,'c'])
+
+statement ok
+INSERT INTO c VALUES(5, ARRAY[], ARRAY[NULL, NULL])
+
+# Create a second inverted index on c, to test backfills.
+statement ok
+CREATE INVERTED INDEX ON c(foo)
+
+statement ok
+CREATE INVERTED INDEX ON c(bar)
+
+query ITT
+SELECT * FROM c WHERE foo @> ARRAY[0]
+----
+3  {0,1,NULL}  {a,NULL,b,NULL}
+
+query error unsupported comparison operator
+SELECT * FROM c WHERE foo @> 0
+
+query ITT
+SELECT * FROM c WHERE foo @> ARRAY[1] ORDER BY id
+----
+3  {0,1,NULL}  {a,NULL,b,NULL}
+4  {1,2,3}     {b,NULL,c}
+
+# This is expected, although it looks odd, because in SQL,
+# ARRAY[NULL] @> ARRAY[NULL] returns false.
+query ITT
+SELECT * FROM c WHERE foo @> ARRAY[NULL]::INT[]
+----
+
+query ITT
+SELECT * FROM c WHERE bar @> ARRAY['a']
+----
+3  {0,1,NULL}  {a,NULL,b,NULL}
+
+query ITT
+SELECT * FROM c WHERE bar @> ARRAY['b'] ORDER BY id
+----
+3  {0,1,NULL}  {a,NULL,b,NULL}
+4  {1,2,3}     {b,NULL,c}
+
+query ITT
+SELECT * FROM c WHERE bar @> ARRAY['c']
+----
+4  {1,2,3}  {b,NULL,c}
+
+query ITT
+SELECT * FROM c WHERE bar @> ARRAY[]::TEXT[] ORDER BY id
+----
+1  {}          {foo,bar,baz}
+3  {0,1,NULL}  {a,NULL,b,NULL}
+4  {1,2,3}     {b,NULL,c}
+5  {}          {NULL,NULL}
+
+query ITT
+SELECT * FROM c WHERE foo @> '{1, 2}' ORDER BY id
+----
+4  {1,2,3}  {b,NULL,c}

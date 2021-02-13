@@ -14,11 +14,13 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -28,8 +30,8 @@ type relocateNode struct {
 	optColumnsSlot
 
 	relocateLease bool
-	tableDesc     *sqlbase.TableDescriptor
-	index         *sqlbase.IndexDescriptor
+	tableDesc     catalog.TableDescriptor
+	index         *descpb.IndexDescriptor
 	rows          planNode
 
 	run relocateRun
@@ -49,6 +51,9 @@ func (n *relocateNode) startExec(runParams) error {
 	n.run.storeMap = make(map[roachpb.StoreID]roachpb.NodeID)
 	return nil
 }
+
+// TODO(aayush): Extend EXPERIMENTAL_RELOCATE syntax to support relocating
+// non-voting replicas.
 
 func (n *relocateNode) Next(params runParams) (bool, error) {
 	// Each Next call relocates one range (corresponding to one row from n.rows).
@@ -90,7 +95,11 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 				// Lookup the store in gossip.
 				var storeDesc roachpb.StoreDescriptor
 				gossipStoreKey := gossip.MakeStoreKey(storeID)
-				if err := params.extendedEvalCtx.ExecCfg.Gossip.GetInfoProto(
+				g, err := params.extendedEvalCtx.ExecCfg.Gossip.OptionalErr(54250)
+				if err != nil {
+					return false, err
+				}
+				if err := g.GetInfoProto(
 					gossipStoreKey, &storeDesc,
 				); err != nil {
 					return false, errors.Wrapf(err, "error looking up store %d", storeID)
@@ -108,7 +117,7 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 	// TODO(a-robinson): Get the lastRangeStartKey via the ReturnRangeInfo option
 	// on the BatchRequest Header. We can't do this until v2.2 because admin
 	// requests don't respect the option on versions earlier than v2.1.
-	rowKey, err := getRowKey(n.tableDesc, n.index, data[1:])
+	rowKey, err := getRowKey(params.ExecCfg().Codec, n.tableDesc, n.index, data[1:])
 	if err != nil {
 		return false, err
 	}
@@ -125,7 +134,9 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 			return false, err
 		}
 	} else {
-		if err := params.p.ExecCfg().DB.AdminRelocateRange(params.ctx, rowKey, relocationTargets); err != nil {
+		if err := params.p.ExecCfg().DB.AdminRelocateRange(
+			params.ctx, rowKey, relocationTargets, nil, /* nonVoterTargets */
+		); err != nil {
 			return false, err
 		}
 	}
@@ -136,7 +147,7 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 func (n *relocateNode) Values() tree.Datums {
 	return tree.Datums{
 		tree.NewDBytes(tree.DBytes(n.run.lastRangeStartKey)),
-		tree.NewDString(keys.PrettyPrint(sqlbase.IndexKeyValDirs(n.index), n.run.lastRangeStartKey)),
+		tree.NewDString(keys.PrettyPrint(catalogkeys.IndexKeyValDirs(n.index), n.run.lastRangeStartKey)),
 	}
 }
 
@@ -145,7 +156,7 @@ func (n *relocateNode) Close(ctx context.Context) {
 }
 
 func lookupRangeDescriptor(
-	ctx context.Context, db *client.DB, rowKey []byte,
+	ctx context.Context, db *kv.DB, rowKey []byte,
 ) (roachpb.RangeDescriptor, error) {
 	startKey := keys.RangeMetaKey(keys.MustAddr(rowKey))
 	endKey := keys.Meta2Prefix.PrefixEnd()

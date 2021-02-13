@@ -8,12 +8,13 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-// +build race
+// +build crdb_test
 
 package memo
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -21,16 +22,16 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// CheckExpr does sanity checking on an Expr. This code is called in testrace
-// builds (which gives us test/CI coverage but elides this code in regular
-// builds).
+// CheckExpr does sanity checking on an Expr. This function is only defined in
+// crdb_test builds so that checks are run for tests while keeping the check
+// code out of non-test builds, since it can be expensive to run.
 //
 // This function does not assume that the expression has been fully normalized.
-//
-// This function is only defined in race builds, so that checks are run on every
-// PR (as part of make testrace) while keeping the check code out of non-test
-// builds, since it can be expensive to run.
 func (m *Memo) CheckExpr(e opt.Expr) {
+	if m.disableCheckExpr {
+		return
+	}
+
 	// Check properties.
 	switch t := e.(type) {
 	case RelExpr:
@@ -77,6 +78,12 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 		}
 
 	case *ProjectExpr:
+		if !t.Passthrough.SubsetOf(t.Input.Relational().OutputCols) {
+			panic(errors.AssertionFailedf(
+				"projection passes through columns not in input: %v",
+				t.Input.Relational().OutputCols.Difference(t.Passthrough),
+			))
+		}
 		for _, item := range t.Projections {
 			// Check that column id is set.
 			if item.Col == 0 {
@@ -99,6 +106,30 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 
 	case *SelectExpr:
 		checkFilters(t.Filters)
+
+	case *UnionExpr, *UnionAllExpr:
+		setPrivate := t.Private().(*SetPrivate)
+		outColSet := setPrivate.OutCols.ToSet()
+
+		// Check that columns on the left side of the union are not reused in
+		// the output.
+		leftColSet := setPrivate.LeftCols.ToSet()
+		if outColSet.Intersects(leftColSet) {
+			panic(errors.AssertionFailedf(
+				"union reuses columns in left input: %v",
+				outColSet.Intersection(leftColSet),
+			))
+		}
+
+		// Check that columns on the right side of the union are not reused in
+		// the output.
+		rightColSet := setPrivate.RightCols.ToSet()
+		if outColSet.Intersects(rightColSet) {
+			panic(errors.AssertionFailedf(
+				"union reuses columns in right input: %v",
+				outColSet.Intersection(rightColSet),
+			))
+		}
 
 	case *AggregationsExpr:
 		var checkAggs func(scalar opt.ScalarExpr)
@@ -130,7 +161,9 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 			}
 		}
 
-	case *DistinctOnExpr, *UpsertDistinctOnExpr:
+	case *DistinctOnExpr, *EnsureDistinctOnExpr, *UpsertDistinctOnExpr, *EnsureUpsertDistinctOnExpr:
+		checkErrorOnDup(e.(RelExpr))
+
 		// Check that aggregates can be only FirstAgg or ConstAgg.
 		for _, item := range *t.Child(1).(*AggregationsExpr) {
 			switch item.Agg.Op() {
@@ -142,6 +175,8 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 		}
 
 	case *GroupByExpr, *ScalarGroupByExpr:
+		checkErrorOnDup(e.(RelExpr))
+
 		// Check that aggregates cannot be FirstAgg.
 		for _, item := range *t.Child(1).(*AggregationsExpr) {
 			switch item.Agg.Op() {
@@ -165,18 +200,50 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 		if t.Cols.SubsetOf(t.Input.Relational().OutputCols) {
 			panic(errors.AssertionFailedf("lookup join with no lookup columns"))
 		}
+		var requiredCols opt.ColSet
+		requiredCols.UnionWith(t.Relational().OutputCols)
+		requiredCols.UnionWith(t.ConstFilters.OuterCols())
+		requiredCols.UnionWith(t.On.OuterCols())
+		requiredCols.UnionWith(t.KeyCols.ToSet())
+		idx := m.Metadata().Table(t.Table).Index(t.Index)
+		for i := range t.KeyCols {
+			requiredCols.Add(t.Table.ColumnID(idx.Column(i).Ordinal()))
+		}
+		if !t.Cols.SubsetOf(requiredCols) {
+			panic(errors.AssertionFailedf("lookup join with columns that are not required"))
+		}
+		if t.IsSecondJoinInPairedJoiner {
+			ij, ok := t.Input.(*InvertedJoinExpr)
+			if !ok {
+				panic(errors.AssertionFailedf(
+					"lookup paired-join is paired with %T instead of inverted join", t.Input))
+			}
+			if !ij.IsFirstJoinInPairedJoiner {
+				panic(errors.AssertionFailedf(
+					"lookup paired-join is paired with inverted join that thinks it is unpaired"))
+			}
+		}
 
 	case *InsertExpr:
 		tab := m.Metadata().Table(t.Table)
-		m.checkColListLen(t.InsertCols, tab.DeletableColumnCount(), "InsertCols")
+		m.checkColListLen(t.InsertCols, tab.ColumnCount(), "InsertCols")
 		m.checkColListLen(t.FetchCols, 0, "FetchCols")
 		m.checkColListLen(t.UpdateCols, 0, "UpdateCols")
 
 		// Ensure that insert columns include all columns except for delete-only
 		// mutation columns (which do not need to be part of INSERT).
-		for i, n := 0, tab.WritableColumnCount(); i < n; i++ {
-			if t.InsertCols[i] == 0 {
+		for i, n := 0, tab.ColumnCount(); i < n; i++ {
+			kind := tab.Column(i).Kind()
+			if (kind == cat.Ordinary || kind == cat.WriteOnly) && t.InsertCols[i] == 0 {
 				panic(errors.AssertionFailedf("insert values not provided for all table columns"))
+			}
+			if t.InsertCols[i] != 0 {
+				switch kind {
+				case cat.System:
+					panic(errors.AssertionFailedf("system column found in insertion columns"))
+				case cat.VirtualInverted:
+					panic(errors.AssertionFailedf("virtual inverted column found in insertion columns"))
+				}
 			}
 		}
 
@@ -185,13 +252,25 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 	case *UpdateExpr:
 		tab := m.Metadata().Table(t.Table)
 		m.checkColListLen(t.InsertCols, 0, "InsertCols")
-		m.checkColListLen(t.FetchCols, tab.DeletableColumnCount(), "FetchCols")
-		m.checkColListLen(t.UpdateCols, tab.DeletableColumnCount(), "UpdateCols")
+		m.checkColListLen(t.FetchCols, tab.ColumnCount(), "FetchCols")
+		m.checkColListLen(t.UpdateCols, tab.ColumnCount(), "UpdateCols")
 		m.checkMutationExpr(t, &t.MutationPrivate)
 
 	case *ZigzagJoinExpr:
 		if len(t.LeftEqCols) != len(t.RightEqCols) {
 			panic(errors.AssertionFailedf("zigzag join with mismatching eq columns"))
+		}
+		meta := m.Metadata()
+		left, right := meta.Table(t.LeftTable), meta.Table(t.RightTable)
+		for i := 0; i < left.ColumnCount(); i++ {
+			if left.Column(i).Kind() == cat.System && t.Cols.Contains(t.LeftTable.ColumnID(i)) {
+				panic(errors.AssertionFailedf("zigzag join should not contain system column"))
+			}
+		}
+		for i := 0; i < right.ColumnCount(); i++ {
+			if right.Column(i).Kind() == cat.System && t.Cols.Contains(t.RightTable.ColumnID(i)) {
+				panic(errors.AssertionFailedf("zigzag join should not contain system column"))
+			}
 		}
 
 	case *AggDistinctExpr:
@@ -206,15 +285,35 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 
 	default:
 		if opt.IsJoinOp(e) {
+			left := e.Child(0).(RelExpr)
+			right := e.Child(1).(RelExpr)
+			// The left side cannot depend on the right side columns.
+			if left.Relational().OuterCols.Intersects(right.Relational().OutputCols) {
+				panic(errors.AssertionFailedf(
+					"%s left side has outer cols in right side", log.Safe(e.Op()),
+				))
+			}
+
+			// The reverse is allowed but only for apply variants.
+			if !opt.IsJoinApplyOp(e) {
+				if right.Relational().OuterCols.Intersects(left.Relational().OutputCols) {
+					panic(errors.AssertionFailedf("%s is correlated", log.Safe(e.Op())))
+				}
+			}
 			checkFilters(*e.Child(2).(*FiltersExpr))
 		}
 	}
 
 	// Check orderings within operators.
 	checkExprOrdering(e)
+
+	// Check for overlapping column IDs in child relational expressions.
+	if opt.IsRelationalOp(e) {
+		checkOutputCols(e)
+	}
 }
 
-func (m *Memo) checkColListLen(colList opt.ColList, expectedLen int, listName string) {
+func (m *Memo) checkColListLen(colList opt.OptionalColList, expectedLen int, listName string) {
 	if len(colList) != expectedLen {
 		panic(errors.AssertionFailedf("column list %s expected length = %d, actual length = %d",
 			listName, log.Safe(expectedLen), len(colList)))
@@ -225,8 +324,10 @@ func (m *Memo) checkMutationExpr(rel RelExpr, private *MutationPrivate) {
 	// Output columns should never include mutation columns.
 	tab := m.Metadata().Table(private.Table)
 	var mutCols opt.ColSet
-	for i, n := tab.ColumnCount(), tab.DeletableColumnCount(); i < n; i++ {
-		mutCols.Add(private.Table.ColumnID(i))
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		if tab.Column(i).IsMutation() {
+			mutCols.Add(private.Table.ColumnID(i))
+		}
 	}
 	if rel.Relational().OutputCols.Intersects(mutCols) {
 		panic(errors.AssertionFailedf("output columns cannot include mutation columns"))
@@ -260,11 +361,53 @@ func checkFilters(filters FiltersExpr) {
 	for _, item := range filters {
 		if item.Condition.Op() == opt.RangeOp {
 			if !item.scalar.TightConstraints {
-				panic(errors.AssertionFailedf("Range operator should always have tight constraints"))
+				panic(errors.AssertionFailedf("range operator should always have tight constraints"))
 			}
 			if item.scalar.OuterCols.Len() != 1 {
-				panic(errors.AssertionFailedf("Range operator should have exactly one outer col"))
+				panic(errors.AssertionFailedf("range operator should have exactly one outer col"))
 			}
 		}
+	}
+}
+
+func checkErrorOnDup(e RelExpr) {
+	// Only EnsureDistinctOn and EnsureUpsertDistinctOn should set the ErrorOnDup
+	// field to a value.
+	if e.Op() != opt.EnsureDistinctOnOp &&
+		e.Op() != opt.EnsureUpsertDistinctOnOp &&
+		e.Private().(*GroupingPrivate).ErrorOnDup != "" {
+		panic(errors.AssertionFailedf(
+			"%s should never set ErrorOnDup to a non-empty string", log.Safe(e.Op())))
+	}
+	if (e.Op() == opt.EnsureDistinctOnOp ||
+		e.Op() == opt.EnsureUpsertDistinctOnOp) &&
+		e.Private().(*GroupingPrivate).ErrorOnDup == "" {
+		panic(errors.AssertionFailedf(
+			"%s should never leave ErrorOnDup as an empty string", log.Safe(e.Op())))
+	}
+}
+
+func checkOutputCols(e opt.Expr) {
+	set := opt.ColSet{}
+
+	for i := 0; i < e.ChildCount(); i++ {
+		rel, ok := e.Child(i).(RelExpr)
+		if !ok {
+			continue
+		}
+
+		// The output columns of child expressions cannot overlap. The only
+		// exception is the first child of RecursiveCTE.
+		if e.Op() == opt.RecursiveCTEOp && i == 0 {
+			continue
+		}
+		cols := rel.Relational().OutputCols
+		if set.Intersects(cols) {
+			panic(errors.AssertionFailedf(
+				"%s RelExpr children have intersecting columns", log.Safe(e.Op()),
+			))
+		}
+
+		set.UnionWith(cols)
 	}
 }

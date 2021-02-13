@@ -12,24 +12,20 @@ package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
-)
-
-const (
-	excludeMutations = false
-	includeMutations = true
 )
 
 // buildDataSource builds a set of memo groups that represent the given table
@@ -53,6 +49,7 @@ func (b *Builder) buildDataSource(
 	case *tree.AliasedTableExpr:
 		if source.IndexFlags != nil {
 			telemetry.Inc(sqltelemetry.IndexHintUseCounter)
+			telemetry.Inc(sqltelemetry.IndexHintSelectUseCounter)
 			indexFlags = source.IndexFlags
 		}
 		if source.As.Alias != "" {
@@ -93,29 +90,37 @@ func (b *Builder) buildDataSource(
 			}
 
 			outScope.expr = b.factory.ConstructWithScan(&memo.WithScanPrivate{
-				With:         cte.id,
-				Name:         string(cte.name.Alias),
-				InCols:       inCols,
-				OutCols:      outCols,
-				BindingProps: cte.bindingProps,
-				ID:           b.factory.Metadata().NextUniqueID(),
+				With:    cte.id,
+				Name:    string(cte.name.Alias),
+				InCols:  inCols,
+				OutCols: outCols,
+				ID:      b.factory.Metadata().NextUniqueID(),
 			})
 
 			return outScope
 		}
 
-		priv := privilege.SELECT
-		locking = locking.filter(tn.TableName)
+		ds, depName, resName := b.resolveDataSource(tn, privilege.SELECT)
+
+		locking = locking.filter(tn.ObjectName)
 		if locking.isSet() {
-			// SELECT ... FOR [KEY] UPDATE/SHARE requires UPDATE privileges.
-			priv = privilege.UPDATE
+			// SELECT ... FOR [KEY] UPDATE/SHARE also requires UPDATE privileges.
+			b.checkPrivilege(depName, ds, privilege.UPDATE)
 		}
 
-		ds, resName := b.resolveDataSource(tn, priv)
 		switch t := ds.(type) {
 		case cat.Table:
 			tabMeta := b.addTable(t, &resName)
-			return b.buildScan(tabMeta, nil /* ordinals */, indexFlags, locking, excludeMutations, inScope)
+			return b.buildScan(
+				tabMeta,
+				tableOrdinals(t, columnKinds{
+					includeMutations:       false,
+					includeSystem:          true,
+					includeVirtualInverted: false,
+					includeVirtualComputed: true,
+				}),
+				indexFlags, locking, inScope,
+			)
 
 		case cat.Sequence:
 			return b.buildSequenceSelect(t, &resName, inScope)
@@ -154,7 +159,7 @@ func (b *Builder) buildDataSource(
 		// This is the special '[ ... ]' syntax. We treat this as syntactic sugar
 		// for a top-level CTE, so it cannot refer to anything in the input scope.
 		// See #41078.
-		emptyScope := &scope{builder: b}
+		emptyScope := b.allocScope()
 		innerScope := b.buildStmt(source.Statement, nil /* desiredTypes */, emptyScope)
 		if len(innerScope.cols) == 0 {
 			panic(pgerror.Newf(pgcode.UndefinedColumn,
@@ -162,13 +167,13 @@ func (b *Builder) buildDataSource(
 		}
 
 		id := b.factory.Memo().NextWithID()
+		b.factory.Metadata().AddWithBinding(id, innerScope.expr)
 		cte := cteSource{
 			name:         tree.AliasClause{},
 			cols:         innerScope.makePresentationWithHiddenCols(),
 			originalExpr: source.Statement,
 			expr:         innerScope.expr,
 			id:           id,
-			bindingProps: innerScope.expr.Relational(),
 		}
 		b.cteStack[len(b.cteStack)-1] = append(b.cteStack[len(b.cteStack)-1], cte)
 
@@ -191,25 +196,24 @@ func (b *Builder) buildDataSource(
 		}
 
 		outScope.expr = b.factory.ConstructWithScan(&memo.WithScanPrivate{
-			With:         cte.id,
-			Name:         string(cte.name.Alias),
-			InCols:       inCols,
-			OutCols:      outCols,
-			BindingProps: cte.bindingProps,
-			ID:           b.factory.Metadata().NextUniqueID(),
+			With:    cte.id,
+			Name:    string(cte.name.Alias),
+			InCols:  inCols,
+			OutCols: outCols,
+			ID:      b.factory.Metadata().NextUniqueID(),
 		})
 
 		return outScope
 
 	case *tree.TableRef:
-		priv := privilege.SELECT
+		ds, depName := b.resolveDataSourceRef(source, privilege.SELECT)
+
 		locking = locking.filter(source.As.Alias)
 		if locking.isSet() {
-			// SELECT ... FOR [KEY] UPDATE/SHARE requires UPDATE privileges.
-			priv = privilege.UPDATE
+			// SELECT ... FOR [KEY] UPDATE/SHARE also requires UPDATE privileges.
+			b.checkPrivilege(depName, ds, privilege.UPDATE)
 		}
 
-		ds := b.resolveDataSourceRef(source, priv)
 		switch t := ds.(type) {
 		case cat.Table:
 			outScope = b.buildScanFromTableRef(t, source, indexFlags, locking, inScope)
@@ -283,7 +287,15 @@ func (b *Builder) buildView(
 		defer func() { b.trackViewDeps = true }()
 	}
 
-	outScope = b.buildSelect(sel, locking, nil /* desiredTypes */, &scope{builder: b})
+	// We don't want the view to be able to refer to any outer scopes in the
+	// query. This shouldn't happen if the view is valid but there may be
+	// cornercases (e.g. renaming tables referenced by the view). To be safe, we
+	// build the view with an empty scope. But after that, we reattach the scope
+	// to the existing scope chain because we want the rest of the query to be
+	// able to refer to the higher scopes (see #46180).
+	emptyScope := b.allocScope()
+	outScope = b.buildSelect(sel, locking, nil /* desiredTypes */, emptyScope)
+	emptyScope.parent = inScope
 
 	// Update data source name to be the name of the view. And if view columns
 	// are specified, then update names of output columns.
@@ -345,7 +357,7 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 					))
 				}
 				col := &scope.cols[colIdx]
-				if col.hidden {
+				if col.visibility != cat.Visible {
 					continue
 				}
 				col.name = colAlias[aliasIdx]
@@ -383,12 +395,19 @@ func (b *Builder) buildScanFromTableRef(
 			panic(pgerror.Newf(pgcode.Syntax,
 				"an explicit list of column IDs must include at least one column"))
 		}
-		ordinals = cat.ConvertColumnIDsToOrdinals(tab, ref.Columns)
+		ordinals = resolveNumericColumnRefs(tab, ref.Columns)
+	} else {
+		ordinals = tableOrdinals(tab, columnKinds{
+			includeMutations:       false,
+			includeSystem:          true,
+			includeVirtualInverted: false,
+			includeVirtualComputed: true,
+		})
 	}
 
 	tn := tree.MakeUnqualifiedTableName(tab.Name())
 	tabMeta := b.addTable(tab, &tn)
-	return b.buildScan(tabMeta, ordinals, indexFlags, locking, excludeMutations, inScope)
+	return b.buildScan(tabMeta, ordinals, indexFlags, locking, inScope)
 }
 
 // addTable adds a table to the metadata and returns the TableMeta. The table
@@ -400,12 +419,25 @@ func (b *Builder) addTable(tab cat.Table, alias *tree.TableName) *opt.TableMeta 
 	return md.TableMeta(tabID)
 }
 
-// buildScan builds a memo group for a ScanOp or VirtualScanOp expression on the
-// given table.
+// buildScan builds a memo group for a ScanOp expression on the given table. If
+// the ordinals list contains any VirtualComputed columns, a ProjectOp is built
+// on top.
 //
-// If the ordinals slice is not nil, then only columns with ordinals in that
-// list are projected by the scan. Otherwise, all columns from the table are
-// projected.
+// The resulting scope and expression output the given table ordinals. If an
+// ordinal is for a VirtualComputed column, the ordinals it depends on must also
+// be in the list (in practice, this coincides with all "ordinary" table columns
+// being in the list).
+//
+// If scanMutationCols is true, then include columns being added or dropped from
+// the table. These are currently required by the execution engine as "fetch
+// columns", when performing mutation DML statements (INSERT, UPDATE, UPSERT,
+// DELETE).
+//
+// NOTE: Callers must take care that mutation columns (columns that are being
+//       added or dropped from the table) are only used when performing mutation
+//       DML statements (INSERT, UPDATE, UPSERT, DELETE). They cannot be used in
+//       any other way because they may not have been initialized yet by the
+//       backfiller!
 //
 // See Builder.buildStmt for a description of the remaining input and return
 // values.
@@ -414,9 +446,11 @@ func (b *Builder) buildScan(
 	ordinals []int,
 	indexFlags *tree.IndexFlags,
 	locking lockingSpec,
-	scanMutationCols bool,
 	inScope *scope,
 ) (outScope *scope) {
+	if ordinals == nil {
+		panic(errors.AssertionFailedf("no ordinals"))
+	}
 	tab := tabMeta.Table
 	tabID := tabMeta.MetaID
 
@@ -424,42 +458,32 @@ func (b *Builder) buildScan(
 		tabMeta.IgnoreForeignKeys = true
 	}
 
-	colCount := len(ordinals)
-	if colCount == 0 {
-		// If scanning mutation columns, then include writable and deletable
-		// columns in the output, in addition to public columns.
-		if scanMutationCols {
-			colCount = tab.DeletableColumnCount()
-		} else {
-			colCount = tab.ColumnCount()
-		}
-	}
-
-	getOrdinal := func(i int) int {
-		if ordinals == nil {
-			return i
-		}
-		return ordinals[i]
-	}
-
-	var tabColIDs opt.ColSet
 	outScope = inScope.push()
-	outScope.cols = make([]scopeColumn, 0, colCount)
-	for i := 0; i < colCount; i++ {
-		ord := getOrdinal(i)
+
+	// We collect VirtualComputed columns separately; these cannot be scanned,
+	// they can only be projected afterward.
+	var scanColIDs, virtualColIDs opt.ColSet
+	outScope.cols = make([]scopeColumn, len(ordinals))
+	for i, ord := range ordinals {
 		col := tab.Column(ord)
 		colID := tabID.ColumnID(ord)
-		tabColIDs.Add(colID)
 		name := col.ColName()
-		isMutation := cat.IsMutationColumn(tab, ord)
-		outScope.cols = append(outScope.cols, scopeColumn{
-			id:       colID,
-			name:     name,
-			table:    tabMeta.Alias,
-			typ:      col.DatumType(),
-			hidden:   col.IsHidden() || isMutation,
-			mutation: isMutation,
-		})
+		if col.IsVirtualComputed() {
+			virtualColIDs.Add(colID)
+		} else {
+			scanColIDs.Add(colID)
+		}
+		kind := col.Kind()
+		outScope.cols[i] = scopeColumn{
+			id:           colID,
+			name:         name,
+			table:        tabMeta.Alias,
+			typ:          col.DatumType(),
+			visibility:   col.Visibility(),
+			kind:         kind,
+			mutation:     kind == cat.WriteOnly || kind == cat.DeleteOnly,
+			tableOrdinal: ord,
+		}
 	}
 
 	if tab.IsVirtualTable() {
@@ -471,71 +495,127 @@ func (b *Builder) buildScan(
 			panic(pgerror.Newf(pgcode.Syntax,
 				"%s not allowed with virtual tables", locking.get().Strength))
 		}
-		private := memo.VirtualScanPrivate{Table: tabID, Cols: tabColIDs}
-		outScope.expr = b.factory.ConstructVirtualScan(&private)
-
-		// Virtual tables should not be collected as view dependencies.
-	} else {
-		private := memo.ScanPrivate{Table: tabID, Cols: tabColIDs}
-		if indexFlags != nil {
-			private.Flags.NoIndexJoin = indexFlags.NoIndexJoin
-			if indexFlags.Index != "" || indexFlags.IndexID != 0 {
-				idx := -1
-				for i := 0; i < tab.IndexCount(); i++ {
-					if tab.Index(i).Name() == tree.Name(indexFlags.Index) ||
-						tab.Index(i).ID() == cat.StableID(indexFlags.IndexID) {
-						idx = i
-						break
-					}
-				}
-				if idx == -1 {
-					var err error
-					if indexFlags.Index != "" {
-						err = errors.Errorf("index %q not found", tree.ErrString(&indexFlags.Index))
-					} else {
-						err = errors.Errorf("index [%d] not found", indexFlags.IndexID)
-					}
-					panic(err)
-				}
-				private.Flags.ForceIndex = true
-				private.Flags.Index = idx
-				private.Flags.Direction = indexFlags.Direction
-			}
-		}
-		if locking.isSet() {
-			private.Locking = locking.get()
-		}
+		private := memo.ScanPrivate{Table: tabID, Cols: scanColIDs}
 		outScope.expr = b.factory.ConstructScan(&private)
 
-		b.addCheckConstraintsForTable(tabMeta)
-		b.addComputedColsForTable(tabMeta)
+		// Note: virtual tables should not be collected as view dependencies.
+		return outScope
+	}
 
-		if b.trackViewDeps {
-			dep := opt.ViewDep{DataSource: tab}
-			for i := 0; i < colCount; i++ {
-				dep.ColumnOrdinals.Add(getOrdinal(i))
+	private := memo.ScanPrivate{Table: tabID, Cols: scanColIDs}
+	if indexFlags != nil {
+		private.Flags.NoIndexJoin = indexFlags.NoIndexJoin
+		if indexFlags.Index != "" || indexFlags.IndexID != 0 {
+			idx := -1
+			for i := 0; i < tab.IndexCount(); i++ {
+				if tab.Index(i).Name() == tree.Name(indexFlags.Index) ||
+					tab.Index(i).ID() == cat.StableID(indexFlags.IndexID) {
+					idx = i
+					break
+				}
 			}
-			if private.Flags.ForceIndex {
-				dep.SpecificIndex = true
-				dep.Index = private.Flags.Index
+			if idx == -1 {
+				var err error
+				if indexFlags.Index != "" {
+					err = errors.Errorf("index %q not found", tree.ErrString(&indexFlags.Index))
+				} else {
+					err = errors.Errorf("index [%d] not found", indexFlags.IndexID)
+				}
+				panic(err)
 			}
-			b.viewDeps = append(b.viewDeps, dep)
+			private.Flags.ForceIndex = true
+			private.Flags.Index = idx
+			private.Flags.Direction = indexFlags.Direction
 		}
+	}
+	if locking.isSet() {
+		private.Locking = locking.get()
+	}
+
+	b.addCheckConstraintsForTable(tabMeta)
+	b.addComputedColsForTable(tabMeta)
+
+	outScope.expr = b.factory.ConstructScan(&private)
+
+	// Add the partial indexes after constructing the scan so we can use the
+	// logical properties of the scan to fully normalize the index predicates.
+	// We don't need to add deletable partial index predicates in the context of
+	// a scan.
+	b.addPartialIndexPredicatesForTable(tabMeta, outScope.expr)
+
+	if !virtualColIDs.Empty() {
+		// Project the expressions for the virtual columns (and pass through all
+		// scanned columns).
+		// TODO(radu): we don't currently support virtual columns depending on other
+		// virtual columns.
+		proj := make(memo.ProjectionsExpr, 0, virtualColIDs.Len())
+		virtualColIDs.ForEach(func(col opt.ColumnID) {
+			item := b.factory.ConstructProjectionsItem(tabMeta.ComputedCols[col], col)
+			if !item.ScalarProps().OuterCols.SubsetOf(scanColIDs) {
+				panic(errors.AssertionFailedf("scanned virtual column depends on non-scanned column"))
+			}
+			proj = append(proj, item)
+		})
+		outScope.expr = b.factory.ConstructProject(outScope.expr, proj, scanColIDs)
+	}
+
+	if b.trackViewDeps {
+		dep := opt.ViewDep{DataSource: tab}
+		dep.ColumnIDToOrd = make(map[opt.ColumnID]int)
+		// We will track the ColumnID to Ord mapping so Ords can be added
+		// when a column is referenced.
+		for i, col := range outScope.cols {
+			dep.ColumnIDToOrd[col.id] = ordinals[i]
+		}
+		if private.Flags.ForceIndex {
+			dep.SpecificIndex = true
+			dep.Index = private.Flags.Index
+		}
+		b.viewDeps = append(b.viewDeps, dep)
 	}
 	return outScope
 }
 
-// addCheckConstraintsForTable finds all the check constraints that apply to the
-// table and adds them to the table metadata. To do this, the scalar expression
-// of the check constraints are built here.
+// addCheckConstraintsForTable extracts filters from the check constraints that
+// apply to the table and adds them to the table metadata (see
+// TableMeta.Constraints). To do this, the scalar expressions of the check
+// constraints are built here.
+//
+// These expressions are used as "known truths" about table data; as such they
+// can only contain immutable operators.
 func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
-	// Find all the check constraints that apply to the table and add them
-	// to the table meta data. To do this, we must build them into scalar
-	// expressions.
-	tableScope := scope{builder: b}
 	tab := tabMeta.Table
-	for i, n := 0, tab.CheckCount(); i < n; i++ {
-		checkConstraint := tab.Check(i)
+
+	// Check if we have any validated check constraints. Only validated
+	// constraints are known to hold on existing table data.
+	numChecks := tab.CheckCount()
+	chkIdx := 0
+	for ; chkIdx < numChecks; chkIdx++ {
+		if tab.Check(chkIdx).Validated {
+			break
+		}
+	}
+	if chkIdx == numChecks {
+		return
+	}
+
+	// Create a scope that can be used for building the scalar expressions.
+	tableScope := b.allocScope()
+	tableScope.appendOrdinaryColumnsFromTable(tabMeta, &tabMeta.Alias)
+
+	// Find the non-nullable table columns. Mutation columns can be NULL during
+	// backfill, so they should be excluded.
+	var notNullCols opt.ColSet
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		if col := tab.Column(i); !col.IsNullable() && !col.IsMutation() {
+			notNullCols.Add(tabMeta.MetaID.ColumnID(i))
+		}
+	}
+
+	var filters memo.FiltersExpr
+	// Skip to the first validated constraint we found above.
+	for ; chkIdx < numChecks; chkIdx++ {
+		checkConstraint := tab.Check(chkIdx)
 
 		// Only add validated check constraints to the table's metadata.
 		if !checkConstraint.Validated {
@@ -546,40 +626,67 @@ func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
 			panic(err)
 		}
 
-		if len(tableScope.cols) == 0 {
-			tableScope.appendColumnsFromTable(tabMeta, &tabMeta.Alias)
+		texpr := tableScope.resolveAndRequireType(expr, types.Bool)
+		var condition opt.ScalarExpr
+		b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
+			condition = b.buildScalar(texpr, tableScope, nil, nil, nil)
+		})
+		// Check constraints that are guaranteed to not evaluate to NULL
+		// are the only ones converted into filters. This is because a NULL
+		// constraint is interpreted as passing, whereas a NULL filter is not.
+		if memo.ExprIsNeverNull(condition, notNullCols) {
+			// Check if the expression contains non-immutable operators.
+			var sharedProps props.Shared
+			memo.BuildSharedProps(condition, &sharedProps)
+			if !sharedProps.VolatilitySet.HasStable() && !sharedProps.VolatilitySet.HasVolatile() {
+				filters = append(filters, b.factory.ConstructFiltersItem(condition))
+			}
 		}
-
-		if texpr := tableScope.resolveAndRequireType(expr, types.Bool); texpr != nil {
-			scalar := b.buildScalar(texpr, &tableScope, nil, nil, nil)
-			tabMeta.AddConstraint(scalar)
-		}
+	}
+	if len(filters) > 0 {
+		tabMeta.SetConstraints(&filters)
 	}
 }
 
 // addComputedColsForTable finds all computed columns in the given table and
-// caches them in the table metadata as scalar expressions.
+// caches them in the table metadata as scalar expressions. These expressions
+// are used as "known truths" about table data. Any columns for which the
+// expression contains non-immutable operators are omitted.
 func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
-	tableScope := scope{builder: b}
+	var tableScope *scope
 	tab := tabMeta.Table
 	for i, n := 0, tab.ColumnCount(); i < n; i++ {
 		tabCol := tab.Column(i)
 		if !tabCol.IsComputed() {
 			continue
 		}
-		expr, err := parser.ParseExpr(tabCol.ComputedExprStr())
-		if err != nil {
+		if tabCol.IsMutation() {
+			// Mutation columns can be NULL during backfill, so they won't equal the
+			// computed column expression value (in general).
 			continue
 		}
+		expr, err := parser.ParseExpr(tabCol.ComputedExprStr())
+		if err != nil {
+			panic(err)
+		}
 
-		if len(tableScope.cols) == 0 {
-			tableScope.appendColumnsFromTable(tabMeta, &tabMeta.Alias)
+		if tableScope == nil {
+			tableScope = b.allocScope()
+			tableScope.appendOrdinaryColumnsFromTable(tabMeta, &tabMeta.Alias)
 		}
 
 		if texpr := tableScope.resolveAndRequireType(expr, types.Any); texpr != nil {
 			colID := tabMeta.MetaID.ColumnID(i)
-			scalar := b.buildScalar(texpr, &tableScope, nil, nil, nil)
-			tabMeta.AddComputedCol(colID, scalar)
+			var scalar opt.ScalarExpr
+			b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
+				scalar = b.buildScalar(texpr, tableScope, nil, nil, nil)
+			})
+			// Check if the expression contains non-immutable operators.
+			var sharedProps props.Shared
+			memo.BuildSharedProps(scalar, &sharedProps)
+			if !sharedProps.VolatilitySet.HasStable() && !sharedProps.VolatilitySet.HasVolatile() {
+				tabMeta.AddComputedCol(colID, scalar)
+			}
 		}
 	}
 }
@@ -590,9 +697,9 @@ func (b *Builder) buildSequenceSelect(
 	md := b.factory.Metadata()
 	outScope = inScope.push()
 
-	cols := make(opt.ColList, len(sqlbase.SequenceSelectColumns))
+	cols := make(opt.ColList, len(colinfo.SequenceSelectColumns))
 
-	for i, c := range sqlbase.SequenceSelectColumns {
+	for i, c := range colinfo.SequenceSelectColumns {
 		cols[i] = md.AddColumn(c.Name, c.Typ)
 	}
 
@@ -641,12 +748,11 @@ func (b *Builder) buildWithOrdinality(colName string, inScope *scope) (outScope 
 }
 
 func (b *Builder) buildCTEs(with *tree.With, inScope *scope) (outScope *scope) {
-	outScope = inScope.push()
-
 	if with == nil {
-		return outScope
+		return inScope
 	}
 
+	outScope = inScope.push()
 	addedCTEs := make([]cteSource, len(with.CTEList))
 	hasRecursive := false
 
@@ -674,14 +780,15 @@ func (b *Builder) buildCTEs(with *tree.With, inScope *scope) (outScope *scope) {
 		}
 
 		id := b.factory.Memo().NextWithID()
+		b.factory.Metadata().AddWithBinding(id, cteExpr)
 
 		addedCTEs[i] = cteSource{
 			name:         cte.Name,
 			cols:         cteCols,
 			originalExpr: cte.Stmt,
 			expr:         cteExpr,
-			bindingProps: cteExpr.Relational(),
 			id:           id,
+			mtr:          cte.Mtr,
 		}
 		cte := &addedCTEs[i]
 		outScope.ctes[cte.name.Alias.String()] = cte
@@ -736,6 +843,7 @@ func (b *Builder) flushCTEs(expr memo.RelExpr) memo.RelExpr {
 			&memo.WithPrivate{
 				ID:           ctes[i].id,
 				Name:         string(ctes[i].name.Alias),
+				Mtr:          ctes[i].mtr,
 				OriginalExpr: ctes[i].originalExpr,
 			},
 		)
@@ -867,10 +975,10 @@ func (b *Builder) buildSelectStmtWithoutParens(
 		projectionsScope.cols = make([]scopeColumn, 0, len(outScope.cols))
 		for i := range outScope.cols {
 			expr := &outScope.cols[i]
-			col := b.addColumn(projectionsScope, "" /* alias */, expr)
+			col := projectionsScope.addColumn("" /* alias */, expr)
 			b.buildScalar(expr, outScope, projectionsScope, col, nil)
 		}
-		orderByScope := b.analyzeOrderBy(orderBy, outScope, projectionsScope)
+		orderByScope := b.analyzeOrderBy(orderBy, outScope, projectionsScope, tree.RejectGenerators|tree.RejectAggregates|tree.RejectWindowApplications)
 		b.buildOrderBy(outScope, projectionsScope, orderByScope)
 		b.constructProjectForScope(outScope, projectionsScope)
 		outScope = projectionsScope
@@ -900,6 +1008,7 @@ func (b *Builder) buildSelectClause(
 	inScope *scope,
 ) (outScope *scope) {
 	fromScope := b.buildFrom(sel.From, locking, inScope)
+
 	b.processWindowDefs(sel, fromScope)
 	b.buildWhere(sel.Where, fromScope)
 
@@ -914,7 +1023,7 @@ func (b *Builder) buildSelectClause(
 	// Any aggregates in the HAVING, ORDER BY and DISTINCT ON clauses (if they
 	// exist) will be added here.
 	havingExpr := b.analyzeHaving(sel.Having, fromScope)
-	orderByScope := b.analyzeOrderBy(orderBy, fromScope, projectionsScope)
+	orderByScope := b.analyzeOrderBy(orderBy, fromScope, projectionsScope, tree.RejectGenerators)
 	distinctOnScope := b.analyzeDistinctOnArgs(sel.DistinctOn, fromScope, projectionsScope)
 
 	var having opt.ScalarExpr
@@ -952,7 +1061,12 @@ func (b *Builder) buildSelectClause(
 		if projectionsScope.distinctOnCols.Empty() {
 			outScope.expr = b.constructDistinct(outScope)
 		} else {
-			outScope = b.buildDistinctOn(projectionsScope.distinctOnCols, outScope, false /* forUpsert */)
+			outScope = b.buildDistinctOn(
+				projectionsScope.distinctOnCols,
+				outScope,
+				false, /* nullsAreDistinct */
+				"",    /* errorOnDup */
+			)
 		}
 	}
 	return outScope
@@ -1014,7 +1128,13 @@ func (b *Builder) buildWhere(where *tree.Where, inScope *scope) {
 		return
 	}
 
-	filter := b.resolveAndBuildScalar(where.Expr, types.Bool, "WHERE", tree.RejectSpecial, inScope)
+	filter := b.resolveAndBuildScalar(
+		where.Expr,
+		types.Bool,
+		exprKindWhere,
+		tree.RejectGenerators|tree.RejectWindowApplications,
+		inScope,
+	)
 
 	// Wrap the filter in a FiltersOp.
 	inScope.expr = b.factory.ConstructSelect(
@@ -1118,6 +1238,7 @@ func (b *Builder) buildFromWithLateral(
 		// have been built already.
 		if b.exprIsLateral(tables[i]) {
 			scope = outScope
+			scope.context = exprKindLateralJoin
 		}
 		tableScope := b.buildDataSource(tables[i], nil /* indexFlags */, locking, scope)
 
@@ -1137,7 +1258,7 @@ func (b *Builder) buildFromWithLateral(
 // validateAsOf ensures that any AS OF SYSTEM TIME timestamp is consistent with
 // that of the root statement.
 func (b *Builder) validateAsOf(asOf tree.AsOfClause) {
-	ts, err := tree.EvalAsOfTimestamp(asOf, b.semaCtx, b.evalCtx)
+	ts, err := tree.EvalAsOfTimestamp(b.ctx, asOf, b.semaCtx, b.evalCtx)
 	if err != nil {
 		panic(err)
 	}
@@ -1203,13 +1324,12 @@ func (b *Builder) validateLockingInFrom(
 		// Validating locking wait policy.
 		switch li.WaitPolicy {
 		case tree.LockWaitBlock:
-			// Default.
+			// Default. Block on conflicting locks.
 		case tree.LockWaitSkip:
 			panic(unimplementedWithIssueDetailf(40476, "",
 				"SKIP LOCKED lock wait policy is not supported"))
 		case tree.LockWaitError:
-			panic(unimplementedWithIssueDetailf(40476, "",
-				"NOWAIT lock wait policy is not supported"))
+			// Raise an error on conflicting locks.
 		default:
 			panic(errors.AssertionFailedf("unknown locking wait policy: %s", li.WaitPolicy))
 		}
@@ -1233,7 +1353,7 @@ func (b *Builder) validateLockingInFrom(
 			// columns to be small enough that doing so is likely not worth it.
 			found := false
 			for _, col := range fromScope.cols {
-				if target.TableName == col.table.TableName {
+				if target.ObjectName == col.table.ObjectName {
 					found = true
 					break
 				}
@@ -1242,7 +1362,7 @@ func (b *Builder) validateLockingInFrom(
 				panic(pgerror.Newf(
 					pgcode.UndefinedTable,
 					"relation %q in %s clause not found in FROM clause",
-					target.TableName, li.Strength,
+					target.ObjectName, li.Strength,
 				))
 			}
 		}

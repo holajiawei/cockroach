@@ -1,5 +1,3 @@
-# LogicTest: local local-vec fakedist fakedist-metadata fakedist-vec 5node-local 5node-dist 5node-dist-metadata 5node-dist-disk
-
 statement ok
 CREATE TABLE kv (
   -- don't add column "a"
@@ -1319,10 +1317,10 @@ SELECT k, lead(k, w) OVER (PARTITION BY v ORDER BY w, k) FROM kv ORDER BY 1
 10  NULL
 11  NULL
 
-query error unknown signature: lag\(int, int, string\)
+query error pq: lag\(\): could not parse "FOO" as type int
 SELECT k, lag(k, 1, 'FOO') OVER () FROM kv ORDER BY 1
 
-query error unknown signature: lead\(int, int, string\)
+query error pq: lead\(\): could not parse "FOO" as type int
 SELECT k, lead(k, 1, 'FOO') OVER () FROM kv ORDER BY 1
 
 query error unknown signature: lag\(int, int, string\)
@@ -1734,7 +1732,7 @@ SELECT k, last_value(v) OVER (PARTITION BY k) FROM kv ORDER BY 1
 10  4
 11  NULL
 
-query error unknown signature: nth_value\(int, string\)
+query error pq: nth_value\(\): could not parse "FOO" as type int
 SELECT k, nth_value(v, 'FOO') OVER () FROM kv ORDER BY 1
 
 query error argument of nth_value\(\) must be greater than zero
@@ -3619,3 +3617,284 @@ ORDER BY
 2  1  2  2  2
 3  2  4  4  3
 4  2  4  4  4
+
+query IIIRRTBTTTTTTTTT
+SELECT
+  *,
+  array_agg(v) OVER (wv RANGE BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING),
+  array_agg(v) OVER (wv RANGE BETWEEN 0 PRECEDING AND 1 PRECEDING),
+  array_agg(f) OVER (wf RANGE BETWEEN UNBOUNDED PRECEDING AND -0.0 PRECEDING),
+  array_agg(f) OVER (wf RANGE BETWEEN 0.0 PRECEDING AND 1.0 PRECEDING),
+  array_agg(d) OVER (wd RANGE BETWEEN 0.0 FOLLOWING AND 0.0 FOLLOWING),
+  array_agg(d) OVER (wd RANGE BETWEEN 1.0 FOLLOWING AND UNBOUNDED FOLLOWING),
+  array_agg(i) OVER (wi RANGE BETWEEN '1s'::INTERVAL PRECEDING AND '0s'::INTERVAL PRECEDING),
+  array_agg(i) OVER (wi RANGE BETWEEN '1s'::INTERVAL FOLLOWING AND '1s'::INTERVAL FOLLOWING)
+FROM
+  kv
+WINDOW
+  wv AS (ORDER BY v DESC),
+  wf AS (ORDER BY f),
+  wd AS (ORDER BY d DESC),
+  wi AS (ORDER BY i)
+ORDER BY
+  k
+----
+1   2     3  1    1     a     true   00:01:00      {4,4,4,2,2,2,2}            NULL         {0.1,0.2,0.3,1.0}                      NULL  {1}               {-321,NULL,NULL,NULL}          {00:01:00}             NULL
+3   4     5  2    8     a     true   00:00:02      {4,4,4}                    NULL         {0.1,0.2,0.3,1.0,2.0}                  NULL  {8}               {4.4,3,1,-321,NULL,NULL,NULL}  {00:00:02}             NULL
+5   NULL  5  9.9  -321  NULL  false  NULL          {4,4,4,2,2,2,2,NULL,NULL}  {NULL,NULL}  {0.1,0.2,0.3,1.0,2.0,3.0,4.4,6.0,9.9}  NULL  {-321}            {NULL,NULL,NULL}               {NULL,NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}
+6   2     3  4.4  4.4   b     true   00:00:00.001  {4,4,4,2,2,2,2}            NULL         {0.1,0.2,0.3,1.0,2.0,3.0,4.4}          NULL  {4.4}             {3,1,-321,NULL,NULL,NULL}      {00:00:00.001}         NULL
+7   2     2  6    7.9   b     true   4 days        {4,4,4,2,2,2,2}            NULL         {0.1,0.2,0.3,1.0,2.0,3.0,4.4,6.0}      NULL  {7.9}             {4.4,3,1,-321,NULL,NULL,NULL}  {"4 days"}             NULL
+8   4     2  3    3     A     false  3 years       {4,4,4}                    NULL         {0.1,0.2,0.3,1.0,2.0,3.0}              NULL  {3}               {1,-321,NULL,NULL,NULL}        {"3 years"}            NULL
+9   2     9  0.1  NULL  NULL  NULL   NULL          {4,4,4,2,2,2,2}            NULL         {0.1}                                  NULL  {NULL,NULL,NULL}  {NULL,NULL,NULL}               {NULL,NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}
+10  4     9  0.2  NULL  NULL  NULL   NULL          {4,4,4}                    NULL         {0.1,0.2}                              NULL  {NULL,NULL,NULL}  {NULL,NULL,NULL}               {NULL,NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}
+11  NULL  9  0.3  NULL  NULL  NULL   NULL          {4,4,4,2,2,2,2,NULL,NULL}  {NULL,NULL}  {0.1,0.2,0.3}                          NULL  {NULL,NULL,NULL}  {NULL,NULL,NULL}               {NULL,NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}
+
+# Regression test for #43083 (CBO optimizing out the single column from ORDER
+# BY clause which led to a crash in the execution engine).
+query IIIRRTBTTTTTTTTT
+SELECT
+  *,
+  array_agg(v) OVER (wv RANGE BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING),
+  array_agg(v) OVER (wv RANGE BETWEEN 0 PRECEDING AND 1 PRECEDING),
+  array_agg(f) OVER (wf RANGE BETWEEN UNBOUNDED PRECEDING AND -0.0 PRECEDING),
+  array_agg(f) OVER (wf RANGE BETWEEN 0.0 PRECEDING AND 1.0 PRECEDING),
+  array_agg(d) OVER (wd RANGE BETWEEN 0.0 FOLLOWING AND 0.0 FOLLOWING),
+  array_agg(d) OVER (wd RANGE BETWEEN 1.0 FOLLOWING AND UNBOUNDED FOLLOWING),
+  array_agg(i) OVER (wi RANGE BETWEEN '1s'::INTERVAL PRECEDING AND '0s'::INTERVAL PRECEDING),
+  array_agg(i) OVER (wi RANGE BETWEEN '1s'::INTERVAL FOLLOWING AND '1s'::INTERVAL FOLLOWING)
+FROM
+  kv
+WINDOW
+  wv AS (PARTITION BY v ORDER BY v),
+  wf AS (PARTITION BY f ORDER BY f DESC),
+  wd AS (PARTITION BY d ORDER BY d),
+  wi AS (PARTITION BY i ORDER BY i DESC)
+ORDER BY
+  k
+----
+1   2     3  1    1     a     true   00:01:00      {2,2,2,2}    NULL         {1.0}  NULL  {1}               NULL              {00:01:00}             NULL
+3   4     5  2    8     a     true   00:00:02      {4,4,4}      NULL         {2.0}  NULL  {8}               NULL              {00:00:02}             NULL
+5   NULL  5  9.9  -321  NULL  false  NULL          {NULL,NULL}  {NULL,NULL}  {9.9}  NULL  {-321}            NULL              {NULL,NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}
+6   2     3  4.4  4.4   b     true   00:00:00.001  {2,2,2,2}    NULL         {4.4}  NULL  {4.4}             NULL              {00:00:00.001}         NULL
+7   2     2  6    7.9   b     true   4 days        {2,2,2,2}    NULL         {6.0}  NULL  {7.9}             NULL              {"4 days"}             NULL
+8   4     2  3    3     A     false  3 years       {4,4,4}      NULL         {3.0}  NULL  {3}               NULL              {"3 years"}            NULL
+9   2     9  0.1  NULL  NULL  NULL   NULL          {2,2,2,2}    NULL         {0.1}  NULL  {NULL,NULL,NULL}  {NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}
+10  4     9  0.2  NULL  NULL  NULL   NULL          {4,4,4}      NULL         {0.2}  NULL  {NULL,NULL,NULL}  {NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}
+11  NULL  9  0.3  NULL  NULL  NULL   NULL          {NULL,NULL}  {NULL,NULL}  {0.3}  NULL  {NULL,NULL,NULL}  {NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}  {NULL,NULL,NULL,NULL}
+
+# Check that telemetry is being collected on the window functions' usage.
+query B
+SELECT count(*) >= 26 FROM crdb_internal.feature_usage WHERE feature_name LIKE 'sql.plan.window_function%' AND usage_count > 0
+----
+true
+
+statement ok
+DROP TABLE t; CREATE TABLE t (a INT, b INT, c INT PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES
+  (0, 1, 0),
+  (1, 1, 1),
+  (0, 2, 2),
+  (1, 2, 3)
+
+# We sort the output on all queries with row_number window function to get
+# deterministic results.
+query III
+SELECT a, b, row_number() OVER (ORDER BY a, b) FROM t ORDER BY a, b
+----
+0 1 1
+0 2 2
+1 1 3
+1 2 4
+
+query III
+SELECT a, b, row_number() OVER (PARTITION BY a ORDER BY b) FROM t ORDER BY a, b
+----
+0 1 1
+0 2 2
+1 1 1
+1 2 2
+
+query III
+SELECT a, b, row_number() OVER (PARTITION BY a, b) FROM t ORDER BY a, b
+----
+0 1 1
+0 2 1
+1 1 1
+1 2 1
+
+query III rowsort
+SELECT a, b, rank() OVER () FROM t
+----
+0 1 1
+0 2 1
+1 1 1
+1 2 1
+
+query III rowsort
+SELECT a, b, rank() OVER (ORDER BY a) FROM t
+----
+0 1 1
+0 2 1
+1 1 3
+1 2 3
+
+query IIII rowsort
+SELECT a, b, c, rank() OVER (PARTITION BY a ORDER BY c) FROM t
+----
+0 1 0 1
+0 2 2 2
+1 1 1 1
+1 2 3 2
+
+query III rowsort
+SELECT a, b, dense_rank() OVER () FROM t
+----
+0 1 1
+0 2 1
+1 1 1
+1 2 1
+
+query III rowsort
+SELECT a, b, dense_rank() OVER (ORDER BY a) FROM t
+----
+0 1 1
+0 2 1
+1 1 2
+1 2 2
+
+query IIII rowsort
+SELECT a, b, c, dense_rank() OVER (PARTITION BY a ORDER BY c) FROM t
+----
+0 1 0 1
+0 2 2 2
+1 1 1 1
+1 2 3 2
+
+query IIIIRR rowsort
+SELECT a, b, rank() OVER w, dense_rank() OVER w, percent_rank() OVER w, cume_dist() OVER w FROM t WINDOW w AS ()
+----
+0  1  1  1  0  1
+1  1  1  1  0  1
+0  2  1  1  0  1
+1  2  1  1  0  1
+
+query IIIIRR rowsort
+SELECT a, b, rank() OVER w, dense_rank() OVER w, percent_rank() OVER w, cume_dist() OVER w FROM t WINDOW w AS (PARTITION BY a)
+----
+0  1  1  1  0  1
+0  2  1  1  0  1
+1  1  1  1  0  1
+1  2  1  1  0  1
+
+
+query IIIIRR rowsort
+SELECT a, b, rank() OVER w, dense_rank() OVER w, percent_rank() OVER w, cume_dist() OVER w FROM t WINDOW w AS (ORDER BY a)
+----
+0  1  1  1  0                  0.5
+0  2  1  1  0                  0.5
+1  1  3  2  0.666666666666667  1
+1  2  3  2  0.666666666666667  1
+
+query IIIIRR rowsort
+SELECT a, b, rank() OVER w, dense_rank() OVER w, percent_rank() OVER w, cume_dist() OVER w FROM t WINDOW w AS (PARTITION BY a ORDER BY b)
+----
+0  1  1  1  0  0.5
+0  2  2  2  1  1
+1  1  1  1  0  0.5
+1  2  2  2  1  1
+
+# Regression test for peer group number computation overflow (#53654).
+query II rowsort
+SELECT
+  max(k) OVER (w GROUPS BETWEEN 9223372036854775807 FOLLOWING AND UNBOUNDED FOLLOWING),
+  max(k) OVER (w GROUPS BETWEEN UNBOUNDED PRECEDING AND 9223372036854775807 FOLLOWING)
+FROM kv WINDOW w AS (PARTITION BY b ORDER BY v)
+----
+NULL  11
+NULL  11
+NULL  11
+NULL  8
+NULL  8
+NULL  7
+NULL  7
+NULL  7
+NULL  7
+
+# Regression test for #53442. Ordering columns are not pruned with RANGE mode
+# and an offset boundary of PRECEDING or FOLLOWING.
+
+statement ok
+CREATE TABLE t53442_a (a INT8 PRIMARY KEY);
+CREATE TABLE t53442_b (b INT2 PRIMARY KEY);
+
+statement ok
+SELECT max(b::INT8) OVER (PARTITION BY b ORDER BY b RANGE 1 PRECEDING)
+FROM t53442_b NATURAL JOIN t53442_a
+WHERE false
+
+statement ok
+SELECT max(b::INT8) OVER (PARTITION BY b ORDER BY a RANGE 1 PRECEDING)
+FROM t53442_b NATURAL JOIN t53442_a
+WHERE false
+
+# Regression test for a crash with json_object_agg used as a window function
+# (#54604).
+statement ok
+CREATE TABLE t54604 (s STRING);
+INSERT INTO t54604 SELECT g::STRING FROM generate_series(1, 5) AS g
+
+query T rowsort
+SELECT json_object_agg(s, s) OVER (ORDER BY s DESC) FROM t54604
+----
+{"1": "1", "2": "2", "3": "3", "4": "4", "5": "5"}
+{"2": "2", "3": "3", "4": "4", "5": "5"}
+{"3": "3", "4": "4", "5": "5"}
+{"4": "4", "5": "5"}
+{"5": "5"}
+
+query T rowsort
+SELECT jsonb_object_agg(s, s) OVER (ORDER BY s RANGE UNBOUNDED PRECEDING) FROM t54604
+----
+{"1": "1"}
+{"1": "1", "2": "2"}
+{"1": "1", "2": "2", "3": "3"}
+{"1": "1", "2": "2", "3": "3", "4": "4"}
+{"1": "1", "2": "2", "3": "3", "4": "4", "5": "5"}
+
+# Regression test for window aggregate functions not making a deep copy of decimals on each iteration (#55944).
+statement ok
+CREATE TABLE t55944 (x decimal);
+INSERT INTO t55944 (x)
+VALUES (1.0),
+       (20.0),
+       (25.0),
+       (41.0),
+       (55.5),
+       (60.9),
+       (72.0),
+       (88.0),
+       (88.0),
+       (89.0);
+
+query RFFFFF
+SELECT x,
+       sqrdiff(x) OVER (ORDER BY x) as sqrdiff,
+       var_pop(x) OVER (ORDER BY x) as var_pop,
+       var_samp(x) OVER (ORDER BY x) as var_samp,
+       stddev_pop(x) OVER (ORDER BY x) as stddev_pop,
+       stddev_samp(x) OVER (ORDER BY x) as stddev_samp
+FROM t55944
+ORDER BY x
+----
+1.0  0                          0                     NULL                  0                     NULL
+20.0 180.5                      90.25                 180.5                 9.5                   13.435028842544402964
+25.0 320.6666666666666666666667 106.88888888888888889 160.33333333333333333 10.338708279513881752 12.662279942148385993
+41.0 814.7500000000000000000001 203.6875              271.58333333333333333 14.271912976192084391 16.479785597310825856
+55.5 1726                       345.2                 431.5                 18.579558659989746915 20.772578077840988103
+60.9 2600.8                     433.46666666666666667 520.16                20.819862311424316109 22.807016464237491316
+72.0 3845.037142857142857142857 549.29102040816326531 640.83952380952380952 23.436958429117103874 25.314808389745394427
+88.0 7527.842222222222222222222 836.42691358024691358 940.98027777777777778 28.921046204801217626 30.675401835636607970
+88.0 7527.842222222222222222222 836.42691358024691358 940.98027777777777778 28.921046204801217626 30.675401835636607970
+89.0 8885.844                   888.5844              987.316               29.809132828715430446 31.421584937746218024

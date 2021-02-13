@@ -20,64 +20,62 @@
 package colexec
 
 import (
-	"fmt"
-	"time"
-
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ = typeconv.DatumVecCanonicalTypeFamily
+	_ apd.Context
+	_ duration.Duration
+	_ encoding.Direction
 )
 
 // {{/*
 
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
-
-const (
-	_FAMILY = types.Family(0)
-	_WIDTH  = int32(0)
-)
-
-type _GOTYPE interface{}
-
 func _ROWS_TO_COL_VEC(
-	rows sqlbase.EncDatumRows, vec coldata.Vec, columnIdx int, alloc *sqlbase.DatumAlloc,
-) error { // */}}
+	rows rowenc.EncDatumRows, vec coldata.Vec, columnIdx int, alloc *rowenc.DatumAlloc,
+) { // */}}
 	// {{define "rowsToColVec" -}}
-	col := vec._TemplateType()
-	datumToPhysicalFn := typeconv.GetDatumToPhysicalFn(columnType)
-	for i := range rows {
-		row := rows[i]
-		if row[columnIdx].Datum == nil {
-			if err = row[columnIdx].EnsureDecoded(columnType, alloc); err != nil {
-				return
+	col := vec.TemplateType()
+	if len(rows) > 0 {
+		_ = col.Get(len(rows) - 1)
+		var v interface{}
+		for i := range rows {
+			row := rows[i]
+			if row[columnIdx].Datum == nil {
+				if err = row[columnIdx].EnsureDecoded(t, alloc); err != nil {
+					return
+				}
 			}
-		}
-		datum := row[columnIdx].Datum
-		if datum == tree.DNull {
-			vec.Nulls().SetNull(i)
-		} else {
-			v, err := datumToPhysicalFn(datum)
-			if err != nil {
-				return
+			datum := row[columnIdx].Datum
+			if datum == tree.DNull {
+				vec.Nulls().SetNull(i)
+			} else {
+				_PRELUDE(datum)
+				v = _CONVERT(datum)
+				castV := v.(_GOTYPE)
+				// {{if .Sliceable}}
+				// {{if not (eq .VecMethod "Decimal")}}
+				// {{/*
+				//     For some reason, decimal vectors - although sliceable -
+				//     still have bounds checks.
+				//     TODO(yuzefovich): figure it out.
+				// */}}
+				//gcassert:bce
+				// {{end}}
+				// {{end}}
+				_SET(col, i, castV)
 			}
-
-			castV := v.(_GOTYPE)
-			execgen.SET(col, i, castV)
 		}
 	}
 	// {{end}}
@@ -89,35 +87,27 @@ func _ROWS_TO_COL_VEC(
 // EncDatumRowsToColVec converts one column from EncDatumRows to a column
 // vector. columnIdx is the 0-based index of the column in the EncDatumRows.
 func EncDatumRowsToColVec(
-	allocator *Allocator,
-	rows sqlbase.EncDatumRows,
+	allocator *colmem.Allocator,
+	rows rowenc.EncDatumRows,
 	vec coldata.Vec,
 	columnIdx int,
-	columnType *types.T,
-	alloc *sqlbase.DatumAlloc,
+	t *types.T,
+	alloc *rowenc.DatumAlloc,
 ) error {
 	var err error
 	allocator.PerformOperation(
 		[]coldata.Vec{vec},
 		func() {
-			switch columnType.Family() {
+			switch t.Family() {
 			// {{range .}}
-			case _FAMILY:
-				// {{ if .Widths }}
-				switch columnType.Width() {
+			case _TYPE_FAMILY:
+				switch t.Width() {
 				// {{range .Widths}}
-				case _WIDTH:
-					_ROWS_TO_COL_VEC(rows, vec, columnIdx, columnType, alloc)
-				// {{end}}
-				default:
-					execerror.VectorizedInternalPanic(fmt.Sprintf("unsupported width %d for column type %s", columnType.Width(), columnType.String()))
+				case _TYPE_WIDTH:
+					_ROWS_TO_COL_VEC(rows, vec, columnIdx, t, alloc)
+					// {{end}}
 				}
-				// {{ else }}
-				_ROWS_TO_COL_VEC(rows, vec, columnIdx, columnType, alloc)
 				// {{end}}
-			// {{end}}
-			default:
-				execerror.VectorizedInternalPanic(fmt.Sprintf("unsupported column type %s", columnType.String()))
 			}
 		},
 	)

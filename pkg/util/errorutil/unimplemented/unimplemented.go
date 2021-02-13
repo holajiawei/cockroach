@@ -13,6 +13,7 @@ package unimplemented
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/errors"
 )
 
@@ -49,15 +50,6 @@ func NewWithIssuef(issue int, format string, args ...interface{}) error {
 	return unimplementedInternal(1 /*depth*/, issue, "" /*detail*/, true /*format*/, format, args...)
 }
 
-// NewWithIssueHint constructs an error with the given
-// message, hint, and a link to the passed issue. Recorded as "#<issue>"
-// in tracking.
-func NewWithIssueHint(issue int, msg, hint string) error {
-	err := unimplementedInternal(1 /*depth*/, issue, "" /*detail*/, false /*format*/, msg)
-	err = errors.WithHint(err, hint)
-	return err
-}
-
 // NewWithIssueDetail constructs an error with the given message
 // and a link to the passed issue. Recorded as "#<issue>.detail" in tracking.
 // This is useful when we need an extra axis of information to drill down into.
@@ -65,8 +57,7 @@ func NewWithIssueDetail(issue int, detail, msg string) error {
 	return unimplementedInternal(1 /*depth*/, issue, detail, false /*format*/, msg)
 }
 
-// NewWithIssueDetailf is like UnimplementedWithIssueDetail
-// but the message is formatted.
+// NewWithIssueDetailf is like NewWithIssueDetail but the message is formatted.
 func NewWithIssueDetailf(issue int, detail, format string, args ...interface{}) error {
 	return unimplementedInternal(1 /*depth*/, issue, detail, true /*format*/, format, args...)
 }
@@ -77,7 +68,7 @@ func unimplementedInternal(
 	// Create the issue link.
 	link := errors.IssueLink{Detail: detail}
 	if issue > 0 {
-		link.IssueURL = makeURL(issue)
+		link.IssueURL = build.MakeIssueURL(issue)
 	}
 
 	// Instantiate the base error.
@@ -106,8 +97,4 @@ func unimplementedInternal(
 		err = errors.WithTelemetry(err, detail)
 	}
 	return err
-}
-
-func makeURL(issue int) string {
-	return fmt.Sprintf("https://github.com/cockroachdb/cockroach/issues/%d", issue)
 }

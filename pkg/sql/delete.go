@@ -14,11 +14,10 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 var deleteNodePool = sync.Pool{
@@ -33,7 +32,7 @@ type deleteNode struct {
 	// columns is set if this DELETE is returning any rows, to be
 	// consumed by a renderNode upstream. This occurs when there is a
 	// RETURNING clause with some scalar expressions.
-	columns sqlbase.ResultColumns
+	columns colinfo.ResultColumns
 
 	run deleteRun
 }
@@ -43,18 +42,17 @@ type deleteRun struct {
 	td         tableDeleter
 	rowsNeeded bool
 
-	// rowCount is the number of rows in the current batch.
-	rowCount int
-
 	// done informs a new call to BatchedNext() that the previous call
 	// to BatchedNext() has completed the work already.
 	done bool
 
-	// rows contains the accumulated result rows if rowsNeeded is set.
-	rows *rowcontainer.RowContainer
-
 	// traceKV caches the current KV tracing flag.
 	traceKV bool
+
+	// partialIndexDelValsOffset is the offset of partial index delete
+	// indicators in the source values. It is equal to the number of fetched
+	// columns.
+	partialIndexDelValsOffset int
 
 	// rowIdxToRetIdx is the mapping from the columns returned by the deleter
 	// to the columns in the resultRowBuffer. A value of -1 is used to indicate
@@ -64,24 +62,14 @@ type deleteRun struct {
 	rowIdxToRetIdx []int
 }
 
-// maxDeleteBatchSize is the max number of entries in the KV batch for
-// the delete operation (including secondary index updates, FK
-// cascading updates, etc), before the current KV batch is executed
-// and a new batch is started.
-const maxDeleteBatchSize = 10000
-
 func (d *deleteNode) startExec(params runParams) error {
-	if err := params.p.maybeSetSystemConfig(d.run.td.tableDesc().GetID()); err != nil {
-		return err
-	}
-
 	// cache traceKV during execution, to avoid re-evaluating it for every row.
 	d.run.traceKV = params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 
 	if d.run.rowsNeeded {
-		d.run.rows = rowcontainer.NewRowContainer(
+		d.run.td.rows = rowcontainer.NewRowContainer(
 			params.EvalContext().Mon.MakeBoundAccount(),
-			sqlbase.ColTypeInfoFromResCols(d.columns), 0)
+			colinfo.ColTypeInfoFromResCols(d.columns))
 	}
 	return d.run.td.init(params.ctx, params.p.txn, params.EvalContext())
 }
@@ -102,13 +90,8 @@ func (d *deleteNode) BatchedNext(params runParams) (bool, error) {
 		return false, nil
 	}
 
-	tracing.AnnotateTrace()
-
-	// Advance one batch. First, clear the current batch.
-	d.run.rowCount = 0
-	if d.run.rows != nil {
-		d.run.rows.Clear(params.ctx)
-	}
+	// Advance one batch. First, clear the last batch.
+	d.run.td.clearLastBatch(params.ctx)
 	// Now consume/accumulate the rows for this batch.
 	lastBatch := false
 	for {
@@ -131,19 +114,13 @@ func (d *deleteNode) BatchedNext(params runParams) (bool, error) {
 			return false, err
 		}
 
-		d.run.rowCount++
-
 		// Are we done yet with the current batch?
-		if d.run.td.curBatchSize() >= maxDeleteBatchSize {
+		if d.run.td.currentBatchSize >= d.run.td.maxBatchSize {
 			break
 		}
 	}
 
-	if d.run.rowCount > 0 {
-		if err := d.run.td.atBatchEnd(params.ctx, d.run.traceKV); err != nil {
-			return false, err
-		}
-
+	if d.run.td.currentBatchSize > 0 {
 		if !lastBatch {
 			// We only run/commit the batch if there were some rows processed
 			// in this batch.
@@ -154,7 +131,7 @@ func (d *deleteNode) BatchedNext(params runParams) (bool, error) {
 	}
 
 	if lastBatch {
-		if _, err := d.run.td.finalize(params.ctx, d.run.traceKV); err != nil {
+		if err := d.run.td.finalize(params.ctx); err != nil {
 			return false, err
 		}
 		// Remember we're done for the next call to BatchedNext().
@@ -163,38 +140,56 @@ func (d *deleteNode) BatchedNext(params runParams) (bool, error) {
 
 	// Possibly initiate a run of CREATE STATISTICS.
 	params.ExecCfg().StatsRefresher.NotifyMutation(
-		d.run.td.tableDesc().ID,
-		d.run.rowCount,
+		d.run.td.tableDesc().GetID(),
+		d.run.td.lastBatchSize,
 	)
 
-	return d.run.rowCount > 0, nil
+	return d.run.td.lastBatchSize > 0, nil
 }
 
 // processSourceRow processes one row from the source for deletion and, if
 // result rows are needed, saves it in the result row container
 func (d *deleteNode) processSourceRow(params runParams, sourceVals tree.Datums) error {
+	// Create a set of partial index IDs to not delete from. Indexes should not
+	// be deleted from when they are partial indexes and the row does not
+	// satisfy the predicate and therefore do not exist in the partial index.
+	// This set is passed as a argument to tableDeleter.row below.
+	var pm row.PartialIndexUpdateHelper
+	if len(d.run.td.tableDesc().PartialIndexes()) > 0 {
+		partialIndexDelVals := sourceVals[d.run.partialIndexDelValsOffset:]
+
+		err := pm.Init(tree.Datums{}, partialIndexDelVals, d.run.td.tableDesc())
+		if err != nil {
+			return err
+		}
+
+		// Truncate sourceVals so that it no longer includes partial index
+		// predicate values.
+		sourceVals = sourceVals[:d.run.partialIndexDelValsOffset]
+	}
+
 	// Queue the deletion in the KV batch.
-	if err := d.run.td.row(params.ctx, sourceVals, d.run.traceKV); err != nil {
+	if err := d.run.td.row(params.ctx, sourceVals, pm, d.run.traceKV); err != nil {
 		return err
 	}
 
 	// If result rows need to be accumulated, do it.
-	if d.run.rows != nil {
+	if d.run.td.rows != nil {
 		// The new values can include all columns, the construction of the
-		// values has used publicAndNonPublicColumns so the values may
-		// contain additional columns for every newly dropped column not
-		// visible. We do not want them to be available for RETURNING.
+		// values has used execinfra.ScanVisibilityPublicAndNotPublic so the
+		// values may contain additional columns for every newly dropped column
+		// not visible. We do not want them to be available for RETURNING.
 		//
 		// d.run.rows.NumCols() is guaranteed to only contain the requested
 		// public columns.
-		resultValues := make(tree.Datums, d.run.rows.NumCols())
+		resultValues := make(tree.Datums, d.run.td.rows.NumCols())
 		for i, retIdx := range d.run.rowIdxToRetIdx {
 			if retIdx >= 0 {
 				resultValues[retIdx] = sourceVals[i]
 			}
 		}
 
-		if _, err := d.run.rows.AddRow(params.ctx, resultValues); err != nil {
+		if _, err := d.run.td.rows.AddRow(params.ctx, resultValues); err != nil {
 			return err
 		}
 	}
@@ -203,93 +198,16 @@ func (d *deleteNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 }
 
 // BatchedCount implements the batchedPlanNode interface.
-func (d *deleteNode) BatchedCount() int { return d.run.rowCount }
+func (d *deleteNode) BatchedCount() int { return d.run.td.lastBatchSize }
 
 // BatchedCount implements the batchedPlanNode interface.
-func (d *deleteNode) BatchedValues(rowIdx int) tree.Datums { return d.run.rows.At(rowIdx) }
+func (d *deleteNode) BatchedValues(rowIdx int) tree.Datums { return d.run.td.rows.At(rowIdx) }
 
 func (d *deleteNode) Close(ctx context.Context) {
 	d.source.Close(ctx)
-	if d.run.rows != nil {
-		d.run.rows.Close(ctx)
-		d.run.rows = nil
-	}
 	d.run.td.close(ctx)
 	*d = deleteNode{}
 	deleteNodePool.Put(d)
-}
-
-func canDeleteFastInterleaved(table *ImmutableTableDescriptor, fkTables row.FkTableMetadata) bool {
-	// If there are no interleaved tables then don't take the fast path.
-	// This avoids superfluous use of DelRange in cases where there isn't as much of a performance boost.
-	hasInterleaved := false
-	for _, idx := range table.AllNonDropIndexes() {
-		if len(idx.InterleavedBy) > 0 {
-			hasInterleaved = true
-			break
-		}
-	}
-	if !hasInterleaved {
-		return false
-	}
-
-	// if the base table is interleaved in another table, fail
-	for _, idx := range fkTables[table.ID].Desc.AllNonDropIndexes() {
-		if len(idx.Interleave.Ancestors) > 0 {
-			return false
-		}
-	}
-
-	interleavedQueue := []sqlbase.ID{table.ID}
-	// interleavedIdxs will contain all of the table and index IDs of the indexes
-	// interleaved in any of the interleaved hierarchy of the input table.
-	interleavedIdxs := make(map[sqlbase.ID]map[sqlbase.IndexID]struct{})
-	for len(interleavedQueue) > 0 {
-		tableID := interleavedQueue[0]
-		interleavedQueue = interleavedQueue[1:]
-		if _, ok := fkTables[tableID]; !ok {
-			return false
-		}
-		tableDesc := fkTables[tableID].Desc
-		if tableDesc == nil {
-			return false
-		}
-		for _, idx := range tableDesc.AllNonDropIndexes() {
-			// Don't allow any secondary indexes
-			// TODO(emmanuel): identify the cases where secondary indexes can still work with the fast path and allow them
-			if idx.ID != tableDesc.PrimaryIndex.ID {
-				return false
-			}
-
-			for _, ref := range idx.InterleavedBy {
-				if _, ok := interleavedIdxs[ref.Table]; !ok {
-					interleavedIdxs[ref.Table] = make(map[sqlbase.IndexID]struct{})
-				}
-				interleavedIdxs[ref.Table][ref.Index] = struct{}{}
-
-			}
-
-			for _, ref := range idx.InterleavedBy {
-				interleavedQueue = append(interleavedQueue, ref.Table)
-			}
-
-		}
-
-		// The index can't be referenced by anything that's not the interleaved relationship.
-		for i := range tableDesc.InboundFKs {
-			fk := &tableDesc.InboundFKs[i]
-			if _, ok := interleavedIdxs[fk.OriginTableID]; !ok {
-				// This table is referenced by a foreign key that lives outside of the
-				// interleaved hierarchy, so we can't fast path delete.
-				return false
-			}
-			// All of these references MUST be ON DELETE CASCADE.
-			if fk.OnDelete != sqlbase.ForeignKeyReference_CASCADE {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 func (d *deleteNode) enableAutoCommit() {

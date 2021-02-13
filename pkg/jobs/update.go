@@ -11,18 +11,19 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // UpdateFn is the callback passed to Job.Update. It is called from the context
@@ -32,7 +33,7 @@ import (
 //
 // The function is free to modify contents of JobMetadata in place (but the
 // changes will be ignored unless JobUpdater is used).
-type UpdateFn func(txn *client.Txn, md JobMetadata, ju *JobUpdater) error
+type UpdateFn func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error
 
 // JobMetadata groups the job metadata values passed to UpdateFn.
 type JobMetadata struct {
@@ -99,27 +100,49 @@ func (ju *JobUpdater) hasUpdates() bool {
 // defined in jobs.go.
 func (j *Job) Update(ctx context.Context, updateFn UpdateFn) error {
 	if j.id == nil {
-		return errors.New("Job: cannot update: job not created")
+		return errors.New("job: cannot update: job not created")
 	}
 
 	var payload *jobspb.Payload
 	var progress *jobspb.Progress
-	if err := j.runInTxn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		const selectStmt = "SELECT status, payload, progress FROM system.jobs WHERE id = $1"
-		row, err := j.registry.ex.QueryRowEx(
-			ctx, "log-job", txn, sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
-			selectStmt, *j.id)
+	if err := j.runInTxn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		stmt := "SELECT status, payload, progress FROM system.jobs WHERE id = $1 FOR UPDATE"
+		if j.sessionID != "" {
+			stmt = "SELECT status, payload, progress, claim_session_id FROM system." +
+				"jobs WHERE id = $1 FOR UPDATE"
+		}
+		var err error
+		var row tree.Datums
+		row, err = j.registry.ex.QueryRowEx(
+			ctx, "log-job", txn, sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			stmt, *j.id,
+		)
 		if err != nil {
 			return err
 		}
 		if row == nil {
-			return errors.Errorf("no such job %d found", *j.id)
+			return errors.Errorf("job %d: not found in system.jobs table", *j.ID())
 		}
 
 		statusString, ok := row[0].(*tree.DString)
 		if !ok {
-			return errors.Errorf("Job: expected string status on job %d, but got %T", *j.id, statusString)
+			return errors.AssertionFailedf("job %d: expected string status, but got %T", *j.id, statusString)
 		}
+
+		if j.sessionID != "" {
+			if row[3] == tree.DNull {
+				return errors.Errorf(
+					"job %d: with status '%s': expected session '%s' but found NULL",
+					*j.ID(), statusString, j.sessionID)
+			}
+			storedSession := []byte(*row[3].(*tree.DBytes))
+			if !bytes.Equal(storedSession, j.sessionID.UnsafeBytes()) {
+				return errors.Errorf(
+					"job %d: with status '%s': expected session '%s' but found '%s'",
+					*j.ID(), statusString, j.sessionID, storedSession)
+			}
+		}
+
 		status := Status(*statusString)
 		if payload, err = UnmarshalPayload(row[1]); err != nil {
 			return err
@@ -138,7 +161,11 @@ func (j *Job) Update(ctx context.Context, updateFn UpdateFn) error {
 		if err := updateFn(txn, md, &ju); err != nil {
 			return err
 		}
-
+		if j.registry.knobs.BeforeUpdate != nil {
+			if err := j.registry.knobs.BeforeUpdate(md, ju.md); err != nil {
+				return err
+			}
+		}
 		if !ju.hasUpdates() {
 			return nil
 		}
@@ -194,7 +221,7 @@ func (j *Job) Update(ctx context.Context, updateFn UpdateFn) error {
 		}
 		if n != 1 {
 			return errors.Errorf(
-				"Job: expected exactly one row affected, but %d rows affected by job update", n,
+				"job %d: expected exactly one row affected, but %d rows affected by job update", *j.id, n,
 			)
 		}
 		return nil

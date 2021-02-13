@@ -15,6 +15,9 @@ option go_package = "roachpb";
 import "gogoproto/gogo.proto";
 import "google/protobuf/timestamp.proto";
 
+// StatementStatistics represent the statement statistics sent to the DB
+// Console for a given statement fingerprint. Note that these stats are cleared
+// ever diagnostics.sql_stat_reset_interval.
 // N.B. When fields are added to this struct, make sure to update
 // (*StatementStatistics).Add and (*StatementStatistics).AlmostEqual
 // in app_stats.go.
@@ -78,17 +81,78 @@ message StatementStatistics {
   // sent to the reg cluster.
   optional SensitiveInfo sensitive_info = 12 [(gogoproto.nullable) = false];
 
-  optional int64 bytes_read = 13 [(gogoproto.nullable) = false];
+  reserved 13, 14;
 
-  optional int64 rows_read = 14 [(gogoproto.nullable) = false];
+  // BytesRead collects the number of bytes read from disk.
+  optional NumericStat bytes_read = 15 [(gogoproto.nullable) = false];
 
-  // Note: be sure to update `sql/app_stats.go` when adding/removing fields here!
+  // RowsRead collects the number of rows read from disk.
+  optional NumericStat rows_read = 16 [(gogoproto.nullable) = false];
+
+  // BytesSentOverNetwork collects the number of bytes sent over the network.
+  optional NumericStat bytes_sent_over_network = 17 [(gogoproto.nullable) = false];
+
+  // MaxMemUsage collects the maximum memory usage that occurred on a node.
+  optional NumericStat max_mem_usage = 18 [(gogoproto.nullable) = false];
+
+  // ExecStatCollectionCount keeps track of how many times execution stats were
+  // recorded for this statement. Since this collection follows a sampling
+  // approach, this number is not necessarily equal to Count. Used to calculate
+  // the mean of the following NumericStat values:
+  //  bytes_sent_over_network
+  //  max_mem_usage
+  //  contention_time
+  optional int64 exec_stat_collection_count = 19 [(gogoproto.nullable) = false];
+
+  // ContentionTime collects the time this statement spent contending.
+  optional NumericStat contention_time = 20 [(gogoproto.nullable) = false];
+
+  // Note: be sure to update `sql/app_stats.go` and the comment above
+  // exec_stat_collection_count when adding/removing fields here!
 }
+
+message TransactionStatistics {
+  // Count is the total number of times this transaction was executed
+  // since the beginning of the reporting period.
+  optional int64 count = 1 [(gogoproto.nullable) = false];
+
+  // MaxRetries collects the maximum observed number of automatic
+  // retries in the reporting period.
+  optional int64 max_retries = 2 [(gogoproto.nullable) = false];
+
+  // NumRows collects the total number of rows returned, observed or affected
+  // across all statements.
+  optional NumericStat num_rows = 3 [(gogoproto.nullable) = false];
+
+  // ServiceLat is the time to service the transaction, from the time a
+  // transaction was received to end of execution.
+  optional NumericStat service_lat = 4 [(gogoproto.nullable) = false];
+
+  // RetryLat is the amount of time spent retrying the transaction.
+  optional NumericStat retry_lat = 5 [(gogoproto.nullable) = false];
+
+  // CommitLat is the amount of time required to commit the transaction after
+  // all statement operations have been applied.
+  optional NumericStat commit_lat = 6 [(gogoproto.nullable) = false];
+
+  // BytesRead collects the number of bytes read from disk.
+  optional NumericStat bytes_read = 7 [(gogoproto.nullable) = false];
+
+  // RowsRead collects the number of rows read from disk.
+  optional NumericStat rows_read = 8 [(gogoproto.nullable) = false];
+
+  // ExecStats are the execution statistics for this transaction, i.e. an
+  // aggregation of all its statements' execution statistics. These statistics
+  // are sampled.
+  optional ExecStats exec_stats = 9 [(gogoproto.nullable) = false];
+}
+
 
 message SensitiveInfo {
   option (gogoproto.equal) = true;
   // LastErr collects the last error encountered.
   // It is only reported once it's been redacted.
+  // See also: https://github.com/cockroachdb/cockroach/issues/53191
   optional string last_err = 1 [(gogoproto.nullable) = false];
 
   // MostRecentPlanDescription is a serialized representation of the logical plan most recently captured for this query.
@@ -118,13 +182,32 @@ message StatementStatisticsKey {
   optional bool failed = 4 [(gogoproto.nullable) = false];
   optional bool opt = 5 [(gogoproto.nullable) = false];
   optional bool implicit_txn = 6 [(gogoproto.nullable) = false];
+  optional bool vec = 7 [(gogoproto.nullable) = false];
 }
 
-// CollectedStats wraps collected timings and metadata for some query's execution.
+// CollectedStatementStatistics wraps collected timings and metadata for some
+// query's execution.
 message CollectedStatementStatistics {
+  // ID is a hash of the statement key (query fingerprint, failure status,
+  // implicit txn or not) which can be used to identify the statement
+  // for instance in transaction statistics.
+  optional uint64 id = 3 [(gogoproto.nullable) = false, (gogoproto.customname) = "ID", (gogoproto.casttype) = "StmtID"];
   optional StatementStatisticsKey key = 1 [(gogoproto.nullable) = false];
   optional StatementStatistics stats = 2 [(gogoproto.nullable) = false];
 }
+
+
+// CollectedTransactionStatistics wraps collected timings and metadata for some
+// transaction executions.
+message CollectedTransactionStatistics {
+  // StatementIDs is the IDs of the statements which this transaction comprises,
+  // in order.
+  repeated uint64 statement_ids = 1 [(gogoproto.customname) = "StatementIDs", (gogoproto.casttype) = "StmtID"] ;
+  // App is the name of the app which executed the transaction.
+  optional string app = 2 [(gogoproto.nullable) = false];
+  optional TransactionStatistics stats = 3 [(gogoproto.nullable) = false];
+}
+
 
 // ExplainTreePlanNode is a serialized representation of an EXPLAIN tree for a logical plan.
 message ExplainTreePlanNode {
@@ -159,4 +242,27 @@ message TxnStats {
   optional int64 implicit_count = 4 [(gogoproto.nullable) = false];
 
   // Note: be sure to update `sql/app_stats.go` when adding/removing fields here!
+}
+
+// ExecStats contains execution statistics that apply to both statements
+// and transactions. These stats are currently collected using a sampling
+// approach.
+// TODO(asubiotto): Use this in StatementStatistics.
+message ExecStats {
+  // Count keeps track of how many times execution stats were recorded. This is
+  // not necessarily equal to the number of times a statement/transaction was
+  // run.
+  optional int64 count = 1 [(gogoproto.nullable) = false];
+
+  // NetworkBytes collects the number of bytes sent over the network.
+  optional NumericStat network_bytes = 2 [(gogoproto.nullable) = false];
+
+  // MaxMemUsage collects the maximum memory usage that occurred on a node.
+  optional NumericStat max_mem_usage = 3 [(gogoproto.nullable) = false];
+
+  // ContentionTime collects the time this statement spent contending.
+  optional NumericStat contention_time = 4 [(gogoproto.nullable) = false];
+
+  // Note: be sure to update `sql/app_stats.go` when adding/removing fields
+  // here!
 }

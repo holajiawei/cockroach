@@ -12,24 +12,26 @@ package colexec
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 type caseOp struct {
-	allocator *Allocator
+	allocator *colmem.Allocator
 	buffer    *bufferOp
 
-	caseOps []Operator
-	elseOp  Operator
+	caseOps []colexecbase.Operator
+	elseOp  colexecbase.Operator
 
 	thenIdxs  []int
 	outputIdx int
-	typ       coltypes.T
+	typ       *types.T
 
 	// origSel is a buffer used to keep track of the original selection vector of
 	// the input batch. We need to do this because we're going to destructively
@@ -44,7 +46,7 @@ type caseOp struct {
 	prevSel []int
 }
 
-var _ InternalMemoryOperator = &caseOp{}
+var _ colexecbase.Operator = &caseOp{}
 
 func (c *caseOp) ChildCount(verbose bool) int {
 	return 1 + len(c.caseOps) + 1
@@ -58,14 +60,9 @@ func (c *caseOp) Child(nth int, verbose bool) execinfra.OpNode {
 	} else if nth == 1+len(c.caseOps) {
 		return c.elseOp
 	}
-	execerror.VectorizedInternalPanic(fmt.Sprintf("invalid idx %d", nth))
+	colexecerror.InternalError(errors.AssertionFailedf("invalid idx %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
-}
-
-func (c *caseOp) InternalMemoryUsage() int {
-	// We internally use two selection vectors, origSel and prevSel.
-	return 2 * sizeOfBatchSizeSelVector
 }
 
 // NewCaseOp returns an operator that runs a case statement.
@@ -79,14 +76,16 @@ func (c *caseOp) InternalMemoryUsage() int {
 // thenCol is the index into the output batch to write to.
 // typ is the type of the CASE expression.
 func NewCaseOp(
-	allocator *Allocator,
-	buffer Operator,
-	caseOps []Operator,
-	elseOp Operator,
+	allocator *colmem.Allocator,
+	buffer colexecbase.Operator,
+	caseOps []colexecbase.Operator,
+	elseOp colexecbase.Operator,
 	thenIdxs []int,
 	outputIdx int,
-	typ coltypes.T,
-) Operator {
+	typ *types.T,
+) colexecbase.Operator {
+	// We internally use two selection vectors, origSel and prevSel.
+	allocator.AdjustMemoryUsage(int64(2 * colmem.SizeOfBatchSizeSelVector))
 	return &caseOp{
 		allocator: allocator,
 		buffer:    buffer.(*bufferOp),
@@ -113,7 +112,6 @@ func (c *caseOp) Next(ctx context.Context) coldata.Batch {
 	if origLen == 0 {
 		return coldata.ZeroBatch
 	}
-	c.allocator.MaybeAddColumn(c.buffer.batch, c.typ, c.outputIdx)
 	var origHasSel bool
 	if sel := c.buffer.batch.Selection(); sel != nil {
 		origHasSel = true
@@ -128,6 +126,15 @@ func (c *caseOp) Next(ctx context.Context) coldata.Batch {
 		copy(c.prevSel[:origLen], sel[:origLen])
 	}
 	outputCol := c.buffer.batch.ColVec(c.outputIdx)
+	if outputCol.MaybeHasNulls() {
+		// We need to make sure that there are no left over null values in the
+		// output vector.
+		// Note: technically, this is not necessary because we're using
+		// Vec.Copy method when populating the output vector which itself
+		// handles the null values, but we want to be on the safe side, so we
+		// have this (at the moment) redundant resetting behavior.
+		outputCol.Nulls().UnsetNulls()
+	}
 	c.allocator.PerformOperation([]coldata.Vec{outputCol}, func() {
 		for i := range c.caseOps {
 			// Run the next case operator chain. It will project its THEN expression
@@ -166,7 +173,6 @@ func (c *caseOp) Next(ctx context.Context) coldata.Batch {
 				outputCol.Copy(
 					coldata.CopySliceArgs{
 						SliceArgs: coldata.SliceArgs{
-							ColType:     c.typ,
 							Src:         inputCol,
 							Sel:         toSubtract,
 							SrcStartIdx: 0,
@@ -233,7 +239,6 @@ func (c *caseOp) Next(ctx context.Context) coldata.Batch {
 			outputCol.Copy(
 				coldata.CopySliceArgs{
 					SliceArgs: coldata.SliceArgs{
-						ColType:     c.typ,
 						Src:         inputCol,
 						Sel:         batch.Selection(),
 						SrcStartIdx: 0,

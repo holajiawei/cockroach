@@ -24,8 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -34,7 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -56,8 +56,6 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	ni := base.NodeIDContainer{}
-	ni.Set(ctx, 1)
 	st := cluster.MakeTestingClusterSettings()
 	mt := execinfra.MakeDistSQLMetrics(time.Hour /* histogramWindow */)
 	srv := NewServer(
@@ -66,7 +64,7 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 			Settings: st,
 			Stopper:  stopper,
 			Metrics:  &mt,
-			NodeID:   &ni,
+			NodeID:   base.TestingIDContainer,
 		},
 	)
 
@@ -87,6 +85,7 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 
 	// The outbox uses this stopper to run a goroutine.
 	outboxStopper := stop.NewStopper()
+	defer outboxStopper.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		Cfg: &execinfra.ServerConfig{
 			Settings:   st,
@@ -96,8 +95,8 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	}
 
 	streamID := execinfrapb.StreamID(1)
-	outbox := flowinfra.NewOutbox(&flowCtx, execinfra.StaticNodeID, execinfrapb.FlowID{}, streamID)
-	outbox.Init(sqlbase.OneIntCol)
+	outbox := flowinfra.NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
+	outbox.Init(rowenc.OneIntCol)
 
 	// WaitGroup for the outbox and inbound stream. If the WaitGroup is done, no
 	// goroutines were leaked. Grab the flow's waitGroup to avoid a copy warning.
@@ -105,7 +104,7 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	wg := f.GetWaitGroup()
 
 	// Use RegisterFlow to register our consumer, which we will control.
-	consumer := distsqlutils.NewRowBuffer(sqlbase.OneIntCol, nil /* rows */, distsqlutils.RowBufferArgs{})
+	consumer := distsqlutils.NewRowBuffer(rowenc.OneIntCol, nil /* rows */, distsqlutils.RowBufferArgs{})
 	connectionInfo := map[execinfrapb.StreamID]*flowinfra.InboundStreamInfo{
 		streamID: flowinfra.NewInboundStreamInfo(
 			flowinfra.RowInboundStreamHandler{RowReceiver: consumer},
@@ -126,7 +125,7 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	// below.
 	consumer.ConsumerDone()
 
-	row := sqlbase.EncDatumRow{sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(0)))}
+	row := rowenc.EncDatumRow{rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(0)))}
 
 	// Now push a row to the outbox's RowChannel and expect the consumer status
 	// returned to be DrainRequested. This is wrapped in a SucceedsSoon because

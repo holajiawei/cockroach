@@ -14,26 +14,38 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type commentOnIndexNode struct {
 	n         *tree.CommentOnIndex
-	tableDesc *sqlbase.TableDescriptor
-	indexDesc *sqlbase.IndexDescriptor
+	tableDesc *tabledesc.Mutable
+	indexDesc *descpb.IndexDescriptor
 }
 
 // CommentOnIndex adds a comment on an index.
 // Privileges: CREATE on table.
 func (p *planner) CommentOnIndex(ctx context.Context, n *tree.CommentOnIndex) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"COMMENT ON INDEX",
+	); err != nil {
+		return nil, err
+	}
+
 	tableDesc, indexDesc, err := p.getTableAndIndex(ctx, &n.Index, privilege.CREATE)
 	if err != nil {
 		return nil, err
 	}
 
-	return &commentOnIndexNode{n: n, tableDesc: tableDesc.TableDesc(), indexDesc: indexDesc}, nil
+	return &commentOnIndexNode{n: n, tableDesc: tableDesc, indexDesc: indexDesc}, nil
 }
 
 func (n *commentOnIndexNode) startExec(params runParams) error {
@@ -53,34 +65,34 @@ func (n *commentOnIndexNode) startExec(params runParams) error {
 		}
 	}
 
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogCommentOnIndex,
-		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID),
-		struct {
-			TableName string
-			IndexName string
-			Statement string
-			User      string
-			Comment   *string
-		}{
-			n.tableDesc.Name,
-			string(n.n.Index.Index),
-			n.n.String(),
-			params.SessionData().User,
-			n.n.Comment},
-	)
+	comment := ""
+	if n.n.Comment != nil {
+		comment = *n.n.Comment
+	}
+
+	tn, err := params.p.getQualifiedTableName(params.ctx, n.tableDesc)
+	if err != nil {
+		return err
+	}
+
+	return params.p.logEvent(params.ctx,
+		n.tableDesc.ID,
+		&eventpb.CommentOnIndex{
+			TableName:   tn.FQString(),
+			IndexName:   string(n.n.Index.Index),
+			Comment:     comment,
+			NullComment: n.n.Comment == nil,
+		})
 }
 
 func (p *planner) upsertIndexComment(
-	ctx context.Context, tableID sqlbase.ID, indexID sqlbase.IndexID, comment string,
+	ctx context.Context, tableID descpb.ID, indexID descpb.IndexID, comment string,
 ) error {
-	_, err := p.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+	_, err := p.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
 		ctx,
 		"set-index-comment",
 		p.Txn(),
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		"UPSERT INTO system.comments VALUES ($1, $2, $3, $4)",
 		keys.IndexCommentType,
 		tableID,
@@ -91,12 +103,13 @@ func (p *planner) upsertIndexComment(
 }
 
 func (p *planner) removeIndexComment(
-	ctx context.Context, tableID sqlbase.ID, indexID sqlbase.IndexID,
+	ctx context.Context, tableID descpb.ID, indexID descpb.IndexID,
 ) error {
-	_, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+	_, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 		ctx,
 		"delete-index-comment",
 		p.txn,
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3",
 		keys.IndexCommentType,
 		tableID,

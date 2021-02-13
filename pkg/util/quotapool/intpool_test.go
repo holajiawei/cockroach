@@ -18,13 +18,15 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -103,7 +105,7 @@ func TestQuotaPoolContextCancellation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("context cancellation did not unblock acquisitions within 5s")
 	case err := <-errCh:
-		if err != context.Canceled {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected context cancellation error, got %v", err)
 		}
 	}
@@ -147,7 +149,7 @@ func TestQuotaPoolClose(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("quota pool closing did not unblock acquisitions within 5s")
 		case err := <-resCh:
-			if _, isErrClosed := err.(*quotapool.ErrClosed); !isErrClosed {
+			if !errors.HasType(err, (*quotapool.ErrClosed)(nil)) {
 				t.Fatal(err)
 			}
 		}
@@ -159,7 +161,7 @@ func TestQuotaPoolClose(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("quota pool closing did not unblock acquisitions within 5s")
 	case err := <-resCh:
-		if _, isErrClosed := err.(*quotapool.ErrClosed); !isErrClosed {
+		if !errors.HasType(err, (*quotapool.ErrClosed)(nil)) {
 			t.Fatal(err)
 		}
 	}
@@ -194,7 +196,7 @@ func TestQuotaPoolCanceledAcquisitions(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("context cancellations did not unblock acquisitions within 5s")
 		case err := <-errCh:
-			if err != context.Canceled {
+			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("expected context cancellation error, got %v", err)
 			}
 		}
@@ -303,6 +305,33 @@ func TestQuotaPoolCappedAcquisition(t *testing.T) {
 	if q := qp.ApproximateQuota(); q != quota {
 		t.Fatalf("expected quota: %d, got: %d", quota, q)
 	}
+}
+
+// TestQuotaPoolZeroCapacity verifies that a non-noop acquisition request on a
+// pool with zero capacity is immediately rejected, regardless of whether the
+// request is permitted to wait or not.
+func TestQuotaPoolZeroCapacity(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const quota = 0
+	qp := quotapool.NewIntPool("test", quota)
+	ctx := context.Background()
+
+	failed, err := qp.Acquire(ctx, 1)
+	require.Equal(t, quotapool.ErrNotEnoughQuota, err)
+	require.Nil(t, failed)
+
+	failed, err = qp.TryAcquire(ctx, 1)
+	require.Equal(t, quotapool.ErrNotEnoughQuota, err)
+	require.Nil(t, failed)
+
+	acq1, err := qp.Acquire(ctx, 0)
+	require.NoError(t, err)
+	acq1.Release()
+
+	acq2, err := qp.TryAcquire(ctx, 0)
+	require.NoError(t, err)
+	acq2.Release()
 }
 
 func TestOnAcquisition(t *testing.T) {
@@ -785,4 +814,91 @@ func TestFreezeUnavailableCapacityPanics(t *testing.T) {
 	require.Panics(t, func() {
 		acq.Freeze()
 	})
+}
+
+// TestLogSlowAcquisition tests that logging that occur only after a specified
+// period indeed does occur after that period.
+func TestLogSlowAcquisition(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	t0 := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	mt := timeutil.NewManualTime(t0)
+	var called, calledAfter int64
+	qp := quotapool.NewIntPool("test", 10,
+		quotapool.OnSlowAcquisition(time.Second, func(
+			ctx context.Context, poolName string, r quotapool.Request, start time.Time,
+		) (onAcquire func()) {
+			atomic.AddInt64(&called, 1)
+			return func() {
+				atomic.AddInt64(&calledAfter, 1)
+			}
+		}),
+		quotapool.WithTimeSource(mt))
+	defer qp.Close("")
+	ctx := context.Background()
+	waitFor1 := func(t *testing.T, p *int64) {
+		testutils.SucceedsSoon(t, func() error {
+			switch got := atomic.LoadInt64(p); got {
+			case 0:
+				return errors.Errorf("not yet called")
+			case 1:
+				return nil
+			default:
+				t.Fatal("expected to be called once")
+				return nil // unreachable
+			}
+		})
+	}
+	acq1, err := qp.Acquire(ctx, 1)
+	acq2, err := qp.Acquire(ctx, 8)
+	require.NoError(t, err)
+	var newAck *quotapool.IntAlloc
+	errCh := make(chan error, 1)
+	acquireFuncCalled := make(chan struct{}, 1)
+	go func() {
+		newAck, err = qp.AcquireFunc(ctx, func(ctx context.Context, p quotapool.PoolInfo) (took uint64, err error) {
+			select {
+			case acquireFuncCalled <- struct{}{}:
+			default:
+			}
+			if p.Available < 10 {
+				return 0, quotapool.ErrNotEnoughQuota
+			}
+			return 10, nil
+		})
+		defer newAck.Release()
+		errCh <- err
+	}()
+	// For the fast path.
+	<-acquireFuncCalled
+	acq1.Release()
+	<-acquireFuncCalled
+	mt.Advance(time.Minute)
+	waitFor1(t, &called)
+	require.Equal(t, int64(0), atomic.LoadInt64(&calledAfter))
+	acq2.Release()
+	require.NoError(t, <-errCh)
+	require.Equal(t, int64(1), atomic.LoadInt64(&calledAfter))
+}
+
+// TestCloser tests that the WithCloser option works.
+func TestCloser(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	t0 := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	mt := timeutil.NewManualTime(t0)
+	closer := make(chan struct{})
+	qp := quotapool.NewIntPool("test", 10,
+		quotapool.WithCloser(closer),
+		quotapool.WithTimeSource(mt))
+	ctx := context.Background()
+	_, err := qp.Acquire(ctx, 10)
+	require.NoError(t, err)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := qp.Acquire(ctx, 1)
+		errCh <- err
+	}()
+	close(closer)
+	require.True(t, quotapool.HasErrClosed(<-errCh))
 }

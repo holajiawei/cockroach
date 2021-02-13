@@ -11,30 +11,50 @@
 package tree
 
 import (
+	"context"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // FollowerReadTimestampFunctionName is the name of the function which can be
 // used with AOST clauses to generate a timestamp likely to be safe for follower
 // reads.
-const FollowerReadTimestampFunctionName = "experimental_follower_read_timestamp"
+const FollowerReadTimestampFunctionName = "follower_read_timestamp"
+
+// FollowerReadTimestampExperimentalFunctionName is the name of the old
+// "experimental_" function, which we keep for backwards compatibility.
+const FollowerReadTimestampExperimentalFunctionName = "experimental_follower_read_timestamp"
 
 var errInvalidExprForAsOf = errors.Errorf("AS OF SYSTEM TIME: only constant expressions or " +
 	FollowerReadTimestampFunctionName + " are allowed")
 
+// IsFollowerReadTimestampFunction determines whether the AS OF SYSTEM TIME
+// clause contains a simple invocation of the follower_read_timestamp function.
+func IsFollowerReadTimestampFunction(asOf AsOfClause, searchPath sessiondata.SearchPath) bool {
+	fe, ok := asOf.Expr.(*FuncExpr)
+	if !ok {
+		return false
+	}
+	def, err := fe.Func.Resolve(searchPath)
+	if err != nil {
+		return false
+	}
+	return def.Name == FollowerReadTimestampFunctionName || def.Name == FollowerReadTimestampExperimentalFunctionName
+}
+
 // EvalAsOfTimestamp evaluates the timestamp argument to an AS OF SYSTEM TIME query.
 func EvalAsOfTimestamp(
-	asOf AsOfClause, semaCtx *SemaContext, evalCtx *EvalContext,
+	ctx context.Context, asOf AsOfClause, semaCtx *SemaContext, evalCtx *EvalContext,
 ) (tsss hlc.Timestamp, err error) {
 	// We need to save and restore the previous value of the field in
 	// semaCtx in case we are recursively called within a subquery
@@ -44,25 +64,23 @@ func EvalAsOfTimestamp(
 	scalarProps.Require("AS OF SYSTEM TIME", RejectSpecial|RejectSubqueries)
 
 	// In order to support the follower reads feature we permit this expression
-	// to be a simple invocation of the `FollowerReadTimestampFunction`.
+	// to be a simple invocation of the follower_read_timestamp function.
 	// Over time we could expand the set of allowed functions or expressions.
 	// All non-function expressions must be const and must TypeCheck into a
 	// string.
 	var te TypedExpr
-	if fe, ok := asOf.Expr.(*FuncExpr); ok {
-		def, err := fe.Func.Resolve(semaCtx.SearchPath)
+	if _, ok := asOf.Expr.(*FuncExpr); ok {
+		if !IsFollowerReadTimestampFunction(asOf, semaCtx.SearchPath) {
+			return hlc.Timestamp{}, errInvalidExprForAsOf
+		}
+		var err error
+		te, err = asOf.Expr.TypeCheck(ctx, semaCtx, types.TimestampTZ)
 		if err != nil {
-			return hlc.Timestamp{}, errInvalidExprForAsOf
-		}
-		if def.Name != FollowerReadTimestampFunctionName {
-			return hlc.Timestamp{}, errInvalidExprForAsOf
-		}
-		if te, err = fe.TypeCheck(semaCtx, types.TimestampTZ); err != nil {
 			return hlc.Timestamp{}, err
 		}
 	} else {
 		var err error
-		te, err = asOf.Expr.TypeCheck(semaCtx, types.String)
+		te, err = asOf.Expr.TypeCheck(ctx, semaCtx, types.String)
 		if err != nil {
 			return hlc.Timestamp{}, err
 		}
@@ -89,7 +107,7 @@ func DatumToHLC(evalCtx *EvalContext, stmtTimestamp time.Time, d Datum) (hlc.Tim
 	case *DString:
 		s := string(*d)
 		// Attempt to parse as timestamp.
-		if dt, err := ParseDTimestamp(evalCtx, s, time.Nanosecond); err == nil {
+		if dt, _, err := ParseDTimestamp(evalCtx, s, time.Nanosecond); err == nil {
 			ts.WallTime = dt.Time.UnixNano()
 			break
 		}
@@ -118,13 +136,15 @@ func DatumToHLC(evalCtx *EvalContext, stmtTimestamp time.Time, d Datum) (hlc.Tim
 	case *DInterval:
 		ts.WallTime = duration.Add(stmtTimestamp, d.Duration).UnixNano()
 	default:
-		convErr = errors.Errorf("expected timestamp, decimal, or interval, got %s (%T)", d.ResolvedType(), d)
+		convErr = errors.WithSafeDetails(
+			errors.Errorf("expected timestamp, decimal, or interval, got %s", d.ResolvedType()),
+			"go type: %T", d)
 	}
 	if convErr != nil {
 		return ts, convErr
 	}
 	zero := hlc.Timestamp{}
-	if ts == zero {
+	if ts.EqOrdering(zero) {
 		return ts, errors.Errorf("zero timestamp is invalid")
 	} else if ts.Less(zero) {
 		return ts, errors.Errorf("timestamp before 1970-01-01T00:00:00Z is invalid")

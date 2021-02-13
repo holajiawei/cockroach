@@ -93,21 +93,27 @@ type Optimizer struct {
 	// disabledRules is a set of rules that are not allowed to run, used for
 	// testing.
 	disabledRules RuleSet
+
+	// JoinOrderBuilder adds new join orderings to the memo.
+	jb JoinOrderBuilder
 }
 
 // Init initializes the Optimizer with a new, blank memo structure inside. This
 // must be called before the optimizer can be used (or reused).
 func (o *Optimizer) Init(evalCtx *tree.EvalContext, catalog cat.Catalog) {
-	o.evalCtx = evalCtx
-	o.catalog = catalog
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*o = Optimizer{
+		evalCtx:  evalCtx,
+		catalog:  catalog,
+		f:        o.f,
+		stateMap: make(map[groupStateKey]*groupState),
+	}
 	o.f.Init(evalCtx, catalog)
 	o.mem = o.f.Memo()
 	o.explorer.init(o)
 	o.defaultCoster.Init(evalCtx, o.mem, evalCtx.TestingKnobs.OptimizerCostPerturbation)
 	o.coster = &o.defaultCoster
-	o.stateMap = make(map[groupStateKey]*groupState)
-	o.matchedRule = nil
-	o.appliedRule = nil
 	if evalCtx.TestingKnobs.DisableOptimizerRuleProbability > 0 {
 		o.disableRules(evalCtx.TestingKnobs.DisableOptimizerRuleProbability)
 	}
@@ -141,6 +147,12 @@ func (o *Optimizer) Coster() Coster {
 // coster to estimate the cost of expression execution.
 func (o *Optimizer) SetCoster(coster Coster) {
 	o.coster = coster
+}
+
+// JoinOrderBuilder returns the JoinOrderBuilder instance that the optimizer is
+// currently using to reorder join trees.
+func (o *Optimizer) JoinOrderBuilder() *JoinOrderBuilder {
+	return &o.jb
 }
 
 // DisableOptimizations disables all transformation rules, including normalize
@@ -914,7 +926,8 @@ func (o *Optimizer) disableRules(probability float64) {
 		// Needed to prevent execbuilder error.
 		// TODO(radu): the DistinctOn execution path should be fixed up so it
 		// supports distinct on an empty column set.
-		int(opt.EliminateDistinctOnNoColumns),
+		int(opt.EliminateDistinctNoColumns),
+		int(opt.EliminateEnsureDistinctNoColumns),
 	)
 
 	for i := opt.RuleName(1); i < opt.NumRuleNames; i++ {

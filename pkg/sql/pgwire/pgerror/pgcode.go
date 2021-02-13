@@ -21,29 +21,18 @@ import (
 // error code. It is called "candidate" because the code is only used
 // by GetPGCode() below conditionally.
 // The code is considered PII-free and is thus reportable.
-func WithCandidateCode(err error, code string) error {
+func WithCandidateCode(err error, code pgcode.Code) error {
 	if err == nil {
 		return nil
 	}
 
-	return &withCandidateCode{cause: err, code: code}
-}
-
-// IsCandidateCode returns true iff the error (not its causes)
-// has a candidate pg error code.
-func IsCandidateCode(err error) bool {
-	_, ok := err.(*withCandidateCode)
-	return ok
+	return &withCandidateCode{cause: err, code: code.String()}
 }
 
 // HasCandidateCode returns tue iff the error or one of its causes
 // has a candidate pg error code.
 func HasCandidateCode(err error) bool {
-	_, ok := errors.If(err, func(err error) (v interface{}, ok bool) {
-		v, ok = err.(*withCandidateCode)
-		return
-	})
-	return ok
+	return errors.HasType(err, (*withCandidateCode)(nil))
 }
 
 // GetPGCodeInternal retrieves a code for the error. It operates by
@@ -69,11 +58,15 @@ func HasCandidateCode(err error) bool {
 //   - if the inner code is not uncategorized, it is retained.
 //   - otherwise the outer code is retained.
 //
-func GetPGCodeInternal(err error, computeDefaultCode func(err error) (code string)) (code string) {
+// This function should not be used directly. It is only exported
+// for use in testing code. Use GetPGCode() instead.
+func GetPGCodeInternal(
+	err error, computeDefaultCode func(err error) (code pgcode.Code),
+) (code pgcode.Code) {
 	code = pgcode.Uncategorized
 	if c, ok := err.(*withCandidateCode); ok {
-		code = c.code
-	} else if newCode := computeDefaultCode(err); newCode != "" {
+		code = pgcode.MakeCode(c.code)
+	} else if newCode := computeDefaultCode(err); newCode.String() != "" {
 		code = newCode
 	}
 
@@ -92,11 +85,14 @@ func GetPGCodeInternal(err error, computeDefaultCode func(err error) (code strin
 // - StatementCompletionUnknown for ambiguous commit errors
 // - InternalError for assertion failures
 // - FeatureNotSupportedError for unimplemented errors.
-func ComputeDefaultCode(err error) string {
+//
+// It is not meant to be used directly - it is only exported
+// for use by test code. Use GetPGCode() instead.
+func ComputeDefaultCode(err error) pgcode.Code {
 	switch e := err.(type) {
 	// If there was already a pgcode in the cause, use that.
 	case *Error:
-		return e.Code
+		return pgcode.MakeCode(e.Code)
 	// Special roachpb errors get a special code.
 	case ClientVisibleRetryError:
 		return pgcode.SerializationFailure
@@ -110,7 +106,7 @@ func ComputeDefaultCode(err error) string {
 	if errors.IsUnimplementedError(err) {
 		return pgcode.FeatureNotSupported
 	}
-	return ""
+	return pgcode.Code{}
 }
 
 // ClientVisibleRetryError mirrors roachpb.ClientVisibleRetryError but
@@ -127,11 +123,11 @@ type ClientVisibleAmbiguousError interface {
 }
 
 // combineCodes combines the inner and outer codes.
-func combineCodes(innerCode, outerCode string) string {
+func combineCodes(innerCode, outerCode pgcode.Code) pgcode.Code {
 	if outerCode == pgcode.Uncategorized {
 		return innerCode
 	}
-	if strings.HasPrefix(outerCode, "XX") {
+	if strings.HasPrefix(outerCode.String(), "XX") {
 		return outerCode
 	}
 	if innerCode != pgcode.Uncategorized {

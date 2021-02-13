@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgtest"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 var (
@@ -29,19 +30,23 @@ var (
 
 func TestPGTest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	addr := *flagAddr
-	user := *flagUser
-	if addr == "" {
-		ctx := context.Background()
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-			Insecure: true,
-		})
-		defer s.Stopper().Stop(ctx)
-
-		addr = s.ServingSQLAddr()
-		user = security.RootUser
+	if *flagAddr == "" {
+		newServer := func() (addr, user string, cleanup func()) {
+			ctx := context.Background()
+			s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+				Insecure: true,
+			})
+			cleanup = func() {
+				s.Stopper().Stop(ctx)
+			}
+			addr = s.ServingSQLAddr()
+			user = security.RootUser
+			return addr, user, cleanup
+		}
+		pgtest.WalkWithNewServer(t, "testdata/pgtest", newServer)
+	} else {
+		pgtest.WalkWithRunningServer(t, "testdata/pgtest", *flagAddr, *flagUser)
 	}
-
-	pgtest.Walk(t, "testdata/pgtest", addr, user)
 }

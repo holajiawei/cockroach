@@ -14,21 +14,31 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type alterSequenceNode struct {
 	n       *tree.AlterSequence
-	seqDesc *sqlbase.MutableTableDescriptor
+	seqDesc *tabledesc.Mutable
 }
 
 // AlterSequence transforms a tree.AlterSequence into a plan node.
 func (p *planner) AlterSequence(ctx context.Context, n *tree.AlterSequence) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER SEQUENCE",
+	); err != nil {
+		return nil, err
+	}
+
 	seqDesc, err := p.ResolveMutableTableDescriptorEx(
-		ctx, n.Name, !n.IfExists, ResolveRequireSequenceDesc,
+		ctx, n.Name, !n.IfExists, tree.ResolveRequireSequenceDesc,
 	)
 	if err != nil {
 		return nil, err
@@ -50,33 +60,30 @@ func (p *planner) AlterSequence(ctx context.Context, n *tree.AlterSequence) (pla
 func (n *alterSequenceNode) ReadingOwnWrites() {}
 
 func (n *alterSequenceNode) startExec(params runParams) error {
-	telemetry.Inc(sqltelemetry.SchemaChangeAlter("sequence"))
+	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounter("sequence"))
 	desc := n.seqDesc
 
-	err := assignSequenceOptions(desc.SequenceOpts, n.n.Options, false /* setDefaults */, &params, desc.GetID())
+	err := assignSequenceOptions(
+		desc.SequenceOpts, n.n.Options, false /* setDefaults */, &params, desc.GetID(), desc.ParentID,
+	)
 	if err != nil {
 		return err
 	}
 
-	if err := params.p.writeSchemaChange(params.ctx, n.seqDesc, sqlbase.InvalidMutationID); err != nil {
+	if err := params.p.writeSchemaChange(
+		params.ctx, n.seqDesc, descpb.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
+	); err != nil {
 		return err
 	}
 
 	// Record this sequence alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogAlterSequence,
-		int32(n.seqDesc.ID),
-		int32(params.extendedEvalCtx.NodeID),
-		struct {
-			SequenceName string
-			Statement    string
-			User         string
-		}{params.p.ResolvedName(n.n.Name).FQString(), n.n.String(), params.SessionData().User},
-	)
+	return params.p.logEvent(params.ctx,
+		n.seqDesc.ID,
+		&eventpb.AlterSequence{
+			SequenceName: params.p.ResolvedName(n.n.Name).FQString(),
+		})
 }
 
 func (n *alterSequenceNode) Next(runParams) (bool, error) { return false, nil }

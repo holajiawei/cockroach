@@ -29,6 +29,7 @@ import (
 
 	cld "github.com/cockroachdb/cockroach/pkg/cmd/roachprod/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/config"
+	rperrors "github.com/cockroachdb/cockroach/pkg/cmd/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/ssh"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/ui"
@@ -38,10 +39,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm/gce"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm/local"
 	"github.com/cockroachdb/cockroach/pkg/util/flagutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
-	"golang.org/x/crypto/ssh/terminal"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 var rootCmd = &cobra.Command{
@@ -79,7 +80,10 @@ var (
 	listMine          bool
 	clusterType       = "cockroach"
 	secure            = false
-	nodeEnv           = "COCKROACH_ENABLE_RPC_COMPRESSION=false"
+	nodeEnv           = []string{
+		"COCKROACH_ENABLE_RPC_COMPRESSION=false",
+		"COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED=true",
+	}
 	nodeArgs          []string
 	tag               string
 	external          = false
@@ -88,10 +92,12 @@ var (
 	adminurlIPs       = false
 	useTreeDist       = true
 	encrypt           = false
+	skipInit          = false
 	quiet             = false
 	sig               = 9
 	waitFlag          = false
 	stageOS           string
+	stageDir          string
 	logsDir           string
 	logsFilter        string
 	logsProgramFilter string
@@ -134,19 +140,13 @@ func newCluster(name string) (*install.SyncedCluster, error) {
 
 	c, ok := install.Clusters[name]
 	if !ok {
-		// NB: We don't use fmt.Errorf due to a linter error about the error
-		// message containing capitals and punctuation. We don't use
-		// errors.New(fmt.Sprintf()) due to a linter error that we should use
-		// fmt.Errorf() instead. Sigh.
-		s := fmt.Sprintf(`unknown cluster: %s
-
+		err := errors.Newf(`unknown cluster: %s`, name)
+		err = errors.WithHintf(err, `
 Available clusters:
   %s
-
-Hint: use "roachprod sync" to update the list of available clusters.
-`,
-			name, strings.Join(sortedClusters(), "\n  "))
-		return nil, errors.New(s)
+`, strings.Join(sortedClusters(), "\n  "))
+		err = errors.WithHint(err, `Use "roachprod sync" to update the list of available clusters.`)
+		return nil, err
 	}
 
 	switch clusterType {
@@ -179,13 +179,13 @@ Hint: use "roachprod sync" to update the list of available clusters.
 	}
 	c.Nodes = nodes
 	c.Secure = secure
-	c.Env = nodeEnv
+	c.Env = strings.Join(nodeEnv, " ")
 	c.Args = nodeArgs
 	if tag != "" {
 		c.Tag = "/" + tag
 	}
 	c.UseTreeDist = useTreeDist
-	c.Quiet = quiet || !terminal.IsTerminal(int(os.Stdout.Fd()))
+	c.Quiet = quiet || !term.IsTerminal(int(os.Stdout.Fd()))
 	c.MaxConcurrency = maxConcurrency
 	return c, nil
 }
@@ -260,12 +260,25 @@ func verifyClusterName(clusterName string) (string, error) {
 		clusterName, suggestions)
 }
 
+// Provide `cobra.Command` functions with a standard return code handler.
+// Exit codes come from rperrors.Error.ExitCode().
+//
+// If the wrapped error tree of an error does not contain an instance of
+// rperrors.Error, the error will automatically be wrapped with
+// rperrors.Unclassified.
 func wrap(f func(cmd *cobra.Command, args []string) error) func(cmd *cobra.Command, args []string) {
 	return func(cmd *cobra.Command, args []string) {
 		err := f(cmd, args)
 		if err != nil {
-			cmd.Println("Error: ", err.Error())
-			os.Exit(1)
+			roachprodError, ok := rperrors.AsError(err)
+			if !ok {
+				roachprodError = rperrors.Unclassified{Err: err}
+				err = roachprodError
+			}
+
+			cmd.Printf("Error: %+v\n", err)
+
+			os.Exit(roachprodError.ExitCode())
 		}
 	}
 }
@@ -276,12 +289,12 @@ type clusterAlreadyExistsError struct {
 	name string
 }
 
-func (e clusterAlreadyExistsError) Error() string {
+func (e *clusterAlreadyExistsError) Error() string {
 	return fmt.Sprintf("cluster %s already exists", e.name)
 }
 
 func newClusterAlreadyExistsError(name string) error {
-	return clusterAlreadyExistsError{name: name}
+	return &clusterAlreadyExistsError{name: name}
 }
 
 var createCmd = &cobra.Command{
@@ -341,7 +354,7 @@ Local Clusters
 			if retErr == nil || clusterName == config.Local {
 				return
 			}
-			if _, ok := retErr.(clusterAlreadyExistsError); ok {
+			if errors.HasType(retErr, (*clusterAlreadyExistsError)(nil)) {
 				return
 			}
 			fmt.Fprintf(os.Stderr, "Cleaning up partially-created cluster (prev err: %s)\n", retErr)
@@ -976,7 +989,9 @@ environment variables to the cockroach process.
 ` + tagHelp + `
 The "start" command takes care of setting up the --join address and specifying
 reasonable defaults for other flags. One side-effect of this convenience is
-that node 1 is special and must be started for the cluster to be initialized.
+that node 1 is special and if started, is used to auto-initialize the cluster.
+The --skip-init flag can be used to avoid auto-initialization (which can then
+separately be done using the "init" command).
 
 If the COCKROACH_DEV_LICENSE environment variable is set the enterprise.license
 cluster setting will be set to its value.
@@ -1023,6 +1038,31 @@ other signals.
 			wait = true
 		}
 		c.Stop(sig, wait)
+		return nil
+	}),
+}
+
+var initCmd = &cobra.Command{
+	Use:   "init <cluster>",
+	Short: "initialize the cluster",
+	Long: `Initialize the cluster.
+
+The "init" command bootstraps the cluster (using "cockroach init"). It also sets
+default cluster settings. It's intended to be used in conjunction with
+'roachprod start --skip-init'.
+`,
+	Args: cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		clusterName, err := verifyClusterName(args[0])
+		if err != nil {
+			return err
+		}
+
+		c, err := newCluster(clusterName)
+		if err != nil {
+			return err
+		}
+		c.Init()
 		return nil
 	}),
 }
@@ -1100,21 +1140,17 @@ of nodes, outputting a line whenever a change is detected:
 		if err != nil {
 			return err
 		}
-		var errs []string
 		for msg := range c.Monitor(monitorIgnoreEmptyNodes, monitorOneShot) {
 			if msg.Err != nil {
 				msg.Msg += "error: " + msg.Err.Error()
 			}
-			s := fmt.Sprintf("%d: %s", msg.Index, msg.Msg)
+			thisError := errors.Newf("%d: %s", msg.Index, msg.Msg)
 			if msg.Err != nil || strings.Contains(msg.Msg, "dead") {
-				errs = append(errs, s)
+				err = errors.CombineErrors(err, thisError)
 			}
-			fmt.Println(s)
+			fmt.Println(thisError.Error())
 		}
-		if len(errs) != 0 {
-			return errors.New(strings.Join(errs, ", "))
-		}
-		return nil
+		return err
 	}),
 }
 
@@ -1177,7 +1213,7 @@ the 'zfs rollback' command:
 			}
 			fsCmd = `sudo zpool create -f data1 -m /mnt/data1 /dev/sdb`
 		case "ext4":
-			fsCmd = `sudo mkfs.ext4 -F /dev/sdb && sudo mount -o discard,defaults /dev/sdb /mnt/data1`
+			fsCmd = `sudo mkfs.ext4 -F /dev/sdb && sudo mount -o defaults /dev/sdb /mnt/data1`
 		default:
 			return fmt.Errorf("unknown filesystem %q", fs)
 		}
@@ -1280,16 +1316,21 @@ Some examples of usage:
 		} else if c.IsLocal() {
 			os = runtime.GOOS
 		}
-		var debugArch, releaseArch string
+		var debugArch, releaseArch, libExt string
 		switch os {
 		case "linux":
-			debugArch, releaseArch = "linux-gnu-amd64", "linux-amd64"
+			debugArch, releaseArch, libExt = "linux-gnu-amd64", "linux-amd64", ".so"
 		case "darwin":
-			debugArch, releaseArch = "darwin-amd64", "darwin-10.9-amd64"
+			debugArch, releaseArch, libExt = "darwin-amd64", "darwin-10.9-amd64", ".dylib"
 		case "windows":
-			debugArch, releaseArch = "windows-amd64", "windows-6.2-amd64"
+			debugArch, releaseArch, libExt = "windows-amd64", "windows-6.2-amd64", ".dll"
 		default:
 			return errors.Errorf("cannot stage binary on %s", os)
+		}
+
+		dir := "."
+		if stageDir != "" {
+			dir = stageDir
 		}
 
 		applicationName := args[1]
@@ -1299,15 +1340,35 @@ Some examples of usage:
 		}
 		switch applicationName {
 		case "cockroach":
-			return install.StageRemoteBinary(
-				c, applicationName, "cockroach/cockroach", versionArg, debugArch,
+			sha, err := install.StageRemoteBinary(
+				c, applicationName, "cockroach/cockroach", versionArg, debugArch, dir,
 			)
+			if err != nil {
+				return err
+			}
+			// NOTE: libraries may not be present in older versions.
+			// Use the sha for the binary to download the same remote library.
+			for _, library := range []string{"libgeos", "libgeos_c"} {
+				if err := install.StageOptionalRemoteLibrary(
+					c,
+					library,
+					fmt.Sprintf("cockroach/lib/%s", library),
+					sha,
+					debugArch,
+					libExt,
+					dir,
+				); err != nil {
+					return err
+				}
+			}
+			return nil
 		case "workload":
-			return install.StageRemoteBinary(
-				c, applicationName, "cockroach/workload", versionArg, "", /* arch */
+			_, err := install.StageRemoteBinary(
+				c, applicationName, "cockroach/workload", versionArg, "" /* arch */, dir,
 			)
+			return err
 		case "release":
-			return install.StageCockroachRelease(c, versionArg, releaseArch)
+			return install.StageCockroachRelease(c, versionArg, releaseArch, dir)
 		default:
 			return fmt.Errorf("unknown application %s", applicationName)
 		}
@@ -1422,9 +1483,15 @@ var pgurlCmd = &cobra.Command{
 
 		var urls []string
 		for i, ip := range ips {
+			if ip == "" {
+				return errors.Errorf("empty ip: %v", ips)
+			}
 			urls = append(urls, c.Impl.NodeURL(c, ip, c.Impl.NodePort(c, nodes[i])))
 		}
 		fmt.Println(strings.Join(urls, " "))
+		if len(urls) != len(nodes) {
+			return errors.Errorf("have nodes %v, but urls %v from ips %v", nodes, urls, ips)
+		}
 		return nil
 	}),
 }
@@ -1529,6 +1596,7 @@ func main() {
 		monitorCmd,
 		startCmd,
 		stopCmd,
+		initCmd,
 		runCmd,
 		wipeCmd,
 		reformatCmd,
@@ -1678,6 +1746,7 @@ func main() {
 	putCmd.Flags().BoolVar(&useTreeDist, "treedist", useTreeDist, "use treedist copy algorithm")
 
 	stageCmd.Flags().StringVar(&stageOS, "os", "", "operating system override for staged binaries")
+	stageCmd.Flags().StringVar(&stageDir, "dir", "", "destination for staged binaries")
 
 	logsCmd.Flags().StringVar(
 		&logsFilter, "filter", "", "re to filter log messages")
@@ -1719,12 +1788,16 @@ func main() {
 				"start nodes sequentially so node IDs match hostnames")
 			cmd.Flags().StringArrayVarP(
 				&nodeArgs, "args", "a", nil, "node arguments")
-			cmd.Flags().StringVarP(
+			cmd.Flags().StringArrayVarP(
 				&nodeEnv, "env", "e", nodeEnv, "node environment variables")
 			cmd.Flags().StringVarP(
 				&clusterType, "type", "t", clusterType, `cluster type ("cockroach" or "cassandra")`)
 			cmd.Flags().BoolVar(
 				&install.StartOpts.Encrypt, "encrypt", encrypt, "start nodes with encryption at rest turned on")
+			cmd.Flags().BoolVar(
+				&install.StartOpts.SkipInit, "skip-init", skipInit, "skip initializing the cluster")
+			cmd.Flags().IntVar(
+				&install.StartOpts.StoreCount, "store-count", 1, "number of stores to start each node with")
 			fallthrough
 		case sqlCmd:
 			cmd.Flags().StringVarP(

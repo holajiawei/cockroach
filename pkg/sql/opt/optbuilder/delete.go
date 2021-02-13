@@ -74,10 +74,15 @@ func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope
 // buildDelete constructs a Delete operator, possibly wrapped by a Project
 // operator that corresponds to the given RETURNING clause.
 func (mb *mutationBuilder) buildDelete(returning tree.ReturningExprs) {
-	mb.buildFKChecksForDelete()
+	mb.buildFKChecksAndCascadesForDelete()
+
+	// Project partial index DEL boolean columns.
+	mb.projectPartialIndexDelCols(mb.fetchScope)
 
 	private := mb.makeMutationPrivate(returning != nil)
-	mb.outScope.expr = mb.b.factory.ConstructDelete(mb.outScope.expr, mb.checks, private)
+	mb.outScope.expr = mb.b.factory.ConstructDelete(
+		mb.outScope.expr, mb.uniqueChecks, mb.fkChecks, private,
+	)
 
 	mb.buildReturning(returning)
 }

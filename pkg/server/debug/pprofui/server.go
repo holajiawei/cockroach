@@ -25,9 +25,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/google/pprof/driver"
 	"github.com/google/pprof/profile"
-	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -65,33 +65,29 @@ func NewServer(storage Storage, hook func(profile string, labels bool, do func()
 		hook:    hook,
 	}
 
-	s.profileTypes = map[string]http.HandlerFunc{
-		// The CPU profile endpoint is special in that the handler actually blocks
-		// for a predetermined duration (recording the profile in the meantime).
-		// It is not included in `runtimepprof.Profiles` below.
-		"profile": func(w http.ResponseWriter, r *http.Request) {
-			const defaultProfileDurationSeconds = 5
-			if r.Form == nil {
-				r.Form = url.Values{}
-			}
-			if r.Form.Get("seconds") == "" {
-				r.Form.Set("seconds", strconv.Itoa(defaultProfileDurationSeconds))
-			}
-			s.profileSem.Lock()
-			defer s.profileSem.Unlock()
-			pprof.Profile(w, r)
-		},
-	}
-
 	// Register the endpoints for heap, block, threadcreate, etc.
+	s.profileTypes = map[string]http.HandlerFunc{}
 	for _, p := range runtimepprof.Profiles() {
-		p := p // copy
-		s.profileTypes[p.Name()] = func(w http.ResponseWriter, r *http.Request) {
-			if err := p.WriteTo(w, 0 /* debug */); err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte(err.Error()))
-			}
+		name := p.Name()
+		s.profileTypes[name] = func(w http.ResponseWriter, r *http.Request) {
+			pprof.Handler(name).ServeHTTP(w, r)
 		}
+	}
+	// The CPU profile endpoint is special cased because a) it's not in the map
+	// yet and b) it always needs to block. We want to default to 5s if profiling
+	// if nothing is specified, we use a convenience mutex to serialize concurrent
+	// attempts to get a profile (the endpoint otherwise returns an error).
+	s.profileTypes["profile"] = func(w http.ResponseWriter, r *http.Request) {
+		const defaultProfileDurationSeconds = 5
+		if r.Form == nil {
+			r.Form = url.Values{}
+		}
+		if r.Form.Get("seconds") == "" {
+			r.Form.Set("seconds", strconv.Itoa(defaultProfileDurationSeconds))
+		}
+		s.profileSem.Lock()
+		defer s.profileSem.Unlock()
+		pprof.Profile(w, r)
 	}
 
 	return s
@@ -136,6 +132,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := s.storage.Get(id, func(io.Reader) error { return nil }); err != nil {
 			msg := fmt.Sprintf("profile for id %s not found: %s", id, err)
 			http.Error(w, msg, http.StatusNotFound)
+			return
+		}
+
+		if r.URL.Query().Get("download") != "" {
+			// TODO(tbg): this has zero discoverability.
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s_%s.pb.gz", profileName, id))
+			w.Header().Set("Content-Type", "application/octet-stream")
+			if err := s.storage.Get(id, func(r io.Reader) error {
+				_, err := io.Copy(w, r)
+				return err
+			}); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
 

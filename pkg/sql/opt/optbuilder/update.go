@@ -14,7 +14,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -102,10 +101,6 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 
 	// Build each of the SET expressions.
 	mb.addUpdateCols(upd.Exprs)
-
-	// Add additional columns for computed expressions that may depend on the
-	// updated columns.
-	mb.addComputedColsForUpdate()
 
 	// Build the final update statement, including any returned expressions.
 	if resultsNeeded(upd.Returning) {
@@ -195,32 +190,47 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	projectionsScope := mb.outScope.replace()
 	projectionsScope.appendColumnsFromScope(mb.outScope)
 
-	checkCol := func(sourceCol *scopeColumn, scopeOrd scopeOrdinal, targetColID opt.ColumnID) {
+	checkCol := func(sourceCol *scopeColumn, targetColID opt.ColumnID) {
 		// Type check the input expression against the corresponding table column.
 		ord := mb.tabID.ColumnOrdinal(targetColID)
 		checkDatumTypeFitsColumnType(mb.tab.Column(ord), sourceCol.typ)
 
-		// Add ordinal of new scope column to the list of columns to update.
-		mb.updateOrds[ord] = scopeOrd
+		// Add source column ID to the list of columns to update.
+		mb.updateColIDs[ord] = sourceCol.id
 
 		// Rename the column to match the target column being updated.
 		sourceCol.name = mb.tab.Column(ord).ColName()
 	}
 
 	addCol := func(expr tree.Expr, targetColID opt.ColumnID) {
+		// If the expression is already a scopeColumn, we can skip creating a
+		// new scopeColumn and proceed with type checking and adding the column
+		// to the list of source columns to update. The expression can be a
+		// scopeColumn when addUpdateCols is called from the
+		// onUpdateCascadeBuilder while building foreign key cascading updates.
+		//
+		// The input scopeColumn is a pointer to a column in mb.outScope. It was
+		// copied by value to projectionsScope. The checkCol function mutates
+		// the name of projected columns, so we must lookup the column in
+		// projectionsScope so that the correct scopeColumn is renamed.
+		if scopeCol, ok := expr.(*scopeColumn); ok {
+			checkCol(projectionsScope.getColumn(scopeCol.id), targetColID)
+			return
+		}
+
 		// Allow right side of SET to be DEFAULT.
 		if _, ok := expr.(tree.DefaultVal); ok {
 			expr = mb.parseDefaultOrComputedExpr(targetColID)
 		}
 
 		// Add new column to the projections scope.
-		desiredType := mb.md.ColumnMeta(targetColID).Type
+		targetColMeta := mb.md.ColumnMeta(targetColID)
+		desiredType := targetColMeta.Type
 		texpr := inScope.resolveType(expr, desiredType)
-		scopeCol := mb.b.addColumn(projectionsScope, "" /* alias */, texpr)
-		scopeColOrd := scopeOrdinal(len(projectionsScope.cols) - 1)
+		scopeCol := projectionsScope.addColumn(targetColMeta.Alias+"_new", texpr)
 		mb.b.buildScalar(texpr, inScope, projectionsScope, scopeCol, nil)
 
-		checkCol(scopeCol, scopeColOrd, targetColID)
+		checkCol(scopeCol, targetColID)
 	}
 
 	n := 0
@@ -235,8 +245,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 				// Type check and rename columns.
 				for i := range subqueryScope.cols {
-					scopeColOrd := scopeOrdinal(len(projectionsScope.cols) + i)
-					checkCol(&subqueryScope.cols[i], scopeColOrd, mb.targetColList[n])
+					checkCol(&subqueryScope.cols[i], mb.targetColList[n])
 					n++
 				}
 
@@ -274,20 +283,15 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
 	mb.outScope = projectionsScope
 
-	// Possibly round DECIMAL-related columns that were updated. Do this
-	// before evaluating computed expressions, since those may depend on the
-	// inserted columns.
-	mb.roundDecimalValues(mb.updateOrds, false /* roundComputedCols */)
-
-	// Add additional columns for computed expressions that may depend on any
+	// Add additional columns for computed expressions that may depend on the
 	// updated columns.
-	mb.addComputedColsForUpdate()
+	mb.addSynthesizedColsForUpdate()
 }
 
-// addComputedColsForUpdate wraps an Update input expression with a Project
+// addSynthesizedColsForUpdate wraps an Update input expression with a Project
 // operator containing any computed columns that need to be updated. This
 // includes write-only mutation columns that are computed.
-func (mb *mutationBuilder) addComputedColsForUpdate() {
+func (mb *mutationBuilder) addSynthesizedColsForUpdate() {
 	// Allow mutation columns to be referenced by other computed mutation
 	// columns (otherwise the scope will raise an error if a mutation column
 	// is referenced). These do not need to be set back to true again because
@@ -296,23 +300,51 @@ func (mb *mutationBuilder) addComputedColsForUpdate() {
 		mb.outScope.cols[i].mutation = false
 	}
 
+	// Add non-computed columns that are being dropped or added (mutated) to the
+	// table. These are not visible to queries, and will always be updated to
+	// their default values. This is necessary because they may not yet have been
+	// set by the backfiller.
+	mb.addSynthesizedDefaultCols(mb.updateColIDs, false /* includeOrdinary */)
+
+	// Possibly round DECIMAL-related columns containing update values. Do
+	// this before evaluating computed expressions, since those may depend on
+	// the inserted columns.
+	mb.roundDecimalValues(mb.updateColIDs, false /* roundComputedCols */)
+
 	// Disambiguate names so that references in the computed expression refer to
 	// the correct columns.
 	mb.disambiguateColumns()
 
-	mb.addSynthesizedCols(
-		mb.updateOrds,
-		func(tabCol cat.Column) bool { return tabCol.IsComputed() },
-	)
+	// Add all computed columns in case their values have changed.
+	mb.addSynthesizedComputedCols(mb.updateColIDs, true /* restrict */)
 
 	// Possibly round DECIMAL-related computed columns.
-	mb.roundDecimalValues(mb.updateOrds, true /* roundComputedCols */)
+	mb.roundDecimalValues(mb.updateColIDs, true /* roundComputedCols */)
 }
 
 // buildUpdate constructs an Update operator, possibly wrapped by a Project
 // operator that corresponds to the given RETURNING clause.
 func (mb *mutationBuilder) buildUpdate(returning tree.ReturningExprs) {
+	// Disambiguate names so that references in any expressions, such as a
+	// check constraint, refer to the correct columns.
+	mb.disambiguateColumns()
+
+	// Keep a reference to the scope before the check constraint columns are
+	// projected. We use this scope when projecting the partial index put
+	// columns because the check columns are not in-scope for those expressions.
+	preCheckScope := mb.outScope
+
 	mb.addCheckConstraintCols()
+
+	// Add the partial index predicate expressions to the table metadata.
+	// These expressions are used to prune fetch columns during
+	// normalization.
+	mb.b.addPartialIndexPredicatesForTable(mb.md.TableMeta(mb.tabID), nil /* scan */)
+
+	// Project partial index PUT and DEL boolean columns.
+	mb.projectPartialIndexPutAndDelCols(preCheckScope, mb.fetchScope)
+
+	mb.buildUniqueChecksForUpdate()
 
 	mb.buildFKChecksForUpdate()
 
@@ -322,6 +354,8 @@ func (mb *mutationBuilder) buildUpdate(returning tree.ReturningExprs) {
 			private.PassthroughCols = append(private.PassthroughCols, col.id)
 		}
 	}
-	mb.outScope.expr = mb.b.factory.ConstructUpdate(mb.outScope.expr, mb.checks, private)
+	mb.outScope.expr = mb.b.factory.ConstructUpdate(
+		mb.outScope.expr, mb.uniqueChecks, mb.fkChecks, private,
+	)
 	mb.buildReturning(returning)
 }

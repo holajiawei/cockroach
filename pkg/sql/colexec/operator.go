@@ -12,39 +12,15 @@ package colexec
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
-
-// Operator is a column vector operator that produces a Batch as output.
-type Operator interface {
-	// Init initializes this operator. Will be called once at operator setup
-	// time. If an operator has an input operator, it's responsible for calling
-	// Init on that input operator as well.
-	// TODO(yuzefovich): we might need to clarify whether it is ok to call
-	// Init() multiple times before the first call to Next(). It is possible to
-	// hit the memory limit during Init(), and a disk-backed operator needs to
-	// make sure that the input has been initialized. We could also in case that
-	// Init() doesn't succeed for bufferingInMemoryOperator - which should only
-	// happen when 'workmem' setting is too low - just bail, even if we have
-	// disk spilling for that operator.
-	Init()
-
-	// Next returns the next Batch from this operator. Once the operator is
-	// finished, it will return a Batch with length 0. Subsequent calls to
-	// Next at that point will always return a Batch with length 0.
-	//
-	// Calling Next may invalidate the contents of the last Batch returned by
-	// Next.
-	// Canceling the provided context results in forceful termination of
-	// execution.
-	Next(context.Context) coldata.Batch
-
-	execinfra.OpNode
-}
 
 // OperatorInitStatus indicates whether Init method has already been called on
 // an Operator.
@@ -66,13 +42,13 @@ type NonExplainable interface {
 }
 
 // NewOneInputNode returns an execinfra.OpNode with a single Operator input.
-func NewOneInputNode(input Operator) OneInputNode {
+func NewOneInputNode(input colexecbase.Operator) OneInputNode {
 	return OneInputNode{input: input}
 }
 
 // OneInputNode is an execinfra.OpNode with a single Operator input.
 type OneInputNode struct {
-	input Operator
+	input colexecbase.Operator
 }
 
 // ChildCount implements the execinfra.OpNode interface.
@@ -85,39 +61,24 @@ func (n OneInputNode) Child(nth int, verbose bool) execinfra.OpNode {
 	if nth == 0 {
 		return n.input
 	}
-	execerror.VectorizedInternalPanic(fmt.Sprintf("invalid index %d", nth))
+	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }
 
 // Input returns the single input of this OneInputNode as an Operator.
-func (n OneInputNode) Input() Operator {
+func (n OneInputNode) Input() colexecbase.Operator {
 	return n.input
 }
 
-// ZeroInputNode is an execinfra.OpNode with no inputs.
-type ZeroInputNode struct{}
-
-// ChildCount implements the execinfra.OpNode interface.
-func (ZeroInputNode) ChildCount(verbose bool) int {
-	return 0
-}
-
-// Child implements the execinfra.OpNode interface.
-func (ZeroInputNode) Child(nth int, verbose bool) execinfra.OpNode {
-	execerror.VectorizedInternalPanic(fmt.Sprintf("invalid index %d", nth))
-	// This code is unreachable, but the compiler cannot infer that.
-	return nil
-}
-
 // newTwoInputNode returns an execinfra.OpNode with two Operator inputs.
-func newTwoInputNode(inputOne, inputTwo Operator) twoInputNode {
+func newTwoInputNode(inputOne, inputTwo colexecbase.Operator) twoInputNode {
 	return twoInputNode{inputOne: inputOne, inputTwo: inputTwo}
 }
 
 type twoInputNode struct {
-	inputOne Operator
-	inputTwo Operator
+	inputOne colexecbase.Operator
+	inputTwo colexecbase.Operator
 }
 
 func (twoInputNode) ChildCount(verbose bool) int {
@@ -131,47 +92,106 @@ func (n *twoInputNode) Child(nth int, verbose bool) execinfra.OpNode {
 	case 1:
 		return n.inputTwo
 	}
-	execerror.VectorizedInternalPanic(fmt.Sprintf("invalid idx %d", nth))
+	colexecerror.InternalError(errors.AssertionFailedf("invalid idx %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
-}
-
-// TODO(yuzefovich): audit all Operators to make sure that all internal memory
-// is accounted for.
-
-// InternalMemoryOperator is an interface that operators which use internal
-// memory need to implement. "Internal memory" is defined as memory that is
-// "private" to the operator and is not exposed to the outside; notably, it
-// does *not* include any coldata.Batch'es and coldata.Vec's.
-type InternalMemoryOperator interface {
-	Operator
-	// InternalMemoryUsage reports the internal memory usage (in bytes) of an
-	// operator.
-	InternalMemoryUsage() int
 }
 
 // resetter is an interface that operators can implement if they can be reset
 // either for reusing (to keep the already allocated memory) or during tests.
 type resetter interface {
-	reset()
+	reset(ctx context.Context)
 }
 
-// resettableOperator is an Operator that can be reset.
-type resettableOperator interface {
-	Operator
+// ResettableOperator is an Operator that can be reset.
+type ResettableOperator interface {
+	colexecbase.Operator
 	resetter
 }
 
-type noopOperator struct {
+// isOperatorChainResettable traverses the whole operator tree rooted at op and
+// returns true if all nodes are resetters.
+func isOperatorChainResettable(op execinfra.OpNode) bool {
+	if _, resettable := op.(resetter); !resettable {
+		return false
+	}
+	for i := 0; i < op.ChildCount(true /* verbose */); i++ {
+		if !isOperatorChainResettable(op.Child(i, true /* verbose */)) {
+			return false
+		}
+	}
+	return true
+}
+
+// CallbackCloser is a utility struct that implements the Closer interface by
+// calling a provided callback.
+type CallbackCloser struct {
+	CloseCb func(context.Context) error
+}
+
+var _ colexecbase.Closer = &CallbackCloser{}
+
+// Close implements the Closer interface.
+func (c *CallbackCloser) Close(ctx context.Context) error {
+	return c.CloseCb(ctx)
+}
+
+// closerHelper is a simple helper that helps Operators implement
+// Closer. If close returns true, resources may be released, if it
+// returns false, close has already been called.
+// use.
+type closerHelper struct {
+	closed bool
+}
+
+// close marks the closerHelper as closed. If true is returned, this is the
+// first call to close.
+func (c *closerHelper) close() bool {
+	if c.closed {
+		return false
+	}
+	c.closed = true
+	return true
+}
+
+type closableOperator interface {
+	colexecbase.Operator
+	colexecbase.Closer
+}
+
+func makeOneInputCloserHelper(input colexecbase.Operator) oneInputCloserHelper {
+	return oneInputCloserHelper{
+		OneInputNode: NewOneInputNode(input),
+	}
+}
+
+type oneInputCloserHelper struct {
 	OneInputNode
+	closerHelper
+}
+
+var _ colexecbase.Closer = &oneInputCloserHelper{}
+
+func (c *oneInputCloserHelper) Close(ctx context.Context) error {
+	if !c.close() {
+		return nil
+	}
+	if closer, ok := c.input.(colexecbase.Closer); ok {
+		return closer.Close(ctx)
+	}
+	return nil
+}
+
+type noopOperator struct {
+	oneInputCloserHelper
 	NonExplainable
 }
 
-var _ Operator = &noopOperator{}
+var _ colexecbase.Operator = &noopOperator{}
 
 // NewNoop returns a new noop Operator.
-func NewNoop(input Operator) Operator {
-	return &noopOperator{OneInputNode: NewOneInputNode(input)}
+func NewNoop(input colexecbase.Operator) ResettableOperator {
+	return &noopOperator{oneInputCloserHelper: makeOneInputCloserHelper(input)}
 }
 
 func (n *noopOperator) Init() {
@@ -182,9 +202,9 @@ func (n *noopOperator) Next(ctx context.Context) coldata.Batch {
 	return n.input.Next(ctx)
 }
 
-func (n *noopOperator) reset() {
+func (n *noopOperator) reset(ctx context.Context) {
 	if r, ok := n.input.(resetter); ok {
-		r.reset()
+		r.reset(ctx)
 	}
 }
 
@@ -193,10 +213,10 @@ type zeroOperator struct {
 	NonExplainable
 }
 
-var _ Operator = &zeroOperator{}
+var _ colexecbase.Operator = &zeroOperator{}
 
 // NewZeroOp creates a new operator which just returns an empty batch.
-func NewZeroOp(input Operator) Operator {
+func NewZeroOp(input colexecbase.Operator) colexecbase.Operator {
 	return &zeroOperator{OneInputNode: NewOneInputNode(input)}
 }
 
@@ -205,54 +225,203 @@ func (s *zeroOperator) Init() {
 }
 
 func (s *zeroOperator) Next(ctx context.Context) coldata.Batch {
-	// TODO(solon): Can we avoid calling Next on the input at all?
-	s.input.Next(ctx)
 	return coldata.ZeroBatch
 }
 
-type singleTupleNoInputOperator struct {
-	ZeroInputNode
+type fixedNumTuplesNoInputOp struct {
+	colexecbase.ZeroInputNode
 	NonExplainable
-	batch  coldata.Batch
-	nexted bool
+	batch         coldata.Batch
+	numTuplesLeft int
 }
 
-var _ Operator = &singleTupleNoInputOperator{}
+var _ colexecbase.Operator = &fixedNumTuplesNoInputOp{}
 
-// NewSingleTupleNoInputOp creates a new Operator which returns a batch of
-// length 1 with no actual columns on the first call to Next() and zero-length
-// batches on all consecutive calls.
-func NewSingleTupleNoInputOp(allocator *Allocator) Operator {
-	return &singleTupleNoInputOperator{
-		batch: allocator.NewMemBatchWithSize(nil /* types */, 1 /* size */),
+// NewFixedNumTuplesNoInputOp creates a new Operator which returns batches with
+// no actual columns that have specified number of tuples as the sum of their
+// lengths.
+func NewFixedNumTuplesNoInputOp(allocator *colmem.Allocator, numTuples int) colexecbase.Operator {
+	capacity := numTuples
+	if capacity > coldata.BatchSize() {
+		capacity = coldata.BatchSize()
+	}
+	return &fixedNumTuplesNoInputOp{
+		batch:         allocator.NewMemBatchWithFixedCapacity(nil /* types */, capacity),
+		numTuplesLeft: numTuples,
 	}
 }
 
-func (s *singleTupleNoInputOperator) Init() {
+func (s *fixedNumTuplesNoInputOp) Init() {
 }
 
-func (s *singleTupleNoInputOperator) Next(ctx context.Context) coldata.Batch {
+func (s *fixedNumTuplesNoInputOp) Next(context.Context) coldata.Batch {
 	s.batch.ResetInternalBatch()
-	if s.nexted {
+	if s.numTuplesLeft == 0 {
 		return coldata.ZeroBatch
 	}
-	s.nexted = true
-	s.batch.SetLength(1)
+	length := s.numTuplesLeft
+	if length > coldata.BatchSize() {
+		length = coldata.BatchSize()
+	}
+	s.numTuplesLeft -= length
+	s.batch.SetLength(length)
 	return s.batch
 }
 
-// feedOperator is used to feed an Operator chain with input by manually
+// FeedOperator is used to feed an Operator chain with input by manually
 // setting the next batch.
-type feedOperator struct {
-	ZeroInputNode
+type FeedOperator struct {
+	colexecbase.ZeroInputNode
 	NonExplainable
 	batch coldata.Batch
 }
 
-func (feedOperator) Init() {}
+// NewFeedOperator returns a new feed operator.
+func NewFeedOperator() *FeedOperator {
+	return &FeedOperator{}
+}
 
-func (o *feedOperator) Next(context.Context) coldata.Batch {
+// Init implements the colexecbase.Operator interface.
+func (FeedOperator) Init() {}
+
+// Next implements the colexecbase.Operator interface.
+func (o *FeedOperator) Next(context.Context) coldata.Batch {
 	return o.batch
 }
 
-var _ Operator = &feedOperator{}
+var _ colexecbase.Operator = &FeedOperator{}
+
+// vectorTypeEnforcer is a utility Operator that on every call to Next
+// enforces that non-zero length batch from the input has a vector of the
+// desired type in the desired position. If the width of the batch is less than
+// the desired position, a new vector will be appended; if the batch has a
+// well-typed vector of an undesired type in the desired position, an error
+// will occur.
+//
+// This Operator is designed to be planned as a wrapper on the input to a
+// "projecting" Operator (such Operator that has a single column as its output
+// and does not touch other columns by simply passing them along).
+//
+// The intended diagram is as follows:
+//
+//       original input                (with schema [t1, ..., tN])
+//       --------------
+//             |
+//             ↓
+//     vectorTypeEnforcer              (will enforce that tN+1 = outputType)
+//     ------------------
+//             |
+//             ↓
+//   "projecting" operator             (projects its output of type outputType
+//   ---------------------              in column at position of N+1)
+//
+type vectorTypeEnforcer struct {
+	oneInputCloserHelper
+	NonExplainable
+
+	allocator *colmem.Allocator
+	typ       *types.T
+	idx       int
+}
+
+var _ ResettableOperator = &vectorTypeEnforcer{}
+
+func newVectorTypeEnforcer(
+	allocator *colmem.Allocator, input colexecbase.Operator, typ *types.T, idx int,
+) colexecbase.Operator {
+	return &vectorTypeEnforcer{
+		oneInputCloserHelper: makeOneInputCloserHelper(input),
+		allocator:            allocator,
+		typ:                  typ,
+		idx:                  idx,
+	}
+}
+
+func (e *vectorTypeEnforcer) Init() {
+	e.input.Init()
+}
+
+func (e *vectorTypeEnforcer) Next(ctx context.Context) coldata.Batch {
+	b := e.input.Next(ctx)
+	if b.Length() == 0 {
+		return b
+	}
+	e.allocator.MaybeAppendColumn(b, e.typ, e.idx)
+	return b
+}
+
+func (e *vectorTypeEnforcer) reset(ctx context.Context) {
+	if r, ok := e.input.(resetter); ok {
+		r.reset(ctx)
+	}
+}
+
+// BatchSchemaSubsetEnforcer is similar to vectorTypeEnforcer in its purpose,
+// but it enforces that the subset of the columns of the non-zero length batch
+// satisfies the desired schema. It needs to wrap the input to a "projecting"
+// operator that internally uses other "projecting" operators (for example,
+// caseOp and logical projection operators). This operator supports type
+// schemas with unsupported types in which case in the corresponding
+// position an "unknown" vector can be appended.
+//
+// The word "subset" is actually more like a "range", but we chose the former
+// since the latter is overloaded.
+//
+// NOTE: the type schema passed into BatchSchemaSubsetEnforcer *must* include
+// the output type of the Operator that the enforcer will be the input to.
+type BatchSchemaSubsetEnforcer struct {
+	oneInputCloserHelper
+	NonExplainable
+
+	allocator                    *colmem.Allocator
+	typs                         []*types.T
+	subsetStartIdx, subsetEndIdx int
+}
+
+var _ colexecbase.Operator = &BatchSchemaSubsetEnforcer{}
+
+// NewBatchSchemaSubsetEnforcer creates a new BatchSchemaSubsetEnforcer.
+// - subsetStartIdx and subsetEndIdx define the boundaries of the range of
+// columns that the projecting operator and its internal projecting operators
+// own.
+func NewBatchSchemaSubsetEnforcer(
+	allocator *colmem.Allocator,
+	input colexecbase.Operator,
+	typs []*types.T,
+	subsetStartIdx, subsetEndIdx int,
+) *BatchSchemaSubsetEnforcer {
+	return &BatchSchemaSubsetEnforcer{
+		oneInputCloserHelper: makeOneInputCloserHelper(input),
+		allocator:            allocator,
+		typs:                 typs,
+		subsetStartIdx:       subsetStartIdx,
+		subsetEndIdx:         subsetEndIdx,
+	}
+}
+
+// Init implements the colexecbase.Operator interface.
+func (e *BatchSchemaSubsetEnforcer) Init() {
+	e.input.Init()
+	if e.subsetStartIdx >= e.subsetEndIdx {
+		colexecerror.InternalError(errors.AssertionFailedf("unexpectedly subsetStartIdx is not less than subsetEndIdx"))
+	}
+}
+
+// Next implements the colexecbase.Operator interface.
+func (e *BatchSchemaSubsetEnforcer) Next(ctx context.Context) coldata.Batch {
+	b := e.input.Next(ctx)
+	if b.Length() == 0 {
+		return b
+	}
+	for i := e.subsetStartIdx; i < e.subsetEndIdx; i++ {
+		e.allocator.MaybeAppendColumn(b, e.typs[i], i)
+	}
+	return b
+}
+
+// SetTypes sets the types of this schema subset enforcer, and sets the end
+// of the range of enforced columns to the length of the input types.
+func (e *BatchSchemaSubsetEnforcer) SetTypes(typs []*types.T) {
+	e.typs = typs
+	e.subsetEndIdx = len(typs)
+}

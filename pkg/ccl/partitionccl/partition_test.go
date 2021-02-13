@@ -21,28 +21,32 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	yaml "gopkg.in/yaml.v2"
 )
 
@@ -72,7 +76,7 @@ type partitioningTest struct {
 
 	// scans are each a shorthand for an assertion of where data should live.
 	// The map key is the used for the `WHERE` clause of a `SELECT *` and the
-	// value is a comma separated whitelist of nodes that are allowed to serve
+	// value is a comma separated allowlist of nodes that are allowed to serve
 	// this query. Example: `map[string]string{`b = 1`: `n2`}` means that
 	// `SELECT * FROM t WHERE b = 1` is required to be served entirely by node2.
 	//
@@ -91,7 +95,7 @@ type partitioningTest struct {
 		createStmt string
 
 		// tableDesc is the TableDescriptor created by `createStmt`.
-		tableDesc *sqlbase.TableDescriptor
+		tableDesc *tabledesc.Mutable
 
 		// zoneConfigStmt contains SQL that effects the zone configs described
 		// by `configs`.
@@ -118,6 +122,7 @@ func (pt *partitioningTest) parse() error {
 
 	{
 		ctx := context.Background()
+		semaCtx := tree.MakeSemaContext()
 		stmt, err := parser.ParseOne(pt.parsed.createStmt)
 		if err != nil {
 			return errors.Wrapf(err, `parsing %s`, pt.parsed.createStmt)
@@ -129,12 +134,12 @@ func (pt *partitioningTest) parse() error {
 		st := cluster.MakeTestingClusterSettings()
 		const parentID, tableID = keys.MinUserDescID, keys.MinUserDescID + 1
 		mutDesc, err := importccl.MakeSimpleTableDescriptor(
-			ctx, st, createTable, parentID, tableID, importccl.NoFKs, hlc.UnixNano())
+			ctx, &semaCtx, st, createTable, parentID, keys.PublicSchemaID, tableID, importccl.NoFKs, hlc.UnixNano())
 		if err != nil {
 			return err
 		}
-		pt.parsed.tableDesc = mutDesc.TableDesc()
-		if err := pt.parsed.tableDesc.ValidateTable(); err != nil {
+		pt.parsed.tableDesc = mutDesc
+		if err := pt.parsed.tableDesc.ValidateTable(ctx); err != nil {
 			return err
 		}
 	}
@@ -172,21 +177,21 @@ func (pt *partitioningTest) parse() error {
 		if !strings.HasPrefix(indexName, "@") {
 			panic(errors.Errorf("unsupported config: %s", c))
 		}
-		idxDesc, _, err := pt.parsed.tableDesc.FindIndexByName(indexName[1:])
+		idx, err := pt.parsed.tableDesc.FindIndexWithName(indexName[1:])
 		if err != nil {
 			return errors.Wrapf(err, "could not find index %s", indexName)
 		}
-		subzone.IndexID = uint32(idxDesc.ID)
+		subzone.IndexID = uint32(idx.GetID())
 		if len(constraints) > 0 {
 			if subzone.PartitionName == "" {
 				fmt.Fprintf(&zoneConfigStmts,
 					`ALTER INDEX %s@%s CONFIGURE ZONE USING constraints = '[%s]';`,
-					pt.parsed.tableName, idxDesc.Name, constraints,
+					pt.parsed.tableName, idx.GetName(), constraints,
 				)
 			} else {
 				fmt.Fprintf(&zoneConfigStmts,
 					`ALTER PARTITION %s OF INDEX %s@%s CONFIGURE ZONE USING constraints = '[%s]';`,
-					subzone.PartitionName, pt.parsed.tableName, idxDesc.Name, constraints,
+					subzone.PartitionName, pt.parsed.tableName, idx.GetName(), constraints,
 				)
 			}
 		}
@@ -862,13 +867,13 @@ func allPartitioningTests(rng *rand.Rand) []partitioningTest {
 	const schemaFmt = `CREATE TABLE %%s (a %s PRIMARY KEY) PARTITION BY LIST (a) (PARTITION p VALUES IN (%s))`
 	for _, typ := range append(types.Scalar, types.AnyCollatedString) {
 		switch typ.Family() {
-		case types.JsonFamily:
+		case types.JsonFamily, types.GeographyFamily, types.GeometryFamily:
 			// Not indexable.
 			continue
 		case types.CollatedStringFamily:
-			typ = types.MakeCollatedString(types.String, *sqlbase.RandCollationLocale(rng))
+			typ = types.MakeCollatedString(types.String, *rowenc.RandCollationLocale(rng))
 		}
-		datum := sqlbase.RandDatum(rng, typ, false /* nullOk */)
+		datum := rowenc.RandDatum(rng, typ, false /* nullOk */)
 		if datum == tree.DNull {
 			// DNull is returned by RandDatum for types.UNKNOWN or if the
 			// column type is unimplemented in RandDatum. In either case, the
@@ -1111,14 +1116,15 @@ func verifyScansOnNode(
 		}
 	}
 	if len(scansWrongNode) > 0 {
-		var err bytes.Buffer
-		fmt.Fprintf(&err, "expected to scan on %s: %s\n%s\nfull trace:",
-			node, query, strings.Join(scansWrongNode, "\n"))
+		err := errors.Newf("expected to scan on %s: %s", node, query)
+		err = errors.WithDetailf(err, "scans:\n%s", strings.Join(scansWrongNode, "\n"))
+		var trace strings.Builder
 		for _, traceLine := range traceLines {
-			err.WriteString("\n  ")
-			err.WriteString(traceLine)
+			trace.WriteString("\n  ")
+			trace.WriteString(traceLine)
 		}
-		return errors.New(err.String())
+		err = errors.WithDetailf(err, "trace:%s", trace.String())
+		return err
 	}
 	return nil
 }
@@ -1132,7 +1138,7 @@ func setupPartitioningTestCluster(
 	tsArgs := func(attr string) base.TestServerArgs {
 		return base.TestServerArgs{
 			Knobs: base.TestingKnobs{
-				Store: &storage.StoreTestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
 					// Disable LBS because when the scan is happening at the rate it's happening
 					// below, it's possible that one of the system ranges trigger a split.
 					DisableLoadBasedSplitting: true,
@@ -1169,15 +1175,15 @@ func setupPartitioningTestCluster(
 
 func TestInitialPartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Skipping as part of test-infra-team flaky test cleanup.
+	skip.WithIssue(t, 49909)
 
 	// This test configures many sub-tests and is too slow to run under nightly
 	// race stress.
-	if testutils.NightlyStress() && util.RaceEnabled {
-		t.Skip("too big for nightly stress race")
-	}
-	if testing.Short() {
-		t.Skip("short")
-	}
+	skip.UnderStressRace(t)
+	skip.UnderShort(t)
 
 	rng, _ := randutil.NewPseudoRand()
 	testCases := allPartitioningTests(rng)
@@ -1204,6 +1210,7 @@ func TestInitialPartitioning(t *testing.T) {
 
 func TestSelectPartitionExprs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// TODO(dan): PartitionExprs for range partitions is waiting on the new
 	// range partitioning syntax.
@@ -1252,7 +1259,7 @@ func TestSelectPartitionExprs(t *testing.T) {
 		{`p33p44,p335p445,p33dp44d`, `((a, b) = (3, 3)) OR ((a, b) = (4, 4))`},
 	}
 
-	evalCtx := &tree.EvalContext{}
+	evalCtx := &tree.EvalContext{Codec: keys.SystemSQLCodec}
 	for _, test := range tests {
 		t.Run(test.partitions, func(t *testing.T) {
 			var partNames tree.NameList
@@ -1279,12 +1286,14 @@ func TestSelectPartitionExprs(t *testing.T) {
 
 func TestRepartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Skipping as part of test-infra-team flaky test cleanup.
+	skip.WithIssue(t, 49112)
 
 	// This test configures many sub-tests and is too slow to run under nightly
 	// race stress.
-	if testutils.NightlyStress() && util.RaceEnabled {
-		t.Skip()
-	}
+	skip.UnderStressRace(t)
 
 	rng, _ := randutil.NewPseudoRand()
 	testCases, err := allRepartitioningTests(allPartitioningTests(rng))
@@ -1317,23 +1326,23 @@ func TestRepartitioning(t *testing.T) {
 				}
 				sqlDB.Exec(t, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", test.old.parsed.tableName, test.new.parsed.tableName))
 
-				testIndex, _, err := test.new.parsed.tableDesc.FindIndexByName(test.index)
+				testIndex, err := test.new.parsed.tableDesc.FindIndexWithName(test.index)
 				if err != nil {
 					t.Fatalf("%+v", err)
 				}
 
 				var repartition bytes.Buffer
-				if testIndex.ID == test.new.parsed.tableDesc.PrimaryIndex.ID {
+				if testIndex.GetID() == test.new.parsed.tableDesc.GetPrimaryIndexID() {
 					fmt.Fprintf(&repartition, `ALTER TABLE %s `, test.new.parsed.tableName)
 				} else {
-					fmt.Fprintf(&repartition, `ALTER INDEX %s@%s `, test.new.parsed.tableName, testIndex.Name)
+					fmt.Fprintf(&repartition, `ALTER INDEX %s@%s `, test.new.parsed.tableName, testIndex.GetName())
 				}
-				if testIndex.Partitioning.NumColumns == 0 {
+				if testIndex.GetPartitioning().NumColumns == 0 {
 					repartition.WriteString(`PARTITION BY NOTHING`)
 				} else {
 					if err := sql.ShowCreatePartitioning(
-						&sqlbase.DatumAlloc{}, test.new.parsed.tableDesc, testIndex,
-						&testIndex.Partitioning, &repartition, 0 /* indent */, 0, /* colOffset */
+						&rowenc.DatumAlloc{}, keys.SystemSQLCodec, test.new.parsed.tableDesc, testIndex.IndexDesc(),
+						&testIndex.IndexDesc().Partitioning, &repartition, 0 /* indent */, 0, /* colOffset */
 					); err != nil {
 						t.Fatalf("%+v", err)
 					}
@@ -1366,8 +1375,84 @@ func TestRepartitioning(t *testing.T) {
 	}
 }
 
+func TestPrimaryKeyChangeZoneConfigs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	// Write a table with some partitions into the database,
+	// and change its primary key.
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+USE t;
+CREATE TABLE t (
+  x INT PRIMARY KEY,
+  y INT NOT NULL,
+  z INT,
+  w INT,
+  INDEX i1 (z),
+  INDEX i2 (w),
+  FAMILY (x, y, z, w)
+);
+ALTER INDEX t@i1 PARTITION BY LIST (z) (
+  PARTITION p1 VALUES IN (1)
+);
+ALTER INDEX t@i2 PARTITION BY LIST (w) (
+  PARTITION p2 VALUES IN (3)
+);
+ALTER PARTITION p1 OF INDEX t@i1 CONFIGURE ZONE USING gc.ttlseconds = 15210;
+ALTER PARTITION p2 OF INDEX t@i2 CONFIGURE ZONE USING gc.ttlseconds = 15213;
+ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y)
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get the zone config corresponding to the table.
+	table := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t")
+	kv, err := kvDB.Get(ctx, config.MakeZoneKey(config.SystemTenantObjectID(table.GetID())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var zone zonepb.ZoneConfig
+	if err := kv.ValueProto(&zone); err != nil {
+		t.Fatal(err)
+	}
+
+	// Our subzones should be spans prefixed with dropped copy of i1,
+	// dropped copy of i2, new copy of i1, and new copy of i2.
+	// These have ID's 2, 3, 6 and 7 respectively.
+	expectedSpans := []roachpb.Key{
+		table.IndexSpan(keys.SystemSQLCodec, 2 /* indexID */).Key,
+		table.IndexSpan(keys.SystemSQLCodec, 3 /* indexID */).Key,
+		table.IndexSpan(keys.SystemSQLCodec, 6 /* indexID */).Key,
+		table.IndexSpan(keys.SystemSQLCodec, 7 /* indexID */).Key,
+	}
+	if len(zone.SubzoneSpans) != len(expectedSpans) {
+		t.Fatalf("expected subzones to have length %d", len(expectedSpans))
+	}
+
+	// Subzone spans have the table prefix omitted.
+	prefix := keys.SystemSQLCodec.TablePrefix(uint32(table.GetID()))
+	for i := range expectedSpans {
+		// Subzone spans have the table prefix omitted.
+		expected := bytes.TrimPrefix(expectedSpans[i], prefix)
+		if !bytes.HasPrefix(zone.SubzoneSpans[i].Key, expected) {
+			t.Fatalf(
+				"expected span to have prefix %s but found %s",
+				expected,
+				zone.SubzoneSpans[i].Key,
+			)
+		}
+	}
+}
+
 func TestRemovePartitioningExpiredLicense(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	defer utilccl.TestingEnableEnterprise()()
 
 	ctx := context.Background()

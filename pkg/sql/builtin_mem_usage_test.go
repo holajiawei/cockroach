@@ -19,6 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
 )
 
@@ -61,6 +63,7 @@ CREATE TABLE d.t (a STRING)
 // record their memory usage as they build up their result.
 func TestAggregatesMonitorMemory(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// By avoiding printing the aggregate results we prevent anything
 	// besides the aggregate itself from being able to catch the
@@ -82,7 +85,8 @@ func TestAggregatesMonitorMemory(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := sqlDB.Exec(statement); err.(*pq.Error).Code != pgcode.OutOfMemory {
+		_, err := sqlDB.Exec(statement)
+		if pqErr := (*pq.Error)(nil); !errors.As(err, &pqErr) || pgcode.MakeCode(string(pqErr.Code)) != pgcode.OutOfMemory {
 			t.Fatalf("Expected \"%s\" to consume too much memory", statement)
 		}
 	}
@@ -90,6 +94,8 @@ func TestAggregatesMonitorMemory(t *testing.T) {
 
 func TestEvaluatedMemoryIsChecked(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	// We select the LENGTH here and elsewhere because if we passed the result of
 	// REPEAT up as a result, the memory error would be caught there even if
 	// REPEAT was not doing its accounting.
@@ -105,9 +111,10 @@ func TestEvaluatedMemoryIsChecked(t *testing.T) {
 			})
 			defer s.Stopper().Stop(context.Background())
 
-			if _, err := sqlDB.Exec(
+			_, err := sqlDB.Exec(
 				statement,
-			); err.(*pq.Error).Code != pgcode.ProgramLimitExceeded {
+			)
+			if pqErr := (*pq.Error)(nil); !errors.As(err, &pqErr) || pgcode.MakeCode(string(pqErr.Code)) != pgcode.ProgramLimitExceeded {
 				t.Errorf("Expected \"%s\" to OOM, but it didn't", statement)
 			}
 		})

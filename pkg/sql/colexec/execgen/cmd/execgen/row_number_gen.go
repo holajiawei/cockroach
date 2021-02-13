@@ -12,7 +12,6 @@ package main
 
 import (
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 )
@@ -22,15 +21,13 @@ type rowNumberTmplInfo struct {
 	String       string
 }
 
-func genRowNumberOp(wr io.Writer) error {
-	d, err := ioutil.ReadFile("pkg/sql/colexec/row_number_tmpl.go")
-	if err != nil {
-		return err
-	}
+const rowNumberTmpl = "pkg/sql/colexec/row_number_tmpl.go"
 
-	s := string(d)
+func genRowNumberOp(inputFileContents string, wr io.Writer) error {
+	s := strings.ReplaceAll(inputFileContents, "_ROW_NUMBER_STRING", "{{.String}}")
 
-	s = strings.Replace(s, "_ROW_NUMBER_STRING", "{{.String}}", -1)
+	computeRowNumberRe := makeFunctionRegex("_COMPUTE_ROW_NUMBER", 1)
+	s = computeRowNumberRe.ReplaceAllString(s, `{{template "computeRowNumber" buildDict "HasPartition" .HasPartition "HasSel" $1}}`)
 
 	// Now, generate the op, from the template.
 	tmpl, err := template.New("row_number_op").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
@@ -46,5 +43,5 @@ func genRowNumberOp(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genRowNumberOp, "row_number.eg.go")
+	registerGenerator(genRowNumberOp, "row_number.eg.go", rowNumberTmpl)
 }

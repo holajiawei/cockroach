@@ -14,23 +14,33 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
-	"github.com/gogo/protobuf/proto"
 )
 
 type alterIndexNode struct {
 	n         *tree.AlterIndex
-	tableDesc *sqlbase.MutableTableDescriptor
-	indexDesc *sqlbase.IndexDescriptor
+	tableDesc *tabledesc.Mutable
+	indexDesc *descpb.IndexDescriptor
 }
 
 // AlterIndex applies a schema change on an index.
 // Privileges: CREATE on table.
 func (p *planner) AlterIndex(ctx context.Context, n *tree.AlterIndex) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER INDEX",
+	); err != nil {
+		return nil, err
+	}
+
 	tableDesc, indexDesc, err := p.getTableAndIndex(ctx, &n.Index, privilege.CREATE)
 	if err != nil {
 		return nil, err
@@ -39,11 +49,11 @@ func (p *planner) AlterIndex(ctx context.Context, n *tree.AlterIndex) (planNode,
 	// different copy than the one in the tableDesc. To make it easier for the
 	// code below, get a pointer to the index descriptor that's actually in
 	// tableDesc.
-	indexDesc, err = tableDesc.FindIndexByID(indexDesc.ID)
+	index, err := tableDesc.FindIndexWithID(indexDesc.ID)
 	if err != nil {
 		return nil, err
 	}
-	return &alterIndexNode{n: n, tableDesc: tableDesc, indexDesc: indexDesc}, nil
+	return &alterIndexNode{n: n, tableDesc: tableDesc, indexDesc: index.IndexDesc()}, nil
 }
 
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
@@ -61,77 +71,79 @@ func (n *alterIndexNode) startExec(params runParams) error {
 	for _, cmd := range n.n.Cmds {
 		switch t := cmd.(type) {
 		case *tree.AlterIndexPartitionBy:
-			telemetry.Inc(sqltelemetry.SchemaChangeAlterWithExtra("index", "partition_by"))
-			partitioning, err := CreatePartitioning(
-				params.ctx, params.extendedEvalCtx.Settings,
+			telemetry.Inc(sqltelemetry.SchemaChangeAlterCounterWithExtra("index", "partition_by"))
+			if n.tableDesc.GetPrimaryIndex().GetPartitioning().NumImplicitColumns > 0 {
+				return unimplemented.New(
+					"ALTER INDEX PARTITION BY",
+					"cannot ALTER INDEX PARTITION BY on index which already has implicit column partitioning",
+				)
+			}
+			newIndexDesc, err := CreatePartitioning(
+				params.ctx,
+				params.extendedEvalCtx.Settings,
 				params.EvalContext(),
-				n.tableDesc, n.indexDesc, t.PartitionBy)
+				n.tableDesc,
+				*n.indexDesc,
+				t.PartitionBy,
+				nil, /* allowedNewColumnNames */
+			)
 			if err != nil {
 				return err
 			}
-			descriptorChanged = !proto.Equal(
+			if newIndexDesc.Partitioning.NumImplicitColumns > 0 {
+				return unimplemented.New(
+					"ALTER INDEX PARTITION BY",
+					"cannot ALTER INDEX and change the partitioning to contain implicit columns",
+				)
+			}
+			descriptorChanged = !n.indexDesc.Equal(&newIndexDesc)
+			if err = deleteRemovedPartitionZoneConfigs(
+				params.ctx,
+				params.p.txn,
+				n.tableDesc,
+				n.indexDesc,
 				&n.indexDesc.Partitioning,
-				&partitioning,
-			)
-			err = deleteRemovedPartitionZoneConfigs(
-				params.ctx, params.p.txn,
-				n.tableDesc.TableDesc(), n.indexDesc,
-				&n.indexDesc.Partitioning, &partitioning,
+				&newIndexDesc.Partitioning,
 				params.extendedEvalCtx.ExecCfg,
-			)
-			if err != nil {
+			); err != nil {
 				return err
 			}
-			n.indexDesc.Partitioning = partitioning
+			*n.indexDesc = newIndexDesc
 		default:
 			return errors.AssertionFailedf(
 				"unsupported alter command: %T", cmd)
 		}
 	}
 
-	if err := n.tableDesc.AllocateIDs(); err != nil {
+	if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
 		return err
 	}
 
 	addedMutations := len(n.tableDesc.Mutations) > origNumMutations
-	mutationID := sqlbase.InvalidMutationID
-	var err error
-	if addedMutations {
-		mutationID, err = params.p.createOrUpdateSchemaChangeJob(
-			params.ctx, n.tableDesc, tree.AsStringWithFQNames(n.n, params.Ann()),
-		)
-	} else if !descriptorChanged {
+	if !addedMutations && !descriptorChanged {
 		// Nothing to be done
 		return nil
 	}
-	if err != nil {
-		return err
+	mutationID := descpb.InvalidMutationID
+	if addedMutations {
+		mutationID = n.tableDesc.ClusterVersion.NextMutationID
 	}
-
-	if err := params.p.writeSchemaChange(params.ctx, n.tableDesc, mutationID); err != nil {
+	if err := params.p.writeSchemaChange(
+		params.ctx, n.tableDesc, mutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
+	); err != nil {
 		return err
 	}
 
 	// Record this index alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-		params.ctx,
-		params.p.txn,
-		EventLogAlterIndex,
-		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID),
-		struct {
-			TableName  string
-			IndexName  string
-			Statement  string
-			User       string
-			MutationID uint32
-		}{
-			n.n.Index.Table.FQString(), n.indexDesc.Name, n.n.String(),
-			params.SessionData().User, uint32(mutationID),
-		},
-	)
+	return params.p.logEvent(params.ctx,
+		n.tableDesc.ID,
+		&eventpb.AlterIndex{
+			TableName:  n.n.Index.Table.FQString(),
+			IndexName:  n.indexDesc.Name,
+			MutationID: uint32(mutationID),
+		})
 }
 
 func (n *alterIndexNode) Next(runParams) (bool, error) { return false, nil }

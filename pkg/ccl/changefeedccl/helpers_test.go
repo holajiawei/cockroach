@@ -18,8 +18,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -31,6 +32,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
+
+var testSinkFlushFrequency = 50 * time.Millisecond
 
 func waitForSchemaChange(
 	t testing.TB, sqlDB *sqlutils.SQLRunner, stmt string, arguments ...interface{},
@@ -60,7 +63,7 @@ func readNextMessages(t testing.TB, f cdctest.TestFeed, numMessages int, stripTs
 	for len(actual) < numMessages {
 		m, err := f.Next()
 		if log.V(1) {
-			log.Infof(context.TODO(), `%v %s: %s->%s`, err, m.Topic, m.Key, m.Value)
+			log.Infof(context.Background(), `%v %s: %s->%s`, err, m.Topic, m.Key, m.Value)
 		}
 		if err != nil {
 			t.Fatal(err)
@@ -152,17 +155,20 @@ func assertPayloadsAvro(
 	}
 }
 
-func skipResolvedTimestamps(t *testing.T, f cdctest.TestFeed) {
+func assertRegisteredSubjects(t testing.TB, reg *testSchemaRegistry, expected []string) {
 	t.Helper()
-	for {
-		m, err := f.Next()
-		if err != nil {
-			t.Fatal(err)
-		} else if m == nil {
-			t.Fatal(`expected message`)
-		} else if m.Key != nil {
-			t.Errorf(`unexpected row %s: %s->%s`, m.Topic, m.Key, m.Value)
-		}
+
+	actual := make([]string, 0, len(reg.mu.subjects))
+
+	for subject := range reg.mu.subjects {
+		actual = append(actual, subject)
+	}
+
+	sort.Strings(expected)
+	sort.Strings(actual)
+	if !reflect.DeepEqual(expected, actual) {
+		t.Fatalf("expected\n  %s\ngot\n  %s",
+			strings.Join(expected, "\n  "), strings.Join(actual, "\n  "))
 	}
 }
 
@@ -231,6 +237,7 @@ func expectResolvedTimestampAvro(
 
 func sinklessTest(testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory)) func(*testing.T) {
 	return func(t *testing.T) {
+		defer TestingSetDefaultFlushFrequency(testSinkFlushFrequency)()
 		ctx := context.Background()
 		knobs := base.TestingKnobs{DistSQL: &execinfra.TestingKnobs{Changefeed: &TestingKnobs{}}}
 		s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
@@ -250,6 +257,11 @@ func sinklessTest(testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory)) f
 		// TODO(dan): This is still needed to speed up table_history, that should be
 		// moved to RangeFeed as well.
 		sqlDB.Exec(t, `SET CLUSTER SETTING changefeed.experimental_poll_interval = '10ms'`)
+		// Change a couple of settings related to the vectorized engine in
+		// order to ensure that changefeeds work as expected with them (note
+		// that we'll still use the row-by-row engine, see #55605).
+		sqlDB.Exec(t, `SET CLUSTER SETTING sql.defaults.vectorize=on`)
+		sqlDB.Exec(t, `SET CLUSTER SETTING sql.defaults.vectorize_row_count_threshold=0`)
 		sqlDB.Exec(t, `CREATE DATABASE d`)
 
 		sink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
@@ -260,7 +272,15 @@ func sinklessTest(testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory)) f
 }
 
 func enterpriseTest(testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory)) func(*testing.T) {
+	return enterpriseTestWithServerArgs(nil, testFn)
+}
+
+func enterpriseTestWithServerArgs(
+	argsFn func(args *base.TestServerArgs),
+	testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory),
+) func(*testing.T) {
 	return func(t *testing.T) {
+		defer TestingSetDefaultFlushFrequency(testSinkFlushFrequency)()
 		ctx := context.Background()
 
 		flushCh := make(chan struct{}, 1)
@@ -274,11 +294,14 @@ func enterpriseTest(testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory))
 				return nil
 			},
 		}}}
-
-		s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		args := base.TestServerArgs{
 			UseDatabase: "d",
 			Knobs:       knobs,
-		})
+		}
+		if argsFn != nil {
+			argsFn(&args)
+		}
+		s, db, _ := serverutils.StartServer(t, args)
 		defer s.Stopper().Stop(ctx)
 		sqlDB := sqlutils.MakeSQLRunner(db)
 		sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
@@ -297,6 +320,7 @@ func cloudStorageTest(
 	testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory),
 ) func(*testing.T) {
 	return func(t *testing.T) {
+		defer TestingSetDefaultFlushFrequency(testSinkFlushFrequency)()
 		ctx := context.Background()
 
 		dir, dirCleanupFn := testutils.TempDir(t)
@@ -356,7 +380,7 @@ func forceTableGC(
 	database, table string,
 ) {
 	t.Helper()
-	if err := tsi.ForceTableGC(context.TODO(), database, table, tsi.Clock().Now()); err != nil {
+	if err := tsi.ForceTableGC(context.Background(), database, table, tsi.Clock().Now()); err != nil {
 		t.Fatal(err)
 	}
 }

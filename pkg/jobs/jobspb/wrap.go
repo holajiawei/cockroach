@@ -14,8 +14,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/errors"
 )
 
 // Details is a marker interface for job details proto structs.
@@ -26,6 +27,10 @@ var _ Details = RestoreDetails{}
 var _ Details = SchemaChangeDetails{}
 var _ Details = ChangefeedDetails{}
 var _ Details = CreateStatsDetails{}
+var _ Details = SchemaChangeGCDetails{}
+var _ Details = StreamIngestionDetails{}
+var _ Details = NewSchemaChangeDetails{}
+var _ Details = MigrationDetails{}
 
 // ProgressDetails is a marker interface for job progress details proto structs.
 type ProgressDetails interface{}
@@ -35,6 +40,10 @@ var _ ProgressDetails = RestoreProgress{}
 var _ ProgressDetails = SchemaChangeProgress{}
 var _ ProgressDetails = ChangefeedProgress{}
 var _ ProgressDetails = CreateStatsProgress{}
+var _ ProgressDetails = SchemaChangeGCProgress{}
+var _ ProgressDetails = StreamIngestionProgress{}
+var _ ProgressDetails = NewSchemaChangeProgress{}
+var _ ProgressDetails = MigrationProgress{}
 
 // Type returns the payload's job type.
 func (p *Payload) Type() Type {
@@ -60,8 +69,18 @@ func DetailsType(d isPayload_Details) Type {
 			return TypeAutoCreateStats
 		}
 		return TypeCreateStats
+	case *Payload_SchemaChangeGC:
+		return TypeSchemaChangeGC
+	case *Payload_TypeSchemaChange:
+		return TypeTypeSchemaChange
+	case *Payload_StreamIngestion:
+		return TypeStreamIngestion
+	case *Payload_NewSchemaChange:
+		return TypeNewSchemaChange
+	case *Payload_Migration:
+		return TypeMigration
 	default:
-		panic(fmt.Sprintf("Payload.Type called on a payload with an unknown details type: %T", d))
+		panic(errors.AssertionFailedf("Payload.Type called on a payload with an unknown details type: %T", d))
 	}
 }
 
@@ -86,8 +105,18 @@ func WrapProgressDetails(details ProgressDetails) interface {
 		return &Progress_Changefeed{Changefeed: &d}
 	case CreateStatsProgress:
 		return &Progress_CreateStats{CreateStats: &d}
+	case SchemaChangeGCProgress:
+		return &Progress_SchemaChangeGC{SchemaChangeGC: &d}
+	case TypeSchemaChangeProgress:
+		return &Progress_TypeSchemaChange{TypeSchemaChange: &d}
+	case StreamIngestionProgress:
+		return &Progress_StreamIngest{StreamIngest: &d}
+	case NewSchemaChangeProgress:
+		return &Progress_NewSchemaChange{NewSchemaChange: &d}
+	case MigrationProgress:
+		return &Progress_Migration{Migration: &d}
 	default:
-		panic(fmt.Sprintf("WrapProgressDetails: unknown details type %T", d))
+		panic(errors.AssertionFailedf("WrapProgressDetails: unknown details type %T", d))
 	}
 }
 
@@ -107,6 +136,16 @@ func (p *Payload) UnwrapDetails() Details {
 		return *d.Changefeed
 	case *Payload_CreateStats:
 		return *d.CreateStats
+	case *Payload_SchemaChangeGC:
+		return *d.SchemaChangeGC
+	case *Payload_TypeSchemaChange:
+		return *d.TypeSchemaChange
+	case *Payload_StreamIngestion:
+		return *d.StreamIngestion
+	case *Payload_NewSchemaChange:
+		return *d.NewSchemaChange
+	case *Payload_Migration:
+		return *d.Migration
 	default:
 		return nil
 	}
@@ -128,6 +167,16 @@ func (p *Progress) UnwrapDetails() ProgressDetails {
 		return *d.Changefeed
 	case *Progress_CreateStats:
 		return *d.CreateStats
+	case *Progress_SchemaChangeGC:
+		return *d.SchemaChangeGC
+	case *Progress_TypeSchemaChange:
+		return *d.TypeSchemaChange
+	case *Progress_StreamIngest:
+		return *d.StreamIngest
+	case *Progress_NewSchemaChange:
+		return *d.NewSchemaChange
+	case *Progress_Migration:
+		return *d.Migration
 	default:
 		return nil
 	}
@@ -162,10 +211,56 @@ func WrapPayloadDetails(details Details) interface {
 		return &Payload_Changefeed{Changefeed: &d}
 	case CreateStatsDetails:
 		return &Payload_CreateStats{CreateStats: &d}
+	case SchemaChangeGCDetails:
+		return &Payload_SchemaChangeGC{SchemaChangeGC: &d}
+	case TypeSchemaChangeDetails:
+		return &Payload_TypeSchemaChange{TypeSchemaChange: &d}
+	case StreamIngestionDetails:
+		return &Payload_StreamIngestion{StreamIngestion: &d}
+	case NewSchemaChangeDetails:
+		return &Payload_NewSchemaChange{NewSchemaChange: &d}
+	case MigrationDetails:
+		return &Payload_Migration{Migration: &d}
 	default:
-		panic(fmt.Sprintf("jobs.WrapPayloadDetails: unknown details type %T", d))
+		panic(errors.AssertionFailedf("jobs.WrapPayloadDetails: unknown details type %T", d))
 	}
 }
 
 // ChangefeedTargets is a set of id targets with metadata.
-type ChangefeedTargets map[sqlbase.ID]ChangefeedTarget
+type ChangefeedTargets map[descpb.ID]ChangefeedTarget
+
+// SchemaChangeDetailsFormatVersion is the format version for
+// SchemaChangeDetails.
+type SchemaChangeDetailsFormatVersion uint32
+
+const (
+	// BaseFormatVersion corresponds to the initial version of
+	// SchemaChangeDetails, intended for the original version of schema change
+	// jobs which were meant to be updated by a SchemaChanger instead of being run
+	// as jobs by the job registry.
+	BaseFormatVersion SchemaChangeDetailsFormatVersion = iota
+	// JobResumerFormatVersion corresponds to the introduction of the schema
+	// change job resumer. This version introduces the TableID and MutationID
+	// fields, and, more generally, flags the job as being suitable for the job
+	// registry to adopt.
+	JobResumerFormatVersion
+	// DatabaseJobFormatVersion indicates that database schema changes are
+	// run in the schema change job.
+	DatabaseJobFormatVersion
+
+	// Silence unused warning.
+	_ = BaseFormatVersion
+)
+
+// SafeValue implements the redact.SafeValue interface.
+func (Type) SafeValue() {}
+
+// NumJobTypes is the number of jobs types.
+const NumJobTypes = 13
+
+func init() {
+	if len(Type_name) != NumJobTypes {
+		panic(fmt.Errorf("NumJobTypes (%d) does not match generated job type name map length (%d)",
+			NumJobTypes, len(Type_name)))
+	}
+}

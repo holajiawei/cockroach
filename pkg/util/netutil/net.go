@@ -22,6 +22,7 @@ import (
 
 	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
@@ -41,20 +42,25 @@ func ListenAndServeGRPC(
 
 	ctx := context.TODO()
 
-	stopper.RunWorker(ctx, func(context.Context) {
+	stopper.AddCloser(stop.CloserFn(server.Stop))
+	waitQuiesce := func(context.Context) {
 		<-stopper.ShouldQuiesce()
 		FatalIfUnexpected(ln.Close())
-		<-stopper.ShouldStop()
-		server.Stop()
-	})
+	}
+	if err := stopper.RunAsyncTask(ctx, "listen-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(ctx)
+		return nil, err
+	}
 
-	stopper.RunWorker(ctx, func(context.Context) {
+	if err := stopper.RunAsyncTask(ctx, "serve", func(context.Context) {
 		FatalIfUnexpected(server.Serve(ln))
-	})
+	}); err != nil {
+		return nil, err
+	}
 	return ln, nil
 }
 
-var httpLogger = log.NewStdLogger(log.Severity_ERROR, "httpLogger")
+var httpLogger = log.NewStdLogger(severity.ERROR, "net/http")
 
 // Server is a thin wrapper around http.Server. See MakeServer for more detail.
 type Server struct {
@@ -100,18 +106,21 @@ func MakeServer(stopper *stop.Stopper, tlsConfig *tls.Config, handler http.Handl
 	// net/http.(*Server).Serve/http2.ConfigureServer are not thread safe with
 	// respect to net/http.(*Server).TLSConfig, so we call it synchronously here.
 	if err := http2.ConfigureServer(server.Server, nil); err != nil {
-		log.Fatal(ctx, err)
+		log.Fatalf(ctx, "%v", err)
 	}
 
-	stopper.RunWorker(ctx, func(context.Context) {
-		<-stopper.ShouldStop()
+	waitQuiesce := func(context.Context) {
+		<-stopper.ShouldQuiesce()
 
 		mu.Lock()
 		for conn := range activeConns {
 			conn.Close()
 		}
 		mu.Unlock()
-	})
+	}
+	if err := stopper.RunAsyncTask(ctx, "http2-wait-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(ctx)
+	}
 
 	return server
 }
@@ -125,7 +134,7 @@ func (s *Server) ServeWith(
 	for {
 		rw, e := l.Accept()
 		if e != nil {
-			if ne, ok := e.(net.Error); ok && ne.Temporary() {
+			if ne := (net.Error)(nil); errors.As(e, &ne) && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
 				} else {
@@ -153,9 +162,7 @@ func (s *Server) ServeWith(
 // IsClosedConnection returns true if err is cmux.ErrListenerClosed,
 // grpc.ErrServerStopped, io.EOF, or the net package's errClosed.
 func IsClosedConnection(err error) bool {
-	return err == cmux.ErrListenerClosed ||
-		err == grpc.ErrServerStopped ||
-		err == io.EOF ||
+	return errors.IsAny(err, cmux.ErrListenerClosed, grpc.ErrServerStopped, io.EOF) ||
 		strings.Contains(err.Error(), "use of closed network connection")
 }
 
@@ -163,7 +170,7 @@ func IsClosedConnection(err error) bool {
 // cmux.ErrListenerClosed, or the net package's errClosed.
 func FatalIfUnexpected(err error) {
 	if err != nil && !IsClosedConnection(err) {
-		log.Fatal(context.TODO(), err)
+		log.Fatalf(context.TODO(), "%+v", err)
 	}
 }
 
@@ -178,12 +185,11 @@ var _ error = (*InitialHeartbeatFailedError)(nil)
 var _ fmt.Formatter = (*InitialHeartbeatFailedError)(nil)
 var _ errors.Formatter = (*InitialHeartbeatFailedError)(nil)
 
-// Note: Error is not a causer. If this is changed to implement
-// Cause()/Unwrap(), change the type assertions in package cli and
-// elsewhere to use errors.As() or equivalent.
-
 // Error implements error.
 func (e *InitialHeartbeatFailedError) Error() string { return fmt.Sprintf("%v", e) }
+
+// Cause implements causer.
+func (e *InitialHeartbeatFailedError) Cause() error { return e.WrappedErr }
 
 // Format implements fmt.Formatter.
 func (e *InitialHeartbeatFailedError) Format(s fmt.State, verb rune) { errors.FormatError(e, s, verb) }

@@ -13,8 +13,8 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -29,7 +29,7 @@ import (
 func (p *planner) analyzeExpr(
 	ctx context.Context,
 	raw tree.Expr,
-	source *sqlbase.DataSourceInfo,
+	source *colinfo.DataSourceInfo,
 	iVarHelper tree.IndexedVarHelper,
 	expectedType *types.T,
 	requireType bool,
@@ -39,7 +39,7 @@ func (p *planner) analyzeExpr(
 	resolved := raw
 	if source != nil {
 		var err error
-		resolved, _, err = p.resolveNames(raw, source, iVarHelper)
+		resolved, err = p.resolveNames(raw, source, iVarHelper)
 		if err != nil {
 			return nil, err
 		}
@@ -50,10 +50,10 @@ func (p *planner) analyzeExpr(
 	var err error
 	p.semaCtx.IVarContainer = iVarHelper.Container()
 	if requireType {
-		typedExpr, err = tree.TypeCheckAndRequire(resolved, &p.semaCtx,
+		typedExpr, err = tree.TypeCheckAndRequire(ctx, resolved, &p.semaCtx,
 			expectedType, typingContext)
 	} else {
-		typedExpr, err = tree.TypeCheck(resolved, &p.semaCtx, expectedType)
+		typedExpr, err = tree.TypeCheck(ctx, resolved, &p.semaCtx, expectedType)
 	}
 	p.semaCtx.IVarContainer = nil
 	if err != nil {

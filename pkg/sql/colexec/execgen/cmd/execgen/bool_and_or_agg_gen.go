@@ -13,14 +13,16 @@ package main
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 type booleanAggTmplInfo struct {
+	aggTmplInfoBase
 	IsAnd bool
 }
 
@@ -31,7 +33,7 @@ func (b booleanAggTmplInfo) AssignBoolOp(target, l, r string) string {
 	case false:
 		return fmt.Sprintf("%s = %s || %s", target, l, r)
 	default:
-		execerror.VectorizedInternalPanic("unsupported boolean agg type")
+		colexecerror.InternalError(errors.AssertionFailedf("unsupported boolean agg type"))
 		// This code is unreachable, but the compiler cannot infer that.
 		return ""
 	}
@@ -58,31 +60,40 @@ var (
 	_ = booleanAggTmplInfo{}.DefaultVal
 )
 
-func genBooleanAgg(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/bool_and_or_agg_tmpl.go")
-	if err != nil {
-		return err
-	}
+const boolAggTmpl = "pkg/sql/colexec/colexecagg/bool_and_or_agg_tmpl.go"
 
-	s := string(t)
+func genBooleanAgg(inputFileContents string, wr io.Writer) error {
+	r := strings.NewReplacer(
+		"_OP_TYPE", "{{.OpType}}",
+		"_DEFAULT_VAL", "{{.DefaultVal}}",
+	)
+	s := r.Replace(inputFileContents)
 
-	s = strings.Replace(s, "_OP_TYPE", "{{.OpType}}", -1)
-	s = strings.Replace(s, "_DEFAULT_VAL", "{{.DefaultVal}}", -1)
-
-	accumulateBoolean := makeFunctionRegex("_ACCUMULATE_BOOLEAN", 3)
-	s = accumulateBoolean.ReplaceAllString(s, `{{template "accumulateBoolean" buildDict "Global" .}}`)
+	accumulateBoolean := makeFunctionRegex("_ACCUMULATE_BOOLEAN", 5)
+	s = accumulateBoolean.ReplaceAllString(s, `{{template "accumulateBoolean" buildDict "Global" . "HasNulls" $4 "HasSel" $5}}`)
 
 	assignBoolRe := makeFunctionRegex("_ASSIGN_BOOL_OP", 3)
 	s = assignBoolRe.ReplaceAllString(s, makeTemplateFunctionCall(`AssignBoolOp`, 3))
+
+	s = replaceManipulationFuncs(s)
 
 	tmpl, err := template.New("bool_and_or_agg").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
 	if err != nil {
 		return err
 	}
 
-	return tmpl.Execute(wr, []booleanAggTmplInfo{{IsAnd: true}, {IsAnd: false}})
+	return tmpl.Execute(wr, []booleanAggTmplInfo{
+		{
+			aggTmplInfoBase: aggTmplInfoBase{canonicalTypeFamily: types.BoolFamily},
+			IsAnd:           true,
+		},
+		{
+			aggTmplInfoBase: aggTmplInfoBase{canonicalTypeFamily: types.BoolFamily},
+			IsAnd:           false,
+		},
+	})
 }
 
 func init() {
-	registerGenerator(genBooleanAgg, "bool_and_or_agg.eg.go")
+	registerAggGenerator(genBooleanAgg, "bool_and_or_agg.eg.go", boolAggTmpl)
 }

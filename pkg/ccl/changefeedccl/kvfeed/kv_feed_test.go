@@ -15,12 +15,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/schemafeed"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/schemafeed/schematestutils"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -38,7 +42,7 @@ func TestKVFeed(t *testing.T) {
 	}
 	kv := func(tableID uint32, k, v string, ts hlc.Timestamp) roachpb.KeyValue {
 		vDatum := tree.DString(k)
-		key, err := sqlbase.EncodeTableKey(keys.MakeTablePrefix(tableID), &vDatum, encoding.Ascending)
+		key, err := rowenc.EncodeTableKey(keys.SystemSQLCodec.TablePrefix(tableID), &vDatum, encoding.Ascending)
 		if err != nil {
 			panic(err)
 		}
@@ -69,24 +73,26 @@ func TestKVFeed(t *testing.T) {
 			},
 		}
 	}
-
 	type testCase struct {
-		name             string
-		needsInitialScan bool
-		withDiff         bool
-		initialHighWater hlc.Timestamp
-		spans            []roachpb.Span
-		events           []roachpb.RangeFeedEvent
+		name               string
+		needsInitialScan   bool
+		withDiff           bool
+		schemaChangeEvents changefeedbase.SchemaChangeEventClass
+		schemaChangePolicy changefeedbase.SchemaChangePolicy
+		initialHighWater   hlc.Timestamp
+		spans              []roachpb.Span
+		events             []roachpb.RangeFeedEvent
 
-		descs []*sqlbase.TableDescriptor
+		descs []catalog.TableDescriptor
 
 		expScans  []hlc.Timestamp
 		expEvents int
+		expErrRE  string
 	}
 	runTest := func(t *testing.T, tc testCase) {
 		settings := cluster.MakeTestingClusterSettings()
 		buf := MakeChanBuffer()
-		mm := mon.MakeUnlimitedMonitor(
+		mm := mon.NewUnlimitedMonitor(
 			context.Background(), "test", mon.MemoryResource,
 			nil /* curCount */, nil /* maxHist */, math.MaxInt64, settings,
 		)
@@ -105,12 +111,17 @@ func TestKVFeed(t *testing.T) {
 		})
 		ref := rawEventFeed(tc.events)
 		tf := newRawTableFeed(tc.descs, tc.initialHighWater)
-		f := newKVFeed(buf, tc.spans, tc.needsInitialScan, tc.withDiff, tc.initialHighWater,
+		f := newKVFeed(buf, tc.spans,
+			tc.schemaChangeEvents, tc.schemaChangePolicy,
+			tc.needsInitialScan, tc.withDiff,
+			tc.initialHighWater,
+			keys.SystemSQLCodec,
 			&tf, sf, rangefeedFactory(ref.run), bufferFactory)
 		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 		g := ctxgroup.WithContext(ctx)
-		g.GoCtx(f.run)
+		g.GoCtx(func(ctx context.Context) error {
+			return f.run(ctx)
+		})
 		testG := ctxgroup.WithContext(ctx)
 		testG.GoCtx(func(ctx context.Context) error {
 			for expScans := tc.expScans; len(expScans) > 0; expScans = expScans[1:] {
@@ -127,15 +138,30 @@ func TestKVFeed(t *testing.T) {
 			}
 			return nil
 		})
+		// Wait for the feed to fail rather than canceling it.
+		if tc.schemaChangePolicy == changefeedbase.OptSchemaChangePolicyStop {
+			testG.Go(func() error {
+				_ = g.Wait()
+				return nil
+			})
+		}
 		require.NoError(t, testG.Wait())
 		cancel()
-		require.Equal(t, context.Canceled, g.Wait())
+		if runErr := g.Wait(); tc.expErrRE != "" {
+			require.Regexp(t, tc.expErrRE, runErr)
+		} else {
+			require.Regexp(t, context.Canceled, runErr)
+		}
 	}
+	makeTableDesc := schematestutils.MakeTableDesc
+	addColumnDropBackfillMutation := schematestutils.AddColumnDropBackfillMutation
 	for _, tc := range []testCase{
 		{
-			name:             "no events",
-			needsInitialScan: true,
-			initialHighWater: ts(2),
+			name:               "no events - backfill",
+			schemaChangeEvents: changefeedbase.OptSchemaChangeEventClassDefault,
+			schemaChangePolicy: changefeedbase.OptSchemaChangePolicyBackfill,
+			needsInitialScan:   true,
+			initialHighWater:   ts(2),
 			spans: []roachpb.Span{
 				tableSpan(42),
 			},
@@ -148,9 +174,11 @@ func TestKVFeed(t *testing.T) {
 			expEvents: 1,
 		},
 		{
-			name:             "one table event",
-			needsInitialScan: true,
-			initialHighWater: ts(2),
+			name:               "one table event - backfill",
+			schemaChangeEvents: changefeedbase.OptSchemaChangeEventClassDefault,
+			schemaChangePolicy: changefeedbase.OptSchemaChangePolicyBackfill,
+			needsInitialScan:   true,
+			initialHighWater:   ts(2),
 			spans: []roachpb.Span{
 				tableSpan(42),
 			},
@@ -165,11 +193,61 @@ func TestKVFeed(t *testing.T) {
 				ts(2),
 				ts(3),
 			},
-			descs: []*sqlbase.TableDescriptor{
+			descs: []catalog.TableDescriptor{
 				makeTableDesc(42, 1, ts(1), 2),
 				addColumnDropBackfillMutation(makeTableDesc(42, 2, ts(3), 1)),
 			},
 			expEvents: 2,
+		},
+		{
+			name:               "one table event - skip",
+			schemaChangeEvents: changefeedbase.OptSchemaChangeEventClassDefault,
+			schemaChangePolicy: changefeedbase.OptSchemaChangePolicyNoBackfill,
+			needsInitialScan:   true,
+			initialHighWater:   ts(2),
+			spans: []roachpb.Span{
+				tableSpan(42),
+			},
+			events: []roachpb.RangeFeedEvent{
+				kvEvent(42, "a", "b", ts(3)),
+				checkpointEvent(tableSpan(42), ts(4)),
+				kvEvent(42, "a", "b", ts(5)),
+				checkpointEvent(tableSpan(42), ts(6)),
+			},
+			expScans: []hlc.Timestamp{
+				ts(2),
+			},
+			descs: []catalog.TableDescriptor{
+				makeTableDesc(42, 1, ts(1), 2),
+				addColumnDropBackfillMutation(makeTableDesc(42, 2, ts(3), 1)),
+			},
+			expEvents: 4,
+		},
+		{
+			name:               "one table event - stop",
+			schemaChangeEvents: changefeedbase.OptSchemaChangeEventClassDefault,
+			schemaChangePolicy: changefeedbase.OptSchemaChangePolicyStop,
+			needsInitialScan:   true,
+			initialHighWater:   ts(2),
+			spans: []roachpb.Span{
+				tableSpan(42),
+			},
+			events: []roachpb.RangeFeedEvent{
+				kvEvent(42, "a", "b", ts(3)),
+				checkpointEvent(tableSpan(42), ts(4)),
+				kvEvent(42, "a", "b", ts(5)),
+				checkpointEvent(tableSpan(42), ts(2)), // ensure that events are filtered
+				checkpointEvent(tableSpan(42), ts(5)),
+			},
+			expScans: []hlc.Timestamp{
+				ts(2),
+			},
+			descs: []catalog.TableDescriptor{
+				makeTableDesc(42, 1, ts(1), 2),
+				addColumnDropBackfillMutation(makeTableDesc(42, 2, ts(4), 1)),
+			},
+			expEvents: 2,
+			expErrRE:  "schema change ...",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -190,23 +268,21 @@ type rawTableFeed struct {
 	events []schemafeed.TableEvent
 }
 
-func newRawTableFeed(
-	descs []*sqlbase.TableDescriptor, initialHighWater hlc.Timestamp,
-) rawTableFeed {
+func newRawTableFeed(descs []catalog.TableDescriptor, initialHighWater hlc.Timestamp) rawTableFeed {
 	sort.Slice(descs, func(i, j int) bool {
-		if descs[i].ID != descs[j].ID {
-			return descs[i].ID < descs[j].ID
+		if descs[i].GetID() != descs[j].GetID() {
+			return descs[i].GetID() < descs[j].GetID()
 		}
-		return descs[i].ModificationTime.Less(descs[j].ModificationTime)
+		return descs[i].GetModificationTime().Less(descs[j].GetModificationTime())
 	})
 	f := rawTableFeed{}
-	curID := sqlbase.ID(math.MaxUint32)
+	curID := descpb.ID(math.MaxUint32)
 	for i, d := range descs {
-		if d.ID != curID {
-			curID = d.ID
+		if d.GetID() != curID {
+			curID = d.GetID()
 			continue
 		}
-		if d.ModificationTime.Less(initialHighWater) {
+		if d.GetModificationTime().Less(initialHighWater) {
 			continue
 		}
 		f.events = append(f.events, schemafeed.TableEvent{
@@ -280,7 +356,7 @@ var _ schemaFeed = (*rawTableFeed)(nil)
 
 func tableSpan(tableID uint32) roachpb.Span {
 	return roachpb.Span{
-		Key:    keys.MakeTablePrefix(tableID),
-		EndKey: roachpb.Key(keys.MakeTablePrefix(tableID)).PrefixEnd(),
+		Key:    keys.SystemSQLCodec.TablePrefix(tableID),
+		EndKey: keys.SystemSQLCodec.TablePrefix(tableID).PrefixEnd(),
 	}
 }

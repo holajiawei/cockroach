@@ -11,22 +11,17 @@
 package cli
 
 import (
-	"fmt"
-	"io/ioutil"
-	"os"
-	"path/filepath"
-	"reflect"
-	"sort"
-	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestInitInsecure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
@@ -75,6 +70,7 @@ func TestInitInsecure(t *testing.T) {
 
 func TestStartArgChecking(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	// In addition to the usual initCLIDefaults, we need to reset
@@ -125,54 +121,9 @@ func TestStartArgChecking(t *testing.T) {
 	}
 }
 
-func TestGCProfiles(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	dir, err := ioutil.TempDir("", "TestGCProfile.")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		_ = os.RemoveAll(dir)
-	}()
-
-	data := []byte("hello world")
-	const prefix = "testprof."
-
-	var expected []string
-	var sum int
-	for i := 1; i < len(data); i++ {
-		p := filepath.Join(dir, fmt.Sprintf("%s%04d", prefix, i))
-		err := ioutil.WriteFile(p, data[:i], 0644)
-		if err != nil {
-			t.Fatal(err)
-		}
-		expected = append(expected, p)
-		sum += len(data[:i])
-
-		otherPath := filepath.Join(dir, fmt.Sprintf("other.%04d", i))
-		if err := ioutil.WriteFile(otherPath, data[:i], 0644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	for i := 1; i < len(data); i++ {
-		gcProfiles(dir, prefix, int64(sum))
-		paths, err := filepath.Glob(filepath.Join(dir, prefix+"*"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		sort.Strings(paths)
-		if e := expected[i-1:]; !reflect.DeepEqual(e, paths) {
-			t.Fatalf("%d: expected\n%s\nfound\n%s\n",
-				i, strings.Join(e, "\n"), strings.Join(paths, "\n"))
-		}
-		sum -= len(data[:i])
-	}
-}
-
 func TestAddrWithDefaultHost(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	testData := []struct {
 		inAddr  string

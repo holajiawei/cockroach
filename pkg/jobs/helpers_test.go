@@ -13,30 +13,29 @@ package jobs
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/errors"
 )
-
-func ResetConstructors() func() {
-	old := make(map[jobspb.Type]Constructor)
-	for k, v := range constructors {
-		old[k] = v
-	}
-	return func() { constructors = old }
-}
 
 // FakeResumer calls optional callbacks during the job lifecycle.
 type FakeResumer struct {
 	OnResume     func(context.Context) error
 	FailOrCancel func(context.Context) error
 	Success      func() error
-	Terminal     func()
+	PauseRequest onPauseRequestFunc
 }
 
-func (d FakeResumer) Resume(ctx context.Context, _ interface{}, _ chan<- tree.Datums) error {
+var _ Resumer = FakeResumer{}
+
+func (d FakeResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	if d.OnResume != nil {
-		return d.OnResume(ctx)
+		if err := d.OnResume(ctx); err != nil {
+			return err
+		}
+	}
+	if d.Success != nil {
+		return d.Success()
 	}
 	return nil
 }
@@ -48,17 +47,48 @@ func (d FakeResumer) OnFailOrCancel(ctx context.Context, _ interface{}) error {
 	return nil
 }
 
-func (d FakeResumer) OnSuccess(_ context.Context, _ *client.Txn) error {
-	if d.Success != nil {
-		return d.Success()
+// OnPauseRequestFunc forwards the definition for use in tests.
+type OnPauseRequestFunc = onPauseRequestFunc
+
+var _ PauseRequester = FakeResumer{}
+
+func (d FakeResumer) OnPauseRequest(
+	ctx context.Context, execCtx interface{}, txn *kv.Txn, details *jobspb.Progress,
+) error {
+	if d.PauseRequest == nil {
+		return nil
 	}
-	return nil
+	return d.PauseRequest(ctx, execCtx, txn, details)
 }
 
-func (d FakeResumer) OnTerminal(_ context.Context, _ Status, _ chan<- tree.Datums) {
-	if d.Terminal != nil {
-		d.Terminal()
-	}
+// Started is a wrapper around the internal function that moves a job to the
+// started state.
+func (j *Job) Started(ctx context.Context) error {
+	return j.started(ctx)
 }
 
-var _ Resumer = FakeResumer{}
+// Created is a test only function that inserts a new jobs table row.
+func (j *Job) Created(ctx context.Context) error {
+	if j.ID() != nil {
+		return errors.Errorf("job already created with ID %v", *j.ID())
+	}
+	return j.deprecatedInsert(ctx, j.registry.makeJobID(), nil /* lease */, nil /* session */)
+}
+
+// Paused is a wrapper around the internal function that moves a job to the
+// paused state.
+func (j *Job) Paused(ctx context.Context) error {
+	return j.paused(ctx, nil /* fn */)
+}
+
+// Failed is a wrapper around the internal function that moves a job to the
+// failed state.
+func (j *Job) Failed(ctx context.Context, causingErr error) error {
+	return j.failed(ctx, causingErr, nil /* fn */)
+}
+
+// Succeeded is a wrapper around the internal function that moves a job to the
+// succeeded state.
+func (j *Job) Succeeded(ctx context.Context) error {
+	return j.succeeded(ctx, nil /* fn */)
+}

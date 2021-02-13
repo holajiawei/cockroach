@@ -81,11 +81,11 @@ func registerLibPQ(r *testRegistry) {
 
 		_ = c.RunE(ctx, node, fmt.Sprintf("mkdir -p %s", resultsDir))
 
-		blacklistName, expectedFailures, ignorelistName, ignoredFailures := libPQBlacklists.getLists(version)
+		blocklistName, expectedFailures, ignorelistName, ignoredFailures := libPQBlocklists.getLists(version)
 		if expectedFailures == nil {
-			t.Fatalf("No lib/pq blacklist defined for cockroach version %s", version)
+			t.Fatalf("No lib/pq blocklist defined for cockroach version %s", version)
 		}
-		c.l.Printf("Running cockroach version %s, using blacklist %s, using ignorelist %s", version, blacklistName, ignorelistName)
+		c.l.Printf("Running cockroach version %s, using blocklist %s, using ignorelist %s", version, blocklistName, ignorelistName)
 
 		t.Status("running lib/pq test suite and collecting results")
 
@@ -98,13 +98,13 @@ func registerLibPQ(r *testRegistry) {
 
 		parseAndSummarizeJavaORMTestsResults(
 			ctx, t, c, node, "lib/pq" /* ormName */, []byte(resultsPath),
-			blacklistName, expectedFailures, ignoredFailures, version, latestTag,
+			blocklistName, expectedFailures, ignoredFailures, version, latestTag,
 		)
 	}
 
 	r.Add(testSpec{
 		Name:       "lib/pq",
-		Owner:      OwnerAppDev,
+		Owner:      OwnerSQLExperience,
 		MinVersion: "v19.2.0",
 		Cluster:    makeClusterSpec(1),
 		Tags:       []string{`default`, `driver`},

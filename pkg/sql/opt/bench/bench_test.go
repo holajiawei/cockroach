@@ -26,6 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
@@ -33,9 +35,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
@@ -144,8 +147,7 @@ var schemas = [...]string{
 		s_order_cnt  integer,
 		s_remote_cnt integer,
 		s_data       varchar(50),
-		primary key (s_w_id, s_i_id),
-		index stock_item_fk_idx (s_i_id)
+		primary key (s_w_id, s_i_id)
 	)
 	`,
 	`
@@ -275,9 +277,9 @@ var profileQuery = flag.String("profile-query", "kv-read", "name of query to run
 // TestCPUProfile writes the output profile to a cpu.out file in the current
 // directory. See the profile flags for ways to configure what is profiled.
 func TestCPUProfile(t *testing.T) {
-	t.Skip(
-		"Remove this when profiling. Use profile flags above to configure. Sample command line: \n" +
-			"GOMAXPROCS=1 go test -run TestCPUProfile --logtostderr NONE && go tool pprof bench.test cpu.out",
+	skip.IgnoreLint(t,
+		"Remove this when profiling. Use profile flags above to configure. Sample command line: \n"+
+			"GOMAXPROCS=1 go test -run TestCPUProfile && go tool pprof cpu.out",
 	)
 
 	h := newHarness()
@@ -318,6 +320,8 @@ func BenchmarkPhases(b *testing.B) {
 
 // BenchmarkEndToEnd measures the time to execute a query end-to-end.
 func BenchmarkEndToEnd(b *testing.B) {
+	defer log.Scope(b).Close(b)
+
 	h := newHarness()
 	defer h.close()
 
@@ -350,7 +354,7 @@ func newHarness() *harness {
 
 func (h *harness) close() {
 	if h.s != nil {
-		h.s.Stopper().Stop(context.TODO())
+		h.s.Stopper().Stop(context.Background())
 	}
 }
 
@@ -506,12 +510,13 @@ func (h *harness) prepareUsingAPI(tb testing.TB) {
 
 		id := tree.PlaceholderIdx(i)
 		typ, _ := h.semaCtx.Placeholders.ValueType(id)
-		texpr, err := sqlbase.SanitizeVarFreeExpr(
+		texpr, err := schemaexpr.SanitizeVarFreeExpr(
+			context.Background(),
 			parg,
 			typ,
 			"", /* context */
 			&h.semaCtx,
-			true, /* allowImpure */
+			tree.VolatilityVolatile,
 		)
 		if err != nil {
 			tb.Fatalf("%v", err)
@@ -570,8 +575,9 @@ func (h *harness) runUsingAPI(tb testing.TB, bmType BenchmarkType, usePrepared b
 	}
 
 	root := execMemo.RootExpr()
-	execFactory := stubFactory{}
-	eb := execbuilder.New(&execFactory, execMemo, nil /* catalog */, root, &h.evalCtx)
+	eb := execbuilder.New(
+		exec.StubFactory{}, execMemo, nil /* catalog */, root, &h.evalCtx, true, /* allowAutoCommit */
+	)
 	if _, err = eb.Build(); err != nil {
 		tb.Fatalf("%v", err)
 	}

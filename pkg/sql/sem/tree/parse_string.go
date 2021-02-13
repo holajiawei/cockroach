@@ -12,55 +12,87 @@ package tree
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
-// ParseAndRequireString parses s as type t for simple types. Arrays and collated
+// ParseAndRequireString parses s as type t for simple types. Collated
 // strings are not handled.
-func ParseAndRequireString(t *types.T, s string, ctx ParseTimeContext) (Datum, error) {
+//
+// The dependsOnContext return value indicates if we had to consult the
+// ParseTimeContext (either for the time or the local timezone).
+func ParseAndRequireString(
+	t *types.T, s string, ctx ParseTimeContext,
+) (d Datum, dependsOnContext bool, err error) {
 	switch t.Family() {
 	case types.ArrayFamily:
-		return ParseDArrayFromString(ctx, s, t.ArrayContents())
+		d, dependsOnContext, err = ParseDArrayFromString(ctx, s, t.ArrayContents())
 	case types.BitFamily:
-		return ParseDBitArray(s)
-	case types.BoolFamily:
-		return ParseDBool(s)
-	case types.BytesFamily:
-		return ParseDByte(s)
-	case types.DateFamily:
-		return ParseDDate(ctx, s)
-	case types.DecimalFamily:
-		return ParseDDecimal(s)
-	case types.FloatFamily:
-		return ParseDFloat(s)
-	case types.INetFamily:
-		return ParseDIPAddrFromINetString(s)
-	case types.IntFamily:
-		return ParseDInt(s)
-	case types.IntervalFamily:
-		itm, err := t.IntervalTypeMetadata()
+		r, err := ParseDBitArray(s)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return ParseDIntervalWithTypeMetadata(s, itm)
+		d = formatBitArrayToType(r, t)
+	case types.BoolFamily:
+		d, err = ParseDBool(s)
+	case types.BytesFamily:
+		d, err = ParseDByte(s)
+	case types.DateFamily:
+		d, dependsOnContext, err = ParseDDate(ctx, s)
+	case types.DecimalFamily:
+		d, err = ParseDDecimal(s)
+	case types.FloatFamily:
+		d, err = ParseDFloat(s)
+	case types.INetFamily:
+		d, err = ParseDIPAddrFromINetString(s)
+	case types.IntFamily:
+		d, err = ParseDInt(s)
+	case types.IntervalFamily:
+		itm, typErr := t.IntervalTypeMetadata()
+		if typErr != nil {
+			return nil, false, typErr
+		}
+		d, err = ParseDIntervalWithTypeMetadata(s, itm)
+	case types.Box2DFamily:
+		d, err = ParseDBox2D(s)
+	case types.GeographyFamily:
+		d, err = ParseDGeography(s)
+	case types.GeometryFamily:
+		d, err = ParseDGeometry(s)
 	case types.JsonFamily:
-		return ParseDJSON(s)
+		d, err = ParseDJSON(s)
 	case types.OidFamily:
 		i, err := ParseDInt(s)
-		return NewDOid(*i), err
+		if err != nil {
+			return nil, false, err
+		}
+		d = NewDOid(*i)
 	case types.StringFamily:
-		return NewDString(s), nil
+		// If the string type specifies a limit we truncate to that limit:
+		//   'hello'::CHAR(2) -> 'he'
+		// This is true of all the string type variants.
+		if t.Width() > 0 {
+			s = util.TruncateString(s, int(t.Width()))
+		}
+		return NewDString(s), false, nil
 	case types.TimeFamily:
-		return ParseDTime(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision()))
+		d, dependsOnContext, err = ParseDTime(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision()))
 	case types.TimeTZFamily:
-		return ParseDTimeTZ(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision()))
+		d, dependsOnContext, err = ParseDTimeTZ(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision()))
 	case types.TimestampFamily:
-		return ParseDTimestamp(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision()))
+		d, dependsOnContext, err = ParseDTimestamp(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision()))
 	case types.TimestampTZFamily:
-		return ParseDTimestampTZ(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision()))
+		d, dependsOnContext, err = ParseDTimestampTZ(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision()))
 	case types.UuidFamily:
-		return ParseDUuidFromString(s)
+		d, err = ParseDUuidFromString(s)
+	case types.EnumFamily:
+		d, err = MakeDEnumFromLogicalRepresentation(t, s)
 	default:
-		return nil, errors.AssertionFailedf("unknown type %s (%T)", t, t)
+		return nil, false, errors.AssertionFailedf("unknown type %s (%T)", t, t)
 	}
+	if err != nil {
+		return d, dependsOnContext, err
+	}
+	d, err = AdjustValueToType(t, d)
+	return d, dependsOnContext, err
 }

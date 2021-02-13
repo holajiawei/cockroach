@@ -23,10 +23,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -36,11 +38,11 @@ func TestColumnConversions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	columnType := func(typStr string) *types.T {
-		t, err := parser.ParseType(typStr)
+		t, err := parser.GetTypeFromValidSQLSyntax(typStr)
 		if err != nil {
 			panic(err)
 		}
-		return t
+		return tree.MustBeStaticallyKnownType(t)
 	}
 
 	// columnConversionInfo is where we document conversions that
@@ -92,28 +94,28 @@ func TestColumnConversions(t *testing.T) {
 
 		"STRING": {
 			"BIT":   ColumnConversionGeneral,
-			"BYTES": ColumnConversionTrivial,
+			"BYTES": ColumnConversionValidate,
 		},
 		"STRING(5)": {
-			"BYTES": ColumnConversionTrivial,
+			"BYTES": ColumnConversionValidate,
 		},
 
 		"TIME": {
 			"TIME":    ColumnConversionTrivial,
-			"TIME(5)": ColumnConversionValidate,
+			"TIME(5)": ColumnConversionGeneral,
 			"TIME(6)": ColumnConversionTrivial,
 		},
 		"TIMETZ": {
 			"TIMETZ":    ColumnConversionTrivial,
-			"TIMETZ(5)": ColumnConversionValidate,
+			"TIMETZ(5)": ColumnConversionGeneral,
 			"TIMETZ(6)": ColumnConversionTrivial,
 		},
 		"TIMESTAMP": {
 			"TIMESTAMP":      ColumnConversionTrivial,
-			"TIMESTAMP(5)":   ColumnConversionValidate,
+			"TIMESTAMP(5)":   ColumnConversionGeneral,
 			"TIMESTAMP(6)":   ColumnConversionTrivial,
 			"TIMESTAMPTZ":    ColumnConversionTrivial,
-			"TIMESTAMPTZ(5)": ColumnConversionValidate,
+			"TIMESTAMPTZ(5)": ColumnConversionGeneral,
 			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
 		},
 		"TIMESTAMP(0)": {
@@ -125,35 +127,35 @@ func TestColumnConversions(t *testing.T) {
 			"TIMESTAMPTZ":    ColumnConversionTrivial,
 		},
 		"TIMESTAMP(3)": {
-			"TIMESTAMP(0)": ColumnConversionValidate,
-			"TIMESTAMP(1)": ColumnConversionValidate,
+			"TIMESTAMP(0)": ColumnConversionGeneral,
+			"TIMESTAMP(1)": ColumnConversionGeneral,
 			"TIMESTAMP(3)": ColumnConversionTrivial,
 			"TIMESTAMP(6)": ColumnConversionTrivial,
 			"TIMESTAMP":    ColumnConversionTrivial,
 
-			"TIMESTAMPTZ(0)": ColumnConversionValidate,
-			"TIMESTAMPTZ(1)": ColumnConversionValidate,
+			"TIMESTAMPTZ(0)": ColumnConversionGeneral,
+			"TIMESTAMPTZ(1)": ColumnConversionGeneral,
 			"TIMESTAMPTZ(3)": ColumnConversionTrivial,
 			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
 			"TIMESTAMPTZ":    ColumnConversionTrivial,
 		},
 		"TIMESTAMPTZ": {
 			"TIMESTAMP":      ColumnConversionTrivial,
-			"TIMESTAMP(5)":   ColumnConversionValidate,
+			"TIMESTAMP(5)":   ColumnConversionGeneral,
 			"TIMESTAMP(6)":   ColumnConversionTrivial,
 			"TIMESTAMPTZ":    ColumnConversionTrivial,
-			"TIMESTAMPTZ(5)": ColumnConversionValidate,
+			"TIMESTAMPTZ(5)": ColumnConversionGeneral,
 			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
 		},
 		"TIMESTAMPTZ(3)": {
-			"TIMESTAMP(0)": ColumnConversionValidate,
-			"TIMESTAMP(1)": ColumnConversionValidate,
+			"TIMESTAMP(0)": ColumnConversionGeneral,
+			"TIMESTAMP(1)": ColumnConversionGeneral,
 			"TIMESTAMP(3)": ColumnConversionTrivial,
 			"TIMESTAMP(6)": ColumnConversionTrivial,
 			"TIMESTAMP":    ColumnConversionTrivial,
 
-			"TIMESTAMPTZ(0)": ColumnConversionValidate,
-			"TIMESTAMPTZ(1)": ColumnConversionValidate,
+			"TIMESTAMPTZ(0)": ColumnConversionGeneral,
+			"TIMESTAMPTZ(1)": ColumnConversionGeneral,
 			"TIMESTAMPTZ(3)": ColumnConversionTrivial,
 			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
 			"TIMESTAMPTZ":    ColumnConversionTrivial,
@@ -176,7 +178,7 @@ func TestColumnConversions(t *testing.T) {
 	t.Run("columnConversionInfo sanity", func(t *testing.T) {
 		for from, mid := range columnConversionInfo {
 			for to, expected := range mid {
-				actual, err := ClassifyConversion(columnType(from), columnType(to))
+				actual, err := ClassifyConversion(context.Background(), columnType(from), columnType(to))
 
 				// Verify that we only return cannot-coerce errors.
 				if err != nil {
@@ -195,6 +197,7 @@ func TestColumnConversions(t *testing.T) {
 	})
 
 	t.Run("column conversion checks", func(t *testing.T) {
+		defer log.Scope(t).Close(t)
 		s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 		defer s.Stopper().Stop(context.Background())
 		sqlDB := sqlutils.MakeSQLRunner(db)
@@ -361,7 +364,7 @@ func TestColumnConversions(t *testing.T) {
 						var a, expr string
 						lookFor := fmt.Sprintf("a %s NULL,", colType.SQLString())
 						sqlDB.QueryRow(t, "SHOW CREATE d.t").Scan(&a, &expr)
-						t.Log(lookFor, expr)
+						log.Infof(context.Background(), "TestColumnConversions: %s %s", lookFor, expr)
 						return strings.Contains(expr, lookFor)
 					}
 

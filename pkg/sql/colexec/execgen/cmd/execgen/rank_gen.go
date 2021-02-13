@@ -11,9 +11,7 @@
 package main
 
 import (
-	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 )
@@ -29,14 +27,10 @@ type rankTmplInfo struct {
 // is used by the template.
 func (r rankTmplInfo) UpdateRank() string {
 	if r.Dense {
-		return fmt.Sprintf(
-			`r.rank++`,
-		)
+		return `r.rank++`
 	}
-	return fmt.Sprintf(
-		`r.rank += r.rankIncrement
-r.rankIncrement = 1`,
-	)
+	return `r.rank += r.rankIncrement
+r.rankIncrement = 1`
 }
 
 // UpdateRankIncrement is used to encompass the different logic between
@@ -46,9 +40,7 @@ func (r rankTmplInfo) UpdateRankIncrement() string {
 	if r.Dense {
 		return ``
 	}
-	return fmt.Sprintf(
-		`r.rankIncrement++`,
-	)
+	return `r.rankIncrement++`
 }
 
 // Avoid unused warnings. These methods are used in the template.
@@ -57,20 +49,17 @@ var (
 	_ = rankTmplInfo{}.UpdateRankIncrement()
 )
 
-func genRankOps(wr io.Writer) error {
-	d, err := ioutil.ReadFile("pkg/sql/colexec/rank_tmpl.go")
-	if err != nil {
-		return err
-	}
+const rankTmpl = "pkg/sql/colexec/rank_tmpl.go"
 
-	s := string(d)
+func genRankOps(inputFileContents string, wr io.Writer) error {
+	s := strings.ReplaceAll(inputFileContents, "_RANK_STRING", "{{.String}}")
 
-	s = strings.Replace(s, "_RANK_STRING", "{{.String}}", -1)
-
+	computeRankRe := makeFunctionRegex("_COMPUTE_RANK", 1)
+	s = computeRankRe.ReplaceAllString(s, `{{template "computeRank" buildDict "Global" . "HasPartition" .HasPartition "HasSel" $1}}`)
 	updateRankRe := makeFunctionRegex("_UPDATE_RANK", 0)
-	s = updateRankRe.ReplaceAllString(s, makeTemplateFunctionCall("UpdateRank", 0))
+	s = updateRankRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.UpdateRank", 0))
 	updateRankIncrementRe := makeFunctionRegex("_UPDATE_RANK_INCREMENT", 0)
-	s = updateRankIncrementRe.ReplaceAllString(s, makeTemplateFunctionCall("UpdateRankIncrement", 0))
+	s = updateRankIncrementRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.UpdateRankIncrement", 0))
 
 	// Now, generate the op, from the template.
 	tmpl, err := template.New("rank_op").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
@@ -88,5 +77,5 @@ func genRankOps(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genRankOps, "rank.eg.go")
+	registerGenerator(genRankOps, "rank.eg.go", rankTmpl)
 }

@@ -19,10 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestParseColumnType(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testData := []struct {
 		str          string
 		expectedType *types.T
@@ -85,9 +87,10 @@ func TestParseColumnType(t *testing.T) {
 			if !ok2 {
 				t.Fatalf("%d: expected tree.ColumnTableDef, but got %T", i, createTable.Defs[0])
 			}
-			if !reflect.DeepEqual(d.expectedType, columnDef.Type) {
+			colType := tree.MustBeStaticallyKnownType(columnDef.Type)
+			if !reflect.DeepEqual(d.expectedType, colType) {
 				t.Fatalf("%d: expected %s, but got %s",
-					i, d.expectedType.DebugString(), columnDef.Type.DebugString())
+					i, d.expectedType.DebugString(), colType.DebugString())
 			}
 		})
 	}
@@ -95,6 +98,7 @@ func TestParseColumnType(t *testing.T) {
 
 func TestParseColumnTypeAliases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testData := []struct {
 		str          string
 		expectedStr  string
@@ -124,8 +128,9 @@ func TestParseColumnTypeAliases(t *testing.T) {
 			if !ok2 {
 				t.Fatalf("%d: expected tree.ColumnTableDef, but got %T", i, createTable.Defs[0])
 			}
-			if !reflect.DeepEqual(*d.expectedType, *columnDef.Type) {
-				t.Fatalf("%d: expected %s, but got %s", i, d.expectedType.DebugString(), columnDef.Type.DebugString())
+			colType := tree.MustBeStaticallyKnownType(columnDef.Type)
+			if !d.expectedType.Identical(colType) {
+				t.Fatalf("%d: expected %s, but got %s", i, d.expectedType.DebugString(), colType.DebugString())
 			}
 		})
 	}

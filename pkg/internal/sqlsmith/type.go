@@ -11,66 +11,60 @@
 package sqlsmith
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
-func typeFromName(name string) *types.T {
-	typ, err := parser.ParseType(name)
+func (s *Smither) typeFromSQLTypeSyntax(typeStr string) (*types.T, error) {
+	typRef, err := parser.GetTypeFromValidSQLSyntax(typeStr)
 	if err != nil {
-		panic(errors.AssertionFailedf("failed to parse type: %v", name))
+		return nil, errors.AssertionFailedf("failed to parse type: %v", typeStr)
 	}
-	return typ
+	typ, err := tree.ResolveType(context.Background(), typRef, s)
+	if err != nil {
+		return nil, err
+	}
+	return typ, nil
 }
 
 // pickAnyType returns a concrete type if typ is types.Any or types.AnyArray,
 // otherwise typ.
-func (s *Smither) pickAnyType(typ *types.T) (_ *types.T, ok bool) {
+func (s *Smither) pickAnyType(typ *types.T) *types.T {
 	switch typ.Family() {
 	case types.AnyFamily:
 		typ = s.randType()
 	case types.ArrayFamily:
 		if typ.ArrayContents().Family() == types.AnyFamily {
-			typ = sqlbase.RandArrayContentsType(s.rnd)
+			typ = rowenc.RandArrayContentsType(s.rnd)
 		}
 	}
-	return typ, s.allowedType(typ)
+	return typ
 }
 
 func (s *Smither) randScalarType() *types.T {
-	for {
-		t := sqlbase.RandScalarType(s.rnd)
-		if !s.allowedType(t) {
-			continue
-		}
-		return t
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	scalarTypes := types.Scalar
+	if s.types != nil {
+		scalarTypes = s.types.scalarTypes
 	}
+	return rowenc.RandTypeFromSlice(s.rnd, scalarTypes)
 }
 
 func (s *Smither) randType() *types.T {
-	for {
-		t := sqlbase.RandType(s.rnd)
-		if !s.allowedType(t) {
-			continue
-		}
-		return t
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	seedTypes := rowenc.SeedTypes
+	if s.types != nil {
+		seedTypes = s.types.seedTypes
 	}
-}
-
-// allowedType returns whether t is ok to be used. This is useful to filter
-// out undesirable types to enable certain execution paths to be taken (like
-// vectorization).
-func (s *Smither) allowedType(types ...*types.T) bool {
-	for _, t := range types {
-		if s.vectorizable && typeconv.FromColumnType(t) == coltypes.Unhandled {
-			return false
-		}
-	}
-	return true
+	return rowenc.RandTypeFromSlice(s.rnd, seedTypes)
 }
 
 func (s *Smither) makeDesiredTypes() []*types.T {
@@ -82,4 +76,30 @@ func (s *Smither) makeDesiredTypes() []*types.T {
 		}
 	}
 	return typs
+}
+
+type typeInfo struct {
+	udts        map[types.UserDefinedTypeName]*types.T
+	seedTypes   []*types.T
+	scalarTypes []*types.T
+}
+
+// ResolveType implements the tree.TypeReferenceResolver interface.
+func (s *Smither) ResolveType(
+	_ context.Context, name *tree.UnresolvedObjectName,
+) (*types.T, error) {
+	key := types.UserDefinedTypeName{
+		Name:   name.Object(),
+		Schema: name.Schema(),
+	}
+	res, ok := s.types.udts[key]
+	if !ok {
+		return nil, errors.Newf("type name %s not found by smither", name.Object())
+	}
+	return res, nil
+}
+
+// ResolveTypeByOID implements the tree.TypeReferenceResolver interface.
+func (s *Smither) ResolveTypeByOID(context.Context, oid.Oid) (*types.T, error) {
+	return nil, errors.AssertionFailedf("smither cannot resolve types by OID")
 }

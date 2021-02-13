@@ -16,32 +16,34 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/workload"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type workloadReader struct {
 	evalCtx *tree.EvalContext
-	table   *sqlbase.TableDescriptor
+	table   catalog.TableDescriptor
 	kvCh    chan row.KVBatch
 }
 
 var _ inputConverter = &workloadReader{}
 
 func newWorkloadReader(
-	kvCh chan row.KVBatch, table *sqlbase.TableDescriptor, evalCtx *tree.EvalContext,
+	kvCh chan row.KVBatch, table catalog.TableDescriptor, evalCtx *tree.EvalContext,
 ) *workloadReader {
 	return &workloadReader{evalCtx: evalCtx, table: table, kvCh: kvCh}
 }
@@ -52,34 +54,37 @@ func (w *workloadReader) start(ctx ctxgroup.Group) {
 // makeDatumFromColOffset tries to fast-path a few workload-generated types into
 // directly datums, to dodge making a string and then the parsing it.
 func makeDatumFromColOffset(
-	alloc *sqlbase.DatumAlloc, hint *types.T, evalCtx *tree.EvalContext, col coldata.Vec, rowIdx int,
+	alloc *rowenc.DatumAlloc, hint *types.T, evalCtx *tree.EvalContext, col coldata.Vec, rowIdx int,
 ) (tree.Datum, error) {
 	if col.Nulls().NullAt(rowIdx) {
 		return tree.DNull, nil
 	}
-	switch col.Type() {
-	case coltypes.Bool:
+	switch t := col.Type(); col.CanonicalTypeFamily() {
+	case types.BoolFamily:
 		return tree.MakeDBool(tree.DBool(col.Bool()[rowIdx])), nil
-	case coltypes.Int64:
-		switch hint.Family() {
-		case types.IntFamily:
-			return alloc.NewDInt(tree.DInt(col.Int64()[rowIdx])), nil
-		case types.DecimalFamily:
-			d := *apd.New(col.Int64()[rowIdx], 0)
-			return alloc.NewDDecimal(tree.DDecimal{Decimal: d}), nil
-		case types.DateFamily:
-			date, err := pgdate.MakeDateFromUnixEpoch(col.Int64()[rowIdx])
-			if err != nil {
-				return nil, err
+	case types.IntFamily:
+		switch t.Width() {
+		case 0, 64:
+			switch hint.Family() {
+			case types.IntFamily:
+				return alloc.NewDInt(tree.DInt(col.Int64()[rowIdx])), nil
+			case types.DecimalFamily:
+				d := *apd.New(col.Int64()[rowIdx], 0)
+				return alloc.NewDDecimal(tree.DDecimal{Decimal: d}), nil
+			case types.DateFamily:
+				date, err := pgdate.MakeDateFromUnixEpoch(col.Int64()[rowIdx])
+				if err != nil {
+					return nil, err
+				}
+				return alloc.NewDDate(tree.DDate{Date: date}), nil
 			}
-			return alloc.NewDDate(tree.DDate{Date: date}), nil
+		case 16:
+			switch hint.Family() {
+			case types.IntFamily:
+				return alloc.NewDInt(tree.DInt(col.Int16()[rowIdx])), nil
+			}
 		}
-	case coltypes.Int16:
-		switch hint.Family() {
-		case types.IntFamily:
-			return alloc.NewDInt(tree.DInt(col.Int16()[rowIdx])), nil
-		}
-	case coltypes.Float64:
+	case types.FloatFamily:
 		switch hint.Family() {
 		case types.FloatFamily:
 			return alloc.NewDFloat(tree.DFloat(col.Float64()[rowIdx])), nil
@@ -90,7 +95,7 @@ func makeDatumFromColOffset(
 			}
 			return alloc.NewDDecimal(tree.DDecimal{Decimal: d}), nil
 		}
-	case coltypes.Bytes:
+	case types.BytesFamily:
 		switch hint.Family() {
 		case types.BytesFamily:
 			return alloc.NewDBytes(tree.DBytes(col.Bytes().Get(rowIdx))), nil
@@ -101,11 +106,11 @@ func makeDatumFromColOffset(
 		default:
 			data := col.Bytes().Get(rowIdx)
 			str := *(*string)(unsafe.Pointer(&data))
-			return sqlbase.ParseDatumStringAs(hint, str, evalCtx)
+			return rowenc.ParseDatumStringAs(hint, str, evalCtx)
 		}
 	}
 	return nil, errors.Errorf(
-		`don't know how to interpret %s column as %s`, col.Type().GoTypeName(), hint)
+		`don't know how to interpret %s column as %s`, col.Type(), hint)
 }
 
 func (w *workloadReader) readFiles(
@@ -114,6 +119,7 @@ func (w *workloadReader) readFiles(
 	_ map[int32]int64,
 	_ roachpb.IOFileFormat,
 	_ cloud.ExternalStorageFactory,
+	_ security.SQLUsername,
 ) error {
 
 	wcs := make([]*WorkloadKVConverter, 0, len(dataFiles))
@@ -122,7 +128,7 @@ func (w *workloadReader) readFiles(
 		if err != nil {
 			return err
 		}
-		conf, err := cloud.ParseWorkloadConfig(file)
+		conf, err := cloudimpl.ParseWorkloadConfig(file)
 		if err != nil {
 			return err
 		}
@@ -138,7 +144,8 @@ func (w *workloadReader) readFiles(
 		}
 		gen := meta.New()
 		if f, ok := gen.(workload.Flagser); ok {
-			if err := f.Flags().Parse(conf.Flags); err != nil {
+			flags := f.Flags()
+			if err := flags.Parse(conf.Flags); err != nil {
 				return errors.Wrapf(err, `parsing parameters %s`, strings.Join(conf.Flags, ` `))
 			}
 		}
@@ -171,7 +178,7 @@ func (w *workloadReader) readFiles(
 
 // WorkloadKVConverter converts workload.BatchedTuples to []roachpb.KeyValues.
 type WorkloadKVConverter struct {
-	tableDesc      *sqlbase.TableDescriptor
+	tableDesc      catalog.TableDescriptor
 	rows           workload.BatchedTuples
 	batchIdxAtomic int64
 	batchEnd       int
@@ -187,7 +194,7 @@ type WorkloadKVConverter struct {
 // range of batches, emitted converted kvs to the given channel.
 func NewWorkloadKVConverter(
 	fileID int32,
-	tableDesc *sqlbase.TableDescriptor,
+	tableDesc catalog.TableDescriptor,
 	rows workload.BatchedTuples,
 	batchStart, batchEnd int,
 	kvCh chan row.KVBatch,
@@ -214,7 +221,8 @@ func NewWorkloadKVConverter(
 //
 // This worker needs its own EvalContext and DatumAlloc.
 func (w *WorkloadKVConverter) Worker(ctx context.Context, evalCtx *tree.EvalContext) error {
-	conv, err := row.NewDatumRowConverter(ctx, w.tableDesc, nil /* targetColNames */, evalCtx, w.kvCh)
+	conv, err := row.NewDatumRowConverter(ctx, w.tableDesc, nil /* targetColNames */, evalCtx,
+		w.kvCh, nil /* seqChunkProvider */)
 	if err != nil {
 		return err
 	}
@@ -222,9 +230,9 @@ func (w *WorkloadKVConverter) Worker(ctx context.Context, evalCtx *tree.EvalCont
 	conv.FractionFn = func() float32 {
 		return float32(atomic.LoadInt64(&w.finishedBatchesAtomic)) / w.totalBatches
 	}
-	var alloc sqlbase.DatumAlloc
+	var alloc rowenc.DatumAlloc
 	var a bufalloc.ByteAllocator
-	cb := coldata.NewMemBatchWithSize(nil, 0)
+	cb := coldata.NewMemBatchWithCapacity(nil /* typs */, 0 /* capacity */, coldata.StandardColumnFactory)
 
 	for {
 		batchIdx := int(atomic.AddInt64(&w.batchIdxAtomic, 1))

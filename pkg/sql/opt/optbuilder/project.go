@@ -60,8 +60,12 @@ func (b *Builder) constructProject(input memo.RelExpr, cols []scopeColumn) memo.
 func (b *Builder) dropOrderingAndExtraCols(s *scope) {
 	s.ordering = nil
 	if len(s.extraCols) > 0 {
+		var passthrough opt.ColSet
+		for i := range s.cols {
+			passthrough.Add(s.cols[i].id)
+		}
+		s.expr = b.factory.ConstructProject(s.expr, nil /* projections */, passthrough)
 		s.extraCols = nil
-		s.expr = b.constructProject(s.expr, s.cols)
 	}
 }
 
@@ -77,8 +81,8 @@ func (b *Builder) analyzeProjectionList(
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
 	defer func(replaceSRFs bool) { inScope.replaceSRFs = replaceSRFs }(inScope.replaceSRFs)
 
-	b.semaCtx.Properties.Require("SELECT", tree.RejectNestedGenerators)
-	inScope.context = "SELECT"
+	b.semaCtx.Properties.Require(exprKindSelect.String(), tree.RejectNestedGenerators)
+	inScope.context = exprKindSelect
 	inScope.replaceSRFs = true
 
 	b.analyzeSelectList(selects, desiredTypes, inScope, outScope)
@@ -96,8 +100,8 @@ func (b *Builder) analyzeReturningList(
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
 
 	// Ensure there are no special functions in the RETURNING clause.
-	b.semaCtx.Properties.Require("RETURNING", tree.RejectSpecial)
-	inScope.context = "RETURNING"
+	b.semaCtx.Properties.Require(exprKindReturning.String(), tree.RejectSpecial)
+	inScope.context = exprKindReturning
 
 	b.analyzeSelectList(tree.SelectExprs(returning), desiredTypes, inScope, outScope)
 }
@@ -136,7 +140,7 @@ func (b *Builder) analyzeSelectList(
 						outScope.cols = make([]scopeColumn, 0, len(selects)+len(exprs)-1)
 					}
 					for j, e := range exprs {
-						b.addColumn(outScope, aliases[j], e)
+						outScope.addColumn(aliases[j], e)
 					}
 					continue
 				}
@@ -157,7 +161,7 @@ func (b *Builder) analyzeSelectList(
 			outScope.cols = make([]scopeColumn, 0, len(selects))
 		}
 		alias := b.getColName(e)
-		b.addColumn(outScope, alias, texpr)
+		outScope.addColumn(alias, texpr)
 	}
 }
 
@@ -220,12 +224,16 @@ func (b *Builder) getColName(expr tree.SelectExpr) string {
 func (b *Builder) finishBuildScalar(
 	texpr tree.TypedExpr, scalar opt.ScalarExpr, inScope, outScope *scope, outCol *scopeColumn,
 ) (out opt.ScalarExpr) {
+	b.maybeTrackRegclassDependenciesForViews(texpr)
+
 	if outScope == nil {
 		return scalar
 	}
 
 	// Avoid synthesizing a new column if possible.
-	if col := outScope.findExistingCol(texpr, false /* allowSideEffects */); col != nil && col != outCol {
+	if col := outScope.findExistingCol(
+		texpr, false, /* allowSideEffects */
+	); col != nil && col != outCol {
 		outCol.id = col.id
 		outCol.scalar = scalar
 		return scalar
@@ -253,6 +261,8 @@ func (b *Builder) finishBuildScalar(
 func (b *Builder) finishBuildScalarRef(
 	col *scopeColumn, inScope, outScope *scope, outCol *scopeColumn, colRefs *opt.ColSet,
 ) (out opt.ScalarExpr) {
+
+	b.trackReferencedColumnForViews(col)
 	// Update the sets of column references and outer columns if needed.
 	if colRefs != nil {
 		colRefs.Add(col.id)
@@ -290,4 +300,61 @@ func (b *Builder) finishBuildScalarRef(
 	// Project the column.
 	b.projectColumn(outCol, col)
 	return outCol.scalar
+}
+
+// projectionBuilder is a helper for adding projected columns to a scope and
+// constructing a Project operator as needed.
+//
+// Sample usage:
+//
+//   pb := makeProjectionBuilder(b, scope)
+//   b.Add(name, expr, typ)
+//   ...
+//   scope = pb.Finish()
+//
+// Note that this is all a cheap no-op if Add is not called.
+type projectionBuilder struct {
+	b        *Builder
+	inScope  *scope
+	outScope *scope
+}
+
+func makeProjectionBuilder(b *Builder, inScope *scope) projectionBuilder {
+	return projectionBuilder{b: b, inScope: inScope}
+}
+
+// Add a projection.
+//
+// Returns the newly synthesized column ID and the scalar expression. If the
+// given expression is a just bare column reference, it returns that column's ID
+// and a nil scalar expression.
+func (pb *projectionBuilder) Add(
+	name tree.Name, expr tree.Expr, desiredType *types.T,
+) (opt.ColumnID, opt.ScalarExpr) {
+	if pb.outScope == nil {
+		pb.outScope = pb.inScope.replace()
+		pb.outScope.appendColumnsFromScope(pb.inScope)
+	}
+	typedExpr := pb.inScope.resolveAndRequireType(expr, desiredType)
+	// Instead of passing the column name here, we let the column get an
+	// auto-generated name in the metadata. We then override it below. This
+	// reduces clashes between column names in the metadata.
+	// TODO(radu): is this really better than using the real column name?
+	scopeCol := pb.outScope.addColumn("" /* alias */, typedExpr)
+	scalar := pb.b.buildScalar(typedExpr, pb.inScope, pb.outScope, scopeCol, nil)
+	scopeCol.name = name
+
+	return scopeCol.id, scalar
+}
+
+// Finish returns a scope that contains all the columns in the original scope
+// plus all the projected columns. If no columns have been added, returns the
+// original scope.
+func (pb *projectionBuilder) Finish() (outScope *scope) {
+	if pb.outScope == nil {
+		// No columns were added; return the original scope.
+		return pb.inScope
+	}
+	pb.b.constructProjectForScope(pb.inScope, pb.outScope)
+	return pb.outScope
 }

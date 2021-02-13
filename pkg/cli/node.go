@@ -19,13 +19,16 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -63,9 +66,10 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 	_, rows, err := runQuery(
 		conn,
 		makeQuery(`SELECT node_id FROM crdb_internal.gossip_liveness
-               WHERE decommissioning = false OR split_part(expiration,',',1)::decimal > now()::decimal`),
+               WHERE membership = 'active' OR split_part(expiration,',',1)::decimal > now()::decimal`),
 		false,
 	)
+
 	if err != nil {
 		return err
 	}
@@ -104,6 +108,7 @@ var statusNodesColumnHeadersForStats = []string{
 var statusNodesColumnHeadersForDecommission = []string{
 	"gossiped_replicas",
 	"is_decommissioning",
+	"membership",
 	"is_draining",
 }
 
@@ -142,7 +147,7 @@ func runStatusNodeInner(showDecommissioned bool, args []string) ([]string, [][]s
 
 	maybeAddActiveNodesFilter := func(query string) string {
 		if !showDecommissioned {
-			query += " WHERE decommissioning = false OR split_part(expiration,',',1)::decimal > now()::decimal"
+			query += " WHERE membership = 'active' OR split_part(expiration,',',1)::decimal > now()::decimal"
 		}
 		return query
 	}
@@ -183,10 +188,12 @@ SELECT node_id AS id,
 FROM crdb_internal.kv_store_status
 GROUP BY node_id`
 
+	// TODO(irfansharif): Remove the `is_decommissioning` column in v20.2.
 	const decommissionQuery = `
 SELECT node_id AS id,
        ranges AS gossiped_replicas,
-       decommissioning AS is_decommissioning,
+       membership != 'active' as is_decommissioning,
+       membership AS membership,
        draining AS is_draining
 FROM crdb_internal.gossip_liveness LEFT JOIN crdb_internal.gossip_nodes USING (node_id)`
 
@@ -273,16 +280,17 @@ var decommissionNodesColumnHeaders = []string{
 	"is_live",
 	"replicas",
 	"is_decommissioning",
+	"membership",
 	"is_draining",
 }
 
 var decommissionNodeCmd = &cobra.Command{
-	Use:   "decommission <node id 1> [<node id 2> ...]",
+	Use:   "decommission { --self | <node id 1> [<node id 2> ...] }",
 	Short: "decommissions the node(s)",
 	Long: `
 Marks the nodes with the supplied IDs as decommissioning.
 This will cause leases and replicas to be removed from these nodes.`,
-	Args: cobra.MinimumNArgs(1),
+	Args: cobra.MinimumNArgs(0),
 	RunE: MaybeDecorateGRPCError(runDecommissionNode),
 }
 
@@ -302,6 +310,10 @@ func runDecommissionNode(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if !nodeCtx.nodeDecommissionSelf && len(args) == 0 {
+		return errors.New("no node ID specified; use --self to target the node specified with --host")
+	}
+
 	nodeIDs, err := parseNodeIDs(args)
 	if err != nil {
 		return err
@@ -309,23 +321,60 @@ func runDecommissionNode(cmd *cobra.Command, args []string) error {
 
 	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
 	if err != nil {
-		return errors.Wrap(err, "Failed to connect to the node")
+		return errors.Wrap(err, "failed to connect to the node")
 	}
 	defer finish()
 
-	if err := expectNodesDecommissioned(ctx, conn, nodeIDs, false /* decommissioned */); err != nil {
+	s := serverpb.NewStatusClient(conn)
+
+	nodeIDs, err = handleNodeDecommissionSelf(ctx, s, nodeIDs, "decommissioning")
+	if err != nil {
+		return err
+	}
+
+	if err := expectNodesDecommissioned(ctx, s, nodeIDs, false /* expDecommissioned */); err != nil {
 		return err
 	}
 
 	c := serverpb.NewAdminClient(conn)
+	if err := runDecommissionNodeImpl(ctx, c, nodeCtx.nodeDecommissionWait, nodeIDs); err != nil {
+		cause := errors.UnwrapAll(err)
+		if s, ok := status.FromError(cause); ok && s.Code() == codes.NotFound {
+			// Are we trying to decommision a node that does not
+			// exist? See Server.Decommission for where this specific grpc error
+			// code is generated.
+			return errors.New("node does not exist")
+		}
+		return err
+	}
+	return nil
+}
 
-	return runDecommissionNodeImpl(ctx, c, nodeCtx.nodeDecommissionWait, nodeIDs)
+func handleNodeDecommissionSelf(
+	ctx context.Context, s serverpb.StatusClient, nodeIDs []roachpb.NodeID, command string,
+) ([]roachpb.NodeID, error) {
+	if !nodeCtx.nodeDecommissionSelf {
+		// --self not passed; nothing to do.
+		return nodeIDs, nil
+	}
+
+	if len(nodeIDs) > 0 {
+		return nil, errors.Newf("cannot use --%s with an explicit list of node IDs",
+			cliflags.NodeDecommissionSelf.Name)
+	}
+
+	// What's this node's ID?
+	resp, err := s.Node(ctx, &serverpb.NodeRequest{NodeId: "local"})
+	if err != nil {
+		return nil, err
+	}
+	log.Infof(ctx, "%s node %d", log.Safe(command), resp.Desc.NodeID)
+	return []roachpb.NodeID{resp.Desc.NodeID}, nil
 }
 
 func expectNodesDecommissioned(
-	ctx context.Context, conn *grpc.ClientConn, nodeIDs []roachpb.NodeID, expDecommissioned bool,
+	ctx context.Context, s serverpb.StatusClient, nodeIDs []roachpb.NodeID, expDecommissioned bool,
 ) error {
-	s := serverpb.NewStatusClient(conn)
 	resp, err := s.Nodes(ctx, &serverpb.NodesRequest{})
 	if err != nil {
 		return err
@@ -340,8 +389,8 @@ func expectNodesDecommissioned(
 			// The user is expecting the node to not be
 			// decommissioned/decommissioning already.
 			switch liveness {
-			case storagepb.NodeLivenessStatus_DECOMMISSIONING,
-				storagepb.NodeLivenessStatus_DECOMMISSIONED:
+			case livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				livenesspb.NodeLivenessStatus_DECOMMISSIONED:
 				fmt.Fprintln(stderr, "warning: node", nodeID, "is already decommissioning or decommissioned")
 			default:
 				// It's always possible to decommission a node that's either live
@@ -350,10 +399,10 @@ func expectNodesDecommissioned(
 		} else {
 			// The user is expecting the node to be recommissionable.
 			switch liveness {
-			case storagepb.NodeLivenessStatus_DECOMMISSIONING,
-				storagepb.NodeLivenessStatus_DECOMMISSIONED:
+			case livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+				livenesspb.NodeLivenessStatus_DECOMMISSIONED:
 				// ok.
-			case storagepb.NodeLivenessStatus_LIVE:
+			case livenesspb.NodeLivenessStatus_LIVE:
 				fmt.Fprintln(stderr, "warning: node", nodeID, "is not decommissioned")
 			default: // dead, unavailable, etc
 				fmt.Fprintln(stderr, "warning: node", nodeID, "is in unexpected state", liveness)
@@ -369,9 +418,6 @@ func runDecommissionNodeImpl(
 	wait nodeDecommissionWaitType,
 	nodeIDs []roachpb.NodeID,
 ) error {
-	if wait == nodeDecommissionWaitLive {
-		fmt.Fprintln(stderr, "\n--wait=live is deprecated and is treated as --wait=all")
-	}
 	minReplicaCount := int64(math.MaxInt64)
 	opts := retry.Options{
 		InitialBackoff: 5 * time.Millisecond,
@@ -379,11 +425,17 @@ func runDecommissionNodeImpl(
 		MaxBackoff:     20 * time.Second,
 	}
 
+	// Marking a node as fully decommissioned is driven by a two-step process.
+	// We start off by marking each node as 'decommissioning'. In doing so,
+	// replicas are slowly moved off of these nodes. It's only after when we're
+	// made aware that the replica counts have all hit zero, and that all nodes
+	// have been successfully marked as 'decommissioning', that we then go and
+	// mark each node as 'decommissioned'.
 	prevResponse := serverpb.DecommissionStatusResponse{}
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
 		req := &serverpb.DecommissionRequest{
-			NodeIDs:         nodeIDs,
-			Decommissioning: true,
+			NodeIDs:          nodeIDs,
+			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
 		}
 		resp, err := c.Decommission(ctx, req)
 		if err != nil {
@@ -400,18 +452,43 @@ func runDecommissionNodeImpl(
 		} else {
 			fmt.Fprintf(stderr, ".")
 		}
+
+		anyActive := false
 		var replicaCount int64
-		allDecommissioning := true
 		for _, status := range resp.Status {
+			anyActive = anyActive || status.Membership.Active()
 			replicaCount += status.ReplicaCount
-			allDecommissioning = allDecommissioning && status.Decommissioning
 		}
-		if replicaCount == 0 && allDecommissioning {
+
+		if !anyActive && replicaCount == 0 {
+			// We now mark the nodes as fully decommissioned.
+			req := &serverpb.DecommissionRequest{
+				NodeIDs:          nodeIDs,
+				TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONED,
+			}
+			resp, err := c.Decommission(ctx, req)
+			if err != nil {
+				fmt.Fprintln(stderr)
+				return errors.Wrap(err, "while trying to mark as decommissioned")
+			}
+			if !reflect.DeepEqual(&prevResponse, resp) {
+				fmt.Fprintln(stderr)
+				if err := printDecommissionStatus(*resp); err != nil {
+					return err
+				}
+				prevResponse = *resp
+			}
+
 			fmt.Fprintln(os.Stdout, "\nNo more data reported on target nodes. "+
 				"Please verify cluster health before removing the nodes.")
 			return nil
 		}
+
 		if wait == nodeDecommissionWaitNone {
+			// The intent behind --wait=none is for it to be used when polling
+			// manually from an external system. We'll only mark nodes as
+			// fully decommissioned once the replica count hits zero and they're
+			// all marked as decommissioning.
 			return nil
 		}
 		if replicaCount < minReplicaCount {
@@ -423,7 +500,7 @@ func runDecommissionNodeImpl(
 }
 
 func decommissionResponseAlignment() string {
-	return "rcrcc"
+	return "rcrccc"
 }
 
 // decommissionResponseValueToRows converts DecommissionStatusResponse_Status to
@@ -438,7 +515,8 @@ func decommissionResponseValueToRows(
 			strconv.FormatInt(int64(node.NodeID), 10),
 			strconv.FormatBool(node.IsLive),
 			strconv.FormatInt(node.ReplicaCount, 10),
-			strconv.FormatBool(node.Decommissioning),
+			strconv.FormatBool(!node.Membership.Active()),
+			node.Membership.String(),
 			strconv.FormatBool(node.Draining),
 		})
 	}
@@ -446,13 +524,13 @@ func decommissionResponseValueToRows(
 }
 
 var recommissionNodeCmd = &cobra.Command{
-	Use:   "recommission <node id 1> [<node id 2> ...]",
+	Use:   "recommission { --self | <node id 1> [<node id 2> ...] }",
 	Short: "recommissions the node(s)",
 	Long: `
 For the nodes with the supplied IDs, resets the decommissioning states,
 signaling the affected nodes to participate in the cluster again.
 	`,
-	Args: cobra.MinimumNArgs(1),
+	Args: cobra.MinimumNArgs(0),
 	RunE: MaybeDecorateGRPCError(runRecommissionNode),
 }
 
@@ -465,6 +543,10 @@ func runRecommissionNode(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if !nodeCtx.nodeDecommissionSelf && len(args) == 0 {
+		return errors.New("no node ID specified; use --self to target the node specified with --host")
+	}
+
 	nodeIDs, err := parseNodeIDs(args)
 	if err != nil {
 		return err
@@ -472,25 +554,86 @@ func runRecommissionNode(cmd *cobra.Command, args []string) error {
 
 	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
 	if err != nil {
-		return errors.Wrap(err, "Failed to connect to the node")
+		return errors.Wrap(err, "failed to connect to the node")
 	}
 	defer finish()
 
-	if err := expectNodesDecommissioned(ctx, conn, nodeIDs, true /* decommissioned */); err != nil {
+	s := serverpb.NewStatusClient(conn)
+
+	nodeIDs, err = handleNodeDecommissionSelf(ctx, s, nodeIDs, "recommissioning")
+	if err != nil {
+		return err
+	}
+
+	if err := expectNodesDecommissioned(ctx, s, nodeIDs, true /* expDecommissioned */); err != nil {
 		return err
 	}
 
 	c := serverpb.NewAdminClient(conn)
-
 	req := &serverpb.DecommissionRequest{
-		NodeIDs:         nodeIDs,
-		Decommissioning: false,
+		NodeIDs:          nodeIDs,
+		TargetMembership: livenesspb.MembershipStatus_ACTIVE,
 	}
 	resp, err := c.Decommission(ctx, req)
 	if err != nil {
+		cause := errors.UnwrapAll(err)
+		// If it's a specific illegal membership transition error, we try to
+		// surface a more readable message to the user. See ValidateTransition
+		// in pkg/liveness/livenesspb for where this error is generated.
+		if s, ok := status.FromError(cause); ok && s.Code() == codes.FailedPrecondition {
+			return errors.Newf("%s", s.Message())
+		}
+		if s, ok := status.FromError(cause); ok && s.Code() == codes.NotFound {
+			// Are we trying to recommission node that does not
+			// exist? See Server.Decommission for where this specific grpc error
+			// code is generated.
+			fmt.Fprintln(stderr)
+			return errors.New("node does not exist")
+		}
 		return err
 	}
 	return printDecommissionStatus(*resp)
+}
+
+var drainNodeCmd = &cobra.Command{
+	Use:   "drain",
+	Short: "drain a node without shutting it down",
+	Long: `
+Prepare a server so it becomes ready to be shut down safely.
+This causes the server to stop accepting client connections, stop
+extant connections, and finally push range leases onto other
+nodes, subject to various timeout parameters configurable via
+cluster settings.
+
+After a successful drain, the server process is still running;
+use a service manager or orchestrator to terminate the process
+gracefully using e.g. a unix signal.`,
+	Args: cobra.NoArgs,
+	RunE: MaybeDecorateGRPCError(runDrain),
+}
+
+// runDrain calls the Drain RPC without the flag to stop the
+// server process.
+func runDrain(cmd *cobra.Command, args []string) (err error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// At the end, we'll report "ok" if there was no error.
+	defer func() {
+		if err == nil {
+			fmt.Println("ok")
+		}
+	}()
+
+	// Establish a RPC connection.
+	c, finish, err := getAdminClient(ctx, serverCfg)
+	if err != nil {
+		return err
+	}
+	defer finish()
+
+	_, _, err = doDrain(ctx, c)
+	return err
 }
 
 // Sub-commands for node command.
@@ -499,12 +642,13 @@ var nodeCmds = []*cobra.Command{
 	statusNodeCmd,
 	decommissionNodeCmd,
 	recommissionNodeCmd,
+	drainNodeCmd,
 }
 
 var nodeCmd = &cobra.Command{
 	Use:   "node [command]",
-	Short: "list, inspect or remove nodes",
-	Long:  "List, inspect or remove nodes.",
+	Short: "list, inspect, drain or remove nodes\n",
+	Long:  "List, inspect, drain or remove nodes.",
 	RunE:  usageAndErr,
 }
 

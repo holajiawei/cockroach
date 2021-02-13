@@ -11,13 +11,11 @@
 package sql
 
 import (
-	"strings"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type windowPlanState struct {
@@ -98,19 +96,18 @@ func (s *windowPlanState) createWindowFnSpec(
 	funcInProgress *windowFuncHolder,
 ) (execinfrapb.WindowerSpec_WindowFn, *types.T, error) {
 	for _, argIdx := range funcInProgress.argsIdxs {
-		if argIdx >= uint32(len(s.plan.ResultTypes)) {
+		if argIdx >= uint32(len(s.plan.GetResultTypes())) {
 			return execinfrapb.WindowerSpec_WindowFn{}, nil, errors.Errorf("ColIdx out of range (%d)", argIdx)
 		}
 	}
 	// Figure out which built-in to compute.
-	funcStr := strings.ToUpper(funcInProgress.expr.Func.String())
-	funcSpec, err := rowexec.CreateWindowerSpecFunc(funcStr)
+	funcSpec, err := rowexec.CreateWindowerSpecFunc(funcInProgress.expr.Func.String())
 	if err != nil {
 		return execinfrapb.WindowerSpec_WindowFn{}, nil, err
 	}
-	argTypes := make([]types.T, len(funcInProgress.argsIdxs))
+	argTypes := make([]*types.T, len(funcInProgress.argsIdxs))
 	for i, argIdx := range funcInProgress.argsIdxs {
-		argTypes[i] = s.plan.ResultTypes[argIdx]
+		argTypes[i] = s.plan.GetResultTypes()[argIdx]
 	}
 	_, outputType, err := execinfrapb.GetWindowFunctionInfo(funcSpec, argTypes...)
 	if err != nil {
@@ -195,7 +192,7 @@ func (s *windowPlanState) addRenderingOrProjection() error {
 	// All passed through columns are contiguous and at the beginning of the
 	// output schema.
 	passedThruColIdx := 0
-	renderTypes := make([]types.T, 0, len(s.n.windowRender))
+	renderTypes := make([]*types.T, 0, len(s.n.windowRender))
 	for i, render := range s.n.windowRender {
 		if render != nil {
 			// render contains at least one reference to windowFuncHolder, so we need
@@ -204,11 +201,11 @@ func (s *windowPlanState) addRenderingOrProjection() error {
 			renderExprs[i] = visitor.replace(render)
 		} else {
 			// render is nil meaning that a column is being passed through.
-			renderExprs[i] = tree.NewTypedOrdinalReference(passedThruColIdx, &s.plan.ResultTypes[passedThruColIdx])
+			renderExprs[i] = tree.NewTypedOrdinalReference(passedThruColIdx, s.plan.GetResultTypes()[passedThruColIdx])
 			passedThruColIdx++
 		}
 		outputType := renderExprs[i].ResolvedType()
-		renderTypes = append(renderTypes, *outputType)
+		renderTypes = append(renderTypes, outputType)
 	}
 	return s.plan.AddRendering(renderExprs, s.planCtx, s.plan.PlanToStreamColMap, renderTypes)
 }

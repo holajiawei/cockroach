@@ -21,10 +21,12 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
@@ -68,13 +70,15 @@ func (f *formattedError) Error() string {
 	severity := "ERROR"
 
 	// Extract the fields.
-	var message, code, hint, detail, location string
-	if pqErr, ok := errors.UnwrapAll(f.err).(*pq.Error); ok {
+	var message, hint, detail, location, constraintName string
+	var code pgcode.Code
+	if pqErr := (*pq.Error)(nil); errors.As(f.err, &pqErr) {
 		if pqErr.Severity != "" {
 			severity = pqErr.Severity
 		}
+		constraintName = pqErr.Constraint
 		message = pqErr.Message
-		code = string(pqErr.Code)
+		code = pgcode.MakeCode(string(pqErr.Code))
 		hint, detail = pqErr.Hint, pqErr.Detail
 		location = formatLocation(pqErr.File, pqErr.Line, pqErr.Routine)
 	} else {
@@ -95,7 +99,8 @@ func (f *formattedError) Error() string {
 	}
 	fmt.Fprintln(&buf, message)
 
-	if code != "" {
+	// Avoid printing the code for NOTICE, as the code is always 00000.
+	if severity != "NOTICE" && code.String() != "" {
 		// In contrast to `psql` we print the code even when printing
 		// non-verbosely, because we want to promote users reporting codes
 		// when interacting with support.
@@ -114,6 +119,9 @@ func (f *formattedError) Error() string {
 
 	if detail != "" {
 		fmt.Fprintln(&buf, "DETAIL:", detail)
+	}
+	if constraintName != "" {
+		fmt.Fprintln(&buf, "CONSTRAINT:", constraintName)
 	}
 	if hint != "" {
 		fmt.Fprintln(&buf, "HINT:", hint)
@@ -228,7 +236,7 @@ func MaybeDecorateGRPCError(
 		connRefused := func() error {
 			extra := extraInsecureHint()
 			return errors.Errorf("server closed the connection.\n"+
-				"Is this a CockroachDB node?\n"+extra+"\n%v", err)
+				"Is this a CockroachDB node?\n%s\n%v", extra, err)
 		}
 
 		// Is this an "unable to connect" type of error?
@@ -263,8 +271,16 @@ func MaybeDecorateGRPCError(
 			// here, there was a TCP connection already.
 
 			// Did we fail due to security settings?
-			if wErr.Code == pgcode.ProtocolViolation {
+			if pgcode.MakeCode(string(wErr.Code)) == pgcode.ProtocolViolation {
 				return connSecurityHint()
+			}
+
+			// Are we running a v20.2 binary against a v20.1 server?
+			if strings.Contains(wErr.Message, "column \"membership\" does not exist") {
+				// The v20.2 binary makes use of columns not present in v20.1,
+				// so this is a disallowed operation. Surface a better error
+				// code here.
+				return fmt.Errorf("cannot use a v20.2 cli against servers running v20.1")
 			}
 			// Otherwise, there was a regular SQL error. Just report
 			// that.
@@ -298,7 +314,8 @@ func MaybeDecorateGRPCError(
 			if reGRPCAuthFailure.MatchString(msg) {
 				return connSecurityHint()
 			}
-			if reGRPCConnFailed.MatchString(msg) {
+			if reGRPCConnFailed.MatchString(msg) /* gRPC 1.21 */ ||
+				status.Code(errors.Cause(err)) == codes.Unavailable /* gRPC 1.27 */ {
 				return connRefused()
 			}
 
@@ -337,6 +354,16 @@ func MaybeDecorateGRPCError(
 					"The CockroachDB CLI does not support GSSAPI authentication; use 'psql' instead")
 		}
 
+		// Are we trying to re-initialize an initialized cluster?
+		if strings.Contains(err.Error(), server.ErrClusterInitialized.Error()) {
+			// We really want to use errors.Is() here but this would require
+			// error serialization support in gRPC.
+			// This is not yet performed in CockroachDB even though the error
+			// library now has infrastructure to do so, see:
+			// https://github.com/cockroachdb/errors/pull/14
+			return server.ErrClusterInitialized
+		}
+
 		// Nothing we can special case, just return what we have.
 		return err
 	}
@@ -353,22 +380,22 @@ func maybeShoutError(
 }
 
 func checkAndMaybeShout(err error) error {
-	return checkAndMaybeShoutTo(err, log.Shout)
+	return checkAndMaybeShoutTo(err, log.Ops.Shoutf)
 }
 
 func checkAndMaybeShoutTo(
-	err error, logger func(context.Context, log.Severity, ...interface{}),
+	err error, logger func(context.Context, log.Severity, string, ...interface{}),
 ) error {
 	if err == nil {
 		return nil
 	}
-	severity := log.Severity_ERROR
+	severity := severity.ERROR
 	cause := err
 	var ec *cliError
 	if errors.As(err, &ec) {
 		severity = ec.severity
 		cause = ec.cause
 	}
-	logger(context.Background(), severity, cause)
+	logger(context.Background(), severity, "%v", cause)
 	return err
 }

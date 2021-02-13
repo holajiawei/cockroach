@@ -14,32 +14,30 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/errors"
 )
 
 type defaultBuiltinFuncOperator struct {
 	OneInputNode
-	allocator      *Allocator
-	evalCtx        *tree.EvalContext
-	funcExpr       *tree.FuncExpr
-	columnTypes    []types.T
-	argumentCols   []int
-	outputIdx      int
-	outputType     *types.T
-	outputPhysType coltypes.T
-	converter      func(tree.Datum) (interface{}, error)
+	allocator           *colmem.Allocator
+	evalCtx             *tree.EvalContext
+	funcExpr            *tree.FuncExpr
+	columnTypes         []*types.T
+	argumentCols        []int
+	outputIdx           int
+	outputType          *types.T
+	toDatumConverter    *colconv.VecToDatumConverter
+	datumToVecConverter func(tree.Datum) interface{}
 
 	row tree.Datums
-	da  sqlbase.DatumAlloc
 }
 
-var _ Operator = &defaultBuiltinFuncOperator{}
+var _ colexecbase.Operator = &defaultBuiltinFuncOperator{}
 
 func (b *defaultBuiltinFuncOperator) Init() {
 	b.input.Init()
@@ -51,24 +49,25 @@ func (b *defaultBuiltinFuncOperator) Next(ctx context.Context) coldata.Batch {
 	if n == 0 {
 		return coldata.ZeroBatch
 	}
-	b.allocator.MaybeAddColumn(batch, b.outputPhysType, b.outputIdx)
 
 	sel := batch.Selection()
 	output := batch.ColVec(b.outputIdx)
+	if output.MaybeHasNulls() {
+		// We need to make sure that there are no left over null values in the
+		// output vector.
+		output.Nulls().UnsetNulls()
+	}
 	b.allocator.PerformOperation(
 		[]coldata.Vec{output},
 		func() {
+			b.toDatumConverter.ConvertBatchAndDeselect(batch)
 			for i := 0; i < n; i++ {
-				rowIdx := i
-				if sel != nil {
-					rowIdx = sel[i]
-				}
-
 				hasNulls := false
 
-				for j := range b.argumentCols {
-					col := batch.ColVec(b.argumentCols[j])
-					b.row[j] = PhysicalTypeColElemToDatum(col, rowIdx, b.da, &b.columnTypes[b.argumentCols[j]])
+				for j, argumentCol := range b.argumentCols {
+					// Note that we don't need to apply sel to index i because
+					// vecToDatumConverter returns a "dense" datum column.
+					b.row[j] = b.toDatumConverter.GetDatumColumn(argumentCol)[i]
 					hasNulls = hasNulls || b.row[j] == tree.DNull
 				}
 
@@ -82,19 +81,21 @@ func (b *defaultBuiltinFuncOperator) Next(ctx context.Context) coldata.Batch {
 				} else {
 					res, err = b.funcExpr.ResolvedOverload().Fn(b.evalCtx, b.row)
 					if err != nil {
-						execerror.NonVectorizedPanic(err)
+						colexecerror.ExpectedError(b.funcExpr.MaybeWrapError(err))
 					}
+				}
+
+				rowIdx := i
+				if sel != nil {
+					rowIdx = sel[i]
 				}
 
 				// Convert the datum into a physical type and write it out.
 				if res == tree.DNull {
-					batch.ColVec(b.outputIdx).Nulls().SetNull(rowIdx)
+					output.Nulls().SetNull(rowIdx)
 				} else {
-					converted, err := b.converter(res)
-					if err != nil {
-						execerror.VectorizedInternalPanic(err)
-					}
-					coldata.SetValueAt(output, converted, rowIdx, b.outputPhysType)
+					converted := b.datumToVecConverter(res)
+					coldata.SetValueAt(output, converted, rowIdx)
 				}
 			}
 		},
@@ -107,41 +108,35 @@ func (b *defaultBuiltinFuncOperator) Next(ctx context.Context) coldata.Batch {
 
 // NewBuiltinFunctionOperator returns an operator that applies builtin functions.
 func NewBuiltinFunctionOperator(
-	allocator *Allocator,
+	allocator *colmem.Allocator,
 	evalCtx *tree.EvalContext,
 	funcExpr *tree.FuncExpr,
-	columnTypes []types.T,
+	columnTypes []*types.T,
 	argumentCols []int,
 	outputIdx int,
-	input Operator,
-) (Operator, error) {
-
+	input colexecbase.Operator,
+) (colexecbase.Operator, error) {
 	switch funcExpr.ResolvedOverload().SpecializedVecBuiltin {
 	case tree.SubstringStringIntInt:
+		input = newVectorTypeEnforcer(allocator, input, types.String, outputIdx)
 		return newSubstringOperator(
 			allocator, columnTypes, argumentCols, outputIdx, input,
 		), nil
 	default:
 		outputType := funcExpr.ResolvedType()
-		outputPhysType := typeconv.FromColumnType(outputType)
-		if outputPhysType == coltypes.Unhandled {
-			return nil, errors.Errorf(
-				"unsupported output type %q of %s",
-				outputType.String(), funcExpr.String(),
-			)
-		}
+		input = newVectorTypeEnforcer(allocator, input, outputType, outputIdx)
 		return &defaultBuiltinFuncOperator{
-			OneInputNode:   NewOneInputNode(input),
-			allocator:      allocator,
-			evalCtx:        evalCtx,
-			funcExpr:       funcExpr,
-			outputIdx:      outputIdx,
-			columnTypes:    columnTypes,
-			outputType:     outputType,
-			outputPhysType: outputPhysType,
-			converter:      typeconv.GetDatumToPhysicalFn(outputType),
-			row:            make(tree.Datums, len(argumentCols)),
-			argumentCols:   argumentCols,
+			OneInputNode:        NewOneInputNode(input),
+			allocator:           allocator,
+			evalCtx:             evalCtx,
+			funcExpr:            funcExpr,
+			outputIdx:           outputIdx,
+			columnTypes:         columnTypes,
+			outputType:          outputType,
+			toDatumConverter:    colconv.NewVecToDatumConverter(len(columnTypes), argumentCols),
+			datumToVecConverter: colconv.GetDatumToPhysicalFn(outputType),
+			row:                 make(tree.Datums, len(argumentCols)),
+			argumentCols:        argumentCols,
 		}, nil
 	}
 }

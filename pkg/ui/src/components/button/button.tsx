@@ -8,26 +8,42 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React from "react";
-import cn from "classnames";
-
-import "./button.styl";
+import React, { ButtonHTMLAttributes } from "react";
+import classNames from "classnames/bind";
+import styles from "./button.module.styl";
 
 export interface ButtonProps {
-  type?: "primary" | "secondary" | "flat";
+  type?: "primary" | "secondary" | "flat" | "unstyled-link";
   disabled?: boolean;
+  textAlign?: "left" | "right" | "center";
   size?: "default" | "small";
   children?: React.ReactNode;
   icon?: () => React.ReactNode;
   iconPosition?: "left" | "right";
   onClick?: (event: React.MouseEvent<HTMLElement>) => void;
   className?: string;
+  buttonType?: ButtonHTMLAttributes<HTMLButtonElement>["type"];
+  tabIndex?: ButtonHTMLAttributes<HTMLButtonElement>["tabIndex"];
 }
 
-export function Button(props: ButtonProps) {
-  const { children, type, disabled, size, icon, iconPosition, onClick, className } = props;
+const cx = classNames.bind(styles);
 
-  const rootStyles = cn(
+export function Button(props: ButtonProps) {
+  const {
+    children,
+    type,
+    disabled,
+    size,
+    icon,
+    iconPosition,
+    onClick,
+    className,
+    buttonType,
+    tabIndex,
+    textAlign,
+  } = props;
+
+  const rootStyles = cx(
     "crl-button",
     `crl-button--type-${type}`,
     `crl-button--size-${size}`,
@@ -42,8 +58,8 @@ export function Button(props: ButtonProps) {
       return null;
     }
     return (
-      <div className={`crl-button__icon--push-${iconPosition}`}>
-        { icon() }
+      <div className={cx(`crl-button__icon--push-${iconPosition}`)}>
+        {icon()}
       </div>
     );
   };
@@ -52,12 +68,16 @@ export function Button(props: ButtonProps) {
     <button
       onClick={onClick}
       className={rootStyles}
+      disabled={disabled}
+      type={buttonType}
+      tabIndex={tabIndex}
     >
-      <div className="crl-button__container">
-        <div className="crl-button__content">
+      <div className={cx("crl-button__container")}>
+        {iconPosition === "left" && renderIcon()}
+        <div className={cx("crl-button__content")} style={{ textAlign }}>
           {children}
         </div>
-        { renderIcon() }
+        {iconPosition === "right" && renderIcon()}
       </div>
     </button>
   );
@@ -70,4 +90,6 @@ Button.defaultProps = {
   size: "default",
   className: "",
   iconPosition: "left",
+  buttonType: "button",
+  textAlign: "left",
 };

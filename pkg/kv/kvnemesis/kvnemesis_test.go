@@ -18,7 +18,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -29,8 +30,9 @@ import (
 
 func TestKVNemesisSingleNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	scope := log.Scope(t)
-	defer scope.Close(t)
+	skip.UnderRace(t)
+
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
@@ -53,15 +55,16 @@ func TestKVNemesisSingleNode(t *testing.T) {
 
 func TestKVNemesisMultiNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	scope := log.Scope(t)
-	defer scope.Close(t)
+	skip.UnderRace(t)
+
+	defer log.Scope(t).Close(t)
 
 	// 4 nodes so we have somewhere to move 3x replicated ranges to.
 	const numNodes = 4
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{})
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{ReplicationMode: base.ReplicationManual})
 	defer tc.Stopper().Stop(ctx)
-	dbs, sqlDBs := make([]*client.DB, numNodes), make([]*gosql.DB, numNodes)
+	dbs, sqlDBs := make([]*kv.DB, numNodes), make([]*gosql.DB, numNodes)
 	for i := 0; i < numNodes; i++ {
 		dbs[i] = tc.Server(i).DB()
 		sqlDBs[i] = tc.ServerConn(i)
@@ -70,13 +73,6 @@ func TestKVNemesisMultiNode(t *testing.T) {
 
 	config := NewDefaultConfig()
 	config.NumNodes, config.NumReplicas = numNodes, 3
-	// kvnemesis found a rare bug with closed timestamps when splits (and maybe
-	// merges) happen on a multinode cluster. Disable the combo for now to keep
-	// the test from flaking. #44878
-	config.OpPs[OpPMergeIsSplit] = 0
-	config.OpPs[OpPMergeNotSplit] = 0
-	config.OpPs[OpPSplitNew] = 0
-	config.OpPs[OpPSplitAgain] = 0
 	rng, _ := randutil.NewPseudoRand()
 	ct := sqlClosedTimestampTargetInterval{sqlDBs: sqlDBs}
 	failures, err := RunNemesis(ctx, rng, ct, config, dbs...)
@@ -107,7 +103,7 @@ func (x sqlClosedTimestampTargetInterval) Set(ctx context.Context, d time.Durati
 func (x sqlClosedTimestampTargetInterval) ResetToDefault(ctx context.Context) error {
 	var err error
 	for i, sqlDB := range x.sqlDBs {
-		q := fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration TO DEFAULT`)
+		q := `SET CLUSTER SETTING kv.closed_timestamp.target_duration TO DEFAULT`
 		if _, err = sqlDB.Exec(q); err == nil {
 			return nil
 		}

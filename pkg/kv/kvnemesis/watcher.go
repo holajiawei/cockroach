@@ -12,12 +12,13 @@ package kvnemesis
 
 import (
 	"context"
+	"reflect"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -49,7 +50,7 @@ type Watcher struct {
 
 // Watch starts a new Watcher over the given span of kvs. See Watcher.
 func Watch(
-	ctx context.Context, dbs []*client.DB, ct ClosedTimestampTargetInterval, dataSpan roachpb.Span,
+	ctx context.Context, dbs []*kv.DB, ct ClosedTimestampTargetInterval, dataSpan roachpb.Span,
 ) (*Watcher, error) {
 	if len(dbs) < 1 {
 		return nil, errors.New(`at least one db must be given`)
@@ -59,16 +60,19 @@ func Watch(
 	w := &Watcher{
 		ct: ct,
 	}
-	w.mu.kvs = MakeEngine()
+	var err error
+	if w.mu.kvs, err = MakeEngine(); err != nil {
+		return nil, err
+	}
 	w.mu.frontier = span.MakeFrontier(dataSpan)
 	w.mu.frontierWaiters = make(map[hlc.Timestamp][]chan error)
 	ctx, w.cancel = context.WithCancel(ctx)
 	w.g = ctxgroup.WithContext(ctx)
 
-	dss := make([]*kv.DistSender, len(dbs))
+	dss := make([]*kvcoord.DistSender, len(dbs))
 	for i := range dbs {
 		sender := dbs[i].NonTransactionalSender()
-		dss[i] = sender.(*client.CrossRangeTxnWrapperSender).Wrapped().(*kv.DistSender)
+		dss[i] = sender.(*kv.CrossRangeTxnWrapperSender).Wrapped().(*kvcoord.DistSender)
 	}
 
 	startTs := firstDB.Clock().Now()
@@ -168,7 +172,7 @@ func (w *Watcher) processEvents(ctx context.Context, eventC chan *roachpb.RangeF
 				// but it means that we'll won't catch it if we violate those semantics.
 				// Consider first doing a Get and somehow failing if this exact key+ts
 				// has previously been put with a different value.
-				w.mu.kvs.Put(engine.MVCCKey{Key: e.Key, Timestamp: e.Value.Timestamp}, e.Value.RawBytes)
+				w.mu.kvs.Put(storage.MVCCKey{Key: e.Key, Timestamp: e.Value.Timestamp}, e.Value.RawBytes)
 				prevTs := e.Value.Timestamp.Prev()
 				prevValue := w.mu.kvs.Get(e.Key, prevTs)
 
@@ -178,7 +182,7 @@ func (w *Watcher) processEvents(ctx context.Context, eventC chan *roachpb.RangeF
 				// which don't need them. This means we'd want to make it an option in
 				// the request, which seems silly to do for only this test.
 				prevValue.Timestamp = hlc.Timestamp{}
-				prevValueMismatch := !prevValue.Equal(e.PrevValue)
+				prevValueMismatch := !reflect.DeepEqual(prevValue, e.PrevValue)
 				var engineContents string
 				if prevValueMismatch {
 					engineContents = w.mu.kvs.DebugPrint("  ")

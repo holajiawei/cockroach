@@ -10,7 +10,7 @@
 
 package catalog
 
-// chart_catalog.go represents a catalog of pre-defined Admin UI charts
+// chart_catalog.go represents a catalog of pre-defined DB Console charts
 // to aid users in debugging CockroachDB clusters. This file represents
 // a simplified structure of the catalog, meant to make it easier for
 // developers to add charts to the catalog. You can find more detail at
@@ -79,6 +79,18 @@ var charts = []sectionDescription{
 				Downsampler: DescribeAggregator_MAX,
 				Aggregator:  DescribeAggregator_MAX,
 				Metrics:     []string{"security.certificate.expiration.ui-ca"},
+			},
+			{
+				Title:       "Tenant Client CA Cert Expiration",
+				Downsampler: DescribeAggregator_MAX,
+				Aggregator:  DescribeAggregator_MAX,
+				Metrics:     []string{"security.certificate.expiration.ca-client-tenant"},
+			},
+			{
+				Title:       "Tenant Client Cert Expiration",
+				Downsampler: DescribeAggregator_MAX,
+				Aggregator:  DescribeAggregator_MAX,
+				Metrics:     []string{"security.certificate.expiration.client-tenant"},
 			},
 		},
 	},
@@ -265,6 +277,102 @@ var charts = []sectionDescription{
 					"distsender.rpc.sent",
 				},
 			},
+			{
+				Title: "Requests",
+				Metrics: []string{
+					"distsender.rpc.addsstable.sent",
+					"distsender.rpc.adminchangereplicas.sent",
+					"distsender.rpc.adminmerge.sent",
+					"distsender.rpc.adminrelocaterange.sent",
+					"distsender.rpc.adminscatter.sent",
+					"distsender.rpc.adminsplit.sent",
+					"distsender.rpc.admintransferlease.sent",
+					"distsender.rpc.adminunsplit.sent",
+					"distsender.rpc.adminverifyprotectedtimestamp.sent",
+					"distsender.rpc.checkconsistency.sent",
+					"distsender.rpc.clearrange.sent",
+					"distsender.rpc.computechecksum.sent",
+					"distsender.rpc.conditionalput.sent",
+					"distsender.rpc.delete.sent",
+					"distsender.rpc.deleterange.sent",
+					"distsender.rpc.endtxn.sent",
+					"distsender.rpc.export.sent",
+					"distsender.rpc.gc.sent",
+					"distsender.rpc.get.sent",
+					"distsender.rpc.heartbeattxn.sent",
+					"distsender.rpc.import.sent",
+					"distsender.rpc.increment.sent",
+					"distsender.rpc.initput.sent",
+					"distsender.rpc.leaseinfo.sent",
+					"distsender.rpc.merge.sent",
+					"distsender.rpc.migrate.sent",
+					"distsender.rpc.pushtxn.sent",
+					"distsender.rpc.put.sent",
+					"distsender.rpc.queryintent.sent",
+					"distsender.rpc.querytxn.sent",
+					"distsender.rpc.rangestats.sent",
+					"distsender.rpc.recomputestats.sent",
+					"distsender.rpc.recovertxn.sent",
+					"distsender.rpc.refresh.sent",
+					"distsender.rpc.refreshrange.sent",
+					"distsender.rpc.requestlease.sent",
+					"distsender.rpc.resolveintent.sent",
+					"distsender.rpc.resolveintentrange.sent",
+					"distsender.rpc.reversescan.sent",
+					"distsender.rpc.revertrange.sent",
+					"distsender.rpc.scan.sent",
+					"distsender.rpc.subsume.sent",
+					"distsender.rpc.transferlease.sent",
+					"distsender.rpc.truncatelog.sent",
+					"distsender.rpc.writebatch.sent",
+				},
+			},
+			{
+				Title: "Errors",
+				Metrics: []string{
+					"distsender.rpc.err.ambiguousresulterrtype",
+					"distsender.rpc.err.batchtimestampbeforegcerrtype",
+					"distsender.rpc.err.communicationerrtype",
+					"distsender.rpc.err.conditionfailederrtype",
+					"distsender.rpc.err.errordetailtype(0)",
+					"distsender.rpc.err.errordetailtype(15)",
+					"distsender.rpc.err.errordetailtype(19)",
+					"distsender.rpc.err.errordetailtype(20)",
+					"distsender.rpc.err.errordetailtype(21)",
+					"distsender.rpc.err.errordetailtype(23)",
+					"distsender.rpc.err.errordetailtype(24)",
+					"distsender.rpc.err.errordetailtype(29)",
+					"distsender.rpc.err.errordetailtype(30)",
+					"distsender.rpc.err.errordetailtype(33)",
+					"distsender.rpc.err.indeterminatecommiterrtype",
+					"distsender.rpc.err.integeroverflowerrtype",
+					"distsender.rpc.err.intentmissingerrtype",
+					"distsender.rpc.err.internalerrtype",
+					"distsender.rpc.err.invalidleaseerrtype",
+					"distsender.rpc.err.leaserejectederrtype",
+					"distsender.rpc.err.mergeinprogresserrtype",
+					"distsender.rpc.err.nodeunavailableerrtype",
+					"distsender.rpc.err.notleaseholdererrtype",
+					"distsender.rpc.err.oprequirestxnerrtype",
+					"distsender.rpc.err.raftgroupdeletederrtype",
+					"distsender.rpc.err.rangefeedretryerrtype",
+					"distsender.rpc.err.rangekeymismatcherrtype",
+					"distsender.rpc.err.rangenotfounderrtype",
+					"distsender.rpc.err.readwithinuncertaintyintervalerrtype",
+					"distsender.rpc.err.replicacorruptionerrtype",
+					"distsender.rpc.err.replicatooolderrtype",
+					"distsender.rpc.err.storenotfounderrtype",
+					"distsender.rpc.err.transactionabortederrtype",
+					"distsender.rpc.err.transactionpusherrtype",
+					"distsender.rpc.err.transactionretryerrtype",
+					"distsender.rpc.err.transactionretrywithprotorefresherrtype",
+					"distsender.rpc.err.transactionstatuserrtype",
+					"distsender.rpc.err.txnalreadyencounterederrtype",
+					"distsender.rpc.err.unsupportedrequesterrtype",
+					"distsender.rpc.err.writeintenterrtype",
+					"distsender.rpc.err.writetooolderrtype",
+				},
+			},
 		},
 	},
 	{
@@ -387,9 +495,9 @@ var charts = []sectionDescription{
 				Title: "Snapshots",
 				Metrics: []string{
 					"range.snapshots.generated",
-					"range.snapshots.normal-applied",
-					"range.snapshots.preemptive-applied",
-					"range.snapshots.learner-applied",
+					"range.snapshots.applied-voter",
+					"range.snapshots.applied-initial",
+					"range.snapshots.applied-non-voter",
 				},
 			},
 		},
@@ -492,6 +600,10 @@ var charts = []sectionDescription{
 			{
 				Title:   "Count",
 				Metrics: []string{"follower_reads.success_count"},
+			},
+			{
+				Title:   "Failed Attempts To Close",
+				Metrics: []string{"kv.closed_timestamp.failures_to_close"},
 			},
 		},
 	},
@@ -622,8 +734,51 @@ var charts = []sectionDescription{
 	},
 	{
 		Organization: [][]string{
+			{KVTransactionLayer, "Requests", "Tenant Rate Limiting"}},
+		Charts: []chartDescription{
+			{
+				Title:       "Requests Blocked on Tenant Rate Limiting",
+				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
+				Metrics:     []string{"kv.tenant_rate_limit.current_blocked"},
+			},
+			{
+				Title:       "Number of Tenants",
+				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
+				Metrics:     []string{"kv.tenant_rate_limit.num_tenants"},
+			},
+			{
+				Title:       "Read Requests Admitted by Rate Limiter",
+				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
+				Metrics:     []string{"kv.tenant_rate_limit.read_requests_admitted"},
+			},
+			{
+				Title:       "Write Requests Admitted by Rate Limiter",
+				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
+				Metrics:     []string{"kv.tenant_rate_limit.write_requests_admitted"},
+			},
+			{
+				Title:       "Read Bytes Admitted by Rate Limiter",
+				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
+				Metrics:     []string{"kv.tenant_rate_limit.read_bytes_admitted"},
+			},
+			{
+				Title:       "Write Bytes Admitted by Rate Limiter",
+				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
+				Metrics:     []string{"kv.tenant_rate_limit.write_bytes_admitted"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{
 			{KVTransactionLayer, "Requests", "Slow"},
 			{ReplicationLayer, "Requests", "Slow"},
+			{DistributionLayer, "Requests", "Slow"},
 		},
 		Charts: []chartDescription{
 			{
@@ -644,17 +799,17 @@ var charts = []sectionDescription{
 				Percentiles: false,
 				Metrics:     []string{"requests.slow.raft"},
 			},
+			{
+				Title:       "Stuck sending RPCs to range",
+				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
+				Metrics:     []string{"requests.slow.distsender"},
+			},
 		},
 	},
 	{
 		Organization: [][]string{{KVTransactionLayer, "Storage"}},
 		Charts: []chartDescription{
-			{
-				Rate:        DescribeDerivative_DERIVATIVE,
-				Percentiles: false,
-				Title:       "Metric Update Frequency",
-				Metrics:     []string{"lastupdatenanos"},
-			},
 			{
 				Title:     "Counts",
 				AxisLabel: "MVCC Keys & Values",
@@ -677,6 +832,7 @@ var charts = []sectionDescription{
 			{
 				Title: "Size",
 				Metrics: []string{
+					"abortspanbytes",
 					"intentbytes",
 					"keybytes",
 					"livebytes",
@@ -724,35 +880,6 @@ var charts = []sectionDescription{
 		},
 	},
 	{
-		Organization: [][]string{{KVTransactionLayer, "Transactions", "Savepoints"}},
-		Charts: []chartDescription{
-			{
-				Title: "Count",
-				Metrics: []string{
-					"sql.savepoint.count",
-					"sql.savepoint.count.internal",
-				},
-				AxisLabel: "SQL Statements",
-			},
-			{
-				Title: "Restarts (Internal)",
-				Metrics: []string{
-					"sql.restart_savepoint.count.internal",
-					"sql.restart_savepoint.release.count.internal",
-					"sql.restart_savepoint.rollback.count.internal",
-				},
-			},
-			{
-				Title: "Restarts",
-				Metrics: []string{
-					"sql.restart_savepoint.count",
-					"sql.restart_savepoint.release.count",
-					"sql.restart_savepoint.rollback.count",
-				},
-			},
-		},
-	},
-	{
 		Organization: [][]string{{KVTransactionLayer, "Transactions", "TxnWaitQueue"}},
 		Charts: []chartDescription{
 			{
@@ -794,8 +921,24 @@ var charts = []sectionDescription{
 				Metrics: []string{"txn.aborts"},
 			},
 			{
-				Title:   "Auto Retries",
-				Metrics: []string{"txn.autoretries"},
+				Title:   "Successful refreshes",
+				Metrics: []string{"txn.refresh.success"},
+			},
+			{
+				Title:   "Failed refreshes",
+				Metrics: []string{"txn.refresh.fail"},
+			},
+			{
+				Title:   "Failed refreshes with condensed spans",
+				Metrics: []string{"txn.refresh.fail_with_condensed_spans"},
+			},
+			{
+				Title:   "Transactions exceeding refresh spans memory limit",
+				Metrics: []string{"txn.refresh.memory_limit_exceeded"},
+			},
+			{
+				Title:   "Auto-Retries",
+				Metrics: []string{"txn.refresh.auto_retries"},
 			},
 			{
 				Title: "Commits",
@@ -887,6 +1030,7 @@ var charts = []sectionDescription{
 				Title: "Errors",
 				Metrics: []string{
 					"changefeed.error_retries",
+					"changefeed.failures",
 				},
 			},
 			{
@@ -911,6 +1055,12 @@ var charts = []sectionDescription{
 				Title: "Poll Request Time",
 				Metrics: []string{
 					"changefeed.poll_request_nanos",
+				},
+			},
+			{
+				Title: "Currently Running",
+				Metrics: []string{
+					"changefeed.running",
 				},
 			},
 			{
@@ -1007,6 +1157,10 @@ var charts = []sectionDescription{
 				Metrics: []string{"liveness.epochincrements"},
 			},
 			{
+				Title:   "Heartbeats In-Flight",
+				Metrics: []string{"liveness.heartbeatsinflight"},
+			},
+			{
 				Title:   "Heartbeat Latency",
 				Metrics: []string{"liveness.heartbeatlatency"},
 			},
@@ -1085,6 +1239,10 @@ var charts = []sectionDescription{
 			{
 				Title:   "Log Commit",
 				Metrics: []string{"raft.process.logcommit.latency"},
+			},
+			{
+				Title:   "Scheduler",
+				Metrics: []string{"raft.scheduler.latency"},
 			},
 		},
 	},
@@ -1332,6 +1490,26 @@ var charts = []sectionDescription{
 		},
 	},
 	{
+		Organization: [][]string{{SQLLayer, "Schema Changer"}},
+		Charts: []chartDescription{
+			{
+				Title:   "Running",
+				Metrics: []string{"sql.schema_changer.running"},
+			},
+			{
+				Title:       "Run Outcomes",
+				Downsampler: DescribeAggregator_MAX,
+				Aggregator:  DescribeAggregator_SUM,
+				Metrics: []string{
+					"sql.schema_changer.permanent_errors",
+					"sql.schema_changer.retry_errors",
+					"sql.schema_changer.successes",
+				},
+				AxisLabel: "Schema Change Executions",
+			},
+		},
+	},
+	{
 		Organization: [][]string{{SQLLayer, "DistSQL", "Flows"}},
 		Charts: []chartDescription{
 			{
@@ -1349,6 +1527,55 @@ var charts = []sectionDescription{
 			{
 				Title:   "Total",
 				Metrics: []string{"sql.distsql.flows.total"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{SQLLayer, "SQL Catalog", "SQL Leases"}},
+		Charts: []chartDescription{
+			{
+				Title: "Outstanding SQL Leases",
+				Metrics: []string{
+					"sql.leases.active",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{SQLLayer, "SQL Catalog", "Hydrated Descriptor Cache"}},
+		Charts: []chartDescription{
+			{
+				Title: "Cache Hits and Misses",
+				Metrics: []string{
+					"sql.hydrated_table_cache.hits",
+					"sql.hydrated_table_cache.misses",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{SQLLayer, "SQL Liveness"}},
+		Charts: []chartDescription{
+			{
+				Title: "Session Writes",
+				Metrics: []string{
+					"sqlliveness.write_successes",
+					"sqlliveness.write_failures",
+				},
+			},
+			{
+				Title: "IsAlive cache",
+				Metrics: []string{
+					"sqlliveness.is_alive.cache_hits",
+					"sqlliveness.is_alive.cache_misses",
+				},
+			},
+			{
+				Title: "Session deletion",
+				Metrics: []string{
+					"sqlliveness.sessions_deletion_runs",
+					"sqlliveness.sessions_deleted",
+				},
 			},
 		},
 	},
@@ -1396,8 +1623,20 @@ var charts = []sectionDescription{
 				Metrics: []string{"sql.distsql.queries.total"},
 			},
 			{
+				Title:   "Contended Queries",
+				Metrics: []string{"sql.distsql.contended_queries.count"},
+			},
+			{
 				Title:   "Vectorized Temporary Storage Open File Descriptors",
 				Metrics: []string{"sql.distsql.vec.openfds"},
+			},
+			{
+				Title:   "Current Disk Usage",
+				Metrics: []string{"sql.disk.distsql.current"},
+			},
+			{
+				Title:   "Disk Usage per Statement",
+				Metrics: []string{"sql.disk.distsql.max"},
 			},
 		},
 	},
@@ -1567,6 +1806,19 @@ var charts = []sectionDescription{
 		},
 	},
 	{
+		Organization: [][]string{{SQLLayer, "SQL Memory"}},
+		Charts: []chartDescription{
+			{
+				Title:   "Current",
+				Metrics: []string{"sql.mem.root.current"},
+			},
+			{
+				Title:   "Max",
+				Metrics: []string{"sql.mem.root.max"},
+			},
+		},
+	},
+	{
 		Organization: [][]string{{SQLLayer, "SQL Memory", "SQL"}},
 		Charts: []chartDescription{
 			{
@@ -1576,6 +1828,23 @@ var charts = []sectionDescription{
 			{
 				Title:   "Max",
 				Metrics: []string{"sql.mem.sql.max"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{SQLLayer, "Temporary Objects Cleanup"}},
+		Charts: []chartDescription{
+			{
+				Title:   "Active Cleaners",
+				Metrics: []string{"sql.temp_object_cleaner.active_cleaners"},
+			},
+			{
+				Title: "Deletion Rate",
+				Metrics: []string{
+					"sql.temp_object_cleaner.schemas_to_delete",
+					"sql.temp_object_cleaner.schemas_deletion_success",
+					"sql.temp_object_cleaner.schemas_deletion_error",
+				},
 			},
 		},
 	},
@@ -1593,6 +1862,22 @@ var charts = []sectionDescription{
 				Metrics: []string{
 					"sql.new_conns",
 				},
+			},
+			{
+				Title: "Open Transactions",
+				Metrics: []string{
+					"sql.txns.open",
+					"sql.txns.open.internal",
+				},
+				AxisLabel: "Transactions",
+			},
+			{
+				Title: "Full Table Index Scans",
+				Metrics: []string{
+					"sql.full.scan.count",
+					"sql.full.scan.count.internal",
+				},
+				AxisLabel: "SQL Statements",
 			},
 			{
 				Title: "Byte I/O",
@@ -1737,6 +2022,14 @@ var charts = []sectionDescription{
 					"sql.savepoint.count.internal",
 					"sql.savepoint.started.count",
 					"sql.savepoint.started.count.internal",
+					"sql.savepoint.rollback.count",
+					"sql.savepoint.rollback.count.internal",
+					"sql.savepoint.rollback.started.count",
+					"sql.savepoint.rollback.started.count.internal",
+					"sql.savepoint.release.count",
+					"sql.savepoint.release.count.internal",
+					"sql.savepoint.release.started.count",
+					"sql.savepoint.release.started.count.internal",
 				},
 				AxisLabel: "SQL Statements",
 			},
@@ -1760,6 +2053,17 @@ var charts = []sectionDescription{
 					"sql.restart_savepoint.started.count.internal",
 					"sql.restart_savepoint.release.started.count.internal",
 					"sql.restart_savepoint.rollback.started.count.internal",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{SQLLayer, "SQL", "Feature Flag"}},
+		Charts: []chartDescription{
+			{
+				Title: "Feature Flag Denials",
+				Metrics: []string{
+					"sql.feature_flag_denial",
 				},
 			},
 		},
@@ -1826,6 +2130,19 @@ var charts = []sectionDescription{
 				Title:   "Pending Compaction",
 				Metrics: []string{"rocksdb.estimated-pending-compaction"},
 			},
+			{
+				Title:   "Ingestion",
+				Metrics: []string{"rocksdb.ingested-bytes"},
+			},
+			{
+				Title: "Flush & Compaction",
+				Metrics: []string{
+					"rocksdb.compacted-bytes-read",
+					"rocksdb.compacted-bytes-written",
+					"rocksdb.flushed-bytes",
+				},
+				AxisLabel: "Bytes",
+			},
 		},
 	},
 	{
@@ -1853,35 +2170,6 @@ var charts = []sectionDescription{
 		},
 	},
 	{
-		Organization: [][]string{{StorageLayer, "Storage", "Compactor"}},
-		Charts: []chartDescription{
-			{
-				Title: "Overview",
-				Metrics: []string{
-					"compactor.suggestionbytes.compacted",
-					"compactor.suggestionbytes.skipped",
-				},
-			},
-			{
-				Title: "Queued",
-				Metrics: []string{
-					"compactor.suggestionbytes.queued",
-				},
-			},
-			{
-				Title: "Success",
-				Metrics: []string{
-					"compactor.compactions.failure",
-					"compactor.compactions.success",
-				},
-			},
-			{
-				Title:   "Time",
-				Metrics: []string{"compactor.compactingnanos"},
-			},
-		},
-	},
-	{
 		Organization: [][]string{{StorageLayer, "Storage", "KV"}},
 		Charts: []chartDescription{
 			{
@@ -1904,12 +2192,9 @@ var charts = []sectionDescription{
 				Metrics: []string{"intentage"},
 			},
 			{
-				Title:   "Metric Update Frequency",
-				Metrics: []string{"lastupdatenanos"},
-			},
-			{
 				Title: "Size",
 				Metrics: []string{
+					"abortspanbytes",
 					"intentbytes",
 					"keybytes",
 					"livebytes",
@@ -1930,6 +2215,13 @@ var charts = []sectionDescription{
 					"capacity",
 					"capacity.reserved",
 					"capacity.used",
+				},
+			},
+			{
+				Title: "Disk Health",
+				Metrics: []string{
+					"storage.disk-slow",
+					"storage.disk-stalled",
 				},
 			},
 		},
@@ -1968,6 +2260,211 @@ var charts = []sectionDescription{
 			{
 				Title:   "Size",
 				Metrics: []string{"timeseries.write.bytes"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{Jobs, "Schedules", "Daemon"}},
+		Charts: []chartDescription{
+			{
+				Title: "Round",
+				Metrics: []string{
+
+					"schedules.round.schedules-ready-to-run",
+					"schedules.round.reschedule-skip",
+					"schedules.round.reschedule-wait",
+					"schedules.round.jobs-started",
+					"schedules.round.num-jobs-running",
+				},
+				AxisLabel: "Count",
+			},
+			{
+				Title: "Total",
+				Metrics: []string{
+					"schedules.malformed",
+					"schedules.error",
+					"schedules.total.started",
+					"schedules.total.succeeded",
+					"schedules.total.failed",
+				},
+				AxisLabel: "Count",
+			},
+		},
+	},
+	{
+		Organization: [][]string{{Jobs, "Schedules", "Backup"}},
+		Charts: []chartDescription{
+			{
+				Title: "Counts",
+				Metrics: []string{
+					"schedules.BACKUP.started",
+					"schedules.BACKUP.succeeded",
+					"schedules.BACKUP.failed",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{Jobs, "Execution"}},
+		Charts: []chartDescription{
+			{
+				Title: "Currently Running",
+				Metrics: []string{
+					"jobs.auto_create_stats.currently_running",
+					"jobs.backup.currently_running",
+					"jobs.changefeed.currently_running",
+					"jobs.create_stats.currently_running",
+					"jobs.import.currently_running",
+					"jobs.restore.currently_running",
+					"jobs.schema_change.currently_running",
+					"jobs.new_schema_change.currently_running",
+					"jobs.schema_change_gc.currently_running",
+					"jobs.typedesc_schema_change.currently_running",
+					"jobs.stream_ingestion.currently_running",
+					"jobs.migration.currently_running",
+				},
+			},
+			{
+				Title: "Auto Create Stats",
+				Metrics: []string{
+					"jobs.auto_create_stats.fail_or_cancel_completed",
+					"jobs.auto_create_stats.fail_or_cancel_failed",
+					"jobs.auto_create_stats.fail_or_cancel_retry_error",
+					"jobs.auto_create_stats.resume_completed",
+					"jobs.auto_create_stats.resume_failed",
+					"jobs.auto_create_stats.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Backup",
+				Metrics: []string{
+					"jobs.backup.fail_or_cancel_completed",
+					"jobs.backup.fail_or_cancel_failed",
+					"jobs.backup.fail_or_cancel_retry_error",
+					"jobs.backup.resume_completed",
+					"jobs.backup.resume_failed",
+					"jobs.backup.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Changefeed",
+				Metrics: []string{
+					"jobs.changefeed.fail_or_cancel_completed",
+					"jobs.changefeed.fail_or_cancel_failed",
+					"jobs.changefeed.fail_or_cancel_retry_error",
+					"jobs.changefeed.resume_completed",
+					"jobs.changefeed.resume_failed",
+					"jobs.changefeed.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Create Stats",
+				Metrics: []string{
+					"jobs.create_stats.fail_or_cancel_completed",
+					"jobs.create_stats.fail_or_cancel_failed",
+					"jobs.create_stats.fail_or_cancel_retry_error",
+					"jobs.create_stats.resume_completed",
+					"jobs.create_stats.resume_failed",
+					"jobs.create_stats.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Import",
+				Metrics: []string{
+					"jobs.import.fail_or_cancel_completed",
+					"jobs.import.fail_or_cancel_failed",
+					"jobs.import.fail_or_cancel_retry_error",
+					"jobs.import.resume_completed",
+					"jobs.import.resume_failed",
+					"jobs.import.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Restore",
+				Metrics: []string{
+					"jobs.restore.fail_or_cancel_completed",
+					"jobs.restore.fail_or_cancel_failed",
+					"jobs.restore.fail_or_cancel_retry_error",
+					"jobs.restore.resume_completed",
+					"jobs.restore.resume_failed",
+					"jobs.restore.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Schema Change",
+				Metrics: []string{
+					"jobs.schema_change.fail_or_cancel_completed",
+					"jobs.schema_change.fail_or_cancel_failed",
+					"jobs.schema_change.fail_or_cancel_retry_error",
+					"jobs.schema_change.resume_completed",
+					"jobs.schema_change.resume_failed",
+					"jobs.schema_change.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Schema Change (New Implementation)",
+				Metrics: []string{
+					"jobs.new_schema_change.fail_or_cancel_completed",
+					"jobs.new_schema_change.fail_or_cancel_failed",
+					"jobs.new_schema_change.fail_or_cancel_retry_error",
+					"jobs.new_schema_change.resume_completed",
+					"jobs.new_schema_change.resume_failed",
+					"jobs.new_schema_change.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Schema Change GC",
+				Metrics: []string{
+					"jobs.schema_change_gc.fail_or_cancel_completed",
+					"jobs.schema_change_gc.fail_or_cancel_failed",
+					"jobs.schema_change_gc.fail_or_cancel_retry_error",
+					"jobs.schema_change_gc.resume_completed",
+					"jobs.schema_change_gc.resume_failed",
+					"jobs.schema_change_gc.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Type Descriptor Change",
+				Metrics: []string{
+					"jobs.typedesc_schema_change.fail_or_cancel_completed",
+					"jobs.typedesc_schema_change.fail_or_cancel_failed",
+					"jobs.typedesc_schema_change.fail_or_cancel_retry_error",
+					"jobs.typedesc_schema_change.resume_completed",
+					"jobs.typedesc_schema_change.resume_failed",
+					"jobs.typedesc_schema_change.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Stream Ingestion",
+				Metrics: []string{
+					"jobs.stream_ingestion.fail_or_cancel_completed",
+					"jobs.stream_ingestion.fail_or_cancel_failed",
+					"jobs.stream_ingestion.fail_or_cancel_retry_error",
+					"jobs.stream_ingestion.resume_completed",
+					"jobs.stream_ingestion.resume_failed",
+					"jobs.stream_ingestion.resume_retry_error",
+				},
+			},
+			{
+				Title: "Long Running Migrations",
+				Metrics: []string{
+					"jobs.migration.fail_or_cancel_completed",
+					"jobs.migration.fail_or_cancel_failed",
+					"jobs.migration.fail_or_cancel_retry_error",
+					"jobs.migration.resume_completed",
+					"jobs.migration.resume_failed",
+					"jobs.migration.resume_retry_error",
+				},
 			},
 		},
 	},

@@ -19,13 +19,9 @@ import (
 )
 
 func (b *Builder) buildControlJobs(n *tree.ControlJobs, inScope *scope) (outScope *scope) {
-	if err := b.catalog.RequireAdminRole(b.ctx, n.StatementTag()); err != nil {
-		panic(err)
-	}
-
 	// We don't allow the input statement to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
-	emptyScope := &scope{builder: b}
+	emptyScope := b.allocScope()
 	colTypes := []*types.T{types.Int}
 	inputScope := b.buildStmt(n.Jobs, colTypes, emptyScope)
 
@@ -50,7 +46,7 @@ func (b *Builder) buildControlJobs(n *tree.ControlJobs, inScope *scope) (outScop
 func (b *Builder) buildCancelQueries(n *tree.CancelQueries, inScope *scope) (outScope *scope) {
 	// We don't allow the input statement to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
-	emptyScope := &scope{builder: b}
+	emptyScope := b.allocScope()
 	colTypes := []*types.T{types.String}
 	inputScope := b.buildStmt(n.Queries, colTypes, emptyScope)
 
@@ -75,7 +71,7 @@ func (b *Builder) buildCancelQueries(n *tree.CancelQueries, inScope *scope) (out
 func (b *Builder) buildCancelSessions(n *tree.CancelSessions, inScope *scope) (outScope *scope) {
 	// We don't allow the input statement to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
-	emptyScope := &scope{builder: b}
+	emptyScope := b.allocScope()
 	colTypes := []*types.T{types.String}
 	inputScope := b.buildStmt(n.Sessions, colTypes, emptyScope)
 
@@ -94,5 +90,45 @@ func (b *Builder) buildCancelSessions(n *tree.CancelSessions, inScope *scope) (o
 			IfExists: n.IfExists,
 		},
 	)
+	return outScope
+}
+
+func (b *Builder) buildControlSchedules(
+	n *tree.ControlSchedules, inScope *scope,
+) (outScope *scope) {
+	if err := b.catalog.RequireAdminRole(b.ctx, n.StatementTag()); err != nil {
+		panic(err)
+	}
+
+	// We don't allow the input statement to reference outer columns, so we
+	// pass a "blank" scope rather than inScope.
+	emptyScope := b.allocScope()
+	colTypes := []*types.T{types.Int}
+	inputScope := b.buildStmt(n.Schedules, colTypes, emptyScope)
+
+	checkInputColumns(
+		fmt.Sprintf("%s SCHEDULES", n.Command),
+		inputScope,
+		[]string{"schedule_id"},
+		colTypes,
+		1, /* minPrefix */
+	)
+
+	outScope = inScope.push()
+	outScope.expr = b.factory.ConstructControlSchedules(
+		inputScope.expr.(memo.RelExpr),
+		&memo.ControlSchedulesPrivate{
+			Props:   inputScope.makePhysicalProps(),
+			Command: n.Command,
+		},
+	)
+	return outScope
+}
+
+func (b *Builder) buildCreateStatistics(n *tree.CreateStats, inScope *scope) (outScope *scope) {
+	outScope = inScope.push()
+	outScope.expr = b.factory.ConstructCreateStatistics(&memo.CreateStatisticsPrivate{
+		Syntax: n,
+	})
 	return outScope
 }

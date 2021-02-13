@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/tools/container/intsets"
@@ -107,6 +108,10 @@ const (
 	// justification for this constant.
 	lookupJoinRetrieveRowCost = 2 * seqIOCostFactor
 
+	// virtualScanTableDescriptorFetchCost is the cost to retrieve the table
+	// descriptors when performing a virtual table scan.
+	virtualScanTableDescriptorFetchCost = 25 * randIOCostFactor
+
 	// Input rows to a join are processed in batches of this size.
 	// See joinreader.go.
 	joinReaderBatchSize = 100.0
@@ -132,13 +137,283 @@ const (
 	// If the final expression has this cost or larger, it means that there was no
 	// plan that could satisfy the hints.
 	hugeCost memo.Cost = 1e100
+
+	// preferLookupJoinFactor is a scale factor for the cost of a lookup join when
+	// we have a hint for preferring a lookup join.
+	preferLookupJoinFactor = 1e-6
 )
+
+// fnCost maps some functions to an execution cost. Currently this list
+// contains only st_* functions, including some we don't have implemented
+// yet. Although function costs differ based on the overload (due to
+// arguments), here we are using the minimum from similar functions based on
+// postgres' pg_proc table. The following query can be used to generate this table:
+//   SELECT proname, min(procost) FROM pg_proc WHERE proname LIKE 'st\_%' AND procost > 1 GROUP BY proname ORDER BY proname
+// TODO(mjibson): Add costs directly to overloads. When that is done, we should
+// also add a test that ensures those costs match postgres.
+var fnCost = map[string]memo.Cost{
+	"st_3dclosestpoint":           1000 * cpuCostFactor,
+	"st_3ddfullywithin":           10000 * cpuCostFactor,
+	"st_3ddistance":               1000 * cpuCostFactor,
+	"st_3ddwithin":                10000 * cpuCostFactor,
+	"st_3dintersects":             10000 * cpuCostFactor,
+	"st_3dlength":                 100 * cpuCostFactor,
+	"st_3dlongestline":            1000 * cpuCostFactor,
+	"st_3dmakebox":                100 * cpuCostFactor,
+	"st_3dmaxdistance":            1000 * cpuCostFactor,
+	"st_3dperimeter":              100 * cpuCostFactor,
+	"st_3dshortestline":           1000 * cpuCostFactor,
+	"st_addmeasure":               1000 * cpuCostFactor,
+	"st_addpoint":                 100 * cpuCostFactor,
+	"st_affine":                   100 * cpuCostFactor,
+	"st_angle":                    100 * cpuCostFactor,
+	"st_area":                     100 * cpuCostFactor,
+	"st_area2d":                   100 * cpuCostFactor,
+	"st_asbinary":                 100 * cpuCostFactor,
+	"st_asencodedpolyline":        100 * cpuCostFactor,
+	"st_asewkb":                   100 * cpuCostFactor,
+	"st_asewkt":                   100 * cpuCostFactor,
+	"st_asgeojson":                100 * cpuCostFactor,
+	"st_asgml":                    100 * cpuCostFactor,
+	"st_ashexewkb":                100 * cpuCostFactor,
+	"st_askml":                    100 * cpuCostFactor,
+	"st_aslatlontext":             100 * cpuCostFactor,
+	"st_assvg":                    100 * cpuCostFactor,
+	"st_astext":                   100 * cpuCostFactor,
+	"st_astwkb":                   1000 * cpuCostFactor,
+	"st_asx3d":                    100 * cpuCostFactor,
+	"st_azimuth":                  100 * cpuCostFactor,
+	"st_bdmpolyfromtext":          100 * cpuCostFactor,
+	"st_bdpolyfromtext":           100 * cpuCostFactor,
+	"st_boundary":                 1000 * cpuCostFactor,
+	"st_boundingdiagonal":         100 * cpuCostFactor,
+	"st_box2dfromgeohash":         1000 * cpuCostFactor,
+	"st_buffer":                   100 * cpuCostFactor,
+	"st_buildarea":                10000 * cpuCostFactor,
+	"st_centroid":                 100 * cpuCostFactor,
+	"st_chaikinsmoothing":         10000 * cpuCostFactor,
+	"st_cleangeometry":            10000 * cpuCostFactor,
+	"st_clipbybox2d":              10000 * cpuCostFactor,
+	"st_closestpoint":             1000 * cpuCostFactor,
+	"st_closestpointofapproach":   10000 * cpuCostFactor,
+	"st_clusterdbscan":            10000 * cpuCostFactor,
+	"st_clusterintersecting":      10000 * cpuCostFactor,
+	"st_clusterkmeans":            10000 * cpuCostFactor,
+	"st_clusterwithin":            10000 * cpuCostFactor,
+	"st_collectionextract":        100 * cpuCostFactor,
+	"st_collectionhomogenize":     100 * cpuCostFactor,
+	"st_concavehull":              10000 * cpuCostFactor,
+	"st_contains":                 10000 * cpuCostFactor,
+	"st_containsproperly":         10000 * cpuCostFactor,
+	"st_convexhull":               10000 * cpuCostFactor,
+	"st_coorddim":                 100 * cpuCostFactor,
+	"st_coveredby":                100 * cpuCostFactor,
+	"st_covers":                   100 * cpuCostFactor,
+	"st_cpawithin":                10000 * cpuCostFactor,
+	"st_createtopogeo":            100 * cpuCostFactor,
+	"st_crosses":                  10000 * cpuCostFactor,
+	"st_curvetoline":              10000 * cpuCostFactor,
+	"st_delaunaytriangles":        10000 * cpuCostFactor,
+	"st_dfullywithin":             10000 * cpuCostFactor,
+	"st_difference":               10000 * cpuCostFactor,
+	"st_dimension":                100 * cpuCostFactor,
+	"st_disjoint":                 10000 * cpuCostFactor,
+	"st_distance":                 100 * cpuCostFactor,
+	"st_distancecpa":              10000 * cpuCostFactor,
+	"st_distancesphere":           100 * cpuCostFactor,
+	"st_distancespheroid":         1000 * cpuCostFactor,
+	"st_dump":                     1000 * cpuCostFactor,
+	"st_dumppoints":               100 * cpuCostFactor,
+	"st_dumprings":                1000 * cpuCostFactor,
+	"st_dwithin":                  100 * cpuCostFactor,
+	"st_endpoint":                 100 * cpuCostFactor,
+	"st_envelope":                 100 * cpuCostFactor,
+	"st_equals":                   10000 * cpuCostFactor,
+	"st_expand":                   100 * cpuCostFactor,
+	"st_exteriorring":             100 * cpuCostFactor,
+	"st_filterbym":                1000 * cpuCostFactor,
+	"st_findextent":               100 * cpuCostFactor,
+	"st_flipcoordinates":          1000 * cpuCostFactor,
+	"st_force2d":                  100 * cpuCostFactor,
+	"st_force3d":                  100 * cpuCostFactor,
+	"st_force3dm":                 100 * cpuCostFactor,
+	"st_force3dz":                 100 * cpuCostFactor,
+	"st_force4d":                  100 * cpuCostFactor,
+	"st_forcecollection":          100 * cpuCostFactor,
+	"st_forcecurve":               1000 * cpuCostFactor,
+	"st_forcepolygonccw":          100 * cpuCostFactor,
+	"st_forcepolygoncw":           1000 * cpuCostFactor,
+	"st_forcerhr":                 1000 * cpuCostFactor,
+	"st_forcesfs":                 1000 * cpuCostFactor,
+	"st_frechetdistance":          10000 * cpuCostFactor,
+	"st_generatepoints":           10000 * cpuCostFactor,
+	"st_geogfromtext":             100 * cpuCostFactor,
+	"st_geogfromwkb":              100 * cpuCostFactor,
+	"st_geographyfromtext":        100 * cpuCostFactor,
+	"st_geohash":                  1000 * cpuCostFactor,
+	"st_geomcollfromtext":         100 * cpuCostFactor,
+	"st_geomcollfromwkb":          100 * cpuCostFactor,
+	"st_geometricmedian":          10000 * cpuCostFactor,
+	"st_geometryfromtext":         1000 * cpuCostFactor,
+	"st_geometryn":                100 * cpuCostFactor,
+	"st_geometrytype":             100 * cpuCostFactor,
+	"st_geomfromewkb":             100 * cpuCostFactor,
+	"st_geomfromewkt":             100 * cpuCostFactor,
+	"st_geomfromgeohash":          1000 * cpuCostFactor,
+	"st_geomfromgeojson":          1000 * cpuCostFactor,
+	"st_geomfromgml":              100 * cpuCostFactor,
+	"st_geomfromkml":              1000 * cpuCostFactor,
+	"st_geomfromtext":             1000 * cpuCostFactor,
+	"st_geomfromtwkb":             100 * cpuCostFactor,
+	"st_geomfromwkb":              100 * cpuCostFactor,
+	"st_gmltosql":                 100 * cpuCostFactor,
+	"st_hasarc":                   100 * cpuCostFactor,
+	"st_hausdorffdistance":        10000 * cpuCostFactor,
+	"st_inittopogeo":              100 * cpuCostFactor,
+	"st_interiorringn":            100 * cpuCostFactor,
+	"st_interpolatepoint":         1000 * cpuCostFactor,
+	"st_intersection":             100 * cpuCostFactor,
+	"st_intersects":               100 * cpuCostFactor,
+	"st_isclosed":                 100 * cpuCostFactor,
+	"st_iscollection":             1000 * cpuCostFactor,
+	"st_isempty":                  100 * cpuCostFactor,
+	"st_ispolygonccw":             100 * cpuCostFactor,
+	"st_ispolygoncw":              100 * cpuCostFactor,
+	"st_isring":                   1000 * cpuCostFactor,
+	"st_issimple":                 1000 * cpuCostFactor,
+	"st_isvalid":                  100 * cpuCostFactor,
+	"st_isvaliddetail":            10000 * cpuCostFactor,
+	"st_isvalidreason":            100 * cpuCostFactor,
+	"st_isvalidtrajectory":        10000 * cpuCostFactor,
+	"st_length":                   100 * cpuCostFactor,
+	"st_length2d":                 100 * cpuCostFactor,
+	"st_length2dspheroid":         1000 * cpuCostFactor,
+	"st_lengthspheroid":           1000 * cpuCostFactor,
+	"st_linecrossingdirection":    10000 * cpuCostFactor,
+	"st_linefromencodedpolyline":  1000 * cpuCostFactor,
+	"st_linefrommultipoint":       100 * cpuCostFactor,
+	"st_linefromtext":             100 * cpuCostFactor,
+	"st_linefromwkb":              100 * cpuCostFactor,
+	"st_lineinterpolatepoint":     1000 * cpuCostFactor,
+	"st_lineinterpolatepoints":    1000 * cpuCostFactor,
+	"st_linelocatepoint":          1000 * cpuCostFactor,
+	"st_linemerge":                10000 * cpuCostFactor,
+	"st_linestringfromwkb":        100 * cpuCostFactor,
+	"st_linesubstring":            1000 * cpuCostFactor,
+	"st_linetocurve":              10000 * cpuCostFactor,
+	"st_locatealong":              1000 * cpuCostFactor,
+	"st_locatebetween":            1000 * cpuCostFactor,
+	"st_locatebetweenelevations":  1000 * cpuCostFactor,
+	"st_longestline":              100 * cpuCostFactor,
+	"st_makeenvelope":             100 * cpuCostFactor,
+	"st_makeline":                 100 * cpuCostFactor,
+	"st_makepoint":                100 * cpuCostFactor,
+	"st_makepointm":               100 * cpuCostFactor,
+	"st_makepolygon":              100 * cpuCostFactor,
+	"st_makevalid":                10000 * cpuCostFactor,
+	"st_maxdistance":              100 * cpuCostFactor,
+	"st_memsize":                  100 * cpuCostFactor,
+	"st_minimumboundingcircle":    10000 * cpuCostFactor,
+	"st_minimumboundingradius":    10000 * cpuCostFactor,
+	"st_minimumclearance":         10000 * cpuCostFactor,
+	"st_minimumclearanceline":     10000 * cpuCostFactor,
+	"st_mlinefromtext":            100 * cpuCostFactor,
+	"st_mlinefromwkb":             100 * cpuCostFactor,
+	"st_mpointfromtext":           100 * cpuCostFactor,
+	"st_mpointfromwkb":            100 * cpuCostFactor,
+	"st_mpolyfromtext":            100 * cpuCostFactor,
+	"st_mpolyfromwkb":             100 * cpuCostFactor,
+	"st_multi":                    100 * cpuCostFactor,
+	"st_multilinefromwkb":         100 * cpuCostFactor,
+	"st_multilinestringfromtext":  100 * cpuCostFactor,
+	"st_multipointfromtext":       100 * cpuCostFactor,
+	"st_multipointfromwkb":        100 * cpuCostFactor,
+	"st_multipolyfromwkb":         100 * cpuCostFactor,
+	"st_multipolygonfromtext":     100 * cpuCostFactor,
+	"st_node":                     10000 * cpuCostFactor,
+	"st_normalize":                100 * cpuCostFactor,
+	"st_npoints":                  100 * cpuCostFactor,
+	"st_nrings":                   100 * cpuCostFactor,
+	"st_numgeometries":            100 * cpuCostFactor,
+	"st_numinteriorring":          100 * cpuCostFactor,
+	"st_numinteriorrings":         100 * cpuCostFactor,
+	"st_numpatches":               100 * cpuCostFactor,
+	"st_numpoints":                100 * cpuCostFactor,
+	"st_offsetcurve":              10000 * cpuCostFactor,
+	"st_orderingequals":           10000 * cpuCostFactor,
+	"st_orientedenvelope":         10000 * cpuCostFactor,
+	"st_overlaps":                 10000 * cpuCostFactor,
+	"st_patchn":                   100 * cpuCostFactor,
+	"st_perimeter":                100 * cpuCostFactor,
+	"st_perimeter2d":              100 * cpuCostFactor,
+	"st_point":                    100 * cpuCostFactor,
+	"st_pointfromgeohash":         1000 * cpuCostFactor,
+	"st_pointfromtext":            100 * cpuCostFactor,
+	"st_pointfromwkb":             100 * cpuCostFactor,
+	"st_pointinsidecircle":        1000 * cpuCostFactor,
+	"st_pointn":                   100 * cpuCostFactor,
+	"st_pointonsurface":           1000 * cpuCostFactor,
+	"st_points":                   1000 * cpuCostFactor,
+	"st_polyfromtext":             100 * cpuCostFactor,
+	"st_polyfromwkb":              100 * cpuCostFactor,
+	"st_polygon":                  100 * cpuCostFactor,
+	"st_polygonfromtext":          100 * cpuCostFactor,
+	"st_polygonfromwkb":           100 * cpuCostFactor,
+	"st_polygonize":               10000 * cpuCostFactor,
+	"st_project":                  1000 * cpuCostFactor,
+	"st_quantizecoordinates":      1000 * cpuCostFactor,
+	"st_relate":                   10000 * cpuCostFactor,
+	"st_relatematch":              1000 * cpuCostFactor,
+	"st_removepoint":              100 * cpuCostFactor,
+	"st_removerepeatedpoints":     1000 * cpuCostFactor,
+	"st_reverse":                  1000 * cpuCostFactor,
+	"st_rotate":                   100 * cpuCostFactor,
+	"st_rotatex":                  100 * cpuCostFactor,
+	"st_rotatey":                  100 * cpuCostFactor,
+	"st_rotatez":                  100 * cpuCostFactor,
+	"st_scale":                    100 * cpuCostFactor,
+	"st_segmentize":               1000 * cpuCostFactor,
+	"st_seteffectivearea":         1000 * cpuCostFactor,
+	"st_setpoint":                 100 * cpuCostFactor,
+	"st_setsrid":                  100 * cpuCostFactor,
+	"st_sharedpaths":              10000 * cpuCostFactor,
+	"st_shortestline":             1000 * cpuCostFactor,
+	"st_simplify":                 100 * cpuCostFactor,
+	"st_simplifypreservetopology": 10000 * cpuCostFactor,
+	"st_simplifyvw":               10000 * cpuCostFactor,
+	"st_snap":                     10000 * cpuCostFactor,
+	"st_snaptogrid":               100 * cpuCostFactor,
+	"st_split":                    10000 * cpuCostFactor,
+	"st_srid":                     100 * cpuCostFactor,
+	"st_startpoint":               100 * cpuCostFactor,
+	"st_subdivide":                10000 * cpuCostFactor,
+	"st_summary":                  100 * cpuCostFactor,
+	"st_swapordinates":            100 * cpuCostFactor,
+	"st_symdifference":            10000 * cpuCostFactor,
+	"st_symmetricdifference":      10000 * cpuCostFactor,
+	"st_tileenvelope":             100 * cpuCostFactor,
+	"st_touches":                  10000 * cpuCostFactor,
+	"st_transform":                100 * cpuCostFactor,
+	"st_translate":                100 * cpuCostFactor,
+	"st_transscale":               100 * cpuCostFactor,
+	"st_unaryunion":               10000 * cpuCostFactor,
+	"st_union":                    10000 * cpuCostFactor,
+	"st_voronoilines":             100 * cpuCostFactor,
+	"st_voronoipolygons":          100 * cpuCostFactor,
+	"st_within":                   10000 * cpuCostFactor,
+	"st_wkbtosql":                 100 * cpuCostFactor,
+	"st_wkttosql":                 1000 * cpuCostFactor,
+}
 
 // Init initializes a new coster structure with the given memo.
 func (c *coster) Init(evalCtx *tree.EvalContext, mem *memo.Memo, perturbation float64) {
-	c.mem = mem
-	c.locality = evalCtx.Locality
-	c.perturbation = perturbation
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*c = coster{
+		mem:          mem,
+		locality:     evalCtx.Locality,
+		perturbation: perturbation,
+	}
 }
 
 // ComputeCost calculates the estimated cost of the top-level operator in a
@@ -157,14 +432,14 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 	case opt.ScanOp:
 		cost = c.computeScanCost(candidate.(*memo.ScanExpr), required)
 
-	case opt.VirtualScanOp:
-		cost = c.computeVirtualScanCost(candidate.(*memo.VirtualScanExpr))
-
 	case opt.SelectOp:
 		cost = c.computeSelectCost(candidate.(*memo.SelectExpr))
 
 	case opt.ProjectOp:
 		cost = c.computeProjectCost(candidate.(*memo.ProjectExpr))
+
+	case opt.InvertedFilterOp:
+		cost = c.computeInvertedFilterCost(candidate.(*memo.InvertedFilterExpr))
 
 	case opt.ValuesOp:
 		cost = c.computeValuesCost(candidate.(*memo.ValuesExpr))
@@ -179,10 +454,13 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		cost = c.computeMergeJoinCost(candidate.(*memo.MergeJoinExpr))
 
 	case opt.IndexJoinOp:
-		cost = c.computeIndexJoinCost(candidate.(*memo.IndexJoinExpr))
+		cost = c.computeIndexJoinCost(candidate.(*memo.IndexJoinExpr), required)
 
 	case opt.LookupJoinOp:
 		cost = c.computeLookupJoinCost(candidate.(*memo.LookupJoinExpr), required)
+
+	case opt.InvertedJoinOp:
+		cost = c.computeInvertedJoinCost(candidate.(*memo.InvertedJoinExpr), required)
 
 	case opt.ZigzagJoinOp:
 		cost = c.computeZigzagJoinCost(candidate.(*memo.ZigzagJoinExpr))
@@ -191,7 +469,8 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp:
 		cost = c.computeSetCost(candidate)
 
-	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.UpsertDistinctOnOp:
+	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.EnsureDistinctOnOp,
+		opt.UpsertDistinctOnOp, opt.EnsureUpsertDistinctOnOp:
 		cost = c.computeGroupingCost(candidate, required)
 
 	case opt.LimitOp:
@@ -246,34 +525,45 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 }
 
 func (c *coster) computeSortCost(sort *memo.SortExpr, required *physical.Required) memo.Cost {
-	// We calculate the cost of a segmented sort. We assume each segment
-	// is of the same size of (rowCount / numSegments). We also calculate the
-	// per-row cost. The cost of the sort is:
+	// We calculate the cost of a (potentially) segmented sort.
 	//
-	// perRowCost * (rowCount + (segmentSize * log2(segmentSize) * numOrderedSegments))
+	// In a non-segmented sort, we have a single segment to sort according to
+	// required.Ordering.Columns.
 	//
-	// The constant term is necessary for cases where the estimated row count is
-	// very small.
+	// In a segmented sort, rows are split into segments according to
+	// InputOrdering.Columns; each segment is sorted according to the remaining
+	// columns from required.Ordering.Columns.
+	//
 	// TODO(rytaft): This is the cost of a local, in-memory sort. When a
 	// certain amount of memory is used, distsql switches to a disk-based sort
 	// with a temp RocksDB store.
+	numKeyCols := len(required.Ordering.Columns)
+	numPreorderedCols := len(sort.InputOrdering.Columns)
 
+	rel := sort.Relational()
+	stats := rel.Stats
 	numSegments := c.countSegments(sort)
-	cost := memo.Cost(0)
-	stats := sort.Relational().Stats
-	rowCount := stats.RowCount
-	perRowCost := c.rowSortCost(len(required.Ordering.Columns) - len(sort.InputOrdering.Columns))
+
+	// Start with a cost of storing each row; this takes the total number of
+	// columns into account so that a sort on fewer columns is preferred (e.g.
+	// sort before projecting a new column).
+	cost := memo.Cost(cpuCostFactor * float64(rel.OutputCols.Len()) * stats.RowCount)
 
 	if !sort.InputOrdering.Any() {
-		// Add the cost for finding the segments.
-		cost += memo.Cost(float64(len(sort.InputOrdering.Columns))*rowCount) * cpuCostFactor
+		// Add the cost for finding the segments: each row is compared to the
+		// previous row on the preordered columns. Most of these comparisons will
+		// yield equality, so we don't use rowCmpCost(): we expect to have to
+		// compare all preordered columns.
+		cost += cpuCostFactor * memo.Cost(numPreorderedCols) * memo.Cost(stats.RowCount)
 	}
 
-	segmentSize := rowCount / numSegments
-	if segmentSize > 1 {
-		cost += memo.Cost(segmentSize) * (memo.Cost(math.Log2(segmentSize)) * memo.Cost(numSegments))
+	// Add the cost to sort the segments. On average, each row is involved in
+	// O(log(segmentSize)) comparisons.
+	numCmpOpsPerRow := float64(1)
+	if segmentSize := stats.RowCount / numSegments; segmentSize > 1 {
+		numCmpOpsPerRow += math.Log2(segmentSize)
 	}
-	cost = perRowCost * (memo.Cost(rowCount) + cost)
+	cost += c.rowCmpCost(numKeyCols-numPreorderedCols) * memo.Cost(numCmpOpsPerRow*stats.RowCount)
 	return cost
 }
 
@@ -300,27 +590,34 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 		}
 	}
 
+	numSpans := 1
+	if scan.Constraint != nil {
+		numSpans = scan.Constraint.Spans.Count()
+	} else if scan.InvertedConstraint != nil {
+		numSpans = len(scan.InvertedConstraint)
+	}
+	baseCost := memo.Cost(numSpans * randIOCostFactor)
+
+	// If this is a virtual scan, add the cost of fetching table descriptors.
+	if c.mem.Metadata().Table(scan.Table).IsVirtualTable() {
+		baseCost += virtualScanTableDescriptorFetchCost
+	}
+
 	// Add a small cost if the scan is unconstrained, so all else being equal, we
 	// will prefer a constrained scan. This is important if our row count
 	// estimate turns out to be smaller than the actual row count.
-	var preferConstrainedScanCost memo.Cost
-	if scan.Constraint == nil || scan.Constraint.IsUnconstrained() {
-		preferConstrainedScanCost = cpuCostFactor
+	if scan.IsUnfiltered(c.mem.Metadata()) {
+		baseCost += cpuCostFactor
 	}
-	return memo.Cost(rowCount)*(seqIOCostFactor+perRowCost) + preferConstrainedScanCost
-}
-
-func (c *coster) computeVirtualScanCost(scan *memo.VirtualScanExpr) memo.Cost {
-	// Virtual tables are generated on-the-fly according to system metadata that
-	// is assumed to be in memory.
-	rowCount := memo.Cost(scan.Relational().Stats.RowCount)
-	return rowCount * cpuCostFactor
+	return baseCost + memo.Cost(rowCount)*(seqIOCostFactor+perRowCost)
 }
 
 func (c *coster) computeSelectCost(sel *memo.SelectExpr) memo.Cost {
 	// The filter has to be evaluated on each input row.
 	inputRowCount := sel.Input.Relational().Stats.RowCount
-	cost := memo.Cost(inputRowCount) * cpuCostFactor
+	filterSetup, filterPerRow := c.computeFiltersCost(sel.Filters, util.FastIntMap{})
+	cost := memo.Cost(inputRowCount) * filterPerRow
+	cost += filterSetup
 	return cost
 }
 
@@ -335,16 +632,31 @@ func (c *coster) computeProjectCost(prj *memo.ProjectExpr) memo.Cost {
 	return cost
 }
 
+func (c *coster) computeInvertedFilterCost(invFilter *memo.InvertedFilterExpr) memo.Cost {
+	// The filter has to be evaluated on each input row.
+	inputRowCount := invFilter.Input.Relational().Stats.RowCount
+	cost := memo.Cost(inputRowCount) * cpuCostFactor
+	return cost
+}
+
 func (c *coster) computeValuesCost(values *memo.ValuesExpr) memo.Cost {
 	return memo.Cost(values.Relational().Stats.RowCount) * cpuCostFactor
 }
 
 func (c *coster) computeHashJoinCost(join memo.RelExpr) memo.Cost {
-	if !join.Private().(*memo.JoinPrivate).Flags.Has(memo.AllowHashJoinStoreRight) {
+	if join.Private().(*memo.JoinPrivate).Flags.Has(memo.DisallowHashJoinStoreRight) {
 		return hugeCost
 	}
 	leftRowCount := join.Child(0).(memo.RelExpr).Relational().Stats.RowCount
 	rightRowCount := join.Child(1).(memo.RelExpr).Relational().Stats.RowCount
+	if (join.Op() == opt.SemiJoinOp || join.Op() == opt.AntiJoinOp) && leftRowCount < rightRowCount {
+		// If we have a semi or an anti join, during the execbuilding we choose
+		// the relation with smaller cardinality to be on the right side, so we
+		// need to swap row counts accordingly.
+		// TODO(raduberinde): we might also need to look at memo.JoinFlags when
+		// choosing a side.
+		leftRowCount, rightRowCount = rightRowCount, leftRowCount
+	}
 
 	// A hash join must process every row from both tables once.
 	//
@@ -358,6 +670,27 @@ func (c *coster) computeHashJoinCost(join memo.RelExpr) memo.Cost {
 	// a temp RocksDB store.
 	cost := memo.Cost(1.25*leftRowCount+1.75*rightRowCount) * cpuCostFactor
 
+	// Compute filter cost. Fetch the equality columns so they can be
+	// ignored later.
+	on := join.Child(2).(*memo.FiltersExpr)
+	leftEq, rightEq := memo.ExtractJoinEqualityColumns(
+		join.Child(0).(memo.RelExpr).Relational().OutputCols,
+		join.Child(1).(memo.RelExpr).Relational().OutputCols,
+		*on,
+	)
+	// Generate a quick way to lookup if two columns are join equality
+	// columns. We add in both directions because we don't know which way
+	// the equality filters will be defined.
+	eqMap := util.FastIntMap{}
+	for i := range leftEq {
+		left := int(leftEq[i])
+		right := int(rightEq[i])
+		eqMap.Set(left, right)
+		eqMap.Set(right, left)
+	}
+	filterSetup, filterPerRow := c.computeFiltersCost(*on, util.FastIntMap{})
+	cost += filterSetup
+
 	// Add the CPU cost of emitting the rows.
 	rowsProcessed, ok := c.mem.RowsProcessed(join)
 	if !ok {
@@ -365,18 +698,22 @@ func (c *coster) computeHashJoinCost(join memo.RelExpr) memo.Cost {
 		// of rows.
 		rowsProcessed = join.Relational().Stats.RowCount
 	}
-	cost += memo.Cost(rowsProcessed) * cpuCostFactor
+	cost += memo.Cost(rowsProcessed) * filterPerRow
 
-	// TODO(rytaft): Add a constant "setup" cost per extra ON condition similar
-	// to merge join and lookup join.
 	return cost
 }
 
 func (c *coster) computeMergeJoinCost(join *memo.MergeJoinExpr) memo.Cost {
+	if join.MergeJoinPrivate.Flags.Has(memo.DisallowMergeJoin) {
+		return hugeCost
+	}
 	leftRowCount := join.Left.Relational().Stats.RowCount
 	rightRowCount := join.Right.Relational().Stats.RowCount
 
 	cost := memo.Cost(leftRowCount+rightRowCount) * cpuCostFactor
+
+	filterSetup, filterPerRow := c.computeFiltersCost(join.On, util.FastIntMap{})
+	cost += filterSetup
 
 	// Add the CPU cost of emitting the rows.
 	rowsProcessed, ok := c.mem.RowsProcessed(join)
@@ -386,59 +723,55 @@ func (c *coster) computeMergeJoinCost(join *memo.MergeJoinExpr) memo.Cost {
 		// logPropsBuilder.clear() is called.
 		panic(errors.AssertionFailedf("could not get rows processed for merge join"))
 	}
-	cost += memo.Cost(rowsProcessed) * cpuCostFactor
-
-	// Add a constant "setup" cost per ON condition to account for the fact that
-	// the rowsProcessed estimate alone cannot effectively discriminate between
-	// plans when RowCount is too small.
-	cost += cpuCostFactor * memo.Cost(len(join.On))
+	cost += memo.Cost(rowsProcessed) * filterPerRow
 	return cost
 }
 
-func (c *coster) computeIndexJoinCost(join *memo.IndexJoinExpr) memo.Cost {
-	leftRowCount := join.Input.Relational().Stats.RowCount
-
-	// The rows in the (left) input are used to probe into the (right) table.
-	// Since the matching rows in the table may not all be in the same range, this
-	// counts as random I/O.
-	perRowCost := cpuCostFactor + randIOCostFactor +
-		c.rowScanCost(join.Table, cat.PrimaryIndex, join.Cols.Len())
-	return memo.Cost(leftRowCount) * perRowCost
+func (c *coster) computeIndexJoinCost(
+	join *memo.IndexJoinExpr, required *physical.Required,
+) memo.Cost {
+	return c.computeIndexLookupJoinCost(
+		join,
+		required,
+		true, /* lookupColsAreTableKey */
+		memo.TrueFilter,
+		join.Cols,
+		join.Table,
+		cat.PrimaryIndex,
+		memo.JoinFlags(0),
+	)
 }
 
 func (c *coster) computeLookupJoinCost(
 	join *memo.LookupJoinExpr, required *physical.Required,
 ) memo.Cost {
-	lookupCount := join.Input.Relational().Stats.RowCount
-
-	// Lookup joins can return early if enough rows have been found. An otherwise
-	// expensive lookup join might have a lower cost if its limit hint estimates
-	// that most rows will not be needed.
-	if required.LimitHint != 0 {
-		outputRows := join.Relational().Stats.RowCount
-		lookupCount = lookupJoinInputLimitHint(lookupCount, outputRows, required.LimitHint)
+	if join.LookupJoinPrivate.Flags.Has(memo.DisallowLookupJoinIntoRight) {
+		return hugeCost
 	}
+	return c.computeIndexLookupJoinCost(
+		join,
+		required,
+		join.LookupColsAreTableKey,
+		join.On,
+		join.Cols,
+		join.Table,
+		join.Index,
+		join.Flags,
+	)
+}
 
-	// The rows in the (left) input are used to probe into the (right) table.
-	// Since the matching rows in the table may not all be in the same range, this
-	// counts as random I/O.
-	perLookupCost := memo.Cost(randIOCostFactor)
-	if !join.LookupColsAreTableKey {
-		// If the lookup columns don't form a key, execution will have to limit
-		// KV batches which prevents running requests to multiple nodes in parallel.
-		// An experiment on a 4 node cluster with a table with 100k rows split into
-		// 100 ranges showed that a "non-parallel" lookup join is about 5 times
-		// slower.
-		perLookupCost *= 5
-	}
-	cost := memo.Cost(lookupCount) * perLookupCost
-
-	// Each lookup might retrieve many rows; add the IO cost of retrieving the
-	// rows (relevant when we expect many resulting rows per lookup) and the CPU
-	// cost of emitting the rows.
-	numLookupCols := join.Cols.Difference(join.Input.Relational().OutputCols).Len()
-	perRowCost := lookupJoinRetrieveRowCost +
-		c.rowScanCost(join.Table, join.Index, numLookupCols)
+func (c *coster) computeIndexLookupJoinCost(
+	join memo.RelExpr,
+	required *physical.Required,
+	lookupColsAreTableKey bool,
+	on memo.FiltersExpr,
+	cols opt.ColSet,
+	table opt.TableID,
+	index cat.IndexOrdinal,
+	flags memo.JoinFlags,
+) memo.Cost {
+	input := join.Child(0).(memo.RelExpr)
+	lookupCount := input.Relational().Stats.RowCount
 
 	// Take into account that the "internal" row count is higher, according to
 	// the selectivities of the conditions. In particular, we need to ignore
@@ -456,13 +789,161 @@ func (c *coster) computeLookupJoinCost(
 		// logPropsBuilder.clear() is called.
 		panic(errors.AssertionFailedf("could not get rows processed for lookup join"))
 	}
+
+	// Lookup joins can return early if enough rows have been found. An otherwise
+	// expensive lookup join might have a lower cost if its limit hint estimates
+	// that most rows will not be needed.
+	if required.LimitHint != 0 && lookupCount > 0 {
+		outputRows := join.Relational().Stats.RowCount
+		unlimitedLookupCount := lookupCount
+		lookupCount = lookupJoinInputLimitHint(unlimitedLookupCount, outputRows, required.LimitHint)
+		// We scale the number of rows processed by the same factor (we are
+		// calculating the average number of rows processed per lookup and
+		// multiplying by the new lookup count).
+		rowsProcessed = (rowsProcessed / unlimitedLookupCount) * lookupCount
+	}
+
+	// The rows in the (left) input are used to probe into the (right) table.
+	// Since the matching rows in the table may not all be in the same range, this
+	// counts as random I/O.
+	perLookupCost := memo.Cost(randIOCostFactor)
+	if !lookupColsAreTableKey {
+		// If the lookup columns don't form a key, execution will have to limit
+		// KV batches which prevents running requests to multiple nodes in parallel.
+		// An experiment on a 4 node cluster with a table with 100k rows split into
+		// 100 ranges showed that a "non-parallel" lookup join is about 5 times
+		// slower.
+		perLookupCost *= 5
+	}
+	if c.mem.Metadata().Table(table).IsVirtualTable() {
+		// It's expensive to perform a lookup join into a virtual table because
+		// we need to fetch the table descriptors on each lookup.
+		perLookupCost += virtualScanTableDescriptorFetchCost
+	}
+	cost := memo.Cost(lookupCount) * perLookupCost
+
+	filterSetup, filterPerRow := c.computeFiltersCost(on, util.FastIntMap{})
+	cost += filterSetup
+
+	// Each lookup might retrieve many rows; add the IO cost of retrieving the
+	// rows (relevant when we expect many resulting rows per lookup) and the CPU
+	// cost of emitting the rows.
+	numLookupCols := cols.Difference(input.Relational().OutputCols).Len()
+	perRowCost := lookupJoinRetrieveRowCost + filterPerRow +
+		c.rowScanCost(table, index, numLookupCols)
+
 	cost += memo.Cost(rowsProcessed) * perRowCost
 
-	// Add a constant "setup" cost per ON condition to account for the fact that
-	// the rowsProcessed estimate alone cannot effectively discriminate between
-	// plans when RowCount is too small.
-	cost += cpuCostFactor * memo.Cost(len(join.On))
+	if flags.Has(memo.PreferLookupJoinIntoRight) {
+		// If we prefer a lookup join, make the cost much smaller.
+		cost *= preferLookupJoinFactor
+	}
 	return cost
+}
+
+func (c *coster) computeInvertedJoinCost(
+	join *memo.InvertedJoinExpr, required *physical.Required,
+) memo.Cost {
+	if join.InvertedJoinPrivate.Flags.Has(memo.DisallowInvertedJoinIntoRight) {
+		return hugeCost
+	}
+	lookupCount := join.Input.Relational().Stats.RowCount
+
+	// Take into account that the "internal" row count is higher, according to
+	// the selectivities of the conditions. In particular, we need to ignore
+	// the conditions that don't affect the number of rows processed.
+	// A contrived example, where gid is a SERIAL PK:
+	//   nyc_census_blocks c JOIN nyc_neighborhoods n ON
+	//   ST_Intersects(c.geom, n.geom) AND c.gid < n.gid
+	// which can become a lookup join with left-over condition c.gid <
+	// n.gid.
+	rowsProcessed, ok := c.mem.RowsProcessed(join)
+	if !ok {
+		// We shouldn't ever get here. Since we don't allow the memo
+		// to be optimized twice, the coster should never be used after
+		// logPropsBuilder.clear() is called.
+		panic(errors.AssertionFailedf("could not get rows processed for inverted join"))
+	}
+
+	// Lookup joins can return early if enough rows have been found. An otherwise
+	// expensive lookup join might have a lower cost if its limit hint estimates
+	// that most rows will not be needed.
+	if required.LimitHint != 0 && lookupCount > 0 {
+		outputRows := join.Relational().Stats.RowCount
+		unlimitedLookupCount := lookupCount
+		lookupCount = lookupJoinInputLimitHint(unlimitedLookupCount, outputRows, required.LimitHint)
+		// We scale the number of rows processed by the same factor (we are
+		// calculating the average number of rows processed per lookup and
+		// multiplying by the new lookup count).
+		rowsProcessed = (rowsProcessed / unlimitedLookupCount) * lookupCount
+	}
+
+	// The rows in the (left) input are used to probe into the (right) table.
+	// Since the matching rows in the table may not all be in the same range, this
+	// counts as random I/O.
+	perLookupCost := memo.Cost(randIOCostFactor)
+	// Since inverted indexes can't form a key, execution will have to
+	// limit KV batches which prevents running requests to multiple nodes
+	// in parallel.  An experiment on a 4 node cluster with a table with
+	// 100k rows split into 100 ranges showed that a "non-parallel" lookup
+	// join is about 5 times slower.
+	perLookupCost *= 5
+	cost := memo.Cost(lookupCount) * perLookupCost
+
+	filterSetup, filterPerRow := c.computeFiltersCost(join.On, util.FastIntMap{})
+	cost += filterSetup
+
+	// Each lookup might retrieve many rows; add the IO cost of retrieving the
+	// rows (relevant when we expect many resulting rows per lookup) and the CPU
+	// cost of emitting the rows.
+	numLookupCols := join.Cols.Difference(join.Input.Relational().OutputCols).Len()
+	perRowCost := lookupJoinRetrieveRowCost + filterPerRow +
+		c.rowScanCost(join.Table, join.Index, numLookupCols)
+
+	cost += memo.Cost(rowsProcessed) * perRowCost
+	return cost
+}
+
+// computeFiltersCost returns the setup and per-row cost of executing
+// a filter. Callers of this function should add setupCost and multiply
+// perRowCost by the number of rows expected to be filtered.
+func (c *coster) computeFiltersCost(
+	filters memo.FiltersExpr, eqMap util.FastIntMap,
+) (setupCost, perRowCost memo.Cost) {
+	// Add a base perRowCost so that callers do not need to have their own
+	// base per-row cost.
+	perRowCost += cpuCostFactor
+	for i := range filters {
+		f := &filters[i]
+		switch f.Condition.Op() {
+		case opt.EqOp:
+			eq := f.Condition.(*memo.EqExpr)
+			leftVar, ok := eq.Left.(*memo.VariableExpr)
+			if !ok {
+				break
+			}
+			rightVar, ok := eq.Right.(*memo.VariableExpr)
+			if !ok {
+				break
+			}
+			if val, ok := eqMap.Get(int(leftVar.Col)); ok && val == int(rightVar.Col) {
+				// Equality filters on some joins are still in
+				// filters, while others have already removed
+				// them. They do not cost anything.
+				continue
+			}
+		case opt.FunctionOp:
+			function := f.Condition.(*memo.FunctionExpr)
+			// We are ok with the zero value here for functions not in the map.
+			perRowCost += fnCost[function.Name]
+		}
+
+		// Add a constant "setup" cost per ON condition to account for the fact that
+		// the rowsProcessed estimate alone cannot effectively discriminate between
+		// plans when RowCount is too small.
+		setupCost += cpuCostFactor
+	}
+	return setupCost, perRowCost
 }
 
 func (c *coster) computeZigzagJoinCost(join *memo.ZigzagJoinExpr) memo.Cost {
@@ -482,9 +963,12 @@ func (c *coster) computeZigzagJoinCost(join *memo.ZigzagJoinExpr) memo.Cost {
 	scanCost := c.rowScanCost(join.LeftTable, join.LeftIndex, leftCols.Len())
 	scanCost += c.rowScanCost(join.RightTable, join.RightIndex, rightCols.Len())
 
+	filterSetup, filterPerRow := c.computeFiltersCost(join.On, util.FastIntMap{})
+
 	// Double the cost of emitting rows as well as the cost of seeking rows,
 	// given two indexes will be accessed.
-	cost := memo.Cost(rowCount) * (2*(cpuCostFactor+seqIOCostFactor) + scanCost)
+	cost := memo.Cost(rowCount) * (2*(cpuCostFactor+seqIOCostFactor) + scanCost + filterPerRow)
+	cost += filterSetup
 	return cost
 }
 
@@ -585,9 +1069,9 @@ func (c *coster) countSegments(sort *memo.SortExpr) float64 {
 	return orderedStats.DistinctCount
 }
 
-// rowSortCost is the CPU cost to sort one row, which depends on the number of
-// columns in the sort key.
-func (c *coster) rowSortCost(numKeyCols int) memo.Cost {
+// rowCmpCost is the CPU cost to compare a pair of rows, which depends on the
+// number of columns in the sort key.
+func (c *coster) rowCmpCost(numKeyCols int) memo.Cost {
 	// Sorting involves comparisons on the key columns, but the cost isn't
 	// directly proportional: we only compare the second column if the rows are
 	// equal on the first column; and so on. We also account for a fixed
@@ -617,11 +1101,17 @@ func (c *coster) rowScanCost(tabID opt.TableID, idxOrd int, numScannedCols int) 
 	tab := md.Table(tabID)
 	idx := tab.Index(idxOrd)
 	numCols := idx.ColumnCount()
+	// Remove any system columns from numCols.
+	for i := 0; i < idx.ColumnCount(); i++ {
+		if idx.Column(i).Kind() == cat.System {
+			numCols--
+		}
+	}
 
 	// Adjust cost based on how well the current locality matches the index's
 	// zone constraints.
 	var costFactor memo.Cost = cpuCostFactor
-	if len(c.locality.Tiers) != 0 {
+	if !tab.IsVirtualTable() && len(c.locality.Tiers) != 0 {
 		// If 0% of locality tiers have matching constraints, then add additional
 		// cost. If 100% of locality tiers have matching constraints, then add no
 		// additional cost. Anything in between is proportional to the number of
@@ -792,6 +1282,10 @@ func localityMatchScore(zone cat.Zone, locality roachpb.Locality) float64 {
 // lookupJoinInputLimitHint calculates an appropriate limit hint for the input
 // to a lookup join.
 func lookupJoinInputLimitHint(inputRowCount, outputRowCount, outputLimitHint float64) float64 {
+	if outputRowCount == 0 {
+		return 0
+	}
+
 	// Estimate the number of lookups needed to output LimitHint rows.
 	expectedLookupCount := outputLimitHint * inputRowCount / outputRowCount
 

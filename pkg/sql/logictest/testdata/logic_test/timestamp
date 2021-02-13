@@ -26,17 +26,17 @@ statement ok
 SET TIME ZONE 'PST8PDT'
 
 query TT
-SELECT TIMESTAMP '2001-02-16 20:38:40' AT TIME ZONE 'MST', timezone(TIMESTAMP '2001-02-16 20:38:40', 'MST')
+SELECT TIMESTAMP '2001-02-16 20:38:40' AT TIME ZONE 'MST', timezone('MST', TIMESTAMP '2001-02-16 20:38:40')
 ----
 2001-02-16 19:38:40 -0800 PST  2001-02-16 19:38:40 -0800 PST
 
 query TT
-SELECT TIMESTAMP WITH TIME ZONE '2001-02-16 20:38:40-05' AT TIME ZONE 'MST', timezone(TIMESTAMP WITH TIME ZONE '2001-02-16 20:38:40-05', 'MST')
+SELECT TIMESTAMP WITH TIME ZONE '2001-02-16 20:38:40-05' AT TIME ZONE 'MST', timezone('MST', TIMESTAMP WITH TIME ZONE '2001-02-16 20:38:40-05')
 ----
 2001-02-16 18:38:40 +0000 +0000  2001-02-16 18:38:40 +0000 +0000
 
 query TT
-SELECT TIMESTAMP '2001-02-16 20:38:40' AT TIME ZONE 'MST', timezone(TIMESTAMP '2001-02-16 20:38:40', 'MST')
+SELECT TIMESTAMP '2001-02-16 20:38:40' AT TIME ZONE 'MST', timezone('MST', TIMESTAMP '2001-02-16 20:38:40')
 ----
 2001-02-16 19:38:40 -0800 PST  2001-02-16 19:38:40 -0800 PST
 
@@ -221,7 +221,16 @@ SET TIME ZONE 'GMT+1'
 query T
 SELECT '2001-01-01 00:00:00'::TIMESTAMP::TIMESTAMPTZ
 ----
-2001-01-01 00:00:00 +0100 +0100
+2001-01-01 00:00:00 -0100 -0100
+
+statement ok
+SET TIME ZONE '+1:00'
+
+query T
+SELECT '2001-01-01 00:00:00'::TIMESTAMP::TIMESTAMPTZ
+----
+2001-01-01 00:00:00 -0100 -0100
+
 
 # test that current_timestamp is correct in different timezones.
 subtest current_timestamp_correct_in_timezone
@@ -249,7 +258,7 @@ subtest localtimestamp_test
 query TTTT
 select pg_typeof(localtimestamp), pg_typeof(current_timestamp), pg_typeof(localtimestamp(3)), pg_typeof(current_timestamp(3))
 ----
-timestamp  timestamptz  timestamp  timestamptz
+timestamp without time zone  timestamp with time zone  timestamp without time zone  timestamp with time zone
 
 query B
 select localtimestamp(3) - localtimestamp <= '1ms'::interval
@@ -262,6 +271,11 @@ subtest regression_django-cockroachdb_120
 
 statement ok
 SET TIME ZONE 'America/Chicago'
+
+query T
+SELECT '1882-05-23T00:00:00-05:51'::timestamptz::text
+----
+1882-05-23 00:00:24-05:50:24
 
 query B
 SELECT '2011-03-13'::date = '2011-03-13'::timestamp
@@ -292,6 +306,14 @@ query B
 SELECT '2011-03-14'::timestamp = '2011-03-14'::timestamptz
 ----
 true
+
+statement ok
+SET TIME ZONE '-00:10:15'
+
+query T
+SELECT '1882-05-23T00:00:00-05:51'::timestamptz::text
+----
+1882-05-23 06:01:15+00:10:15
 
 statement ok
 SET TIME ZONE 0
@@ -393,11 +415,80 @@ SELECT
 FROM example
 ORDER BY a
 ----
-2010-11-07 22:59:00 -0600 CST  2010-11-07 23:59:00 -0600 CST  2010-12-06 23:59:00 -0600 CST  2010-11-05 23:59:00 -0500 CDT  2010-11-05 23:59:00 -0500 CDT  2010-10-06 23:59:00 -0500 CDT  00:00:00  -25:00:00  2010-11-06 23:59:00-05:00
-2010-11-08 23:59:00 -0600 CST  2010-11-08 23:59:00 -0600 CST  2010-12-07 23:59:00 -0600 CST  2010-11-07 00:59:00 -0500 CDT  2010-11-06 23:59:00 -0500 CDT  2010-10-07 23:59:00 -0500 CDT  25:00:00  00:00:00   2010-11-07 23:59:00-06:00
+2010-11-07 22:59:00 -0600 CST  2010-11-07 23:59:00 -0600 CST  2010-12-06 23:59:00 -0600 CST  2010-11-05 23:59:00 -0500 CDT  2010-11-05 23:59:00 -0500 CDT  2010-10-06 23:59:00 -0500 CDT  00:00:00        -1 days -01:00:00  2010-11-06 23:59:00-05:00
+2010-11-08 23:59:00 -0600 CST  2010-11-08 23:59:00 -0600 CST  2010-12-07 23:59:00 -0600 CST  2010-11-07 00:59:00 -0500 CDT  2010-11-06 23:59:00 -0500 CDT  2010-10-07 23:59:00 -0500 CDT  1 day 01:00:00  00:00:00           2010-11-07 23:59:00-06:00
 
 statement ok
 DROP TABLE example
 
 statement ok
 SET TIME ZONE 0
+
+subtest regression_46973
+
+statement ok
+CREATE TABLE regression_46973(c0 TIMESTAMP UNIQUE, c1 TIMESTAMPTZ UNIQUE)
+
+statement ok
+INSERT INTO regression_46973 VALUES ('1970-01-01 00:00:00', '1970-01-01 00:00:00')
+
+statement error "292277026596-12-04T15:30:08Z" exceeds supported timestamp bounds
+SELECT * FROM regression_46973 WHERE (-9223372036854775808)::TIMESTAMP!=regression_46973.c0
+
+statement error "292277026596-12-04T15:30:08Z" exceeds supported timestamp bounds
+SELECT * FROM regression_46973 WHERE (-9223372036854775808)::TIMESTAMPTZ!=regression_46973.c1
+
+statement error "294277-01-01T00:00:00Z" exceeds supported timestamp bounds
+SELECT '294276-12-31 23:59:59.999999'::TIMESTAMP(0)
+
+statement ok
+DROP TABLE regression_46973
+
+subtest regression_extract_epoch_timestamptz
+
+query R
+set time zone 'Europe/Berlin'; select extract(epoch from TIMESTAMP WITH TIME ZONE '2010-11-06 23:59:00-05:00')
+----
+1.28910594e+09
+
+query R
+set time zone 'UTC'; select extract(epoch from TIMESTAMP WITH TIME ZONE '2010-11-06 23:59:00-05:00')
+----
+1.28910594e+09
+
+query TTTTTT
+SET TIME ZONE 'Europe/Berlin'; SELECT
+  age(a::timestamptz, b::timestamptz),
+  age(b::timestamptz, a::timestamptz),
+  a::timestamptz - b::timestamptz,
+  b::timestamptz - a::timestamptz,
+  a::timestamp - b::timestamp,
+  b::timestamp - a::timestamp
+FROM (VALUES
+  ('2020-05-06 11:12:13', '2015-06-07 13:14:15'),
+  ('2020-05-06 15:00:00.112233', '2020-04-03 16:00:00.001122'),
+  ('2020-02-29 00:02:05', '2019-02-28 18:19:01'),
+  ('2020-02-29 00:02:05', '2020-01-28 18:19:01'),
+  ('2020-02-29 00:02:05', '2020-03-28 18:19:01'),
+  ('2021-02-27 00:02:05.333333', '2019-02-28 18:19:01.444444'),
+  ('2021-02-27 00:02:05', '2021-01-28 18:19:01'),
+  ('2021-02-27 00:02:05', '2021-03-28 18:19:01'),
+  ('2020-02-28 00:02:05', '2020-02-28 18:19:01'),
+  ('2020-06-30 11:11:11.111111', '2020-06-29 12:12:12.222222')
+) regression_age_tests(a, b)
+----
+4 years 10 mons 28 days 21:57:58        -4 years -10 mons -28 days -21:57:58         1794 days 21:57:58        -1794 days -21:57:58        1794 days 21:57:58        -1794 days -21:57:58
+1 mon 2 days 23:00:00.111111            -1 mons -2 days -23:00:00.111111             32 days 23:00:00.111111   -32 days -23:00:00.111111   32 days 23:00:00.111111   -32 days -23:00:00.111111
+1 year 05:43:04                         -1 years -05:43:04                           365 days 05:43:04         -365 days -05:43:04         365 days 05:43:04         -365 days -05:43:04
+1 mon 05:43:04                          -1 mons -05:43:04                            31 days 05:43:04          -31 days -05:43:04          31 days 05:43:04          -31 days -05:43:04
+-28 days -18:16:56                      28 days 18:16:56                             -28 days -18:16:56        28 days 18:16:56            -28 days -18:16:56        28 days 18:16:56
+1 year 11 mons 26 days 05:43:03.888889  -1 years -11 mons -26 days -05:43:03.888889  729 days 05:43:03.888889  -729 days -05:43:03.888889  729 days 05:43:03.888889  -729 days -05:43:03.888889
+29 days 05:43:04                        -29 days -05:43:04                           29 days 05:43:04          -29 days -05:43:04          29 days 05:43:04          -29 days -05:43:04
+-1 mons -1 days -17:16:56               1 mon 1 day 17:16:56                         -29 days -17:16:56        29 days 17:16:56            -29 days -18:16:56        29 days 18:16:56
+-18:16:56                               18:16:56                                     -18:16:56                 18:16:56                    -18:16:56                 18:16:56
+22:58:58.888889                         -22:58:58.888889                             22:58:58.888889           -22:58:58.888889            22:58:58.888889           -22:58:58.888889
+
+query T
+SET TIME ZONE 'AuStralIA/SyDNEY'; SELECT '2000-05-15 00:00:00'::timestamptz
+----
+2000-05-15 00:00:00 +1000 AEST

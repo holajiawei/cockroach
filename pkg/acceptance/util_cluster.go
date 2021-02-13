@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -98,7 +98,7 @@ func StartCluster(ctx context.Context, t *testing.T, cfg cluster.TestConfig) (c 
 
 			testutils.SucceedsSoon(t, func() error {
 				select {
-				case <-stopper.ShouldStop():
+				case <-stopper.ShouldQuiesce():
 					t.Fatal("interrupted")
 				case <-time.After(time.Second):
 				}

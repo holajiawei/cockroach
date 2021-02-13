@@ -16,10 +16,13 @@ import (
 	"strings"
 	"testing"
 
+	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
@@ -52,7 +55,7 @@ func (hs healthServer) Watch(*healthpb.HealthCheckRequest, healthpb.Health_Watch
 func TestRequestDidNotStart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	t.Skip("https://github.com/cockroachdb/cockroach/issues/19708")
+	skip.WithIssue(t, 19708)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -116,4 +119,10 @@ func TestRequestDidNotStart(t *testing.T) {
 	} else if !grpcutil.RequestDidNotStart(err) {
 		t.Fatalf("request should not have started, but got %s", err)
 	}
+}
+
+func TestRequestDidNotStart_OpenBreaker(t *testing.T) {
+	err := errors.Wrapf(circuit.ErrBreakerOpen, "unable to dial n%d", 42)
+	res := grpcutil.RequestDidNotStart(err)
+	assert.True(t, res)
 }

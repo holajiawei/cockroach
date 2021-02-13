@@ -36,6 +36,8 @@ package optbuilder
 //   post-projection: 1 + col3
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -222,19 +224,36 @@ func (a *aggregateInfo) Walk(v tree.Visitor) tree.Expr {
 }
 
 // TypeCheck is part of the tree.Expr interface.
-func (a *aggregateInfo) TypeCheck(ctx *tree.SemaContext, desired *types.T) (tree.TypedExpr, error) {
-	if _, err := a.FuncExpr.TypeCheck(ctx, desired); err != nil {
+func (a *aggregateInfo) TypeCheck(
+	ctx context.Context, semaCtx *tree.SemaContext, desired *types.T,
+) (tree.TypedExpr, error) {
+	if _, err := a.FuncExpr.TypeCheck(ctx, semaCtx, desired); err != nil {
 		return nil, err
 	}
 	return a, nil
+}
+
+// isOrderedSetAggregate returns true if the given aggregate operator is an
+// ordered-set aggregate.
+func (a aggregateInfo) isOrderedSetAggregate() bool {
+	switch a.def.Name {
+	case "percentile_disc_impl", "percentile_cont_impl":
+		return true
+	default:
+		return false
+	}
 }
 
 // isOrderingSensitive returns true if the given aggregate operator is
 // ordering sensitive. That is, it can give different results based on the order
 // values are fed to it.
 func (a aggregateInfo) isOrderingSensitive() bool {
+	if a.isOrderedSetAggregate() {
+		return true
+	}
 	switch a.def.Name {
-	case "array_agg", "concat_agg", "string_agg", "json_agg", "jsonb_agg":
+	case "array_agg", "concat_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
+		"st_makeline", "st_collect", "st_memcollect":
 		return true
 	default:
 		return false
@@ -250,6 +269,11 @@ func (a aggregateInfo) isCommutative() bool {
 // Eval is part of the tree.TypedExpr interface.
 func (a *aggregateInfo) Eval(_ *tree.EvalContext) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("aggregateInfo must be replaced before evaluation"))
+}
+
+// ResolvedType is part of the tree.TypedExpr interface.
+func (a *aggregateInfo) ResolvedType() *types.T {
+	return a.col.typ
 }
 
 var _ tree.Expr = &aggregateInfo{}
@@ -434,8 +458,10 @@ func (b *Builder) analyzeHaving(having *tree.Where, fromScope *scope) tree.Typed
 	// We need to save and restore the previous value of the field in semaCtx
 	// in case we are recursively called within a subquery context.
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
-	b.semaCtx.Properties.Require("HAVING", tree.RejectWindowApplications|tree.RejectGenerators)
-	fromScope.context = "HAVING"
+	b.semaCtx.Properties.Require(
+		exprKindHaving.String(), tree.RejectWindowApplications|tree.RejectGenerators,
+	)
+	fromScope.context = exprKindHaving
 	return fromScope.resolveAndRequireType(having.Expr, types.Bool)
 }
 
@@ -589,8 +615,8 @@ func (b *Builder) buildGrouping(
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
 
 	// Make sure the GROUP BY columns have no special functions.
-	b.semaCtx.Properties.Require("GROUP BY", tree.RejectSpecial)
-	fromScope.context = "GROUP BY"
+	b.semaCtx.Properties.Require(exprKindGroupBy.String(), tree.RejectSpecial)
+	fromScope.context = exprKindGroupBy
 
 	// Resolve types, expand stars, and flatten tuples.
 	exprs := b.expandStarAndResolveType(groupBy, fromScope)
@@ -608,7 +634,7 @@ func (b *Builder) buildGrouping(
 		// Save a representation of the GROUP BY expression for validation of the
 		// SELECT and HAVING expressions. This enables queries such as:
 		//   SELECT x+y FROM t GROUP BY x+y
-		col := b.addColumn(aggInScope, alias, e)
+		col := aggInScope.addColumn(alias, e)
 		b.buildScalar(e, fromScope, aggInScope, col, nil)
 		fromScope.groupby.groupStrs[exprStr] = col
 	}
@@ -622,12 +648,25 @@ func (b *Builder) buildAggArg(
 ) opt.ScalarExpr {
 	// This synthesizes a new tempScope column, unless the argument is a
 	// simple VariableOp.
-	col := b.addColumn(tempScope, "" /* alias */, e)
+	col := tempScope.addColumn("" /* alias */, e)
 	b.buildScalar(e, fromScope, tempScope, col, &info.colRefs)
 	if col.scalar != nil {
 		return col.scalar
 	}
 	return b.factory.ConstructVariable(col.id)
+}
+
+// translateAggName translates the aggregate name if needed. This is used
+// to override the output column name of an aggregation.
+// See isOrderedSetAggregate.
+func translateAggName(name string) string {
+	switch name {
+	case "percentile_disc_impl":
+		return "percentile_disc"
+	case "percentile_cont_impl":
+		return "percentile_cont"
+	}
+	return name
 }
 
 // buildAggregateFunction is called when we are building a function which is an
@@ -643,10 +682,12 @@ func (b *Builder) buildAggArg(
 // buildAggregateFunction returns a pointer to the aggregateInfo containing
 // the function definition, fully built arguments, and the aggregate output
 // column.
+//
+// tempScope is a temporary scope which is used for building the aggregate
+// function arguments before the correct scope is determined.
 func (b *Builder) buildAggregateFunction(
-	f *tree.FuncExpr, def *memo.FunctionPrivate, fromScope *scope,
+	f *tree.FuncExpr, def *memo.FunctionPrivate, tempScope, fromScope *scope,
 ) *aggregateInfo {
-	tempScope := fromScope.startAggFunc()
 	tempScopeColsBefore := len(tempScope.cols)
 
 	info := aggregateInfo{
@@ -689,9 +730,12 @@ func (b *Builder) buildAggregateFunction(
 	// expression and synthesize a column for the aggregation result.
 	info.col = g.findAggregate(info)
 	if info.col == nil {
+		// Translate function name if needed.
+		funcName := translateAggName(def.Name)
+
 		// Use 0 as the group for now; it will be filled in later by the
 		// buildAggregation method.
-		info.col = b.synthesizeColumn(g.aggOutScope, def.Name, f.ResolvedType(), f, nil /* scalar */)
+		info.col = b.synthesizeColumn(g.aggOutScope, funcName, f.ResolvedType(), f, nil /* scalar */)
 
 		// Move the columns for the aggregate input expressions to the correct scope.
 		if g.aggInScope != tempScope {
@@ -750,7 +794,7 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 		return b.factory.ConstructBitAndAgg(args[0])
 	case "bit_or":
 		return b.factory.ConstructBitOrAgg(args[0])
-	case "bool_and":
+	case "bool_and", "every":
 		return b.factory.ConstructBoolAnd(args[0])
 	case "bool_or":
 		return b.factory.ConstructBoolOr(args[0])
@@ -762,6 +806,28 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 		return b.factory.ConstructCount(args[0])
 	case "count_rows":
 		return b.factory.ConstructCountRows()
+	case "covar_pop":
+		return b.factory.ConstructCovarPop(args[0], args[1])
+	case "covar_samp":
+		return b.factory.ConstructCovarSamp(args[0], args[1])
+	case "regr_avgx":
+		return b.factory.ConstructRegressionAvgX(args[0], args[1])
+	case "regr_avgy":
+		return b.factory.ConstructRegressionAvgY(args[0], args[1])
+	case "regr_intercept":
+		return b.factory.ConstructRegressionIntercept(args[0], args[1])
+	case "regr_r2":
+		return b.factory.ConstructRegressionR2(args[0], args[1])
+	case "regr_slope":
+		return b.factory.ConstructRegressionSlope(args[0], args[1])
+	case "regr_sxx":
+		return b.factory.ConstructRegressionSXX(args[0], args[1])
+	case "regr_sxy":
+		return b.factory.ConstructRegressionSXY(args[0], args[1])
+	case "regr_syy":
+		return b.factory.ConstructRegressionSYY(args[0], args[1])
+	case "regr_count":
+		return b.factory.ConstructRegressionCount(args[0], args[1])
 	case "max":
 		return b.factory.ConstructMax(args[0])
 	case "min":
@@ -772,10 +838,22 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 		return b.factory.ConstructSum(args[0])
 	case "sqrdiff":
 		return b.factory.ConstructSqrDiff(args[0])
-	case "variance":
+	case "variance", "var_samp":
 		return b.factory.ConstructVariance(args[0])
-	case "stddev":
+	case "stddev", "stddev_samp":
 		return b.factory.ConstructStdDev(args[0])
+	case "stddev_pop":
+		return b.factory.ConstructStdDevPop(args[0])
+	case "var_pop":
+		return b.factory.ConstructVarPop(args[0])
+	case "st_makeline":
+		return b.factory.ConstructSTMakeLine(args[0])
+	case "st_collect", "st_memcollect":
+		return b.factory.ConstructSTCollect(args[0])
+	case "st_extent":
+		return b.factory.ConstructSTExtent(args[0])
+	case "st_union", "st_memunion":
+		return b.factory.ConstructSTUnion(args[0])
 	case "xor_agg":
 		return b.factory.ConstructXorAgg(args[0])
 	case "json_agg":
@@ -784,7 +862,16 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 		return b.factory.ConstructJsonbAgg(args[0])
 	case "string_agg":
 		return b.factory.ConstructStringAgg(args[0], args[1])
+	case "percentile_disc_impl":
+		return b.factory.ConstructPercentileDisc(args[0], args[1])
+	case "percentile_cont_impl":
+		return b.factory.ConstructPercentileCont(args[0], args[1])
+	case "json_object_agg":
+		return b.factory.ConstructJsonObjectAgg(args[0], args[1])
+	case "jsonb_object_agg":
+		return b.factory.ConstructJsonbObjectAgg(args[0], args[1])
 	}
+
 	panic(errors.AssertionFailedf("unhandled aggregate: %s", name))
 }
 
@@ -798,6 +885,10 @@ func isWindow(def *tree.FunctionDefinition) bool {
 
 func isGenerator(def *tree.FunctionDefinition) bool {
 	return def.Class == tree.GeneratorClass
+}
+
+func isSQLFn(def *tree.FunctionDefinition) bool {
+	return def.Class == tree.SQLClass
 }
 
 func newGroupingError(name *tree.Name) error {
@@ -826,7 +917,7 @@ func (b *Builder) allowImplicitGroupingColumn(colID opt.ColumnID, g *groupby) bo
 	}
 	primaryIndex := tab.Index(cat.PrimaryIndex)
 	for i := 0; i < primaryIndex.KeyColumnCount(); i++ {
-		pkCols.Add(colMeta.Table.ColumnID(primaryIndex.Column(i).Ordinal))
+		pkCols.Add(colMeta.Table.IndexColumnID(primaryIndex, i))
 	}
 	// Remove PK columns that are grouping cols and see if there's anything left.
 	groupingCols := g.groupingCols()

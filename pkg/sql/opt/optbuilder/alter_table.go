@@ -11,6 +11,7 @@
 package optbuilder
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -19,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -46,19 +46,19 @@ func (b *Builder) buildAlterTableSplit(split *tree.Split, inScope *scope) (outSc
 
 	// We don't allow the input statement to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
-	emptyScope := &scope{builder: b}
+	emptyScope := b.allocScope()
 	inputScope := b.buildStmt(split.Rows, colTypes, emptyScope)
 	checkInputColumns("SPLIT AT", inputScope, colNames, colTypes, 1)
 
 	// Build the expiration scalar.
 	var expiration opt.ScalarExpr
 	if split.ExpireExpr != nil {
-		emptyScope.context = "ALTER TABLE SPLIT AT"
+		emptyScope.context = exprKindAlterTableSplitAt
 		// We need to save and restore the previous value of the field in
 		// semaCtx in case we are recursively called within a subquery
 		// context.
 		defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
-		b.semaCtx.Properties.Require(emptyScope.context, tree.RejectSpecial)
+		b.semaCtx.Properties.Require(emptyScope.context.String(), tree.RejectSpecial)
 
 		texpr := emptyScope.resolveType(split.ExpireExpr, types.String)
 		expiration = b.buildScalar(texpr, emptyScope, nil /* outScope */, nil /* outCol */, nil /* colRefs */)
@@ -67,7 +67,7 @@ func (b *Builder) buildAlterTableSplit(split *tree.Split, inScope *scope) (outSc
 	}
 
 	outScope = inScope.push()
-	b.synthesizeResultColumns(outScope, sqlbase.AlterTableSplitColumns)
+	b.synthesizeResultColumns(outScope, colinfo.AlterTableSplitColumns)
 	outScope.expr = b.factory.ConstructAlterTableSplit(
 		inputScope.expr.(memo.RelExpr),
 		expiration,
@@ -99,7 +99,7 @@ func (b *Builder) buildAlterTableUnsplit(unsplit *tree.Unsplit, inScope *scope) 
 	b.DisableMemoReuse = true
 
 	outScope = inScope.push()
-	b.synthesizeResultColumns(outScope, sqlbase.AlterTableUnsplitColumns)
+	b.synthesizeResultColumns(outScope, colinfo.AlterTableUnsplitColumns)
 	private := &memo.AlterTableSplitPrivate{
 		Table:   b.factory.Metadata().AddTable(table, &tn),
 		Index:   index.Ordinal(),
@@ -118,7 +118,7 @@ func (b *Builder) buildAlterTableUnsplit(unsplit *tree.Unsplit, inScope *scope) 
 
 	// We don't allow the input statement to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
-	inputScope := b.buildStmt(unsplit.Rows, colTypes, &scope{builder: b})
+	inputScope := b.buildStmt(unsplit.Rows, colTypes, b.allocScope())
 	checkInputColumns("UNSPLIT AT", inputScope, colNames, colTypes, 1)
 	private.Props = inputScope.makePhysicalProps()
 
@@ -149,7 +149,7 @@ func (b *Builder) buildAlterTableRelocate(
 	b.DisableMemoReuse = true
 
 	outScope = inScope.push()
-	b.synthesizeResultColumns(outScope, sqlbase.AlterTableRelocateColumns)
+	b.synthesizeResultColumns(outScope, colinfo.AlterTableRelocateColumns)
 
 	// Calculate the desired types for the input expression. It is OK if it
 	// returns fewer columns (the relevant prefix is used).
@@ -169,7 +169,7 @@ func (b *Builder) buildAlterTableRelocate(
 
 	// We don't allow the input statement to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
-	inputScope := b.buildStmt(relocate.Rows, colTypes, &scope{builder: b})
+	inputScope := b.buildStmt(relocate.Rows, colTypes, b.allocScope())
 	checkInputColumns(cmdName, inputScope, colNames, colTypes, 2)
 
 	outScope.expr = b.factory.ConstructAlterTableRelocate(
@@ -195,6 +195,14 @@ func getIndexColumnNamesAndTypes(index cat.Index) (colNames []string, colTypes [
 		c := index.Column(i)
 		colNames[i] = string(c.ColName())
 		colTypes[i] = c.DatumType()
+	}
+	if index.IsInverted() && index.GeoConfig() != nil {
+		// TODO(sumeer): special case Array too. JSON is harder since the split
+		// needs to be a Datum and the JSON inverted column is not.
+		//
+		// Geospatial inverted index. The first column is the inverted column and
+		// is an int.
+		colTypes[0] = types.Int
 	}
 	return colNames, colTypes
 }

@@ -9,11 +9,16 @@
 // licenses/APL.txt.
 
 declare module "assets/*" {
-    var _: string;
-    export default _;
+  const _: string;
+  export default _;
 }
 
 declare module "!!raw-loader!*" {
-    var _: string;
-    export default _;
+  const _: string;
+  export default _;
+}
+
+declare module "!!url-loader!*" {
+  const _: string;
+  export default _;
 }

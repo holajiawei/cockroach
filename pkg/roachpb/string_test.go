@@ -11,15 +11,17 @@
 package roachpb_test
 
 import (
-	"fmt"
 	"testing"
 
 	// Hook up the pretty printer.
 	_ "github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/redact"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTransactionString(t *testing.T) {
@@ -37,14 +39,14 @@ func TestTransactionString(t *testing.T) {
 			Priority:       957356782,
 			Sequence:       15,
 		},
-		Name:          "name",
-		Status:        roachpb.COMMITTED,
-		LastHeartbeat: hlc.Timestamp{WallTime: 10, Logical: 11},
-		ReadTimestamp: hlc.Timestamp{WallTime: 30, Logical: 31},
-		MaxTimestamp:  hlc.Timestamp{WallTime: 40, Logical: 41},
+		Name:                   "name",
+		Status:                 roachpb.COMMITTED,
+		LastHeartbeat:          hlc.Timestamp{WallTime: 10, Logical: 11},
+		ReadTimestamp:          hlc.Timestamp{WallTime: 30, Logical: 31},
+		GlobalUncertaintyLimit: hlc.Timestamp{WallTime: 40, Logical: 41, Synthetic: true},
 	}
 	expStr := `"name" meta={id=d7aa0f5e key="foo" pri=44.58039917 epo=2 ts=0.000000020,21 min=0.000000010,11 seq=15}` +
-		` rw=true stat=COMMITTED rts=0.000000030,31 wto=false max=0.000000040,41`
+		` lock=true stat=COMMITTED rts=0.000000030,31 wto=false gul=0.000000040,41?`
 
 	if str := txn.String(); str != expStr {
 		t.Errorf(
@@ -55,7 +57,7 @@ func TestTransactionString(t *testing.T) {
 }
 
 func TestBatchRequestString(t *testing.T) {
-	br := roachpb.BatchRequest{}
+	ba := roachpb.BatchRequest{}
 	txn := roachpb.MakeTransaction(
 		"test",
 		nil, /* baseKey */
@@ -63,19 +65,28 @@ func TestBatchRequestString(t *testing.T) {
 		hlc.Timestamp{}, // now
 		0,               // maxOffsetNs
 	)
-	br.Txn = &txn
+	txn.ID = uuid.NamespaceDNS
+	ba.Txn = &txn
+	ba.WaitPolicy = lock.WaitPolicy_Error
+	ba.CanForwardReadTimestamp = true
 	for i := 0; i < 100; i++ {
 		var ru roachpb.RequestUnion
 		ru.MustSetInner(&roachpb.GetRequest{})
-		br.Requests = append(br.Requests, ru)
+		ba.Requests = append(ba.Requests, ru)
 	}
 	var ru roachpb.RequestUnion
 	ru.MustSetInner(&roachpb.EndTxnRequest{})
-	br.Requests = append(br.Requests, ru)
+	ba.Requests = append(ba.Requests, ru)
 
-	e := fmt.Sprintf(`[txn: %s], Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), ... 76 skipped ..., Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), EndTxn(commit:false tsflex:false) [/Min] `,
-		br.Txn.Short())
-	if e != br.String() {
-		t.Fatalf("e = %s\nv = %s", e, br.String())
+	{
+		exp := `Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min),... 76 skipped ..., Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), Get [/Min,/Min), EndTxn(commit:false) [/Min], [txn: 6ba7b810], [wait-policy: Error], [can-forward-ts]`
+		act := ba.String()
+		require.Equal(t, exp, act)
+	}
+
+	{
+		exp := `Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›),... 76 skipped ..., Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), EndTxn(commit:false) [‹/Min›], [txn: 6ba7b810], [wait-policy: Error], [can-forward-ts]`
+		act := redact.Sprint(ba)
+		require.EqualValues(t, exp, act)
 	}
 }

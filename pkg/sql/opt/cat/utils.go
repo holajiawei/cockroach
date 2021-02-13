@@ -18,8 +18,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // ExpandDataSourceGlob is a utility function that expands a tree.TablePattern
@@ -37,7 +38,7 @@ func ExpandDataSourceGlob(
 		return []DataSourceName{name}, nil
 
 	case *tree.AllTablesSelector:
-		schema, _, err := catalog.ResolveSchema(ctx, flags, &p.TableNamePrefix)
+		schema, _, err := catalog.ResolveSchema(ctx, flags, &p.ObjectNamePrefix)
 		if err != nil {
 			return nil, err
 		}
@@ -53,7 +54,7 @@ func ExpandDataSourceGlob(
 func ResolveTableIndex(
 	ctx context.Context, catalog Catalog, flags Flags, name *tree.TableIndexName,
 ) (Index, DataSourceName, error) {
-	if name.Table.TableName != "" {
+	if name.Table.ObjectName != "" {
 		ds, tn, err := catalog.ResolveDataSource(ctx, flags, &name.Table)
 		if err != nil {
 			return nil, DataSourceName{}, err
@@ -61,7 +62,7 @@ func ResolveTableIndex(
 		table, ok := ds.(Table)
 		if !ok {
 			return nil, DataSourceName{}, pgerror.Newf(
-				pgcode.WrongObjectType, "%q is not a table", name.Table.TableName,
+				pgcode.WrongObjectType, "%q is not a table", name.Table.ObjectName,
 			)
 		}
 		if name.Index == "" {
@@ -79,7 +80,7 @@ func ResolveTableIndex(
 	}
 
 	// We have to search for a table that has an index with the given name.
-	schema, _, err := catalog.ResolveSchema(ctx, flags, &name.Table.TableNamePrefix)
+	schema, _, err := catalog.ResolveSchema(ctx, flags, &name.Table.ObjectNamePrefix)
 	if err != nil {
 		return nil, DataSourceName{}, err
 	}
@@ -120,40 +121,6 @@ func ResolveTableIndex(
 	return found, foundTabName, nil
 }
 
-// ConvertColumnIDsToOrdinals converts a list of ColumnIDs (such as from a
-// tree.TableRef), to a list of ordinal positions of columns within the given
-// table. See tree.Table for more information on column ordinals.
-func ConvertColumnIDsToOrdinals(tab Table, columns []tree.ColumnID) (ordinals []int) {
-	ordinals = make([]int, len(columns))
-	for i, c := range columns {
-		ord := 0
-		cnt := tab.ColumnCount()
-		for ord < cnt {
-			if tab.Column(ord).ColID() == StableID(c) {
-				break
-			}
-			ord++
-		}
-		if ord >= cnt {
-			panic(pgerror.Newf(pgcode.UndefinedColumn,
-				"column [%d] does not exist", c))
-		}
-		ordinals[i] = ord
-	}
-	return ordinals
-}
-
-// FindTableColumnByName returns the ordinal of the non-mutation column having
-// the given name, if one exists in the given table. Otherwise, it returns -1.
-func FindTableColumnByName(tab Table, name tree.Name) int {
-	for ord, n := 0, tab.ColumnCount(); ord < n; ord++ {
-		if tab.Column(ord).ColName() == name {
-			return ord
-		}
-	}
-	return -1
-}
-
 // FormatTable nicely formats a catalog table using a treeprinter for debugging
 // and testing.
 func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
@@ -163,9 +130,9 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 	}
 
 	var buf bytes.Buffer
-	for i := 0; i < tab.DeletableColumnCount(); i++ {
+	for i := 0; i < tab.ColumnCount(); i++ {
 		buf.Reset()
-		formatColumn(tab.Column(i), IsMutationColumn(tab, i), &buf)
+		formatColumn(tab.Column(i), &buf)
 		child.Child(buf.String())
 	}
 
@@ -192,6 +159,22 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 
 	for i := 0; i < tab.InboundForeignKeyCount(); i++ {
 		formatCatalogFKRef(cat, true /* inbound */, tab.InboundForeignKey(i), child)
+	}
+
+	for i := 0; i < tab.UniqueCount(); i++ {
+		var withoutIndexStr string
+		uniq := tab.Unique(i)
+		if uniq.WithoutIndex() {
+			withoutIndexStr = "WITHOUT INDEX "
+		}
+		c := child.Childf(
+			"UNIQUE %s%s",
+			withoutIndexStr,
+			formatCols(tab, tab.Unique(i).ColumnCount(), tab.Unique(i).ColumnOrdinal),
+		)
+		if pred, isPartial := uniq.Predicate(); isPartial {
+			c.Childf("WHERE %s", pred)
+		}
 	}
 
 	// TODO(radu): show stats.
@@ -222,7 +205,7 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 		buf.Reset()
 
 		idxCol := idx.Column(i)
-		formatColumn(idxCol.Column, false /* isMutationCol */, &buf)
+		formatColumn(idxCol.Column, &buf)
 		if idxCol.Descending {
 			fmt.Fprintf(&buf, " desc")
 		}
@@ -242,6 +225,26 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 		for i := range partPrefixes {
 			c.Child(partPrefixes[i].String())
 		}
+	}
+	if n := idx.InterleaveAncestorCount(); n > 0 {
+		c := child.Child("interleave ancestors")
+		for i := 0; i < n; i++ {
+			table, index, numKeyCols := idx.InterleaveAncestor(i)
+			c.Childf(
+				"table=%d index=%d (%d key column%s)",
+				table, index, numKeyCols, util.Pluralize(int64(numKeyCols)),
+			)
+		}
+	}
+	if n := idx.InterleavedByCount(); n > 0 {
+		c := child.Child("interleaved by")
+		for i := 0; i < n; i++ {
+			table, index := idx.InterleavedBy(i)
+			c.Childf("table=%d index=%d", table, index)
+		}
+	}
+	if pred, isPartial := idx.Predicate(); isPartial {
+		child.Childf("WHERE %s", pred)
 	}
 }
 
@@ -300,22 +303,45 @@ func formatCatalogFKRef(
 	)
 }
 
-func formatColumn(col Column, isMutationCol bool, buf *bytes.Buffer) {
+func formatColumn(col *Column, buf *bytes.Buffer) {
 	fmt.Fprintf(buf, "%s %s", col.ColName(), col.DatumType())
 	if !col.IsNullable() {
 		fmt.Fprintf(buf, " not null")
 	}
 	if col.IsComputed() {
-		fmt.Fprintf(buf, " as (%s) stored", col.ComputedExprStr())
+		if col.IsVirtualComputed() {
+			fmt.Fprintf(buf, " as (%s) virtual", col.ComputedExprStr())
+		} else {
+			fmt.Fprintf(buf, " as (%s) stored", col.ComputedExprStr())
+		}
 	}
 	if col.HasDefault() {
 		fmt.Fprintf(buf, " default (%s)", col.DefaultExprStr())
 	}
-	if col.IsHidden() {
-		fmt.Fprintf(buf, " [hidden]")
+	kind := col.Kind()
+	// Omit the visibility for mutation and virtual inverted columns, which are
+	// always inacessible.
+	if kind != WriteOnly && kind != DeleteOnly && kind != VirtualInverted {
+		switch col.Visibility() {
+		case Hidden:
+			fmt.Fprintf(buf, " [hidden]")
+		case Inaccessible:
+			fmt.Fprintf(buf, " [inaccessible]")
+		}
 	}
-	if isMutationCol {
-		fmt.Fprintf(buf, " [mutation]")
+
+	switch kind {
+	case WriteOnly:
+		fmt.Fprintf(buf, " [write-only]")
+
+	case DeleteOnly:
+		fmt.Fprintf(buf, " [delete-only]")
+
+	case System:
+		fmt.Fprintf(buf, " [system]")
+
+	case VirtualInverted:
+		fmt.Fprintf(buf, " [virtual-inverted]")
 	}
 }
 

@@ -12,9 +12,17 @@
 
 package cli
 
+import (
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+)
+
 func Example_demo_locality() {
 	c := newCLITest(cliTestParams{noServer: true})
 	defer c.cleanup()
+
+	defer func(b bool) { testingForceRandomizeDemoPorts = b }(testingForceRandomizeDemoPorts)
+	testingForceRandomizeDemoPorts = true
 
 	testData := [][]string{
 		{`demo`, `--nodes`, `3`, `-e`, `select node_id, locality from crdb_internal.gossip_nodes order by node_id`},
@@ -23,7 +31,15 @@ func Example_demo_locality() {
 			`-e`, `select node_id, locality from crdb_internal.gossip_nodes order by node_id`},
 	}
 	setCLIDefaultsForTests()
+	// We must reset the security asset loader here, otherwise the dummy
+	// asset loader that is set by default in tests will not be able to
+	// find the certs that demo sets up.
+	security.ResetAssetLoader()
 	for _, cmd := range testData {
+		// `demo` sets up a server and log file redirection, which asserts
+		// that the logging subsystem has not been initialized yet.  Fake
+		// this to be true.
+		log.TestingResetActive()
 		c.RunWithArgs(cmd)
 	}
 

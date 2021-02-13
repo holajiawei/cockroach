@@ -25,15 +25,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // staticAddressResolver maps StaticNodeID to the given address.
@@ -51,7 +52,7 @@ func TestOutbox(t *testing.T) {
 
 	// Create a mock server that the outbox will connect and push rows to.
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	clusterID, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(clock, stopper, execinfra.StaticNodeID)
 	if err != nil {
@@ -64,18 +65,18 @@ func TestOutbox(t *testing.T) {
 	clientRPC := rpc.NewInsecureTestingContextWithClusterID(clock, stopper, clusterID)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 		Cfg: &execinfra.ServerConfig{
 			Settings:   st,
 			Stopper:    stopper,
 			NodeDialer: nodedialer.New(clientRPC, staticAddressResolver(addr)),
 		},
 	}
-	flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 	streamID := execinfrapb.StreamID(42)
-	outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, flowID, streamID)
-	outbox.Init(sqlbase.OneIntCol)
+	outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
+	outbox.Init(rowenc.OneIntCol)
 	var outboxWG sync.WaitGroup
-	ctx, cancel := context.WithCancel(context.TODO())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// Start the outbox. This should cause the stream to connect, even though
 	// we're not sending any rows.
@@ -86,8 +87,8 @@ func TestOutbox(t *testing.T) {
 	producerC := make(chan error)
 	go func() {
 		producerC <- func() error {
-			row := sqlbase.EncDatumRow{
-				sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(0))),
+			row := rowenc.EncDatumRow{
+				rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(0))),
 			}
 			if consumerStatus := outbox.Push(row, nil /* meta */); consumerStatus != execinfra.NeedMoreRows {
 				return errors.Errorf("expected status: %d, got: %d", execinfra.NeedMoreRows, consumerStatus)
@@ -95,8 +96,8 @@ func TestOutbox(t *testing.T) {
 
 			// Send rows until the drain request is observed.
 			for {
-				row = sqlbase.EncDatumRow{
-					sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(-1))),
+				row = rowenc.EncDatumRow{
+					rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(-1))),
 				}
 				consumerStatus := outbox.Push(row, nil /* meta */)
 				if consumerStatus == execinfra.DrainRequested {
@@ -108,7 +109,7 @@ func TestOutbox(t *testing.T) {
 			}
 
 			// Now send another row that the outbox will discard.
-			row = sqlbase.EncDatumRow{sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(2)))}
+			row = rowenc.EncDatumRow{rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(2)))}
 			if consumerStatus := outbox.Push(row, nil /* meta */); consumerStatus != execinfra.DrainRequested {
 				return errors.Errorf("expected status: %d, got: %d", execinfra.NeedMoreRows, consumerStatus)
 			}
@@ -129,7 +130,7 @@ func TestOutbox(t *testing.T) {
 
 	// Consume everything that the outbox sends on the stream.
 	var decoder StreamDecoder
-	var rows sqlbase.EncDatumRows
+	var rows rowenc.EncDatumRows
 	var metas []execinfrapb.ProducerMetadata
 	drainSignalSent := false
 	for {
@@ -140,7 +141,7 @@ func TestOutbox(t *testing.T) {
 			}
 			t.Fatal(err)
 		}
-		err = decoder.AddMessage(context.TODO(), msg)
+		err = decoder.AddMessage(context.Background(), msg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -149,12 +150,12 @@ func TestOutbox(t *testing.T) {
 		// about the draining.
 		last := -1
 		for i := 0; i < len(rows); i++ {
-			if rows[i].String(sqlbase.OneIntCol) != "[-1]" {
+			if rows[i].String(rowenc.OneIntCol) != "[-1]" {
 				last = i
 				continue
 			}
 			for j := i; j < len(rows); j++ {
-				if rows[j].String(sqlbase.OneIntCol) == "[-1]" {
+				if rows[j].String(rowenc.OneIntCol) == "[-1]" {
 					continue
 				}
 				rows[i] = rows[j]
@@ -187,7 +188,7 @@ func TestOutbox(t *testing.T) {
 			t.Fatalf("expected: %q, got: %q", expectedStr, m.Err.Error())
 		}
 	}
-	str := rows.String(sqlbase.OneIntCol)
+	str := rows.String(rowenc.OneIntCol)
 	expected := "[[0]]"
 	if str != expected {
 		t.Errorf("invalid results: %s, expected %s'", str, expected)
@@ -206,7 +207,7 @@ func TestOutboxInitializesStreamBeforeReceivingAnyRows(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	clusterID, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(clock, stopper, execinfra.StaticNodeID)
 	if err != nil {
@@ -220,20 +221,20 @@ func TestOutboxInitializesStreamBeforeReceivingAnyRows(t *testing.T) {
 	clientRPC := rpc.NewInsecureTestingContextWithClusterID(clock, stopper, clusterID)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 		Cfg: &execinfra.ServerConfig{
 			Settings:   st,
 			Stopper:    stopper,
 			NodeDialer: nodedialer.New(clientRPC, staticAddressResolver(addr)),
 		},
 	}
-	flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 	streamID := execinfrapb.StreamID(42)
-	outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, flowID, streamID)
+	outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 
 	var outboxWG sync.WaitGroup
-	ctx, cancel := context.WithCancel(context.TODO())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	outbox.Init(sqlbase.OneIntCol)
+	outbox.Init(rowenc.OneIntCol)
 	// Start the outbox. This should cause the stream to connect, even though
 	// we're not sending any rows.
 	outbox.Start(ctx, &outboxWG, cancel)
@@ -247,7 +248,7 @@ func TestOutboxInitializesStreamBeforeReceivingAnyRows(t *testing.T) {
 	if producerMsg.Header == nil {
 		t.Fatal("missing header")
 	}
-	if producerMsg.Header.FlowID != flowID || producerMsg.Header.StreamID != streamID {
+	if producerMsg.Header.FlowID != flowCtx.ID || producerMsg.Header.StreamID != streamID {
 		t.Fatalf("wrong header: %v", producerMsg)
 	}
 
@@ -280,7 +281,7 @@ func TestOutboxClosesWhenConsumerCloses(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
 			stopper := stop.NewStopper()
-			defer stopper.Stop(context.TODO())
+			defer stopper.Stop(context.Background())
 			clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 			clusterID, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(clock, stopper, execinfra.StaticNodeID)
 			if err != nil {
@@ -294,23 +295,23 @@ func TestOutboxClosesWhenConsumerCloses(t *testing.T) {
 			clientRPC := rpc.NewInsecureTestingContextWithClusterID(clock, stopper, clusterID)
 			flowCtx := execinfra.FlowCtx{
 				EvalCtx: &evalCtx,
+				ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 				Cfg: &execinfra.ServerConfig{
 					Settings:   st,
 					Stopper:    stopper,
 					NodeDialer: nodedialer.New(clientRPC, staticAddressResolver(addr)),
 				},
 			}
-			flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 			streamID := execinfrapb.StreamID(42)
 			var outbox *Outbox
 			var wg sync.WaitGroup
 			var expectedErr error
 			consumerReceivedMsg := make(chan struct{})
-			ctx, cancel := context.WithCancel(context.TODO())
+			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			if tc.outboxIsClient {
-				outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, flowID, streamID)
-				outbox.Init(sqlbase.OneIntCol)
+				outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
+				outbox.Init(rowenc.OneIntCol)
 				outbox.Start(ctx, &wg, cancel)
 
 				// Wait for the outbox to connect the stream.
@@ -376,7 +377,7 @@ func TestOutboxClosesWhenConsumerCloses(t *testing.T) {
 						Stopper:  stopper,
 					},
 				})
-				outbox.Init(sqlbase.OneIntCol)
+				outbox.Init(rowenc.OneIntCol)
 				// In a RunSyncFlow call, the outbox runs under the call's context.
 				outbox.Start(call.Stream.Context(), &wg, cancel)
 				// Wait for the consumer to receive the header message that the outbox
@@ -416,7 +417,7 @@ func TestOutboxCancelsFlowOnError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	clusterID, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(clock, stopper, execinfra.StaticNodeID)
 	if err != nil {
@@ -430,17 +431,17 @@ func TestOutboxCancelsFlowOnError(t *testing.T) {
 	clientRPC := rpc.NewInsecureTestingContextWithClusterID(clock, stopper, clusterID)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 		Cfg: &execinfra.ServerConfig{
 			Settings:   st,
 			Stopper:    stopper,
 			NodeDialer: nodedialer.New(clientRPC, staticAddressResolver(addr)),
 		},
 	}
-	flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 	streamID := execinfrapb.StreamID(42)
 	var outbox *Outbox
 	var wg sync.WaitGroup
-	ctx, cancel := context.WithCancel(context.TODO())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// We could test this on ctx.cancel(), but this mock
@@ -450,8 +451,8 @@ func TestOutboxCancelsFlowOnError(t *testing.T) {
 		ctxCanceled = true
 	}
 
-	outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, flowID, streamID)
-	outbox.Init(sqlbase.OneIntCol)
+	outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
+	outbox.Init(rowenc.OneIntCol)
 	outbox.Start(ctx, &wg, mockCancel)
 
 	// Wait for the outbox to connect the stream.
@@ -460,7 +461,7 @@ func TestOutboxCancelsFlowOnError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	streamNotification.Donec <- sqlbase.QueryCanceledError
+	streamNotification.Donec <- cancelchecker.QueryCanceledError
 
 	wg.Wait()
 	if !ctxCanceled {
@@ -474,7 +475,7 @@ func TestOutboxUnblocksProducers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	ctx := context.TODO()
+	ctx := context.Background()
 	defer stopper.Stop(ctx)
 
 	st := cluster.MakeTestingClusterSettings()
@@ -482,6 +483,7 @@ func TestOutboxUnblocksProducers(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 			Stopper:  stopper,
@@ -489,15 +491,14 @@ func TestOutboxUnblocksProducers(t *testing.T) {
 			NodeDialer: nil,
 		},
 	}
-	flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 	streamID := execinfrapb.StreamID(42)
 	var outbox *Outbox
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, flowID, streamID)
-	outbox.Init(sqlbase.OneIntCol)
+	outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
+	outbox.Init(rowenc.OneIntCol)
 
 	// Fill up the outbox.
 	for i := 0; i < outboxBufRows; i++ {
@@ -533,7 +534,7 @@ func BenchmarkOutbox(b *testing.B) {
 
 	// Create a mock server that the outbox will connect and push rows to.
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	clusterID, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(clock, stopper, execinfra.StaticNodeID)
 	if err != nil {
@@ -541,12 +542,11 @@ func BenchmarkOutbox(b *testing.B) {
 	}
 	st := cluster.MakeTestingClusterSettings()
 	for _, numCols := range []int{1, 2, 4, 8} {
-		row := sqlbase.EncDatumRow{}
+		row := rowenc.EncDatumRow{}
 		for i := 0; i < numCols; i++ {
-			row = append(row, sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(2))))
+			row = append(row, rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(2))))
 		}
 		b.Run(fmt.Sprintf("numCols=%d", numCols), func(b *testing.B) {
-			flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 			streamID := execinfrapb.StreamID(42)
 			evalCtx := tree.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(context.Background())
@@ -554,16 +554,17 @@ func BenchmarkOutbox(b *testing.B) {
 			clientRPC := rpc.NewInsecureTestingContextWithClusterID(clock, stopper, clusterID)
 			flowCtx := execinfra.FlowCtx{
 				EvalCtx: &evalCtx,
+				ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 				Cfg: &execinfra.ServerConfig{
 					Settings:   st,
 					Stopper:    stopper,
 					NodeDialer: nodedialer.New(clientRPC, staticAddressResolver(addr)),
 				},
 			}
-			outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, flowID, streamID)
-			outbox.Init(sqlbase.MakeIntCols(numCols))
+			outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
+			outbox.Init(rowenc.MakeIntCols(numCols))
 			var outboxWG sync.WaitGroup
-			ctx, cancel := context.WithCancel(context.TODO())
+			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			// Start the outbox. This should cause the stream to connect, even though
 			// we're not sending any rows.

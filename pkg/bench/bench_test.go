@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -105,9 +106,7 @@ func BenchmarkSelect3(b *testing.B) {
 }
 
 func BenchmarkCount(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
 	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
 		defer func() {
@@ -141,9 +140,7 @@ func BenchmarkCount(b *testing.B) {
 }
 
 func BenchmarkCountTwoCF(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
 	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
 		defer func() {
@@ -177,9 +174,7 @@ func BenchmarkCountTwoCF(b *testing.B) {
 }
 
 func BenchmarkSort(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
 	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
 		defer func() {
@@ -215,9 +210,7 @@ func BenchmarkSort(b *testing.B) {
 // BenchmarkTableResolution benchmarks table name resolution
 // for a variety of different naming schemes.
 func BenchmarkTableResolution(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
 
 	for _, createTempTables := range []bool{false, true} {
@@ -379,9 +372,7 @@ func runBenchmarkInsertSecondaryIndex(b *testing.B, db *sqlutils.SQLRunner, coun
 }
 
 func BenchmarkSQL(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
 	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
 		for _, runFn := range []func(*testing.B, *sqlutils.SQLRunner, int){
@@ -407,6 +398,53 @@ func BenchmarkSQL(b *testing.B) {
 			})
 		}
 	})
+}
+
+// BenchmarkTracing measures the overhead of always-on tracing. It also reports
+// the memory utilization.
+//
+// TODO(irfansharif): This benchmark is only useful while we transition between
+// the legacy trace.mode, and the "always-on" mode introduced in 21.1. We can
+// remove it in 21.2.
+func BenchmarkTracing(b *testing.B) {
+	skip.UnderShort(b)
+	defer log.Scope(b).Close(b)
+
+	for _, dbFn := range []func(*testing.B, BenchmarkFn){
+		benchmarkCockroach,
+		benchmarkMultinodeCockroach,
+	} {
+		dbName := runtime.FuncForPC(reflect.ValueOf(dbFn).Pointer()).Name()
+		dbName = strings.TrimPrefix(dbName, "github.com/cockroachdb/cockroach/pkg/bench.benchmark")
+
+		b.Run(dbName, func(b *testing.B) {
+			dbFn(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+				for _, tracingEnabled := range []bool{true, false} {
+					var tracingMode string
+					if tracingEnabled {
+						tracingMode = "background"
+					} else {
+						tracingMode = "legacy"
+					}
+					db.Exec(b, fmt.Sprintf("SET CLUSTER SETTING trace.mode = %s", tracingMode))
+					b.Run(fmt.Sprintf("tracing=%s", tracingMode[:1]), func(b *testing.B) {
+						for _, runFn := range []func(*testing.B, *sqlutils.SQLRunner, int){
+							runBenchmarkScan1,
+							runBenchmarkInsert,
+						} {
+							fnName := runtime.FuncForPC(reflect.ValueOf(runFn).Pointer()).Name()
+							fnName = strings.TrimPrefix(fnName, "github.com/cockroachdb/cockroach/pkg/bench.runBenchmark")
+							b.Run(fnName, func(b *testing.B) {
+								b.ReportAllocs()
+
+								runFn(b, db, 1 /* count */)
+							})
+						}
+					})
+				}
+			})
+		})
+	}
 }
 
 // runBenchmarkUpdate benchmarks updating count random rows in a table.
@@ -515,6 +553,10 @@ func runBenchmarkDelete(b *testing.B, db *sqlutils.SQLRunner, rows int) {
 	b.StopTimer()
 }
 
+func runBenchmarkScan1(b *testing.B, db *sqlutils.SQLRunner, count int) {
+	runBenchmarkScan(b, db, count, 1)
+}
+
 // runBenchmarkScan benchmarks scanning a table containing count rows.
 func runBenchmarkScan(b *testing.B, db *sqlutils.SQLRunner, count int, limit int) {
 	defer func() {
@@ -561,9 +603,7 @@ func runBenchmarkScan(b *testing.B, db *sqlutils.SQLRunner, count int, limit int
 }
 
 func BenchmarkScan(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
 	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
 		for _, count := range []int{1, 10, 100, 1000, 10000} {
@@ -775,9 +815,7 @@ func runBenchmarkOrderBy(
 }
 
 func BenchmarkOrderBy(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
 	const count = 100000
 	const limit = 10
@@ -884,7 +922,7 @@ CREATE TABLE bench.insert_distinct (
 						fmt.Fprintf(&buf, "(%d, %d)", zipf.Uint64(), n)
 					}
 
-					if _, err := db.DB.ExecContext(context.TODO(), buf.String()); err != nil {
+					if _, err := db.DB.ExecContext(context.Background(), buf.String()); err != nil {
 						return err
 					}
 				}
@@ -1006,10 +1044,39 @@ func runBenchmarkWideTable(b *testing.B, db *sqlutils.SQLRunner, count int, bigC
 	b.StopTimer()
 }
 
+// BenchmarkVecSkipScan benchmarks the vectorized engine's performance
+// when skipping unneeded key values in the decoding process.
+func BenchmarkVecSkipScan(b *testing.B) {
+	benchmarkCockroach(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+		create := `
+CREATE TABLE bench.scan(
+	x INT, y INT, z INT, 
+	a INT, w INT, v INT, 
+	PRIMARY KEY (x, y, z, a, w, v)
+)
+`
+		db.Exec(b, create)
+		const count = 1000
+		for i := 0; i < count; i++ {
+			db.Exec(
+				b,
+				fmt.Sprintf(
+					"INSERT INTO bench.scan VALUES (%d, %d, %d, %d, %d, %d)",
+					i, i, i, i, i, i,
+				),
+			)
+		}
+		b.ResetTimer()
+		b.Run("Bench scan with skip", func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				db.Exec(b, `SET vectorize=on; SELECT y FROM bench.scan`)
+			}
+		})
+	})
+}
+
 func BenchmarkWideTable(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
 	const count = 10
 	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
@@ -1024,9 +1091,7 @@ func BenchmarkWideTable(b *testing.B) {
 }
 
 func BenchmarkWideTableIgnoreColumns(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
 	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
 		db.Exec(b, wideTableSchema)
@@ -1045,9 +1110,7 @@ func BenchmarkWideTableIgnoreColumns(b *testing.B) {
 // BenchmarkPlanning runs some queries on an empty table. The purpose is to
 // benchmark (and get memory allocation statistics for) the planning process.
 func BenchmarkPlanning(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
 		db.Exec(b, `CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT, INDEX(b), UNIQUE INDEX(c))`)
 
@@ -1151,9 +1214,7 @@ func BenchmarkSortJoinAggregation(b *testing.B) {
 }
 
 func BenchmarkNameResolution(b *testing.B) {
-	if testing.Short() {
-		b.Skip("short flag")
-	}
+	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
 	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
 		db.Exec(b, `CREATE TABLE namespace (k INT PRIMARY KEY, v INT)`)

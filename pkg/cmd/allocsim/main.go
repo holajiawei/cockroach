@@ -28,13 +28,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/acceptance/localcluster"
 	"github.com/cockroachdb/cockroach/pkg/acceptance/localcluster/tc"
 	"github.com/cockroachdb/cockroach/pkg/cli"
+	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 var workers = flag.Int("w", 1, "number of workers; the i'th worker talks to node i%numNodes")
@@ -170,7 +171,7 @@ func (a *allocSim) runWithConfig(config Configuration) {
 func (a *allocSim) setup() {
 	db := a.Nodes[0].DB()
 	if _, err := db.Exec("CREATE DATABASE IF NOT EXISTS allocsim"); err != nil {
-		log.Fatal(context.Background(), err)
+		log.Fatalf(context.Background(), "%v", err)
 	}
 
 	blocks := `
@@ -182,7 +183,7 @@ CREATE TABLE IF NOT EXISTS blocks (
 )
 `
 	if _, err := db.Exec(blocks); err != nil {
-		log.Fatal(context.Background(), err)
+		log.Fatalf(context.Background(), "%v", err)
 	}
 }
 
@@ -190,7 +191,7 @@ func (a *allocSim) maybeLogError(err error) {
 	if localcluster.IsUnavailableError(err) {
 		return
 	}
-	log.Error(context.Background(), err)
+	log.Errorf(context.Background(), "%v", err)
 	atomic.AddUint64(&a.stats.errors, 1)
 }
 
@@ -248,14 +249,14 @@ func (a *allocSim) rangeInfo() allocStats {
 				return
 			}
 			resp, err := status.Metrics(context.Background(), &serverpb.MetricsRequest{
-				NodeId: fmt.Sprintf("local"),
+				NodeId: "local",
 			})
 			if err != nil {
-				log.Fatal(context.Background(), err)
+				log.Fatalf(context.Background(), "%v", err)
 			}
 			var metrics map[string]interface{}
 			if err := json.Unmarshal(resp.Data, &metrics); err != nil {
-				log.Fatal(context.Background(), err)
+				log.Fatalf(context.Background(), "%v", err)
 			}
 			stores := metrics["stores"].(map[string]interface{})
 			for _, v := range stores {
@@ -402,7 +403,7 @@ func handleStart() bool {
 	// in the few minutes after allocsim starts up causes it to take a long time
 	// for leases to settle onto other nodes even when requests are skewed heavily
 	// onto them.
-	storage.MinLeaseTransferStatsDuration = 10 * time.Second
+	kvserver.MinLeaseTransferStatsDuration = 10 * time.Second
 
 	cli.Main()
 	return true
@@ -420,7 +421,7 @@ func main() {
 		var err error
 		config, err = loadConfig(*configFile)
 		if err != nil {
-			log.Fatal(context.Background(), err)
+			log.Fatalf(context.Background(), "%v", err)
 		}
 	}
 
@@ -479,11 +480,11 @@ func main() {
 			// set up tc rules on the loopback device.
 			tcController = tc.NewController("lo")
 			if err := tcController.Init(); err != nil {
-				log.Fatal(context.Background(), err)
+				log.Fatalf(context.Background(), "%v", err)
 			}
 			defer func() {
 				if err := tcController.CleanUp(); err != nil {
-					log.Error(context.Background(), err)
+					log.Errorf(context.Background(), "%v", err)
 				}
 			}()
 		}
@@ -495,7 +496,7 @@ func main() {
 							if err := tcController.AddLatency(
 								perNodeCfg[srcNodeIdx].Addr, perNodeCfg[dstNodeIdx].Addr, time.Duration(outgoing.Latency/2),
 							); err != nil {
-								log.Fatal(context.Background(), err)
+								log.Fatalf(context.Background(), "%v", err)
 							}
 						}
 					}
@@ -518,9 +519,9 @@ func main() {
 	a := newAllocSim(c)
 	a.localities = localities
 
-	log.SetExitFunc(false /* hideStack */, func(code int) {
+	log.SetExitFunc(false /* hideStack */, func(code exit.Code) {
 		c.Close()
-		os.Exit(code)
+		exit.WithCode(code)
 	})
 
 	go func() {
@@ -542,7 +543,7 @@ func main() {
 	c.UpdateZoneConfig(1, 1<<20)
 	_, err := c.Nodes[0].DB().Exec("SET CLUSTER SETTING kv.raft_log.disable_synchronization_unsafe = true")
 	if err != nil {
-		log.Fatal(context.Background(), err)
+		log.Fatalf(context.Background(), "%v", err)
 	}
 	if len(config.Localities) != 0 {
 		a.runWithConfig(config)

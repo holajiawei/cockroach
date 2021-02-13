@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"io/ioutil"
+	"net/http"
 	"regexp"
 	"time"
 
@@ -30,6 +31,15 @@ const (
 	instanceClass         = "instanceClass"
 	region                = "region"
 )
+
+var enabled = true
+
+// Disable disables cloud detection until the returned function is called.
+// Used for tests that trigger diagnostics updates.
+func Disable() (restore func()) {
+	enabled = false
+	return func() { enabled = true }
+}
 
 // client is necessary to provide a struct for mocking http requests
 // in testing.
@@ -156,7 +166,7 @@ func (cli *client) getAzureInstanceMetadata(
 func (cli *client) getInstanceMetadata(
 	ctx context.Context, url string, headers []metadataReqHeader,
 ) ([]byte, error) {
-	req, err := httputil.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -181,6 +191,10 @@ func (cli *client) getInstanceMetadata(
 // the node is running on, as well as the value of the requested metadata
 // element.
 func getCloudInfo(ctx context.Context, metadataElement string) (provider string, element string) {
+	if !enabled {
+		return "", ""
+	}
+
 	const timeout = 500 * time.Millisecond
 	cli := client{httputil.NewClientWithTimeout(timeout)}
 

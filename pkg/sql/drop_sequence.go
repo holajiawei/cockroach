@@ -14,12 +14,18 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/errors"
 )
 
 type dropSequenceNode struct {
@@ -28,10 +34,18 @@ type dropSequenceNode struct {
 }
 
 func (p *planner) DropSequence(ctx context.Context, n *tree.DropSequence) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"DROP SEQUENCE",
+	); err != nil {
+		return nil, err
+	}
+
 	td := make([]toDelete, 0, len(n.Names))
 	for i := range n.Names {
 		tn := &n.Names[i]
-		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, ResolveRequireSequenceDesc)
+		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, tree.ResolveRequireSequenceDesc)
 		if err != nil {
 			return nil, err
 		}
@@ -63,30 +77,25 @@ func (p *planner) DropSequence(ctx context.Context, n *tree.DropSequence) (planN
 func (n *dropSequenceNode) ReadingOwnWrites() {}
 
 func (n *dropSequenceNode) startExec(params runParams) error {
-	telemetry.Inc(sqltelemetry.SchemaChangeDrop("sequence"))
+	telemetry.Inc(sqltelemetry.SchemaChangeDropCounter("sequence"))
 
 	ctx := params.ctx
 	for _, toDel := range n.td {
 		droppedDesc := toDel.desc
-		err := params.p.dropSequenceImpl(ctx, droppedDesc, n.n.DropBehavior)
+		err := params.p.dropSequenceImpl(
+			ctx, droppedDesc, true /* queueJob */, tree.AsStringWithFQNames(n.n, params.Ann()), n.n.DropBehavior,
+		)
 		if err != nil {
 			return err
 		}
 		// Log a Drop Sequence event for this table. This is an auditable log event
 		// and is recorded in the same transaction as the table descriptor
 		// update.
-		if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			ctx,
-			params.p.txn,
-			EventLogDropSequence,
-			int32(droppedDesc.ID),
-			int32(params.extendedEvalCtx.NodeID),
-			struct {
-				SequenceName string
-				Statement    string
-				User         string
-			}{toDel.tn.FQString(), n.n.String(), params.SessionData().User},
-		); err != nil {
+		if err := params.p.logEvent(params.ctx,
+			droppedDesc.ID,
+			&eventpb.DropSequence{
+				SequenceName: toDel.tn.FQString(),
+			}); err != nil {
 			return err
 		}
 	}
@@ -98,16 +107,23 @@ func (*dropSequenceNode) Values() tree.Datums          { return tree.Datums{} }
 func (*dropSequenceNode) Close(context.Context)        {}
 
 func (p *planner) dropSequenceImpl(
-	ctx context.Context, seqDesc *sqlbase.MutableTableDescriptor, behavior tree.DropBehavior,
+	ctx context.Context,
+	seqDesc *tabledesc.Mutable,
+	queueJob bool,
+	jobDesc string,
+	behavior tree.DropBehavior,
 ) error {
-	return p.initiateDropTable(ctx, seqDesc, true /* drainName */)
+	if err := removeSequenceOwnerIfExists(ctx, p, seqDesc.ID, seqDesc.GetSequenceOpts()); err != nil {
+		return err
+	}
+	return p.initiateDropTable(ctx, seqDesc, queueJob, jobDesc, true /* drainName */)
 }
 
 // sequenceDependency error returns an error if the given sequence cannot be dropped because
 // a table uses it in a DEFAULT expression on one of its columns, or nil if there is no
 // such dependency.
 func (p *planner) sequenceDependencyError(
-	ctx context.Context, droppedDesc *sqlbase.MutableTableDescriptor,
+	ctx context.Context, droppedDesc *tabledesc.Mutable,
 ) error {
 	if len(droppedDesc.DependedOnBy) > 0 {
 		return pgerror.Newf(
@@ -120,7 +136,7 @@ func (p *planner) sequenceDependencyError(
 }
 
 func (p *planner) canRemoveAllTableOwnedSequences(
-	ctx context.Context, desc *sqlbase.MutableTableDescriptor, behavior tree.DropBehavior,
+	ctx context.Context, desc *tabledesc.Mutable, behavior tree.DropBehavior,
 ) error {
 	for _, col := range desc.Columns {
 		err := p.canRemoveOwnedSequencesImpl(ctx, desc, &col, behavior, false /* isColumnDrop */)
@@ -133,8 +149,8 @@ func (p *planner) canRemoveAllTableOwnedSequences(
 
 func (p *planner) canRemoveAllColumnOwnedSequences(
 	ctx context.Context,
-	desc *sqlbase.MutableTableDescriptor,
-	col *sqlbase.ColumnDescriptor,
+	desc *tabledesc.Mutable,
+	col *descpb.ColumnDescriptor,
 	behavior tree.DropBehavior,
 ) error {
 	return p.canRemoveOwnedSequencesImpl(ctx, desc, col, behavior, true /* isColumnDrop */)
@@ -142,43 +158,64 @@ func (p *planner) canRemoveAllColumnOwnedSequences(
 
 func (p *planner) canRemoveOwnedSequencesImpl(
 	ctx context.Context,
-	desc *sqlbase.MutableTableDescriptor,
-	col *sqlbase.ColumnDescriptor,
+	desc *tabledesc.Mutable,
+	col *descpb.ColumnDescriptor,
 	behavior tree.DropBehavior,
 	isColumnDrop bool,
 ) error {
 	for _, sequenceID := range col.OwnsSequenceIds {
-		seqLookup, err := p.LookupTableByID(ctx, sequenceID)
+		seqDesc, err := p.LookupTableByID(ctx, sequenceID)
 		if err != nil {
+			// Special case error swallowing for #50711 and #50781, which can cause a
+			// column to own sequences that have been dropped/do not exist.
+			if errors.Is(err, catalog.ErrDescriptorDropped) ||
+				pgerror.GetPGCode(err) == pgcode.UndefinedTable {
+				log.Eventf(ctx, "swallowing error ensuring owned sequences can be removed: %s", err.Error())
+				continue
+			}
 			return err
 		}
-		seqDesc := seqLookup.Desc
-		affectsNoColumns := len(seqDesc.DependedOnBy) == 0
-		// It is okay if the sequence is depended on by columns that are being
-		// dropped in the same transaction
-		canBeSafelyRemoved := len(seqDesc.DependedOnBy) == 1 && seqDesc.DependedOnBy[0].ID == desc.ID
-		// If only the column is being dropped, no other columns of the table can
-		// depend on that sequence either
-		if isColumnDrop {
-			canBeSafelyRemoved = canBeSafelyRemoved && len(seqDesc.DependedOnBy[0].ColumnIDs) == 1 &&
-				seqDesc.DependedOnBy[0].ColumnIDs[0] == col.ID
+
+		var firstDep *descpb.TableDescriptor_Reference
+		multipleIterationErr := seqDesc.ForeachDependedOnBy(func(dep *descpb.TableDescriptor_Reference) error {
+			if firstDep != nil {
+				return iterutil.StopIteration()
+			}
+			firstDep = dep
+			return nil
+		})
+
+		if firstDep == nil {
+			// This sequence is not depended on by anything, it's safe to remove.
+			continue
 		}
 
-		canRemove := affectsNoColumns || canBeSafelyRemoved
+		if multipleIterationErr == nil && firstDep.ID == desc.ID {
+			// This sequence is depended on only by columns in the table of interest.
+			if !isColumnDrop {
+				// Either we're dropping the whole table and thereby also anything
+				// that might depend on this sequence, making it safe to remove...
+				continue
+			}
+			// ...or we're dropping a column in the table of interest.
+			if len(firstDep.ColumnIDs) == 1 && firstDep.ColumnIDs[0] == col.ID {
+				// The sequence is safe to remove iff it's not depended on by any other
+				// columns in the table other than that one.
+				continue
+			}
+		}
 
 		// Once Drop Sequence Cascade actually respects the drop behavior, this
 		// check should go away.
-		if behavior == tree.DropCascade && !canRemove {
+		if behavior == tree.DropCascade {
 			return unimplemented.NewWithIssue(20965, "DROP SEQUENCE CASCADE is currently unimplemented")
 		}
 		// If Cascade is not enabled, and more than 1 columns depend on it, and the
-		if behavior != tree.DropCascade && !canRemove {
-			return pgerror.Newf(
-				pgcode.DependentObjectsStillExist,
-				"cannot drop table %s because other objects depend on it",
-				desc.Name,
-			)
-		}
+		return pgerror.Newf(
+			pgcode.DependentObjectsStillExist,
+			"cannot drop table %s because other objects depend on it",
+			desc.Name,
+		)
 	}
 	return nil
 }

@@ -15,12 +15,15 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -37,15 +40,15 @@ import (
 // TODO(joey): If we want a way find the key for the error, we will need
 // additional data such as the key bytes and the table descriptor ID.
 // Repair won't be possible without this.
-var ScrubTypes = []types.T{
-	*types.String,
-	*types.String,
-	*types.Jsonb,
+var ScrubTypes = []*types.T{
+	types.String,
+	types.String,
+	types.Jsonb,
 }
 
 type scrubTableReader struct {
 	tableReader
-	tableDesc sqlbase.TableDescriptor
+	tableDesc catalog.TableDescriptor
 	// fetcherResultToColIdx maps Fetcher results to the column index in
 	// the TableDescriptor. This is only initialized and used during scrub
 	// physical checks.
@@ -68,14 +71,15 @@ func newScrubTableReader(
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (*scrubTableReader, error) {
-	if flowCtx.NodeID == 0 {
+	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
+	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
 		return nil, errors.Errorf("attempting to create a tableReader with uninitialized NodeID")
 	}
 	tr := &scrubTableReader{
 		indexIdx: int(spec.IndexIdx),
 	}
 
-	tr.tableDesc = spec.Table
+	tr.tableDesc = tabledesc.NewImmutable(spec.Table)
 	tr.limitHint = execinfra.LimitHint(spec.LimitHint, post)
 
 	if err := tr.Init(
@@ -109,9 +113,9 @@ func newScrubTableReader(
 			tr.fetcherResultToColIdx = append(tr.fetcherResultToColIdx, i)
 		}
 	} else {
-		colIdxMap := spec.Table.ColumnIdxMap()
-		err := spec.Table.Indexes[spec.IndexIdx-1].RunOverAllColumns(func(id sqlbase.ColumnID) error {
-			neededColumns.Add(colIdxMap[id])
+		colIdxMap := catalog.ColumnIDToOrdinalMap(tr.tableDesc.PublicColumns())
+		err := spec.Table.Indexes[spec.IndexIdx-1].RunOverAllColumns(func(id descpb.ColumnID) error {
+			neededColumns.Add(colIdxMap.GetDefault(id))
 			return nil
 		})
 		if err != nil {
@@ -121,9 +125,10 @@ func newScrubTableReader(
 
 	var fetcher row.Fetcher
 	if _, _, err := initRowFetcher(
-		&fetcher, &tr.tableDesc, int(spec.IndexIdx), tr.tableDesc.ColumnIdxMap(), spec.Reverse,
-		neededColumns, true /* isCheck */, &tr.alloc,
-		execinfrapb.ScanVisibility_PUBLIC, spec.LockingStrength,
+		flowCtx, &fetcher, tr.tableDesc, int(spec.IndexIdx), catalog.ColumnIDToOrdinalMap(tr.tableDesc.PublicColumns()),
+		spec.Reverse, neededColumns, true /* isCheck */, flowCtx.EvalCtx.Mon, &tr.alloc,
+		execinfra.ScanVisibilityPublic, spec.LockingStrength, spec.LockingWaitPolicy,
+		false /* withSystemColumns */, nil, /* virtualColumn */
 	); err != nil {
 		return nil, err
 	}
@@ -141,24 +146,19 @@ func newScrubTableReader(
 // physical check error encountered when scanning table data. The schema
 // of the EncDatumRow is the ScrubTypes constant.
 func (tr *scrubTableReader) generateScrubErrorRow(
-	row sqlbase.EncDatumRow, scrubErr *scrub.Error,
-) (sqlbase.EncDatumRow, error) {
+	row rowenc.EncDatumRow, scrubErr *scrub.Error,
+) (rowenc.EncDatumRow, error) {
 	details := make(map[string]interface{})
-	var index *sqlbase.IndexDescriptor
-	if tr.indexIdx == 0 {
-		index = &tr.tableDesc.PrimaryIndex
-	} else {
-		index = &tr.tableDesc.Indexes[tr.indexIdx-1]
-	}
+	index := tr.tableDesc.ActiveIndexes()[tr.indexIdx]
 	// Collect all the row values into JSON
 	rowDetails := make(map[string]interface{})
 	for i, colIdx := range tr.fetcherResultToColIdx {
-		col := tr.tableDesc.Columns[colIdx]
+		col := tr.tableDesc.PublicColumns()[colIdx]
 		// TODO(joey): We should maybe try to get the underlying type.
-		rowDetails[col.Name] = row[i].String(&col.Type)
+		rowDetails[col.GetName()] = row[i].String(col.GetType())
 	}
 	details["row_data"] = rowDetails
-	details["index_name"] = index.Name
+	details["index_name"] = index.GetName()
 	details["error_message"] = scrub.UnwrapScrubError(error(scrubErr)).Error()
 
 	detailsJSON, err := tree.MakeDJSON(details)
@@ -166,34 +166,34 @@ func (tr *scrubTableReader) generateScrubErrorRow(
 		return nil, err
 	}
 
-	primaryKeyValues := tr.prettyPrimaryKeyValues(row, &tr.tableDesc)
-	return sqlbase.EncDatumRow{
-		sqlbase.DatumToEncDatum(
-			&ScrubTypes[0],
+	primaryKeyValues := tr.prettyPrimaryKeyValues(row, tr.tableDesc.TableDesc())
+	return rowenc.EncDatumRow{
+		rowenc.DatumToEncDatum(
+			ScrubTypes[0],
 			tree.NewDString(scrubErr.Code),
 		),
-		sqlbase.DatumToEncDatum(
-			&ScrubTypes[1],
+		rowenc.DatumToEncDatum(
+			ScrubTypes[1],
 			tree.NewDString(primaryKeyValues),
 		),
-		sqlbase.DatumToEncDatum(
-			&ScrubTypes[2],
+		rowenc.DatumToEncDatum(
+			ScrubTypes[2],
 			detailsJSON,
 		),
 	}, nil
 }
 
 func (tr *scrubTableReader) prettyPrimaryKeyValues(
-	row sqlbase.EncDatumRow, table *sqlbase.TableDescriptor,
+	row rowenc.EncDatumRow, table *descpb.TableDescriptor,
 ) string {
-	colIdxMap := make(map[sqlbase.ColumnID]int, len(table.Columns))
+	var colIdxMap catalog.TableColMap
 	for i := range table.Columns {
 		id := table.Columns[i].ID
-		colIdxMap[id] = i
+		colIdxMap.Set(id, i)
 	}
-	colIDToRowIdxMap := make(map[sqlbase.ColumnID]int, len(table.Columns))
+	var colIDToRowIdxMap catalog.TableColMap
 	for rowIdx, colIdx := range tr.fetcherResultToColIdx {
-		colIDToRowIdxMap[tr.tableDesc.Columns[colIdx].ID] = rowIdx
+		colIDToRowIdxMap.Set(tr.tableDesc.PublicColumns()[colIdx].GetID(), rowIdx)
 	}
 	var primaryKeyValues bytes.Buffer
 	primaryKeyValues.WriteByte('(')
@@ -202,7 +202,7 @@ func (tr *scrubTableReader) prettyPrimaryKeyValues(
 			primaryKeyValues.WriteByte(',')
 		}
 		primaryKeyValues.WriteString(
-			row[colIDToRowIdxMap[id]].String(&table.Columns[colIdxMap[id]].Type))
+			row[colIDToRowIdxMap.GetDefault(id)].String(table.Columns[colIdxMap.GetDefault(id)].Type))
 	}
 	primaryKeyValues.WriteByte(')')
 	return primaryKeyValues.String()
@@ -219,8 +219,8 @@ func (tr *scrubTableReader) Start(ctx context.Context) context.Context {
 	log.VEventf(ctx, 1, "starting")
 
 	if err := tr.fetcher.StartScan(
-		ctx, tr.FlowCtx.Txn, tr.spans,
-		true /* limit batches */, tr.limitHint, tr.FlowCtx.TraceKV,
+		ctx, tr.FlowCtx.Txn, tr.spans, true /* limit batches */, tr.limitHint,
+		tr.FlowCtx.TraceKV, tr.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 	); err != nil {
 		tr.MoveToDraining(err)
 	}
@@ -229,9 +229,9 @@ func (tr *scrubTableReader) Start(ctx context.Context) context.Context {
 }
 
 // Next is part of the RowSource interface.
-func (tr *scrubTableReader) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
+func (tr *scrubTableReader) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	for tr.State == execinfra.StateRunning {
-		var row sqlbase.EncDatumRow
+		var row rowenc.EncDatumRow
 		var err error
 		// If we are running a scrub physical check, we use a specialized
 		// procedure that runs additional checks while fetching the row

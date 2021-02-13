@@ -18,10 +18,11 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"strings"
 	"text/template"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -37,8 +38,9 @@ var Subdomain = func() string {
 	return "roachprod.crdb.io"
 }()
 
-// Startup script used to find/format/mount all local SSDs in GCE.
-// Each disk is mounted to /mnt/data<disknum> and chmoded to all users.
+// Startup script used to find/format/mount all local SSDs and (non-boot)
+// persistent disks in GCE. Each disk is mounted to /mnt/data<disknum> and
+// chmoded to all users.
 //
 // This is a template because the instantiator needs to optionally configure the
 // mounting options. The script cannot take arguments since it is to be invoked
@@ -46,11 +48,12 @@ var Subdomain = func() string {
 const gceLocalSSDStartupScriptTemplate = `#!/usr/bin/env bash
 # Script for setting up a GCE machine for roachprod use.
 
-mount_opts="discard,defaults"
+mount_opts="defaults"
 {{if .ExtraMountOpts}}mount_opts="${mount_opts},{{.ExtraMountOpts}}"{{end}}
 
+# ignore the boot disk: /dev/disk/by-id/google-persistent-disk-0.
 disknum=0
-for d in $(ls /dev/disk/by-id/google-local-*); do
+for d in $(ls /dev/disk/by-id/google-local-* /dev/disk/by-id/google-persistent-disk-[1-9]); do
   let "disknum++"
   grep -e "${d}" /etc/fstab > /dev/null
   if [ $? -ne 0 ]; then
@@ -59,7 +62,8 @@ for d in $(ls /dev/disk/by-id/google-local-*); do
     sudo mkdir -p "${mountpoint}"
     sudo mkfs.ext4 -F ${d}
     sudo mount -o ${mount_opts} ${d} ${mountpoint}
-    echo "${d} ${mountpoint} ext4 ${mount_opts} 1 1" | sudo tee -a /etc/fstab
+	echo "${d} ${mountpoint} ext4 ${mount_opts} 1 1" | sudo tee -a /etc/fstab
+	sudo chmod 777 ${mountpoint}
   else
     echo "Disk ${disknum}: ${d} already mounted, skipping..."
   fi
@@ -67,9 +71,9 @@ done
 if [ "${disknum}" -eq "0" ]; then
   echo "No disks mounted, creating /mnt/data1"
   sudo mkdir -p /mnt/data1
+  sudo chmod 777 /mnt/data1
 fi
 
-sudo chmod 777 /mnt/data1
 # sshguard can prevent frequent ssh connections to the same host. Disable it.
 sudo service sshguard stop
 # increase the number of concurrent unauthenticated connections to the sshd
@@ -84,7 +88,7 @@ sudo service sshd restart
 # increase the default maximum number of open file descriptors for
 # root and non-root users. Load generators running a lot of concurrent
 # workers bump into this often.
-sudo sh -c 'echo "root - nofile 65536\n* - nofile 65536" > /etc/security/limits.d/10-roachprod-nofiles.conf'
+sudo sh -c 'echo "root - nofile 1048576\n* - nofile 1048576" > /etc/security/limits.d/10-roachprod-nofiles.conf'
 
 # Send TCP keepalives every minute since GCE will terminate idle connections
 # after 10m. Note that keepalives still need to be requested by the application
@@ -158,11 +162,16 @@ func SyncDNS(vms vm.List) error {
 			fmt.Fprintf(os.Stderr, "removing %s failed: %v", f.Name(), err)
 		}
 	}()
+
+	var zoneBuilder strings.Builder
 	for _, vm := range vms {
 		if len(vm.Name) < 60 {
-			fmt.Fprintf(f, "%s 60 IN A %s\n", vm.Name, vm.PublicIP)
+			zoneBuilder.WriteString(fmt.Sprintf("%s 60 IN A %s\n", vm.Name, vm.PublicIP))
+		} else {
+			fmt.Printf("WARN: not adding `%s' to the zone file because it is longer than 60 characters\n", vm.Name)
 		}
 	}
+	fmt.Fprint(f, zoneBuilder.String())
 	f.Close()
 
 	args := []string{"--project", dnsProject, "dns", "record-sets", "import",
@@ -170,7 +179,7 @@ func SyncDNS(vms vm.List) error {
 	cmd := exec.Command("gcloud", args...)
 	output, err := cmd.CombinedOutput()
 
-	return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", args, output)
+	return errors.Wrapf(err, "Command: %s\nOutput: %s\nZone file contents:\n%s", cmd, output, zoneBuilder.String())
 }
 
 // GetUserAuthorizedKeys retreives reads a list of user public keys from the

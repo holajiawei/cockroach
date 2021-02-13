@@ -14,76 +14,95 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 )
 
 // rowFetcher is an interface used to abstract a row fetcher so that a stat
 // collector wrapper can be plugged in.
 type rowFetcher interface {
 	StartScan(
-		_ context.Context, _ *client.Txn, _ roachpb.Spans, limitBatches bool, limitHint int64, traceKV bool,
+		_ context.Context, _ *kv.Txn, _ roachpb.Spans, limitBatches bool,
+		limitHint int64, traceKV bool, forceProductionKVBatchSize bool,
 	) error
 	StartInconsistentScan(
 		_ context.Context,
-		_ *client.DB,
+		_ *kv.DB,
 		initialTimestamp hlc.Timestamp,
 		maxTimestampAge time.Duration,
 		spans roachpb.Spans,
 		limitBatches bool,
 		limitHint int64,
 		traceKV bool,
+		forceProductionKVBatchSize bool,
 	) error
 
 	NextRow(ctx context.Context) (
-		sqlbase.EncDatumRow, *sqlbase.TableDescriptor, *sqlbase.IndexDescriptor, error)
+		rowenc.EncDatumRow, catalog.TableDescriptor, *descpb.IndexDescriptor, error)
 
 	// PartialKey is not stat-related but needs to be supported.
 	PartialKey(int) (roachpb.Key, error)
 	Reset()
 	GetBytesRead() int64
-	GetRangesInfo() []roachpb.RangeInfo
-	NextRowWithErrors(context.Context) (sqlbase.EncDatumRow, error)
+	NextRowWithErrors(context.Context) (rowenc.EncDatumRow, error)
+	// Close releases any resources held by this fetcher.
+	Close(ctx context.Context)
 }
 
 // initRowFetcher initializes the fetcher.
 func initRowFetcher(
+	flowCtx *execinfra.FlowCtx,
 	fetcher *row.Fetcher,
-	desc *sqlbase.TableDescriptor,
+	desc catalog.TableDescriptor,
 	indexIdx int,
-	colIdxMap map[sqlbase.ColumnID]int,
+	colIdxMap catalog.TableColMap,
 	reverseScan bool,
 	valNeededForCol util.FastIntSet,
 	isCheck bool,
-	alloc *sqlbase.DatumAlloc,
+	mon *mon.BytesMonitor,
+	alloc *rowenc.DatumAlloc,
 	scanVisibility execinfrapb.ScanVisibility,
-	lockStr sqlbase.ScanLockingStrength,
-) (index *sqlbase.IndexDescriptor, isSecondaryIndex bool, err error) {
-	immutDesc := sqlbase.NewImmutableTableDescriptor(*desc)
-	index, isSecondaryIndex, err = immutDesc.FindIndexByIndexIdx(indexIdx)
-	if err != nil {
-		return nil, false, err
+	lockStrength descpb.ScanLockingStrength,
+	lockWaitPolicy descpb.ScanLockingWaitPolicy,
+	withSystemColumns bool,
+	virtualColumn catalog.Column,
+) (index *descpb.IndexDescriptor, isSecondaryIndex bool, err error) {
+	if indexIdx >= len(desc.ActiveIndexes()) {
+		return nil, false, errors.Errorf("invalid indexIdx %d", indexIdx)
 	}
+	indexI := desc.ActiveIndexes()[indexIdx]
+	index = indexI.IndexDesc()
+	isSecondaryIndex = !indexI.Primary()
 
-	cols := immutDesc.Columns
-	if scanVisibility == execinfrapb.ScanVisibility_PUBLIC_AND_NOT_PUBLIC {
-		cols = immutDesc.ReadableColumns
-	}
 	tableArgs := row.FetcherTableArgs{
-		Desc:             immutDesc,
+		Desc:             desc,
 		Index:            index,
 		ColIdxMap:        colIdxMap,
 		IsSecondaryIndex: isSecondaryIndex,
-		Cols:             cols,
 		ValNeededForCol:  valNeededForCol,
 	}
+	tableArgs.InitCols(desc, scanVisibility, withSystemColumns, virtualColumn)
+
 	if err := fetcher.Init(
-		reverseScan, lockStr, true /* returnRangeInfo */, isCheck, alloc, tableArgs,
+		flowCtx.EvalCtx.Context,
+		flowCtx.Codec(),
+		reverseScan,
+		lockStrength,
+		lockWaitPolicy,
+		isCheck,
+		alloc,
+		mon,
+		tableArgs,
 	); err != nil {
 		return nil, false, err
 	}

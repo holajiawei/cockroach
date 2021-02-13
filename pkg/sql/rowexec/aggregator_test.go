@@ -18,8 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -72,13 +72,13 @@ func TestAggregator(t *testing.T) {
 			Name: "MinMaxCountAvgSumStddevGroupByNoneNoRows",
 			Input: ProcessorTestCaseRows{
 				Rows:  [][]interface{}{},
-				Types: sqlbase.MakeIntCols(1),
+				Types: rowenc.MakeIntCols(1),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{nil, nil, 0, nil, nil, nil, nil},
 				},
-				Types: []types.T{*types.Int, *types.Int, *types.Int, *types.Decimal, *types.Decimal, *types.Decimal, *types.Decimal},
+				Types: []*types.T{types.Int, types.Int, types.Int, types.Decimal, types.Decimal, types.Decimal, types.Decimal},
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -105,7 +105,7 @@ func TestAggregator(t *testing.T) {
 					{7, 2},
 					{8, 4},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
@@ -113,7 +113,7 @@ func TestAggregator(t *testing.T) {
 					{4, 1},
 					{2, 3},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -136,14 +136,14 @@ func TestAggregator(t *testing.T) {
 					{7, 2},
 					{8, 4},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{4, 2},
 					{2, 3},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -166,14 +166,14 @@ func TestAggregator(t *testing.T) {
 					{3, 4},
 					{8, 4},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{2, 3},
 					{4, 2},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			DisableSort: true,
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
@@ -198,14 +198,14 @@ func TestAggregator(t *testing.T) {
 					{7, 2},
 					{8, 4},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{2, 14},
 					{4, 11},
 				},
-				Types: []types.T{*types.Int, *types.Decimal},
+				Types: []*types.T{types.Int, types.Decimal},
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -228,14 +228,14 @@ func TestAggregator(t *testing.T) {
 					{8, 4},
 					{3, 4},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{2, 14},
 					{4, 11},
 				},
-				Types: []types.T{*types.Int, *types.Decimal},
+				Types: []*types.T{types.Int, types.Decimal},
 			},
 			DisableSort: true,
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
@@ -260,13 +260,13 @@ func TestAggregator(t *testing.T) {
 					{4, 2},
 					{5, 4},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{5, 14},
 				},
-				Types: []types.T{*types.Int, *types.Decimal},
+				Types: []*types.T{types.Int, types.Decimal},
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -288,13 +288,13 @@ func TestAggregator(t *testing.T) {
 					{2},
 					{4},
 				},
-				Types: sqlbase.MakeIntCols(1),
+				Types: rowenc.MakeIntCols(1),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{6},
 				},
-				Types: sqlbase.MakeIntCols(1),
+				Types: rowenc.MakeIntCols(1),
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -313,13 +313,13 @@ func TestAggregator(t *testing.T) {
 					{1},
 					{1},
 				},
-				Types: sqlbase.MakeIntCols(1),
+				Types: rowenc.MakeIntCols(1),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{1},
 				},
-				Types: sqlbase.MakeIntCols(1),
+				Types: rowenc.MakeIntCols(1),
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -339,13 +339,13 @@ func TestAggregator(t *testing.T) {
 					{4, 2},
 					{5, 4},
 				},
-				Types: sqlbase.MakeIntCols(2),
+				Types: rowenc.MakeIntCols(2),
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{5, 2, 5, 2},
 				},
-				Types: sqlbase.MakeIntCols(4),
+				Types: rowenc.MakeIntCols(4),
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -368,13 +368,13 @@ func TestAggregator(t *testing.T) {
 					{3, nil, 1, true},
 					{2, true, 1, true},
 				},
-				Types: []types.T{*types.Int, *types.Bool, *types.Int, *types.Bool},
+				Types: []*types.T{types.Int, types.Bool, types.Int, types.Bool},
 			},
 			Output: ProcessorTestCaseRows{
 				Rows: [][]interface{}{
 					{2, 3, 3},
 				},
-				Types: sqlbase.MakeIntCols(3),
+				Types: rowenc.MakeIntCols(3),
 			},
 			ProcessorCore: execinfrapb.ProcessorCoreUnion{
 				Aggregator: &execinfrapb.AggregatorSpec{
@@ -432,8 +432,8 @@ func BenchmarkAggregation(b *testing.B) {
 				},
 			}
 			post := &execinfrapb.PostProcessSpec{}
-			disposer := &execinfra.RowDisposer{}
-			input := execinfra.NewRepeatableRowSource(sqlbase.OneIntCol, sqlbase.MakeIntRows(numRows, numCols))
+			disposer := &rowDisposer{}
+			input := execinfra.NewRepeatableRowSource(rowenc.OneIntCol, rowenc.MakeIntRows(numRows, numCols))
 
 			b.SetBytes(int64(8 * numRows * numCols))
 			b.ResetTimer()
@@ -442,7 +442,7 @@ func BenchmarkAggregation(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				d.Run(context.TODO())
+				d.Run(context.Background())
 				input.Reset()
 			}
 			b.StopTimer()
@@ -459,10 +459,10 @@ func BenchmarkCountRows(b *testing.B) {
 		},
 	}
 	post := &execinfrapb.PostProcessSpec{}
-	disposer := &execinfra.RowDisposer{}
+	disposer := &rowDisposer{}
 	const numCols = 1
 	const numRows = 100000
-	input := execinfra.NewRepeatableRowSource(sqlbase.OneIntCol, sqlbase.MakeIntRows(numRows, numCols))
+	input := execinfra.NewRepeatableRowSource(rowenc.OneIntCol, rowenc.MakeIntRows(numRows, numCols))
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
@@ -481,7 +481,7 @@ func BenchmarkCountRows(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		d.Run(context.TODO())
+		d.Run(context.Background())
 		input.Reset()
 	}
 }
@@ -503,8 +503,8 @@ func BenchmarkGrouping(b *testing.B) {
 		GroupCols: []uint32{0},
 	}
 	post := &execinfrapb.PostProcessSpec{}
-	disposer := &execinfra.RowDisposer{}
-	input := execinfra.NewRepeatableRowSource(sqlbase.OneIntCol, sqlbase.MakeIntRows(numRows, numCols))
+	disposer := &rowDisposer{}
+	input := execinfra.NewRepeatableRowSource(rowenc.OneIntCol, rowenc.MakeIntRows(numRows, numCols))
 
 	b.SetBytes(int64(8 * numRows * numCols))
 	b.ResetTimer()
@@ -561,8 +561,8 @@ func benchmarkAggregationWithGrouping(b *testing.B, numOrderedCols int) {
 			}
 			spec.OrderedGroupCols = allOrderedGroupCols[:numOrderedCols]
 			post := &execinfrapb.PostProcessSpec{}
-			disposer := &execinfra.RowDisposer{}
-			input := execinfra.NewRepeatableRowSource(sqlbase.ThreeIntCols, makeGroupedIntRows(groupSize, numCols, groupedCols[:]))
+			disposer := &rowDisposer{}
+			input := execinfra.NewRepeatableRowSource(rowenc.ThreeIntCols, makeGroupedIntRows(groupSize, numCols, groupedCols[:]))
 
 			b.SetBytes(int64(8 * intPow(groupSize, len(groupedCols)+1) * numCols))
 			b.ResetTimer()
@@ -612,9 +612,9 @@ func intPow(a, b int) int {
 // [0 1]
 // [1 1]
 // [1 1]
-func makeGroupedIntRows(groupSize, numCols int, groupedCols []int) sqlbase.EncDatumRows {
+func makeGroupedIntRows(groupSize, numCols int, groupedCols []int) rowenc.EncDatumRows {
 	numRows := intPow(groupSize, len(groupedCols)+1)
-	rows := make(sqlbase.EncDatumRows, numRows)
+	rows := make(rowenc.EncDatumRows, numRows)
 
 	groupColSet := util.MakeFastIntSet(groupedCols...)
 	getGroupedColVal := func(rowIdx, colIdx int) int {
@@ -632,13 +632,13 @@ func makeGroupedIntRows(groupSize, numCols int, groupedCols []int) sqlbase.EncDa
 	}
 
 	for i := range rows {
-		rows[i] = make(sqlbase.EncDatumRow, numCols)
+		rows[i] = make(rowenc.EncDatumRow, numCols)
 		for j := 0; j < numCols; j++ {
 			if groupColSet.Contains(j) {
-				rows[i][j] = sqlbase.DatumToEncDatum(
+				rows[i][j] = rowenc.DatumToEncDatum(
 					types.Int, tree.NewDInt(tree.DInt(getGroupedColVal(i, j))))
 			} else {
-				rows[i][j] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(i+j)))
+				rows[i][j] = rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(i+j)))
 			}
 		}
 	}

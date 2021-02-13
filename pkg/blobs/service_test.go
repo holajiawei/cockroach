@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/errors/oserror"
 )
 
 func TestBlobServiceList(t *testing.T) {
@@ -34,7 +35,7 @@ func TestBlobServiceList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	t.Run("list-correct-files", func(t *testing.T) {
 		resp, err := service.List(ctx, &blobspb.GlobRequest{
@@ -78,7 +79,7 @@ func TestBlobServiceDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	t.Run("delete-correct-file", func(t *testing.T) {
 		_, err := service.Delete(ctx, &blobspb.DeleteRequest{
@@ -87,7 +88,7 @@ func TestBlobServiceDelete(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(filepath.Join(tmpDir, filename)); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(tmpDir, filename)); !oserror.IsNotExist(err) {
 			t.Fatalf("expected not exists err, got: %s", err)
 		}
 	})
@@ -127,7 +128,7 @@ func TestBlobServiceStat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	t.Run("get-correct-file-size", func(t *testing.T) {
 		resp, err := service.Stat(ctx, &blobspb.StatRequest{

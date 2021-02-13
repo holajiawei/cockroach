@@ -13,7 +13,10 @@ package colexec
 import (
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -30,6 +33,8 @@ const (
 	likeSuffixNegate
 	likePrefix
 	likePrefixNegate
+	likeContains
+	likeContainsNegate
 	likeRegexp
 	likeRegexpNegate
 )
@@ -74,6 +79,13 @@ func getLikeOperatorType(pattern string, negate bool) (likeOpType, string, error
 			}
 			return likePrefix, prefix, nil
 		}
+		if firstChar == '%' && lastChar == '%' {
+			contains := pattern[1 : len(pattern)-1]
+			if negate {
+				return likeContainsNegate, contains, nil
+			}
+			return likeContains, contains, nil
+		}
 	}
 	// Default (slow) case: execute as a regular expression match.
 	if negate {
@@ -86,8 +98,8 @@ func getLikeOperatorType(pattern string, negate bool) (likeOpType, string, error
 // pattern, or NOT LIKE if the negate argument is true. The implementation
 // varies depending on the complexity of the pattern.
 func GetLikeOperator(
-	ctx *tree.EvalContext, input Operator, colIdx int, pattern string, negate bool,
-) (Operator, error) {
+	ctx *tree.EvalContext, input colexecbase.Operator, colIdx int, pattern string, negate bool,
+) (colexecbase.Operator, error) {
 	likeOpType, pattern, err := getLikeOperatorType(pattern, negate)
 	if err != nil {
 		return nil, err
@@ -140,6 +152,16 @@ func GetLikeOperator(
 			selConstOpBase: base,
 			constArg:       pat,
 		}, nil
+	case likeContains:
+		return &selContainsBytesBytesConstOp{
+			selConstOpBase: base,
+			constArg:       pat,
+		}, nil
+	case likeContainsNegate:
+		return &selNotContainsBytesBytesConstOp{
+			selConstOpBase: base,
+			constArg:       pat,
+		}, nil
 	case likeRegexp:
 		re, err := tree.ConvertLikeToRegexp(ctx, pattern, false, '\\')
 		if err != nil {
@@ -171,19 +193,20 @@ func isWildcard(c byte) bool {
 // result of the specified LIKE pattern, or NOT LIKE if the negate argument is
 // true. The implementation varies depending on the complexity of the pattern.
 func GetLikeProjectionOperator(
-	allocator *Allocator,
+	allocator *colmem.Allocator,
 	ctx *tree.EvalContext,
-	input Operator,
+	input colexecbase.Operator,
 	colIdx int,
 	resultIdx int,
 	pattern string,
 	negate bool,
-) (Operator, error) {
+) (colexecbase.Operator, error) {
 	likeOpType, pattern, err := getLikeOperatorType(pattern, negate)
 	if err != nil {
 		return nil, err
 	}
 	pat := []byte(pattern)
+	input = newVectorTypeEnforcer(allocator, input, types.Bool, resultIdx)
 	base := projConstOpBase{
 		OneInputNode: NewOneInputNode(input),
 		allocator:    allocator,
@@ -230,6 +253,16 @@ func GetLikeProjectionOperator(
 		}, nil
 	case likePrefixNegate:
 		return &projNotPrefixBytesBytesConstOp{
+			projConstOpBase: base,
+			constArg:        pat,
+		}, nil
+	case likeContains:
+		return &projContainsBytesBytesConstOp{
+			projConstOpBase: base,
+			constArg:        pat,
+		}, nil
+	case likeContainsNegate:
+		return &projNotContainsBytesBytesConstOp{
 			projConstOpBase: base,
 			constArg:        pat,
 		}, nil

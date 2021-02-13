@@ -27,6 +27,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -36,7 +39,6 @@ import (
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/go-connections/nat"
 	isatty "github.com/mattn/go-isatty"
-	"github.com/pkg/errors"
 )
 
 // Retrieve the IP address of docker itself.
@@ -218,7 +220,7 @@ func createContainer(
 	// container.
 	for _, bind := range hostConfig.Binds {
 		hostPath, _ := splitBindSpec(bind)
-		if _, err := os.Stat(hostPath); os.IsNotExist(err) {
+		if _, err := os.Stat(hostPath); oserror.IsNotExist(err) {
 			maybePanic(os.MkdirAll(hostPath, 0755))
 		} else {
 			maybePanic(err)
@@ -299,13 +301,13 @@ func (c *Container) Wait(ctx context.Context, condition container.WaitCondition)
 
 		out := io.MultiWriter(cmdLog, os.Stderr)
 		if err := c.Logs(ctx, out); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 
 		if exitCode := waitOKBody.StatusCode; exitCode != 0 {
 			err = errors.Errorf("non-zero exit code: %d", exitCode)
 			fmt.Fprintln(out, err.Error())
-			log.Shout(ctx, log.Severity_INFO, "command left-over files in ", c.cluster.volumesDir)
+			log.Shoutf(ctx, severity.INFO, "command left-over files in %s", c.cluster.volumesDir)
 		}
 
 		return err
@@ -351,7 +353,7 @@ func (c *Container) Inspect(ctx context.Context) (types.ContainerJSON, error) {
 func (c *Container) Addr(ctx context.Context, port nat.Port) *net.TCPAddr {
 	containerInfo, err := c.Inspect(ctx)
 	if err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return nil
 	}
 	bindings, ok := containerInfo.NetworkSettings.Ports[port]
@@ -360,7 +362,7 @@ func (c *Container) Addr(ctx context.Context, port nat.Port) *net.TCPAddr {
 	}
 	portNum, err := strconv.Atoi(bindings[0].HostPort)
 	if err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return nil
 	}
 	return &net.TCPAddr{
@@ -388,7 +390,7 @@ func (cli resilientDockerClient) ContainerStart(
 
 		// Keep going if ContainerStart timed out, but client's context is not
 		// expired.
-		if errors.Cause(err) == context.DeadlineExceeded && clientCtx.Err() == nil {
+		if errors.Is(err, context.DeadlineExceeded) && clientCtx.Err() == nil {
 			log.Warningf(clientCtx, "ContainerStart timed out, retrying")
 			continue
 		}

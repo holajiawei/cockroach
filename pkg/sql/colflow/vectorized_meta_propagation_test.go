@@ -18,8 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -45,9 +45,9 @@ func TestVectorizedMetaPropagation(t *testing.T) {
 
 	nRows := 10
 	nCols := 1
-	types := sqlbase.OneIntCol
+	types := rowenc.OneIntCol
 
-	input := distsqlutils.NewRowBuffer(types, sqlbase.MakeIntRows(nRows, nCols), distsqlutils.RowBufferArgs{})
+	input := distsqlutils.NewRowBuffer(types, rowenc.MakeIntRows(nRows, nCols), distsqlutils.RowBufferArgs{})
 	mtsSpec := execinfrapb.ProcessorCoreUnion{
 		MetadataTestSender: &execinfrapb.MetadataTestSenderSpec{
 			ID: uuid.MakeV4().String(),
@@ -65,7 +65,7 @@ func TestVectorizedMetaPropagation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	col, err := colexec.NewColumnarizer(ctx, testAllocator, &flowCtx, 1, mts)
+	col, err := colexec.NewBufferingColumnarizer(ctx, testAllocator, &flowCtx, 1, mts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,10 +76,10 @@ func TestVectorizedMetaPropagation(t *testing.T) {
 		2, /* processorID */
 		noop,
 		types,
-		&execinfrapb.PostProcessSpec{},
 		nil, /* output */
 		[]execinfrapb.MetadataSource{col},
-		nil, /* outputStatsToTrace */
+		nil, /* toClose */
+		nil, /* execStatsForTrace */
 		nil, /* cancelFlow */
 	)
 	if err != nil {

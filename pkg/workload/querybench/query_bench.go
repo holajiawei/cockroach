@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -64,13 +64,10 @@ var queryBenchMeta = workload.Meta{
 	},
 }
 
-// vectorizeSetting19_1Translation is a mapping from the 19.2+ vectorize session
-// variable value to the 19.1 syntax.
-var vectorizeSetting19_1Translation = map[string]string{
-	"experimental_on":     "on",
-	"experimental_always": "always",
-	// Translate auto as on, this was not an option in 19.1.
-	"auto": "on",
+// vectorizeSetting19_2Translation is a mapping from the 20.1+ vectorize session
+// variable value to the 19.2 syntax.
+var vectorizeSetting19_2Translation = map[string]string{
+	"on": "experimental_on",
 }
 
 // Meta implements the Generator interface.
@@ -109,7 +106,9 @@ func (*queryBench) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (g *queryBench) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
+func (g *queryBench) Ops(
+	ctx context.Context, urls []string, reg *histogram.Registry,
+) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(g, g.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -124,15 +123,11 @@ func (g *queryBench) Ops(urls []string, reg *histogram.Registry) (workload.Query
 
 	if g.vectorize != "" {
 		_, err := db.Exec("SET vectorize=" + g.vectorize)
-		if err != nil && strings.Contains(err.Error(), "unrecognized configuration") {
-			if _, ok := vectorizeSetting19_1Translation[g.vectorize]; !ok {
-				// Unrecognized setting value.
-				return workload.QueryLoad{}, err
+		if err != nil && strings.Contains(err.Error(), "invalid value") {
+			if _, ok := vectorizeSetting19_2Translation[g.vectorize]; ok {
+				// Fall back to using the pre-20.1 vectorize options.
+				_, err = db.Exec("SET vectorize=" + vectorizeSetting19_2Translation[g.vectorize])
 			}
-			// Fall back to using the pre-19.2 syntax.
-			// TODO(asubiotto): Remove this once we stop running this test against
-			//  19.1.
-			_, err = db.Exec("SET experimental_vectorize=" + vectorizeSetting19_1Translation[g.vectorize])
 		}
 		if err != nil {
 			return workload.QueryLoad{}, err
@@ -141,16 +136,17 @@ func (g *queryBench) Ops(urls []string, reg *histogram.Registry) (workload.Query
 
 	stmts := make([]namedStmt, len(g.queries))
 	for i, query := range g.queries {
-		stmt, err := db.Prepare(query)
-		if err != nil {
-			return workload.QueryLoad{}, errors.Wrapf(err, "failed to prepare query %q", query)
-		}
 		stmts[i] = namedStmt{
 			// TODO(solon): Allow specifying names in the query file rather than using
 			// the entire query as the name.
 			name: fmt.Sprintf("%2d: %s", i+1, query),
-			stmt: stmt,
 		}
+		stmt, err := db.Prepare(query)
+		if err != nil {
+			stmts[i].query = query
+			continue
+		}
+		stmts[i].preparedStmt = stmt
 	}
 
 	maxNumStmts := 0
@@ -199,7 +195,11 @@ func GetQueries(path string) ([]string, error) {
 
 type namedStmt struct {
 	name string
-	stmt *gosql.Stmt
+	// We will try to Prepare the statement, and if that succeeds, the prepared
+	// statement will be stored in `preparedStmt', otherwise, we will store
+	// plain query in 'query'.
+	preparedStmt *gosql.Stmt
+	query        string
 }
 
 type queryBenchWorker struct {
@@ -228,15 +228,31 @@ func (o *queryBenchWorker) run(ctx context.Context) error {
 	stmt := o.stmts[o.stmtIdx%len(o.stmts)]
 	o.stmtIdx++
 
-	rows, err := stmt.stmt.Query()
-	if err != nil {
-		return err
+	exhaustRows := func(execFn func() (*gosql.Rows, error)) error {
+		rows, err := execFn()
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return nil
 	}
-	defer rows.Close()
-	for rows.Next() {
-	}
-	if err := rows.Err(); err != nil {
-		return err
+	if stmt.preparedStmt != nil {
+		if err := exhaustRows(func() (*gosql.Rows, error) {
+			return stmt.preparedStmt.Query()
+		}); err != nil {
+			return err
+		}
+	} else {
+		if err := exhaustRows(func() (*gosql.Rows, error) {
+			return o.db.Query(stmt.query)
+		}); err != nil {
+			return err
+		}
 	}
 	elapsed := timeutil.Since(start)
 	if o.verbose {

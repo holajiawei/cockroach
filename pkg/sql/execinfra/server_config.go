@@ -13,77 +13,31 @@
 package execinfra
 
 import (
+	"time"
+
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/diskmap"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/fs"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/marusama/semaphore"
-)
-
-// Version identifies the distsql protocol version.
-//
-// This version is separate from the main CockroachDB version numbering; it is
-// only changed when the distsql API changes.
-//
-// The planner populates the version in SetupFlowRequest.
-// A server only accepts requests with versions in the range MinAcceptedVersion
-// to Version.
-//
-// Is is possible used to provide a "window" of compatibility when new features are
-// added. Example:
-//  - we start with Version=1; distsql servers with version 1 only accept
-//    requests with version 1.
-//  - a new distsql feature is added; Version is bumped to 2. The
-//    planner does not yet use this feature by default; it still issues
-//    requests with version 1.
-//  - MinAcceptedVersion is still 1, i.e. servers with version 2
-//    accept both versions 1 and 2.
-//  - after an upgrade cycle, we can enable the feature in the planner,
-//    requiring version 2.
-//  - at some later point, we can choose to deprecate version 1 and have
-//    servers only accept versions >= 2 (by setting
-//    MinAcceptedVersion to 2).
-//
-// ATTENTION: When updating these fields, add to version_history.txt explaining
-// what changed.
-const Version execinfrapb.DistSQLVersion = 26
-
-// MinAcceptedVersion is the oldest version that the server is
-// compatible with; see above.
-const MinAcceptedVersion execinfrapb.DistSQLVersion = 24
-
-// SettingUseTempStorageJoins is a cluster setting that configures whether
-// joins are allowed to spill to disk.
-// TODO(yuzefovich): remove this setting.
-var SettingUseTempStorageJoins = settings.RegisterPublicBoolSetting(
-	"sql.distsql.temp_storage.joins",
-	"set to true to enable use of disk for distributed sql joins. "+
-		"Note that disabling this can have negative impact on memory usage and performance.",
-	true,
-)
-
-// SettingUseTempStorageSorts is a cluster setting that configures whether
-// sorts are allowed to spill to disk.
-// TODO(yuzefovich): remove this setting.
-var SettingUseTempStorageSorts = settings.RegisterPublicBoolSetting(
-	"sql.distsql.temp_storage.sorts",
-	"set to true to enable use of disk for distributed sql sorts. "+
-		"Note that disabling this can have negative impact on memory usage and performance.",
-	true,
 )
 
 // SettingWorkMemBytes is a cluster setting that determines the maximum amount
@@ -102,18 +56,22 @@ type ServerConfig struct {
 	Settings     *cluster.Settings
 	RuntimeStats RuntimeStats
 
+	ClusterID   *base.ClusterIDContainer
+	ClusterName string
+
+	// NodeID is the id of the node on which this Server is running.
+	NodeID *base.SQLIDContainer
+
+	// Codec is capable of encoding and decoding sql table keys.
+	Codec keys.SQLCodec
+
 	// DB is a handle to the cluster.
-	DB *client.DB
+	DB *kv.DB
 	// Executor can be used to run "internal queries". Note that Flows also have
 	// access to an executor in the EvalContext. That one is "session bound"
 	// whereas this one isn't.
 	Executor sqlutil.InternalExecutor
 
-	// FlowDB is the DB that flows should use for interacting with the database.
-	// This DB has to be set such that it bypasses the local TxnCoordSender. We
-	// want only the TxnCoordSender on the gateway to be involved with requests
-	// performed by DistSQL.
-	FlowDB       *client.DB
 	RPCContext   *rpc.Context
 	Stopper      *stop.Stopper
 	TestingKnobs TestingKnobs
@@ -139,7 +97,11 @@ type ServerConfig struct {
 	VecFDSemaphore semaphore.Semaphore
 
 	// BulkAdder is used by some processors to bulk-ingest data as SSTs.
-	BulkAdder storagebase.BulkAdderFactory
+	BulkAdder kvserverbase.BulkAdderFactory
+
+	// Child monitor of the bulk monitor which will be used to monitor the memory
+	// used by the column and index backfillers.
+	BackfillerMonitor *mon.BytesMonitor
 
 	// DiskMonitor is used to monitor temporary storage disk usage. Actual disk
 	// space used will be a small multiple (~1.1) of this because of RocksDB
@@ -148,21 +110,19 @@ type ServerConfig struct {
 
 	Metrics *DistSQLMetrics
 
-	// NodeID is the id of the node on which this Server is running.
-	NodeID      *base.NodeIDContainer
-	ClusterID   *base.ClusterIDContainer
-	ClusterName string
+	// SQLLivenessReader provides access to reading the liveness of sessions.
+	SQLLivenessReader sqlliveness.Reader
 
 	// JobRegistry manages jobs being used by this Server.
 	JobRegistry *jobs.Registry
 
-	// LeaseManager is a *sql.LeaseManager. It's stored as an `interface{}` due
+	// LeaseManager is a *lease.Manager. It's stored as an `interface{}` due
 	// to package dependency cycles
 	LeaseManager interface{}
 
 	// A handle to gossip used to broadcast the node's DistSQL version and
 	// draining state.
-	Gossip *gossip.Gossip
+	Gossip gossip.OptionalGossip
 
 	NodeDialer *nodedialer.Dialer
 
@@ -173,6 +133,21 @@ type ServerConfig struct {
 
 	ExternalStorage        cloud.ExternalStorageFactory
 	ExternalStorageFromURI cloud.ExternalStorageFromURIFactory
+
+	// ProtectedTimestampProvider maintains the state of the protected timestamp
+	// subsystem. It is queried during the GC process and in the handling of
+	// AdminVerifyProtectedTimestampRequest.
+	ProtectedTimestampProvider protectedts.Provider
+
+	// RangeCache is used by processors that were supposed to have been planned on
+	// the leaseholders of the data ranges that they're consuming. These
+	// processors query the cache to see if they should communicate updates to the
+	// gateway.
+	RangeCache *rangecache.RangeCache
+
+	// HydratedTables is a node-level cache of table descriptors which utilize
+	// user-defined types.
+	HydratedTables *hydratedtables.Cache
 }
 
 // RuntimeStats is an interface through which the rowexec layer can get
@@ -188,16 +163,30 @@ type TestingKnobs struct {
 	// RunBeforeBackfillChunk is called before executing each chunk of a
 	// backfill during a schema change operation. It is called with the
 	// current span and returns an error which eventually is returned to the
-	// caller of SchemaChanger.exec(). It is called at the start of the
-	// backfill function passed into the transaction executing the chunk.
+	// caller of SchemaChanger.exec(). In the case of a column backfill, it is
+	// called at the start of the backfill function passed into the transaction
+	// executing the chunk.
 	RunBeforeBackfillChunk func(sp roachpb.Span) error
 
-	// RunAfterBackfillChunk is called after executing each chunk of a
-	// backfill during a schema change operation. It is called just before
-	// returning from the backfill function passed into the transaction
-	// executing the chunk. It is always called even when the backfill
+	// RunAfterBackfillChunk is called after executing each chunk of a backfill
+	// during a schema change operation. In the case of a column backfill, it is
+	// called just before returning from the backfill function passed into the
+	// transaction executing the chunk. It is always called even when the backfill
 	// function returns an error, or if the table has already been dropped.
 	RunAfterBackfillChunk func()
+
+	// SerializeIndexBackfillCreationAndIngestion ensures that every index batch
+	// created during an index backfill is also ingested before moving on to the
+	// next batch or returning.
+	// Ingesting does not mean that the index entries are necessarily written to
+	// storage but instead that they are buffered in the index backfillers' bulk
+	// adder.
+	SerializeIndexBackfillCreationAndIngestion chan struct{}
+
+	// IndexBackfillProgressReportInterval is the periodic interval at which the
+	// processor pushes the spans for which it has successfully backfilled the
+	// indexes.
+	IndexBackfillProgressReportInterval time.Duration
 
 	// ForceDiskSpill forces any processors/operators that can fall back to disk
 	// to fall back to disk immediately.
@@ -221,12 +210,15 @@ type TestingKnobs struct {
 	// checked by a test receiver on the gateway.
 	MetadataTestLevel MetadataTestLevel
 
-	// DeterministicStats overrides stats which don't have reliable values, like
-	// stall time and bytes sent. It replaces them with a zero value.
-	DeterministicStats bool
+	// CheckVectorizedFlowIsClosedCorrectly checks that all components in a flow
+	// were closed explicitly in flow.Cleanup.
+	CheckVectorizedFlowIsClosedCorrectly bool
 
 	// Changefeed contains testing knobs specific to the changefeed system.
 	Changefeed base.ModuleTestingKnobs
+
+	// Flowinfra contains testing knobs specific to the flowinfra system
+	Flowinfra base.ModuleTestingKnobs
 
 	// EnableVectorizedInvariantsChecker, if enabled, will allow for planning
 	// the invariant checkers between all columnar operators.
@@ -234,6 +226,15 @@ type TestingKnobs struct {
 
 	// Forces bulk adder flush every time a KV batch is processed.
 	BulkAdderFlushesEveryBatch bool
+
+	// JobsTestingKnobs is jobs infra specific testing knobs.
+	JobsTestingKnobs base.ModuleTestingKnobs
+
+	// BackupRestoreTestingKnobs are backup and restore specific testing knobs.
+	BackupRestoreTestingKnobs base.ModuleTestingKnobs
+
+	// BackupRestoreTestingKnobs are stream ingestion specific testing knobs.
+	StreamIngestionTestingKnobs base.ModuleTestingKnobs
 }
 
 // MetadataTestLevel represents the types of queries where metadata test

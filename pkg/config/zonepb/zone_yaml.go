@@ -49,17 +49,17 @@ func (l *LeasePreference) UnmarshalYAML(unmarshal func(interface{}) error) error
 	return nil
 }
 
-var _ yaml.Marshaler = Constraints{}
-var _ yaml.Unmarshaler = &Constraints{}
+var _ yaml.Marshaler = ConstraintsConjunction{}
+var _ yaml.Unmarshaler = &ConstraintsConjunction{}
 
 // MarshalYAML implements yaml.Marshaler.
-func (c Constraints) MarshalYAML() (interface{}, error) {
+func (c ConstraintsConjunction) MarshalYAML() (interface{}, error) {
 	return nil, fmt.Errorf(
 		"MarshalYAML should never be called directly on Constraints (%v): %v", c, debug.Stack())
 }
 
 // UnmarshalYAML implements yaml.Marshaler.
-func (c *Constraints) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (c *ConstraintsConjunction) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return fmt.Errorf(
 		"UnmarshalYAML should never be called directly on Constraints: %v", debug.Stack())
 }
@@ -67,7 +67,7 @@ func (c *Constraints) UnmarshalYAML(unmarshal func(interface{}) error) error {
 // ConstraintsList is an alias for a slice of Constraints that can be
 // properly marshaled to/from YAML.
 type ConstraintsList struct {
-	Constraints []Constraints
+	Constraints []ConstraintsConjunction
 	Inherited   bool
 }
 
@@ -124,10 +124,10 @@ func (c *ConstraintsList) UnmarshalYAML(unmarshal func(interface{}) error) error
 			}
 		}
 		if len(constraints) == 0 {
-			c.Constraints = []Constraints{}
+			c.Constraints = []ConstraintsConjunction{}
 			c.Inherited = false
 		} else {
-			c.Constraints = []Constraints{
+			c.Constraints = []ConstraintsConjunction{
 				{
 					Constraints: constraints,
 					NumReplicas: 0,
@@ -146,7 +146,7 @@ func (c *ConstraintsList) UnmarshalYAML(unmarshal func(interface{}) error) error
 			"invalid constraints format. expected an array of strings or a map of strings to ints")
 	}
 
-	constraintsList := make([]Constraints, 0, len(constraintsMap))
+	constraintsList := make([]ConstraintsConjunction, 0, len(constraintsMap))
 	for constraintsStr, numReplicas := range constraintsMap {
 		shortConstraints := strings.Split(constraintsStr, ",")
 		constraints := make([]Constraint, len(shortConstraints))
@@ -155,7 +155,7 @@ func (c *ConstraintsList) UnmarshalYAML(unmarshal func(interface{}) error) error
 				return err
 			}
 		}
-		constraintsList = append(constraintsList, Constraints{
+		constraintsList = append(constraintsList, ConstraintsConjunction{
 			Constraints: constraints,
 			NumReplicas: numReplicas,
 		})
@@ -202,8 +202,11 @@ type marshalableZoneConfig struct {
 	RangeMinBytes                *int64            `json:"range_min_bytes" yaml:"range_min_bytes"`
 	RangeMaxBytes                *int64            `json:"range_max_bytes" yaml:"range_max_bytes"`
 	GC                           *GCPolicy         `json:"gc"`
+	GlobalReads                  *bool             `json:"global_reads" yaml:"global_reads"`
 	NumReplicas                  *int32            `json:"num_replicas" yaml:"num_replicas"`
+	NumVoters                    *int32            `json:"num_voters" yaml:"num_voters"`
 	Constraints                  ConstraintsList   `json:"constraints" yaml:"constraints,flow"`
+	VoterConstraints             ConstraintsList   `json:"voter_constraints" yaml:"voter_constraints,flow"`
 	LeasePreferences             []LeasePreference `json:"lease_preferences" yaml:"lease_preferences,flow"`
 	ExperimentalLeasePreferences []LeasePreference `json:"experimental_lease_preferences" yaml:"experimental_lease_preferences,flow,omitempty"`
 	Subzones                     []Subzone         `json:"subzones" yaml:"-"`
@@ -222,10 +225,17 @@ func zoneConfigToMarshalable(c ZoneConfig) marshalableZoneConfig {
 		tempGC := *c.GC
 		m.GC = &tempGC
 	}
+	if c.GlobalReads != nil {
+		m.GlobalReads = proto.Bool(*c.GlobalReads)
+	}
 	if c.NumReplicas != nil && *c.NumReplicas != 0 {
 		m.NumReplicas = proto.Int32(*c.NumReplicas)
 	}
 	m.Constraints = ConstraintsList{c.Constraints, c.InheritedConstraints}
+	if c.NumVoters != nil && *c.NumVoters != 0 {
+		m.NumVoters = proto.Int32(*c.NumVoters)
+	}
+	m.VoterConstraints = ConstraintsList{c.VoterConstraints, c.InheritedVoterConstraints}
 	if !c.InheritedLeasePreferences {
 		m.LeasePreferences = c.LeasePreferences
 	}
@@ -250,11 +260,19 @@ func zoneConfigFromMarshalable(m marshalableZoneConfig, c ZoneConfig) ZoneConfig
 		tempGC := *m.GC
 		c.GC = &tempGC
 	}
+	if m.GlobalReads != nil {
+		c.GlobalReads = proto.Bool(*m.GlobalReads)
+	}
 	if m.NumReplicas != nil {
 		c.NumReplicas = proto.Int32(*m.NumReplicas)
 	}
 	c.Constraints = m.Constraints.Constraints
 	c.InheritedConstraints = m.Constraints.Inherited
+	if m.NumVoters != nil {
+		c.NumVoters = proto.Int32(*m.NumVoters)
+	}
+	c.VoterConstraints = m.VoterConstraints.Constraints
+	c.InheritedVoterConstraints = m.VoterConstraints.Inherited
 	if m.LeasePreferences != nil {
 		c.LeasePreferences = m.LeasePreferences
 	}

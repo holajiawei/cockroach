@@ -16,19 +16,33 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
 
 func TestRandomizedCast(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+	flowCtx := &execinfra.FlowCtx{
+		EvalCtx: &evalCtx,
+		Cfg: &execinfra.ServerConfig{
+			Settings: st,
+		},
+	}
+	rng, _ := randutil.NewPseudoRand()
 
 	datumAsBool := func(d tree.Datum) interface{} {
 		return bool(tree.MustBeDBool(d))
@@ -42,81 +56,122 @@ func TestRandomizedCast(t *testing.T) {
 	datumAsDecimal := func(d tree.Datum) interface{} {
 		return tree.MustBeDDecimal(d).Decimal
 	}
+	datumAsColdataextDatum := func(datumVec coldata.DatumVec, d tree.Datum) interface{} {
+		datumVec.Set(0, d)
+		return datumVec.Get(0)
+	}
+	makeDatumVecAdapter := func(datumVec coldata.DatumVec) func(tree.Datum) interface{} {
+		return func(d tree.Datum) interface{} {
+			return datumAsColdataextDatum(datumVec, d)
+		}
+	}
+
+	collatedStringType := types.MakeCollatedString(types.String, *rowenc.RandCollationLocale(rng))
+	collatedStringVec := testColumnFactory.MakeColumn(collatedStringType, 1 /* n */).(coldata.DatumVec)
+	getCollatedStringsThatCanBeCastAsBools := func() []tree.Datum {
+		var res []tree.Datum
+		for _, validString := range []string{"true", "false", "yes", "no"} {
+			d, err := tree.NewDCollatedString(validString, collatedStringType.Locale(), &tree.CollationEnvironment{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			res = append(res, d)
+		}
+		return res
+	}
 
 	tc := []struct {
 		fromTyp      *types.T
 		fromPhysType func(tree.Datum) interface{}
 		toTyp        *types.T
 		toPhysType   func(tree.Datum) interface{}
-		// Some types casting can fail, so retry if we
-		// generate a datum that is unable to be casted.
+		// getValidSet (when non-nil) is a function that returns a set of valid
+		// datums of fromTyp type that can be cast to toTyp type. The test
+		// harness will be randomly choosing a datum from this set. This
+		// function should be specified when rowenc.RandDatum will take ages
+		// (if ever) to generate the datum that is valid for a cast.
+		getValidSet func() []tree.Datum
+		// Some types casting can fail, so retry if we generate a datum that is
+		// unable to be cast.
 		retryGeneration bool
 	}{
 		//bool -> t tests
-		{types.Bool, datumAsBool, types.Bool, datumAsBool, false},
-		{types.Bool, datumAsBool, types.Int, datumAsInt, false},
-		{types.Bool, datumAsBool, types.Float, datumAsFloat, false},
+		{fromTyp: types.Bool, fromPhysType: datumAsBool, toTyp: types.Bool, toPhysType: datumAsBool},
+		{fromTyp: types.Bool, fromPhysType: datumAsBool, toTyp: types.Int, toPhysType: datumAsInt},
+		{fromTyp: types.Bool, fromPhysType: datumAsBool, toTyp: types.Float, toPhysType: datumAsFloat},
 		// decimal -> t tests
-		{types.Decimal, datumAsDecimal, types.Bool, datumAsBool, false},
+		{fromTyp: types.Decimal, fromPhysType: datumAsDecimal, toTyp: types.Bool, toPhysType: datumAsBool},
 		// int -> t tests
-		{types.Int, datumAsInt, types.Bool, datumAsBool, false},
-		{types.Int, datumAsInt, types.Float, datumAsFloat, false},
-		{types.Int, datumAsInt, types.Decimal, datumAsDecimal, false},
+		{fromTyp: types.Int, fromPhysType: datumAsInt, toTyp: types.Bool, toPhysType: datumAsBool},
+		{fromTyp: types.Int, fromPhysType: datumAsInt, toTyp: types.Float, toPhysType: datumAsFloat},
+		{fromTyp: types.Int, fromPhysType: datumAsInt, toTyp: types.Decimal, toPhysType: datumAsDecimal},
 		// float -> t tests
-		{types.Float, datumAsFloat, types.Bool, datumAsBool, false},
+		{fromTyp: types.Float, fromPhysType: datumAsFloat, toTyp: types.Bool, toPhysType: datumAsBool},
 		// We can sometimes generate a float outside of the range of the integers,
 		// so we want to retry with generation if that occurs.
-		{types.Float, datumAsFloat, types.Int, datumAsInt, true},
-		{types.Float, datumAsFloat, types.Decimal, datumAsDecimal, false},
+		{fromTyp: types.Float, fromPhysType: datumAsFloat, toTyp: types.Int, toPhysType: datumAsInt, retryGeneration: true},
+		{fromTyp: types.Float, fromPhysType: datumAsFloat, toTyp: types.Decimal, toPhysType: datumAsDecimal},
+		// datum-backed type -> t tests
+		{fromTyp: collatedStringType, fromPhysType: makeDatumVecAdapter(collatedStringVec), toTyp: types.Bool, toPhysType: datumAsBool, getValidSet: getCollatedStringsThatCanBeCastAsBools},
 	}
 
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-	rng, _ := randutil.NewPseudoRand()
-
 	for _, c := range tc {
-		t.Run(fmt.Sprintf("%sTo%s", c.fromTyp.String(), c.toTyp.String()), func(t *testing.T) {
-			n := 100
-			// Make an input vector of length n.
-			input := tuples{}
-			output := tuples{}
-			for i := 0; i < n; i++ {
+		log.Infof(ctx, "%sTo%s", c.fromTyp.String(), c.toTyp.String())
+		n := 100
+		// Make an input vector of length n.
+		input := tuples{}
+		output := tuples{}
+		for i := 0; i < n; i++ {
+			var (
+				fromDatum, toDatum tree.Datum
+				err                error
+			)
+			if c.getValidSet != nil {
+				validFromDatums := c.getValidSet()
+				fromDatum = validFromDatums[rng.Intn(len(validFromDatums))]
+				toDatum, err = tree.PerformCast(&evalCtx, fromDatum, c.toTyp)
+			} else {
 				// We don't allow any NULL datums to be generated, so disable
 				// this ability in the RandDatum function.
-				fromDatum := sqlbase.RandDatum(rng, c.fromTyp, false)
-				var (
-					toDatum tree.Datum
-					err     error
-				)
-				toDatum, err = tree.PerformCast(evalCtx, fromDatum, c.toTyp)
+				fromDatum = rowenc.RandDatum(rng, c.fromTyp, false)
+				toDatum, err = tree.PerformCast(&evalCtx, fromDatum, c.toTyp)
 				if c.retryGeneration {
 					for err != nil {
 						// If we are allowed to retry, make a new datum and cast it on error.
-						fromDatum = sqlbase.RandDatum(rng, c.fromTyp, false)
-						toDatum, err = tree.PerformCast(evalCtx, fromDatum, c.toTyp)
-					}
-				} else {
-					if err != nil {
-						t.Fatal(err)
+						fromDatum = rowenc.RandDatum(rng, c.fromTyp, false)
+						toDatum, err = tree.PerformCast(&evalCtx, fromDatum, c.toTyp)
 					}
 				}
-				input = append(input, tuple{c.fromPhysType(fromDatum)})
-				output = append(output, tuple{c.fromPhysType(fromDatum), c.toPhysType(toDatum)})
 			}
-			runTests(t, []tuples{input}, output, orderedVerifier,
-				func(input []Operator) (Operator, error) {
-					return GetCastOperator(testAllocator, input[0], 0 /* inputIdx*/, 1 /* resultIdx */, c.fromTyp, c.toTyp)
-				})
-		})
+			if err != nil {
+				t.Fatal(err)
+			}
+			input = append(input, tuple{c.fromPhysType(fromDatum)})
+			output = append(output, tuple{c.fromPhysType(fromDatum), c.toPhysType(toDatum)})
+		}
+		runTestsWithTyps(t, []tuples{input}, [][]*types.T{{c.fromTyp}}, output, orderedVerifier,
+			func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+				return createTestCastOperator(ctx, flowCtx, input[0], c.fromTyp, c.toTyp)
+			})
 	}
 }
 
 func BenchmarkCastOp(b *testing.B) {
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+	flowCtx := &execinfra.FlowCtx{
+		EvalCtx: &evalCtx,
+		Cfg: &execinfra.ServerConfig{
+			Settings: st,
+		},
+	}
 	rng, _ := randutil.NewPseudoRand()
-	for _, typePair := range [][]types.T{
-		{*types.Int, *types.Float},
-		{*types.Int, *types.Decimal},
-		{*types.Float, *types.Decimal},
+	for _, typePair := range [][]*types.T{
+		{types.Int, types.Float},
+		{types.Int, types.Decimal},
+		{types.Float, types.Decimal},
 	} {
 		for _, useSel := range []bool{true, false} {
 			for _, hasNulls := range []bool{true, false} {
@@ -124,21 +179,21 @@ func BenchmarkCastOp(b *testing.B) {
 					fmt.Sprintf("useSel=%t/hasNulls=%t/%s_to_%s",
 						useSel, hasNulls, typePair[0].Name(), typePair[1].Name(),
 					), func(b *testing.B) {
-						fromType := typeconv.FromColumnType(&typePair[0])
 						nullProbability := nullProbability
 						if !hasNulls {
 							nullProbability = 0
 						}
 						selectivity := selectivity
 						if !useSel {
-							selectivity = 1.0
+							selectivity = 0
 						}
-						batch := randomBatchWithSel(
-							testAllocator, rng, []coltypes.T{fromType},
+						typs := []*types.T{typePair[0]}
+						batch := coldatatestutils.RandomBatchWithSel(
+							testAllocator, rng, typs,
 							coldata.BatchSize(), nullProbability, selectivity,
 						)
-						source := NewRepeatableBatchSource(testAllocator, batch)
-						op, err := GetCastOperator(testAllocator, source, 0, 1, &typePair[0], &typePair[1])
+						source := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
+						op, err := createTestCastOperator(ctx, flowCtx, source, typePair[0], typePair[1])
 						require.NoError(b, err)
 						b.SetBytes(int64(8 * coldata.BatchSize()))
 						b.ResetTimer()
@@ -150,4 +205,20 @@ func BenchmarkCastOp(b *testing.B) {
 			}
 		}
 	}
+}
+
+func createTestCastOperator(
+	ctx context.Context,
+	flowCtx *execinfra.FlowCtx,
+	input colexecbase.Operator,
+	fromTyp *types.T,
+	toTyp *types.T,
+) (colexecbase.Operator, error) {
+	// We currently don't support casting to decimal type (other than when
+	// casting from decimal with the same precision), so we will allow falling
+	// back to row-by-row engine.
+	return createTestProjectingOperator(
+		ctx, flowCtx, input, []*types.T{fromTyp},
+		fmt.Sprintf("@1::%s", toTyp.Name()), true, /* canFallbackToRowexec */
+	)
 }

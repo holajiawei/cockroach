@@ -77,14 +77,14 @@ func (node *ParenSelect) Format(ctx *FmtCtx) {
 
 // SelectClause represents a SELECT statement.
 type SelectClause struct {
-	Distinct    bool
+	From        From
 	DistinctOn  DistinctOn
 	Exprs       SelectExprs
-	From        From
-	Where       *Where
 	GroupBy     GroupBy
-	Having      *Where
 	Window      Window
+	Having      *Where
+	Where       *Where
+	Distinct    bool
 	TableSelect bool
 }
 
@@ -445,9 +445,10 @@ const (
 
 // JoinTableExpr.Hint
 const (
-	AstHash   = "HASH"
-	AstLookup = "LOOKUP"
-	AstMerge  = "MERGE"
+	AstHash     = "HASH"
+	AstLookup   = "LOOKUP"
+	AstMerge    = "MERGE"
+	AstInverted = "INVERTED"
 )
 
 // Format implements the NodeFormatter interface.
@@ -801,13 +802,13 @@ const (
 // OverrideWindowDef implements the logic to have a base window definition which
 // then gets augmented by a different window definition.
 func OverrideWindowDef(base *WindowDef, override WindowDef) (WindowDef, error) {
-	// referencedSpec.Partitions is always used.
+	// base.Partitions is always used.
 	if len(override.Partitions) > 0 {
 		return WindowDef{}, pgerror.Newf(pgcode.Windowing, "cannot override PARTITION BY clause of window %q", base.Name)
 	}
 	override.Partitions = base.Partitions
 
-	// referencedSpec.OrderBy is used if set.
+	// base.OrderBy is used if set.
 	if len(base.OrderBy) > 0 {
 		if len(override.OrderBy) > 0 {
 			return WindowDef{}, pgerror.Newf(pgcode.Windowing, "cannot override ORDER BY clause of window %q", base.Name)
@@ -838,6 +839,11 @@ const (
 	UnboundedFollowing
 )
 
+// IsOffset returns true if the WindowFrameBoundType is an offset.
+func (ft WindowFrameBoundType) IsOffset() bool {
+	return ft == OffsetPreceding || ft == OffsetFollowing
+}
+
 // WindowFrameBound specifies the offset and the type of boundary.
 type WindowFrameBound struct {
 	BoundType  WindowFrameBoundType
@@ -846,7 +852,7 @@ type WindowFrameBound struct {
 
 // HasOffset returns whether node contains an offset.
 func (node *WindowFrameBound) HasOffset() bool {
-	return node.BoundType == OffsetPreceding || node.BoundType == OffsetFollowing
+	return node.BoundType.IsOffset()
 }
 
 // WindowFrameBounds specifies boundaries of the window frame.
@@ -1027,9 +1033,10 @@ func (s LockingStrength) Max(s2 LockingStrength) LockingStrength {
 	return LockingStrength(max(byte(s), byte(s2)))
 }
 
-// LockingWaitPolicy represents the possible policies for dealing with rows
-// being locked by FOR UPDATE/SHARE clauses (i.e., it represents the NOWAIT
-// and SKIP LOCKED options).
+// LockingWaitPolicy represents the possible policies for handling conflicting
+// locks held by other active transactions when attempting to lock rows due to
+// FOR UPDATE/SHARE clauses (i.e. it represents the NOWAIT and SKIP LOCKED
+// options).
 type LockingWaitPolicy byte
 
 // The ordering of the variants is important, because the highest numerical

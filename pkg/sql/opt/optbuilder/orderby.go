@@ -23,7 +23,7 @@ import (
 // analyzeOrderBy analyzes an Ordering physical property from the ORDER BY
 // clause and adds the resulting typed expressions to orderByScope.
 func (b *Builder) analyzeOrderBy(
-	orderBy tree.OrderBy, inScope, projectionsScope *scope,
+	orderBy tree.OrderBy, inScope, projectionsScope *scope, rejectFlags tree.SemaRejectFlags,
 ) (orderByScope *scope) {
 	if orderBy == nil {
 		return nil
@@ -36,8 +36,8 @@ func (b *Builder) analyzeOrderBy(
 	// semaCtx in case we are recursively called within a subquery
 	// context.
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
-	b.semaCtx.Properties.Require("ORDER BY", tree.RejectGenerators)
-	inScope.context = "ORDER BY"
+	b.semaCtx.Properties.Require(exprKindOrderBy.String(), rejectFlags)
+	inScope.context = exprKindOrderBy
 
 	for i := range orderBy {
 		b.analyzeOrderByArg(orderBy[i], inScope, projectionsScope, orderByScope)
@@ -146,7 +146,7 @@ func (b *Builder) analyzeOrderByIndex(
 
 		colItem := tree.NewColumnItem(&tn, col.ColName())
 		expr := inScope.resolveType(colItem, types.Any)
-		outCol := b.addColumn(orderByScope, "" /* alias */, expr)
+		outCol := orderByScope.addColumn("" /* alias */, expr)
 		outCol.descending = desc
 	}
 }
@@ -231,12 +231,12 @@ func (b *Builder) analyzeExtraArgument(
 	//    e.g. SELECT a, b FROM t ORDER by a+b
 
 	// First, deal with projection aliases.
-	idx := colIdxByProjectionAlias(expr, inScope.context, projectionsScope)
+	idx := colIdxByProjectionAlias(expr, inScope.context.String(), projectionsScope)
 
 	// If the expression does not refer to an alias, deal with
 	// column ordinals.
 	if idx == -1 {
-		idx = colIndex(len(projectionsScope.cols), expr, inScope.context)
+		idx = colIndex(len(projectionsScope.cols), expr, inScope.context.String())
 	}
 
 	var exprs tree.TypedExprs
@@ -252,16 +252,14 @@ func (b *Builder) analyzeExtraArgument(
 	for _, e := range exprs {
 		// Ensure we can order on the given column(s).
 		ensureColumnOrderable(e)
-		b.addColumn(extraColsScope, "" /* alias */, e)
+		extraColsScope.addColumn("" /* alias */, e)
 	}
 }
 
 func ensureColumnOrderable(e tree.TypedExpr) {
 	typ := e.ResolvedType()
-	if typ.Family() == types.ArrayFamily {
-		panic(unimplementedWithIssueDetailf(35707, "", "can't order by column type %s", typ))
-	}
-	if typ.Family() == types.JsonFamily {
+	if typ.Family() == types.JsonFamily ||
+		(typ.Family() == types.ArrayFamily && typ.ArrayContents().Family() == types.JsonFamily) {
 		panic(unimplementedWithIssueDetailf(35706, "", "can't order by column type jsonb"))
 	}
 }

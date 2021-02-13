@@ -15,18 +15,21 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
 	yaml "gopkg.in/yaml.v2"
 )
 
 func TestPlanToTreeAndPlanToString(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	s, sqlDB, db := serverutils.StartServer(t, base.TestServerArgs{})
@@ -54,23 +57,30 @@ func TestPlanToTreeAndPlanToString(t *testing.T) {
 
 			internalPlanner, cleanup := NewInternalPlanner(
 				"test",
-				client.NewTxn(ctx, db, s.NodeID()),
-				security.RootUser,
+				kv.NewTxn(ctx, db, s.NodeID()),
+				security.RootUserName(),
 				&MemoryMetrics{},
 				&execCfg,
+				sessiondatapb.SessionData{},
 			)
 			defer cleanup()
 			p := internalPlanner.(*planner)
 
-			p.stmt = &Statement{Statement: stmt}
+			ih := &p.instrumentation
+			ih.codec = execCfg.Codec
+			ih.collectBundle = true
+			ih.savePlanForStats = true
+
+			p.stmt = makeStatement(stmt, ClusterWideID{})
 			if err := p.makeOptimizerPlan(ctx); err != nil {
 				t.Fatal(err)
 			}
+			p.curPlan.flags.Set(planFlagExecDone)
+			p.curPlan.close(ctx)
 			if d.Cmd == "plan-string" {
-				return planToString(ctx, p.curPlan.plan, p.curPlan.subqueryPlans, p.curPlan.postqueryPlans)
+				return ih.planStringForBundle(&phaseTimes{})
 			}
-			tree := planToTree(ctx, &p.curPlan)
-			treeYaml, err := yaml.Marshal(tree)
+			treeYaml, err := yaml.Marshal(ih.PlanForStats(ctx))
 			if err != nil {
 				t.Fatal(err)
 			}

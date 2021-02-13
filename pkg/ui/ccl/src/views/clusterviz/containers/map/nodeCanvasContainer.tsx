@@ -13,9 +13,21 @@ import { withRouter, RouteComponentProps } from "react-router-dom";
 import { createSelector } from "reselect";
 
 import { cockroach } from "src/js/protos";
-import { refreshNodes, refreshLiveness, refreshLocations } from "src/redux/apiReducers";
-import { selectLocalityTree, LocalityTier, LocalityTree } from "src/redux/localities";
-import { selectLocationsRequestStatus, selectLocationTree, LocationTree } from "src/redux/locations";
+import {
+  refreshNodes,
+  refreshLiveness,
+  refreshLocations,
+} from "src/redux/apiReducers";
+import {
+  selectLocalityTree,
+  LocalityTier,
+  LocalityTree,
+} from "src/redux/localities";
+import {
+  selectLocationsRequestStatus,
+  selectLocationTree,
+  LocationTree,
+} from "src/redux/locations";
 import {
   nodesSummarySelector,
   NodesSummary,
@@ -28,10 +40,10 @@ import {
 import { AdminUIState } from "src/redux/state";
 import { CLUSTERVIZ_ROOT } from "src/routes/visualization";
 import { getLocality } from "src/util/localities";
-import Loading from "src/views/shared/components/loading";
+import { Loading } from "@cockroachlabs/cluster-ui";
 import { NodeCanvas } from "./nodeCanvas";
 
-type Liveness = cockroach.storage.ILiveness;
+type Liveness = cockroach.kv.kvserver.liveness.livenesspb.ILiveness;
 
 interface NodeCanvasContainerProps {
   nodesSummary: NodesSummary;
@@ -51,21 +63,26 @@ export interface NodeCanvasContainerOwnProps {
   tiers: LocalityTier[];
 }
 
-class NodeCanvasContainer extends React.Component<NodeCanvasContainerProps & NodeCanvasContainerOwnProps & RouteComponentProps> {
-  componentWillMount() {
+class NodeCanvasContainer extends React.Component<
+  NodeCanvasContainerProps & NodeCanvasContainerOwnProps & RouteComponentProps
+> {
+  componentDidMount() {
     this.props.refreshNodes();
     this.props.refreshLiveness();
     this.props.refreshLocations();
   }
 
-  componentWillReceiveProps(props: NodeCanvasContainerProps & NodeCanvasContainerOwnProps & RouteComponentProps) {
-    props.refreshNodes();
-    props.refreshLiveness();
-    props.refreshLocations();
+  componentDidUpdate() {
+    this.props.refreshNodes();
+    this.props.refreshLiveness();
+    this.props.refreshLocations();
   }
 
   render() {
-    const currentLocality = getLocality(this.props.localityTree, this.props.tiers);
+    const currentLocality = getLocality(
+      this.props.localityTree,
+      this.props.tiers,
+    );
     if (this.props.dataIsValid && _.isNil(currentLocality)) {
       this.props.history.replace(CLUSTERVIZ_ROOT);
     }
@@ -92,37 +109,45 @@ const selectDataExists = createSelector(
   selectNodeRequestStatus,
   selectLocationsRequestStatus,
   selectLivenessRequestStatus,
-  (nodes, locations, liveness) => !!nodes.data && !!locations.data && !!liveness.data,
+  (nodes, locations, liveness) =>
+    !!nodes.data && !!locations.data && !!liveness.data,
 );
 
 const selectDataIsValid = createSelector(
   selectNodeRequestStatus,
   selectLocationsRequestStatus,
   selectLivenessRequestStatus,
-  (nodes, locations, liveness) => nodes.valid && locations.valid && liveness.valid,
+  (nodes, locations, liveness) =>
+    nodes.valid && locations.valid && liveness.valid,
 );
 
 const dataErrors = createSelector(
   selectNodeRequestStatus,
   selectLocationsRequestStatus,
   selectLivenessRequestStatus,
-  (nodes, locations, liveness) => [nodes.lastError, locations.lastError, liveness.lastError],
+  (nodes, locations, liveness) => [
+    nodes.lastError,
+    locations.lastError,
+    liveness.lastError,
+  ],
 );
 
-export default withRouter(connect(
-  (state: AdminUIState, _ownProps: NodeCanvasContainerOwnProps) => ({
-    nodesSummary: nodesSummarySelector(state),
-    localityTree: selectLocalityTree(state),
-    locationTree: selectLocationTree(state),
-    livenessStatuses: livenessStatusByNodeIDSelector(state),
-    livenesses: livenessByNodeIDSelector(state),
-    dataIsValid: selectDataIsValid(state),
-    dataExists: selectDataExists(state),
-    dataErrors: dataErrors(state),
-  }),
-  {
-    refreshNodes,
-    refreshLiveness,
-    refreshLocations,
-  },
-)(NodeCanvasContainer));
+export default withRouter(
+  connect(
+    (state: AdminUIState, _ownProps: NodeCanvasContainerOwnProps) => ({
+      nodesSummary: nodesSummarySelector(state),
+      localityTree: selectLocalityTree(state),
+      locationTree: selectLocationTree(state),
+      livenessStatuses: livenessStatusByNodeIDSelector(state),
+      livenesses: livenessByNodeIDSelector(state),
+      dataIsValid: selectDataIsValid(state),
+      dataExists: selectDataExists(state),
+      dataErrors: dataErrors(state),
+    }),
+    {
+      refreshNodes,
+      refreshLiveness,
+      refreshLocations,
+    },
+  )(NodeCanvasContainer),
+);

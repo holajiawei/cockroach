@@ -15,9 +15,13 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type createDatabaseNode struct {
@@ -25,10 +29,16 @@ type createDatabaseNode struct {
 }
 
 // CreateDatabase creates a database.
-// Privileges: superuser.
-//   Notes: postgres requires superuser or "CREATEDB".
-//          mysql uses the mysqladmin command.
+// Privileges: superuser or CREATEDB
 func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"CREATE DATABASE",
+	); err != nil {
+		return nil, err
+	}
+
 	if n.Name == "" {
 		return nil, errEmptyDatabaseName
 	}
@@ -67,40 +77,43 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 		}
 	}
 
-	if err := p.RequireAdminRole(ctx, "CREATE DATABASE"); err != nil {
+	if n.ConnectionLimit != -1 {
+		return nil, unimplemented.NewWithIssueDetailf(
+			54241,
+			"create.db.connection_limit",
+			"only connection limit -1 is supported, got: %d",
+			n.ConnectionLimit,
+		)
+	}
+
+	hasCreateDB, err := p.HasRoleOption(ctx, roleoption.CREATEDB)
+	if err != nil {
 		return nil, err
+	}
+	if !hasCreateDB {
+		return nil, pgerror.New(pgcode.InsufficientPrivilege, "permission denied to create database")
 	}
 
 	return &createDatabaseNode{n: n}, nil
 }
 
 func (n *createDatabaseNode) startExec(params runParams) error {
-	telemetry.Inc(sqltelemetry.SchemaChangeCreate("database"))
-	desc := makeDatabaseDesc(n.n)
+	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("database"))
 
-	created, err := params.p.createDatabase(params.ctx, &desc, n.n.IfNotExists)
+	desc, created, err := params.p.createDatabase(
+		params.ctx, n.n, tree.AsStringWithFQNames(n.n, params.Ann()))
 	if err != nil {
 		return err
 	}
 	if created {
 		// Log Create Database event. This is an auditable log event and is
 		// recorded in the same transaction as the table descriptor update.
-		if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
-			params.ctx,
-			params.p.txn,
-			EventLogCreateDatabase,
-			int32(desc.ID),
-			int32(params.extendedEvalCtx.NodeID),
-			struct {
-				DatabaseName string
-				Statement    string
-				User         string
-			}{n.n.Name.String(), n.n.String(), params.SessionData().User},
-		); err != nil {
+		if err := params.p.logEvent(params.ctx, desc.GetID(),
+			&eventpb.CreateDatabase{
+				DatabaseName: n.n.Name.String(),
+			}); err != nil {
 			return err
 		}
-		params.extendedEvalCtx.Tables.addUncommittedDatabase(
-			desc.Name, desc.ID, dbCreated)
 	}
 	return nil
 }
@@ -108,3 +121,9 @@ func (n *createDatabaseNode) startExec(params runParams) error {
 func (*createDatabaseNode) Next(runParams) (bool, error) { return false, nil }
 func (*createDatabaseNode) Values() tree.Datums          { return tree.Datums{} }
 func (*createDatabaseNode) Close(context.Context)        {}
+
+// ReadingOwnWrites implements the planNodeReadingOwnWrites Interface. This is
+// required because we create a type descriptor for multi-region databases,
+// which must be read during validation. We also call CONFIGURE ZONE which
+// perms multiple KV operations on descriptors and expects to see its own writes.
+func (*createDatabaseNode) ReadingOwnWrites() {}

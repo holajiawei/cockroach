@@ -16,8 +16,11 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // TestHashFunctionFamily verifies the assumption that our vectorized hashing
@@ -26,26 +29,28 @@ import (
 // sufficient to get a "different" hash function.
 func TestHashFunctionFamily(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	bucketsA, bucketsB := make([]uint64, coldata.BatchSize()), make([]uint64, coldata.BatchSize())
 	nKeys := coldata.BatchSize()
-	keyTypes := []coltypes.T{coltypes.Int64}
+	keyTypes := []*types.T{types.Int}
 	keys := []coldata.Vec{testAllocator.NewMemColumn(keyTypes[0], coldata.BatchSize())}
 	for i := int64(0); i < int64(coldata.BatchSize()); i++ {
 		keys[0].Int64()[i] = i
 	}
 	numBuckets := uint64(16)
 	var (
-		cancelChecker  CancelChecker
-		decimalScratch decimalOverloadScratch
+		cancelChecker     CancelChecker
+		overloadHelperVar execgen.OverloadHelper
+		datumAlloc        rowenc.DatumAlloc
 	)
 
 	for initHashValue, buckets := range [][]uint64{bucketsA, bucketsB} {
 		// We need +1 here because 0 is not a valid initial hash value.
 		initHash(buckets, nKeys, uint64(initHashValue+1))
-		for i, typ := range keyTypes {
-			rehash(ctx, buckets, typ, keys[i], nKeys, nil /* sel */, cancelChecker, decimalScratch)
+		for _, keysCol := range keys {
+			rehash(ctx, buckets, keysCol, nKeys, nil /* sel */, cancelChecker, overloadHelperVar, &datumAlloc)
 		}
 		finalizeHash(buckets, nKeys, numBuckets)
 	}

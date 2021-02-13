@@ -11,10 +11,12 @@
 package roachpb
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
@@ -215,58 +217,63 @@ func TestBatchRequestSummary(t *testing.T) {
 	}
 }
 
-func TestIntentSpanIterate(t *testing.T) {
-	testCases := []struct {
+func TestLockSpanIterate(t *testing.T) {
+	type testReq struct {
 		req    Request
 		resp   Response
 		span   Span
 		resume Span
-	}{
-		{&ScanRequest{}, &ScanResponse{}, sp("a", "c"), sp("b", "c")},
-		{&ReverseScanRequest{}, &ReverseScanResponse{}, sp("d", "f"), sp("d", "e")},
-		{&DeleteRangeRequest{}, &DeleteRangeResponse{}, sp("g", "i"), sp("h", "i")},
+	}
+	testReqs := []testReq{
+		{&GetRequest{}, &GetResponse{}, sp("a", ""), sp("", "")},
+		{&ScanRequest{}, &ScanResponse{}, sp("b", "d"), sp("c", "d")},
+		{&ReverseScanRequest{}, &ReverseScanResponse{}, sp("e", "g"), sp("f", "g")},
+		{&PutRequest{}, &PutResponse{}, sp("h", ""), sp("", "")},
+		{&DeleteRangeRequest{}, &DeleteRangeResponse{}, sp("i", "k"), sp("j", "k")},
+		{&GetRequest{KeyLocking: lock.Exclusive}, &GetResponse{}, sp("l", ""), sp("", "")},
+		{&ScanRequest{KeyLocking: lock.Exclusive}, &ScanResponse{}, sp("m", "o"), sp("n", "o")},
+		{&ReverseScanRequest{KeyLocking: lock.Exclusive}, &ReverseScanResponse{}, sp("p", "r"), sp("q", "r")},
 	}
 
-	// A batch request with a batch response with no ResumeSpan.
-	ba := BatchRequest{}
-	br := BatchResponse{}
-	for _, tc := range testCases {
-		tc.req.SetHeader(RequestHeaderFromSpan(tc.span))
-		ba.Add(tc.req)
-		br.Add(tc.resp)
-	}
+	// NB: can't import testutils for RunTrueAndFalse.
+	for _, resume := range []bool{false, true} {
+		t.Run(fmt.Sprintf("resume=%t", resume), func(t *testing.T) {
+			// A batch request with a batch response with no ResumeSpan.
+			ba := BatchRequest{}
+			br := BatchResponse{}
+			for i := range testReqs {
+				tr := &testReqs[i]
+				tr.req.SetHeader(RequestHeaderFromSpan(tr.span))
+				ba.Add(tr.req)
+				if resume {
+					tr.resp.SetHeader(ResponseHeader{ResumeSpan: &tr.resume})
+				}
+				br.Add(tr.resp)
+			}
 
-	var spans []Span
-	fn := func(span Span) {
-		spans = append(spans, span)
-	}
-	ba.IntentSpanIterate(&br, fn)
-	// Only DeleteRangeResponse is a write request.
-	if e := 1; len(spans) != e {
-		t.Fatalf("unexpected number of spans: e = %d, found = %d", e, len(spans))
-	}
-	if e := testCases[2].span; !reflect.DeepEqual(e, spans[0]) {
-		t.Fatalf("unexpected spans: e = %+v, found = %+v", e, spans[0])
-	}
+			var spans [lock.MaxDurability + 1][]Span
+			fn := func(span Span, dur lock.Durability) {
+				spans[dur] = append(spans[dur], span)
+			}
+			ba.LockSpanIterate(&br, fn)
 
-	// A batch request with a batch response with a ResumeSpan.
-	ba = BatchRequest{}
-	br = BatchResponse{}
-	for _, tc := range testCases {
-		tc.req.SetHeader(RequestHeaderFromSpan(tc.span))
-		ba.Add(tc.req)
-		tc.resp.SetHeader(ResponseHeader{ResumeSpan: &tc.resume})
-		br.Add(tc.resp)
-	}
+			toExpSpans := func(trs ...testReq) []Span {
+				exp := make([]Span, len(trs))
+				for i, tr := range trs {
+					exp[i] = tr.span
+					if resume {
+						exp[i].EndKey = tr.resume.Key
+					}
+				}
+				return exp
+			}
 
-	spans = []Span{}
-	ba.IntentSpanIterate(&br, fn)
-	// Only DeleteRangeResponse is a write request.
-	if e := 1; len(spans) != e {
-		t.Fatalf("unexpected number of spans: e = %d, found = %d", e, len(spans))
-	}
-	if e := sp("g", "h"); !reflect.DeepEqual(e, spans[0]) {
-		t.Fatalf("unexpected spans: e = %+v, found = %+v", e, spans[0])
+			// The intent writes are replicated locking request.
+			require.Equal(t, toExpSpans(testReqs[3], testReqs[4]), spans[lock.Replicated])
+
+			// The scans with KeyLocking are unreplicated locking requests.
+			require.Equal(t, toExpSpans(testReqs[5], testReqs[6], testReqs[7]), spans[lock.Unreplicated])
+		})
 	}
 }
 

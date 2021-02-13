@@ -12,7 +12,6 @@ package main
 
 import (
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 )
@@ -24,23 +23,18 @@ type relativeRankTmplInfo struct {
 	String        string
 }
 
-func genRelativeRankOps(wr io.Writer) error {
-	d, err := ioutil.ReadFile("pkg/sql/colexec/relative_rank_tmpl.go")
-	if err != nil {
-		return err
-	}
+const relativeRankTmpl = "pkg/sql/colexec/relative_rank_tmpl.go"
 
-	s := string(d)
+func genRelativeRankOps(inputFileContents string, wr io.Writer) error {
+	s := strings.ReplaceAll(inputFileContents, "_RELATIVE_RANK_STRING", "{{.String}}")
 
-	s = strings.Replace(s, "_RELATIVE_RANK_STRING", "{{.String}}", -1)
-
-	computeNumPeersRe := makeFunctionRegex("_COMPUTE_NUM_PEERS", 0)
-	s = computeNumPeersRe.ReplaceAllString(s, `{{template "computeNumPeers"}}`)
-	computeCumeDistRe := makeFunctionRegex("_COMPUTE_CUME_DIST", 0)
-	s = computeCumeDistRe.ReplaceAllString(s, `{{template "computeCumeDist"}}`)
+	computePartitionsSizesRe := makeFunctionRegex("_COMPUTE_PARTITIONS_SIZES", 1)
+	s = computePartitionsSizesRe.ReplaceAllString(s, `{{template "computePartitionsSizes" buildDict "HasSel" $1}}`)
+	computePeerGroupsSizesRe := makeFunctionRegex("_COMPUTE_PEER_GROUPS_SIZES", 1)
+	s = computePeerGroupsSizesRe.ReplaceAllString(s, `{{template "computePeerGroupsSizes" buildDict "HasSel" $1}}`)
 
 	// Now, generate the op, from the template.
-	tmpl, err := template.New("relative_rank_op").Parse(s)
+	tmpl, err := template.New("relative_rank_op").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
 	if err != nil {
 		return err
 	}
@@ -55,5 +49,5 @@ func genRelativeRankOps(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genRelativeRankOps, "relative_rank.eg.go")
+	registerGenerator(genRelativeRankOps, "relative_rank.eg.go", relativeRankTmpl)
 }

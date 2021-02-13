@@ -12,6 +12,7 @@ package tree
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -69,6 +70,20 @@ func (up UserPriority) String() string {
 	return userPriorityNames[up]
 }
 
+// UserPriorityFromString converts a string into a UserPriority.
+func UserPriorityFromString(val string) (_ UserPriority, ok bool) {
+	switch strings.ToUpper(val) {
+	case "LOW":
+		return Low, true
+	case "NORMAL":
+		return Normal, true
+	case "HIGH":
+		return High, true
+	default:
+		return 0, false
+	}
+}
+
 // ReadWriteMode holds the read write mode for a transaction.
 type ReadWriteMode int
 
@@ -92,12 +107,36 @@ func (ro ReadWriteMode) String() string {
 	return readWriteModeNames[ro]
 }
 
+// DeferrableMode holds the deferrable mode for a transaction.
+type DeferrableMode int
+
+// DeferrableMode values.
+const (
+	UnspecifiedDeferrableMode DeferrableMode = iota
+	Deferrable
+	NotDeferrable
+)
+
+var deferrableModeNames = [...]string{
+	UnspecifiedDeferrableMode: "UNSPECIFIED",
+	Deferrable:                "DEFERRABLE",
+	NotDeferrable:             "NOT DEFERRABLE",
+}
+
+func (d DeferrableMode) String() string {
+	if d < 0 || d > DeferrableMode(len(deferrableModeNames)-1) {
+		return fmt.Sprintf("DeferrableMode(%d)", d)
+	}
+	return deferrableModeNames[d]
+}
+
 // TransactionModes holds the transaction modes for a transaction.
 type TransactionModes struct {
 	Isolation     IsolationLevel
 	UserPriority  UserPriority
 	ReadWriteMode ReadWriteMode
 	AsOf          AsOfClause
+	Deferrable    DeferrableMode
 }
 
 // Format implements the NodeFormatter interface.
@@ -113,11 +152,16 @@ func (node *TransactionModes) Format(ctx *FmtCtx) {
 	}
 	if node.ReadWriteMode != UnspecifiedReadWriteMode {
 		ctx.Printf("%s READ %s", sep, node.ReadWriteMode)
+		sep = ","
 	}
 	if node.AsOf.Expr != nil {
 		ctx.WriteString(sep)
 		ctx.WriteString(" ")
 		node.AsOf.Format(ctx)
+		sep = ","
+	}
+	if node.Deferrable != UnspecifiedDeferrableMode {
+		ctx.Printf("%s %s", sep, node.Deferrable)
 	}
 }
 
@@ -126,6 +170,7 @@ var (
 	errUserPrioritySpecifiedMultipleTimes   = pgerror.New(pgcode.Syntax, "user priority specified multiple times")
 	errReadModeSpecifiedMultipleTimes       = pgerror.New(pgcode.Syntax, "read mode specified multiple times")
 	errAsOfSpecifiedMultipleTimes           = pgerror.New(pgcode.Syntax, "AS OF SYSTEM TIME specified multiple times")
+	errDeferrableSpecifiedMultipleTimes     = pgerror.New(pgcode.Syntax, "deferrable mode specified multiple times")
 
 	// ErrAsOfSpecifiedWithReadWrite is returned when a statement attempts to set
 	// a historical query to READ WRITE which conflicts with its implied READ ONLY
@@ -164,6 +209,12 @@ func (node *TransactionModes) Merge(other TransactionModes) error {
 		node.ReadWriteMode != ReadOnly &&
 		node.AsOf.Expr != nil {
 		return ErrAsOfSpecifiedWithReadWrite
+	}
+	if other.Deferrable != UnspecifiedDeferrableMode {
+		if node.Deferrable != UnspecifiedDeferrableMode {
+			return errDeferrableSpecifiedMultipleTimes
+		}
+		node.Deferrable = other.Deferrable
 	}
 	return nil
 }

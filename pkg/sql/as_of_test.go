@@ -16,28 +16,28 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestAsOfTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
-	params.Knobs.SQLSchemaChanger = &sql.SchemaChangerTestingKnobs{
-		AsyncExecNotification: asyncSchemaChangerDisabled,
-	}
+	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { select {} }}
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	const val1 = 1
 	const val2 = 2
@@ -250,10 +250,11 @@ func TestAsOfTime(t *testing.T) {
 // a failure will occur.
 func TestAsOfRetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, cmdFilters := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	const val1 = 1
 	const val2 = 2
@@ -294,13 +295,13 @@ func TestAsOfRetry(t *testing.T) {
 		name: 5,
 	}
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			magicVals.Lock()
 			defer magicVals.Unlock()
 
 			switch req := args.Req.(type) {
 			case *roachpb.ScanRequest:
-				if client.TestingIsRangeLookupRequest(req) {
+				if kv.TestingIsRangeLookupRequest(req) {
 					return nil
 				}
 				for key, count := range magicVals.restartCounts {
@@ -348,9 +349,10 @@ func TestAsOfRetry(t *testing.T) {
 // Test that tracing works with SELECT ... AS OF SYSTEM TIME.
 func TestShowTraceAsOfTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	const val1 = 456
 	const val2 = 789

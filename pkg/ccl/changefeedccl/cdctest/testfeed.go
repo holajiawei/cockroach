@@ -35,8 +35,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx"
-	"github.com/pkg/errors"
 )
 
 // TestFeedFactory is an interface to create changefeeds.
@@ -255,7 +255,7 @@ func (f *jobFeed) fetchJobError() error {
 		return err
 	}
 	if len(errorStr.String) > 0 {
-		f.jobErr = errors.New(errorStr.String)
+		f.jobErr = errors.Newf("%s", errorStr.String)
 	}
 	return nil
 }
@@ -321,7 +321,7 @@ func MakeTableFeedFactory(
 }
 
 // Feed implements the TestFeedFactory interface
-func (f *tableFeedFactory) Feed(create string, args ...interface{}) (TestFeed, error) {
+func (f *tableFeedFactory) Feed(create string, args ...interface{}) (_ TestFeed, err error) {
 	sink := f.sink
 	sink.Path = fmt.Sprintf(`table_%d`, timeutil.Now().UnixNano())
 
@@ -329,6 +329,11 @@ func (f *tableFeedFactory) Feed(create string, args ...interface{}) (TestFeed, e
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil {
+			_ = db.Close()
+		}
+	}()
 
 	sink.Scheme = `experimental-sql`
 	c := &TableFeed{
@@ -372,6 +377,14 @@ type TableFeed struct {
 
 	rows *gosql.Rows
 	seen map[string]struct{}
+}
+
+// ResetSeen is useful when manually pausing and resuming a TableFeed.
+// We want to be able to assert that rows are not re-emitted in some cases.
+func (c *TableFeed) ResetSeen() {
+	for k := range c.seen {
+		delete(c.seen, k)
+	}
 }
 
 // Partitions implements the TestFeed interface.
@@ -492,7 +505,7 @@ func (f *cloudFeedFactory) Feed(create string, args ...interface{}) (TestFeed, e
 	}
 	feedDir := strconv.Itoa(f.feedIdx)
 	f.feedIdx++
-	sinkURI := `experimental-nodelocal:///` + feedDir
+	sinkURI := `experimental-nodelocal://0/` + feedDir
 	// TODO(dan): This is a pretty unsatisfying way to test that the sink passes
 	// through params it doesn't understand to ExternalStorage.
 	sinkURI += `?should_be=ignored`

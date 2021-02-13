@@ -11,39 +11,38 @@
 package main
 
 import (
+	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-func genSubstring(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/substring_tmpl.go")
-	if err != nil {
-		return err
-	}
+const substringTmpl = "pkg/sql/colexec/substring_tmpl.go"
 
-	s := string(t)
-
-	s = strings.Replace(s, "_StartType_T", "coltypes.{{$startType}}", -1)
-	s = strings.Replace(s, "_LengthType_T", "coltypes.{{$lengthType}}", -1)
-	s = strings.Replace(s, "_StartType", "{{$startType}}", -1)
-	s = strings.Replace(s, "_LengthType", "{{$lengthType}}", -1)
+func genSubstring(inputFileContents string, wr io.Writer) error {
+	r := strings.NewReplacer(
+		"_START_WIDTH", fmt.Sprintf("{{$startWidth}}{{if eq $startWidth %d}}: default{{end}}", anyWidth),
+		"_LENGTH_WIDTH", fmt.Sprintf("{{$lengthWidth}}{{if eq $lengthWidth %d}}: default{{end}}", anyWidth),
+		"_StartType", fmt.Sprintf("Int{{if eq $startWidth %d}}64{{else}}{{$startWidth}}{{end}}", anyWidth),
+		"_LengthType", fmt.Sprintf("Int{{if eq $lengthWidth %d}}64{{else}}{{$lengthWidth}}{{end}}", anyWidth),
+	)
+	s := r.Replace(inputFileContents)
 
 	tmpl, err := template.New("substring").Parse(s)
 	if err != nil {
 		return err
 	}
 
-	intToInts := make(map[coltypes.T][]coltypes.T)
-	for _, intType := range coltypes.IntTypes {
-		intToInts[intType] = coltypes.IntTypes
+	supportedIntWidths := supportedWidthsByCanonicalTypeFamily[types.IntFamily]
+	intWidthsToIntWidths := make(map[int32][]int32)
+	for _, intWidth := range supportedIntWidths {
+		intWidthsToIntWidths[intWidth] = supportedIntWidths
 	}
-	return tmpl.Execute(wr, intToInts)
+	return tmpl.Execute(wr, intWidthsToIntWidths)
 }
 
 func init() {
-	registerGenerator(genSubstring, "substring.eg.go")
+	registerGenerator(genSubstring, "substring.eg.go", substringTmpl)
 }

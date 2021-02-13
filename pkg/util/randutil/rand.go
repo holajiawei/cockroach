@@ -40,6 +40,13 @@ func NewPseudoRand() (*rand.Rand, int64) {
 	return rand.New(rand.NewSource(seed)), seed
 }
 
+// NewTestPseudoRand wraps NewPseudoRand logging the seed for recovery later.
+func NewTestPseudoRand() (*rand.Rand, int64) {
+	rng, seed := NewPseudoRand()
+	log.Printf("random seed: %v", seed)
+	return rng, seed
+}
+
 // RandIntInRange returns a value in [min, max)
 func RandIntInRange(r *rand.Rand, min, max int) int {
 	return min + r.Intn(max-min)
@@ -82,5 +89,5 @@ func ReadTestdataBytes(r *rand.Rand, arr []byte) {
 func SeedForTests() {
 	seed := envutil.EnvOrDefaultInt64("COCKROACH_RANDOM_SEED", NewPseudoSeed())
 	rand.Seed(seed)
-	log.Printf("Random seed: %v", seed)
+	log.Printf("random seed: %v", seed)
 }

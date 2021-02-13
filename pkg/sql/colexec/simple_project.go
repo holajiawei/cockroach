@@ -12,21 +12,28 @@ package colexec
 
 import (
 	"context"
-	"io"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // simpleProjectOp is an operator that implements "simple projection" - removal of
 // columns that aren't needed by later operators.
 type simpleProjectOp struct {
-	OneInputNode
+	oneInputCloserHelper
 	NonExplainable
 
-	batch *projectingBatch
+	projection []uint32
+	batches    map[coldata.Batch]*projectingBatch
+	// numBatchesLoggingThreshold is the threshold on the number of items in
+	// 'batches' map at which we will log a message when a new projectingBatch
+	// is created. It is growing exponentially.
+	numBatchesLoggingThreshold int
 }
 
-var _ Operator = &simpleProjectOp{}
+var _ closableOperator = &simpleProjectOp{}
+var _ ResettableOperator = &simpleProjectOp{}
 
 // projectingBatch is a Batch that applies a simple projection to another,
 // underlying batch, discarding all columns but the ones in its projection
@@ -41,9 +48,12 @@ type projectingBatch struct {
 }
 
 func newProjectionBatch(projection []uint32) *projectingBatch {
-	return &projectingBatch{
-		projection: projection,
+	p := &projectingBatch{
+		projection: make([]uint32, len(projection)),
 	}
+	// We make a copy of projection to be safe.
+	copy(p.projection, projection)
+	return p
 }
 
 func (b *projectingBatch) ColVec(i int) coldata.Vec {
@@ -54,7 +64,7 @@ func (b *projectingBatch) ColVecs() []coldata.Vec {
 	if b.Batch == coldata.ZeroBatch {
 		return nil
 	}
-	if b.colVecs == nil {
+	if b.colVecs == nil || len(b.colVecs) != len(b.projection) {
 		b.colVecs = make([]coldata.Vec, len(b.projection))
 	}
 	for i := range b.colVecs {
@@ -72,12 +82,18 @@ func (b *projectingBatch) AppendCol(col coldata.Vec) {
 	b.projection = append(b.projection, uint32(b.Batch.Width())-1)
 }
 
+func (b *projectingBatch) ReplaceCol(col coldata.Vec, idx int) {
+	b.Batch.ReplaceCol(col, int(b.projection[idx]))
+}
+
 // NewSimpleProjectOp returns a new simpleProjectOp that applies a simple
 // projection on the columns in its input batch, returning a new batch with
 // only the columns in the projection slice, in order. In a degenerate case
 // when input already outputs batches that satisfy the projection, a
 // simpleProjectOp is not planned and input is returned.
-func NewSimpleProjectOp(input Operator, numInputCols int, projection []uint32) Operator {
+func NewSimpleProjectOp(
+	input colexecbase.Operator, numInputCols int, projection []uint32,
+) colexecbase.Operator {
 	if numInputCols == len(projection) {
 		projectionIsRedundant := true
 		for i := range projection {
@@ -89,10 +105,15 @@ func NewSimpleProjectOp(input Operator, numInputCols int, projection []uint32) O
 			return input
 		}
 	}
-	return &simpleProjectOp{
-		OneInputNode: NewOneInputNode(input),
-		batch:        newProjectionBatch(projection),
+	s := &simpleProjectOp{
+		oneInputCloserHelper:       makeOneInputCloserHelper(input),
+		projection:                 make([]uint32, len(projection)),
+		batches:                    make(map[coldata.Batch]*projectingBatch),
+		numBatchesLoggingThreshold: 128,
 	}
+	// We make a copy of projection to be safe.
+	copy(s.projection, projection)
+	return s
 }
 
 func (d *simpleProjectOp) Init() {
@@ -101,14 +122,26 @@ func (d *simpleProjectOp) Init() {
 
 func (d *simpleProjectOp) Next(ctx context.Context) coldata.Batch {
 	batch := d.input.Next(ctx)
-	d.batch.Batch = batch
-
-	return d.batch
+	if batch.Length() == 0 {
+		return coldata.ZeroBatch
+	}
+	projBatch, found := d.batches[batch]
+	if !found {
+		projBatch = newProjectionBatch(d.projection)
+		d.batches[batch] = projBatch
+		if len(d.batches) == d.numBatchesLoggingThreshold {
+			if log.V(1) {
+				log.Infof(ctx, "simpleProjectOp: size of 'batches' map = %d", len(d.batches))
+			}
+			d.numBatchesLoggingThreshold = d.numBatchesLoggingThreshold * 2
+		}
+	}
+	projBatch.Batch = batch
+	return projBatch
 }
 
-func (d *simpleProjectOp) Close() error {
-	if c, ok := d.input.(io.Closer); ok {
-		return c.Close()
+func (d *simpleProjectOp) reset(ctx context.Context) {
+	if r, ok := d.input.(resetter); ok {
+		r.reset(ctx)
 	}
-	return nil
 }

@@ -11,15 +11,17 @@
 package sqlsmith
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 var (
-	alters               = append(altersTableExistence, altersExistingTable...)
+	alters               = append(append(altersTableExistence, altersExistingTable...), altersTypeExistence...)
 	altersTableExistence = []statementWeight{
 		{10, makeCreateTable},
+		{2, makeCreateSchema},
 		{1, makeDropTable},
 	}
 	altersExistingTable = []statementWeight{
@@ -35,6 +37,9 @@ var (
 		{10, makeCreateIndex},
 		{1, makeDropIndex},
 		{5, makeRenameIndex},
+	}
+	altersTypeExistence = []statementWeight{
+		{5, makeCreateType},
 	}
 )
 
@@ -58,9 +63,20 @@ func makeAlter(s *Smither) (tree.Statement, bool) {
 	return nil, false
 }
 
+func makeCreateSchema(s *Smither) (tree.Statement, bool) {
+	return &tree.CreateSchema{
+		Schema: tree.ObjectNamePrefix{
+			SchemaName:     s.name("schema"),
+			ExplicitSchema: true,
+		},
+	}, true
+}
+
 func makeCreateTable(s *Smither) (tree.Statement, bool) {
-	table := sqlbase.RandCreateTable(s.rnd, "", 0)
-	table.Table = tree.MakeUnqualifiedTableName(s.name("tab"))
+	table := rowenc.RandCreateTable(s.rnd, "", 0)
+	schemaOrd := s.rnd.Intn(len(s.schemas))
+	schema := s.schemas[schemaOrd]
+	table.Table = tree.MakeTableNameWithSchema(tree.Name(s.dbName), schema.SchemaName, s.name("tab"))
 	return table, true
 }
 
@@ -114,7 +130,7 @@ func makeAlterColumnType(s *Smither) (tree.Statement, bool) {
 	if !ok {
 		return nil, false
 	}
-	typ := sqlbase.RandColumnType(s.rnd)
+	typ := rowenc.RandColumnType(s.rnd)
 	col := tableRef.Columns[s.rnd.Intn(len(tableRef.Columns))]
 
 	return &tree.AlterTable{
@@ -134,7 +150,7 @@ func makeAddColumn(s *Smither) (tree.Statement, bool) {
 		return nil, false
 	}
 	colRefs.stripTableName()
-	t := sqlbase.RandColumnType(s.rnd)
+	t := rowenc.RandColumnType(s.rnd)
 	col, err := tree.NewColumnTableDef(s.name("col"), t, false /* isSerial */, nil)
 	if err != nil {
 		return nil, false
@@ -188,7 +204,7 @@ func makeJSONComputedColumn(s *Smither) (tree.Statement, bool) {
 		return nil, false
 	}
 	col.Computed.Computed = true
-	col.Computed.Expr = tree.NewTypedBinaryExpr(tree.JSONFetchText, ref.typedExpr(), sqlbase.RandDatumSimple(s.rnd, types.String), types.String)
+	col.Computed.Expr = tree.NewTypedBinaryExpr(tree.JSONFetchText, ref.typedExpr(), rowenc.RandDatumSimple(s.rnd, types.String), types.String)
 
 	return &tree.AlterTable{
 		Table: tableRef.TableName.ToUnresolvedObjectName(),
@@ -268,7 +284,8 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 		}
 		seen[col.Name] = true
 		// If this is the first column and it's invertable (i.e., JSONB), make an inverted index.
-		if len(cols) == 0 && sqlbase.ColumnTypeIsInvertedIndexable(col.Type) {
+		if len(cols) == 0 &&
+			colinfo.ColumnTypeIsInvertedIndexable(tree.MustBeStaticallyKnownType(col.Type)) {
 			inverted = true
 			unique = false
 			cols = append(cols, tree.IndexElem{
@@ -276,7 +293,7 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 			})
 			break
 		}
-		if sqlbase.ColumnTypeIsIndexable(col.Type) {
+		if colinfo.ColumnTypeIsIndexable(tree.MustBeStaticallyKnownType(col.Type)) {
 			cols = append(cols, tree.IndexElem{
 				Column:    col.Name,
 				Direction: s.randDirection(),
@@ -294,12 +311,13 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 	}
 
 	return &tree.CreateIndex{
-		Name:     s.name("idx"),
-		Table:    *tableRef.TableName,
-		Unique:   unique,
-		Columns:  cols,
-		Storing:  storing,
-		Inverted: inverted,
+		Name:         s.name("idx"),
+		Table:        *tableRef.TableName,
+		Unique:       unique,
+		Columns:      cols,
+		Storing:      storing,
+		Inverted:     inverted,
+		Concurrently: s.coin(),
 	}, true
 }
 
@@ -308,6 +326,7 @@ func makeDropIndex(s *Smither) (tree.Statement, bool) {
 	return &tree.DropIndex{
 		IndexList:    tree.TableIndexNames{tin},
 		DropBehavior: s.randDropBehavior(),
+		Concurrently: s.coin(),
 	}, ok
 }
 
@@ -317,4 +336,9 @@ func makeRenameIndex(s *Smither) (tree.Statement, bool) {
 		Index:   tin,
 		NewName: tree.UnrestrictedName(s.name("idx")),
 	}, ok
+}
+
+func makeCreateType(s *Smither) (tree.Statement, bool) {
+	name := s.name("typ")
+	return rowenc.RandCreateType(s.rnd, string(name), letters), true
 }

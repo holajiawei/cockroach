@@ -11,6 +11,7 @@
 package optbuilder
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -39,8 +40,10 @@ func (w *windowInfo) Walk(v tree.Visitor) tree.Expr {
 }
 
 // TypeCheck is part of the tree.Expr interface.
-func (w *windowInfo) TypeCheck(ctx *tree.SemaContext, desired *types.T) (tree.TypedExpr, error) {
-	if _, err := w.FuncExpr.TypeCheck(ctx, desired); err != nil {
+func (w *windowInfo) TypeCheck(
+	ctx context.Context, semaCtx *tree.SemaContext, desired *types.T,
+) (tree.TypedExpr, error) {
+	if _, err := w.FuncExpr.TypeCheck(ctx, semaCtx, desired); err != nil {
 		return nil, err
 	}
 	return w, nil
@@ -78,7 +81,7 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 	// relation. Build a projection that produces those values to go underneath
 	// the window functions.
 	// TODO(justin): this is unfortunate in common cases where the arguments are
-	// constant, since we'll be projecting an extra column in every row.  It
+	// constant, since we'll be projecting an extra column in every row. It
 	// would be good if the windower supported being specified with constant
 	// values.
 	for i := range inScope.windows {
@@ -479,7 +482,7 @@ func (b *Builder) constructWindowGroup(
 ) memo.RelExpr {
 	if groupingColSet.Empty() {
 		// Construct a scalar GroupBy wrapped around the appropriate projections.
-		return b.constructScalarWindowGroup(input, groupingColSet, aggInfos, outScope)
+		return b.constructScalarWindowGroup(input, aggInfos, outScope)
 	}
 
 	// Construct a GroupBy using the groupingColSet. Use the ConstAgg aggregate for
@@ -520,7 +523,7 @@ func (b *Builder) replaceDefaultReturn(
 func (b *Builder) overrideDefaultNullValue(agg aggregateInfo) (opt.ScalarExpr, bool) {
 	switch agg.def.Name {
 	case "count", "count_rows":
-		return b.factory.ConstructConst(tree.NewDInt(0)), true
+		return b.factory.ConstructConst(tree.NewDInt(0), types.Int), true
 	default:
 		return nil, false
 	}
@@ -531,10 +534,8 @@ func (b *Builder) overrideDefaultNullValue(agg aggregateInfo) (opt.ScalarExpr, b
 // The expression may be wrapped with a projection so ensure the default NULL
 // values of the aggregates are respected when no rows are returned.
 func (b *Builder) constructScalarWindowGroup(
-	input memo.RelExpr, groupingColSet opt.ColSet, aggInfos []aggregateInfo, outScope *scope,
+	input memo.RelExpr, aggInfos []aggregateInfo, outScope *scope,
 ) memo.RelExpr {
-	private := memo.GroupingPrivate{GroupingCols: groupingColSet}
-	private.Ordering.FromOrderingWithOptCols(nil, groupingColSet)
 	aggs := make(memo.AggregationsExpr, 0, len(aggInfos))
 
 	// Create a projection here to replace the NULL values with pre-defined
@@ -552,7 +553,7 @@ func (b *Builder) constructScalarWindowGroup(
 	projections := make(memo.ProjectionsExpr, 0, len(aggInfos))
 
 	// Create an appropriate passthrough for the projection.
-	passthrough := input.Relational().OutputCols.Copy()
+	var passthrough opt.ColSet
 	for i := range aggInfos {
 		varExpr := b.factory.ConstructConstAgg(b.factory.ConstructVariable(aggInfos[i].col.id))
 
@@ -565,10 +566,9 @@ func (b *Builder) constructScalarWindowGroup(
 		}
 
 		aggs = append(aggs, b.factory.ConstructAggregationsItem(varExpr, aggregateCol.id))
-		passthrough.Add(aggInfos[i].col.id)
 
-		// Add projection to replace default NULL value.
 		if requiresProjection {
+			// Add projection to replace default NULL value.
 			projections = append(projections, b.factory.ConstructProjectionsItem(
 				b.replaceDefaultReturn(
 					b.factory.ConstructVariable(aggregateCol.id),
@@ -576,11 +576,13 @@ func (b *Builder) constructScalarWindowGroup(
 					defaultNullVal),
 				aggInfos[i].col.id,
 			))
-			passthrough.Remove(aggInfos[i].col.id)
+		} else {
+			// Pass through the aggregate column directly.
+			passthrough.Add(aggInfos[i].col.id)
 		}
 	}
 
-	scalarAggExpr := b.factory.ConstructScalarGroupBy(input, aggs, &private)
+	scalarAggExpr := b.factory.ConstructScalarGroupBy(input, aggs, &memo.GroupingPrivate{})
 	if len(projections) != 0 {
 		return b.factory.ConstructProject(scalarAggExpr, projections, passthrough)
 	}

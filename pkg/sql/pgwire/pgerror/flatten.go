@@ -13,8 +13,10 @@ package pgerror
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/errors"
 )
@@ -37,8 +39,10 @@ func Flatten(err error) *Error {
 		return nil
 	}
 	resErr := &Error{
-		Code:    GetPGCode(err),
-		Message: err.Error(),
+		Code:           GetPGCode(err).String(),
+		Message:        err.Error(),
+		Severity:       GetSeverity(err),
+		ConstraintName: GetConstraintName(err),
 	}
 
 	// Populate the source field if available.
@@ -46,28 +50,18 @@ func Flatten(err error) *Error {
 		resErr.Source = &Error_Source{File: file, Line: int32(line), Function: fn}
 	}
 
+	// Add serialization failure hints if available.
+	if resErr.Code == pgcode.SerializationFailure.String() {
+		err = withSerializationFailureHints(err)
+	}
+
 	// Populate the details and hints.
 	resErr.Hint = errors.FlattenHints(err)
 	resErr.Detail = errors.FlattenDetails(err)
 
-	// Populate Keys for backward-compatibility with 19.1.
-	// TODO(knz): Remove in 19.3.
-	if keys := errors.GetTelemetryKeys(err); len(keys) > 0 {
-		// We may lose keys. That's all right, backward compat here is just best effort.
-		resErr.TelemetryKey = keys[0]
-	}
-	// Populate safe strings for backward-compatibility with 19.1.
-	// TODO(knz): Remove in 19.3.
-	for _, dd := range errors.GetAllSafeDetails(err) {
-		for _, d := range dd.SafeDetails {
-			resErr.SafeDetail = append(resErr.SafeDetail,
-				&Error_SafeDetail{SafeMessage: d})
-		}
-	}
-
 	// Add a useful error prefix if not already there.
 	switch resErr.Code {
-	case pgcode.Internal:
+	case pgcode.Internal.String():
 		// The string "internal error" clarifies the nature of the error
 		// to users, and is also introduced for compatibility with
 		// previous CockroachDB versions.
@@ -81,7 +75,7 @@ func Flatten(err error) *Error {
 		// append the innermost stack trace.
 		resErr.Detail += getInnerMostStackTraceAsDetail(err)
 
-	case pgcode.SerializationFailure:
+	case pgcode.SerializationFailure.String():
 		// The string "restart transaction" is asserted by test code. This
 		// can be changed if/when test code learns to use the 40001 code
 		// (or the errors library) instead.
@@ -95,6 +89,24 @@ func Flatten(err error) *Error {
 	}
 
 	return resErr
+}
+
+// serializationFailureReasonRegexp captures known failure reasons for
+// the serialization failure error messages.
+// We cannot use roachpb.TransactionRetryReason or roachpb.TransactionAbortedReason
+// as this introduces a circular dependency.
+var serializationFailureReasonRegexp = regexp.MustCompile(
+	`((?:ABORT_|RETRY_)[A-Z_]*|ReadWithinUncertaintyInterval)`,
+)
+
+// withSerializationFailureHints appends a doc URL that contains information for
+// commonly seen error messages.
+func withSerializationFailureHints(err error) error {
+	url := docs.URL("transaction-retry-error-reference.html")
+	if match := serializationFailureReasonRegexp.FindStringSubmatch(err.Error()); len(match) >= 2 {
+		url += "#" + strings.ToLower(match[1])
+	}
+	return errors.WithIssueLink(err, errors.IssueLink{IssueURL: url})
 }
 
 func getInnerMostStackTraceAsDetail(err error) string {
@@ -124,6 +136,6 @@ const InternalErrorPrefix = "internal error"
 const TxnRetryMsgPrefix = "restart transaction"
 
 // GetPGCode retrieves the error code for an error.
-func GetPGCode(err error) string {
+func GetPGCode(err error) pgcode.Code {
 	return GetPGCodeInternal(err, ComputeDefaultCode)
 }

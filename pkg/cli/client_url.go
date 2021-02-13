@@ -19,8 +19,10 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -77,6 +79,10 @@ func (u urlParser) Type() string {
 }
 
 func (u urlParser) Set(v string) error {
+	return u.setInternal(v, true /* warn */)
+}
+
+func (u urlParser) setInternal(v string, warn bool) error {
 	parsedURL, err := url.Parse(v)
 	if err != nil {
 		return err
@@ -110,9 +116,11 @@ func (u urlParser) Set(v string) error {
 			// information. We do not produce an error however, so that a
 			// user can readily copy-paste the URL produced by `cockroach
 			// start` even if the client command does not accept a username.
-			fmt.Fprintf(stderr,
-				"warning: --url specifies user/password, but command %q does not accept user/password details - details ignored\n",
-				u.cmd.Name())
+			if warn {
+				fmt.Fprintf(stderr,
+					"warning: --url specifies user/password, but command %q does not accept user/password details - details ignored\n",
+					u.cmd.Name())
+			}
 		} else {
 			if err := f.Value.Set(parsedURL.User.Username()); err != nil {
 				return errors.Wrapf(err, "extracting user")
@@ -149,9 +157,11 @@ func (u urlParser) Set(v string) error {
 			// not produce an error however, so that a user can readily
 			// copy-paste an URL they picked up from another tool (a GUI
 			// tool for example).
-			fmt.Fprintf(stderr,
-				"warning: --url specifies database %q, but command %q does not accept a database name - database name ignored\n",
-				dbPath, u.cmd.Name())
+			if warn {
+				fmt.Fprintf(stderr,
+					"warning: --url specifies database %q, but command %q does not accept a database name - database name ignored\n",
+					dbPath, u.cmd.Name())
+			}
 		} else {
 			if err := f.Value.Set(dbPath); err != nil {
 				return errors.Wrapf(err, "extracting database name")
@@ -168,12 +178,25 @@ func (u urlParser) Set(v string) error {
 			return err
 		}
 
+		// If the URL specifies host/port as query args, we're having to do
+		// with a unix socket. In that case, we don't want to populate
+		// the host field in the URL.
+		if options.Get("host") != "" {
+			cliCtx.clientConnHost = ""
+			cliCtx.clientConnPort = ""
+		}
+
 		cliCtx.extraConnURLOptions = options
 
 		switch sslMode := options.Get("sslmode"); sslMode {
 		case "", "disable":
-			if err := fl.Set(cliflags.ClientInsecure.Name, "true"); err != nil {
-				return errors.Wrapf(err, "setting insecure connection based on --url")
+			if u.sslStrict {
+				// For "strict" mode (RPC client commands) we don't support non-TLS
+				// yet. See https://github.com/cockroachdb/cockroach/issues/54007
+				// Instead, we see a request for no TLS to imply insecure mode.
+				if err := fl.Set(cliflags.ClientInsecure.Name, "true"); err != nil {
+					return errors.Wrapf(err, "setting secure connection based on --url")
+				}
 			}
 		case "require", "verify-ca", "verify-full":
 			if sslMode != "verify-full" && u.sslStrict {
@@ -272,9 +295,9 @@ func (u urlParser) Set(v string) error {
 					return nil
 				}
 
-				userName := security.RootUser
+				userName := security.RootUserName()
 				if cliCtx.sqlConnUser != "" {
-					userName = cliCtx.sqlConnUser
+					userName, _ = security.MakeSQLUsernameFromUserInput(cliCtx.sqlConnUser, security.UsernameValidation)
 				}
 				if err := tryCertsDir("sslrootcert", security.CACertFilename()); err != nil {
 					return err
@@ -305,9 +328,13 @@ func (u urlParser) Set(v string) error {
 // Do not call this function before command-line argument parsing has completed:
 // this initializes the certificate manager with the configured --certs-dir.
 func (cliCtx *cliContext) makeClientConnURL() (url.URL, error) {
+	netHost := ""
+	if cliCtx.clientConnHost != "" || cliCtx.clientConnPort != "" {
+		netHost = net.JoinHostPort(cliCtx.clientConnHost, cliCtx.clientConnPort)
+	}
 	pgurl := url.URL{
 		Scheme: "postgresql",
-		Host:   net.JoinHostPort(cliCtx.clientConnHost, cliCtx.clientConnPort),
+		Host:   netHost,
 		Path:   cliCtx.sqlConnDBName,
 	}
 
@@ -324,12 +351,20 @@ func (cliCtx *cliContext) makeClientConnURL() (url.URL, error) {
 		opts[k] = v
 	}
 
-	userName := cliCtx.sqlConnUser
-	if userName == "" {
-		userName = security.RootUser
+	if netHost != "" {
+		// Only add TLS parameters when using a network connection.
+		userName, _ := security.MakeSQLUsernameFromUserInput(cliCtx.sqlConnUser, security.UsernameValidation)
+		if userName.Undefined() {
+			userName = security.RootUserName()
+		}
+		sCtx := rpc.MakeSecurityContext(cliCtx.Config, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+		if err := sCtx.LoadSecurityOptions(
+			opts, userName,
+		); err != nil {
+			return url.URL{}, err
+		}
 	}
 
-	err := cliCtx.LoadSecurityOptions(opts, userName)
 	pgurl.RawQuery = opts.Encode()
-	return pgurl, err
+	return pgurl, nil
 }

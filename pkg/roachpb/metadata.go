@@ -17,10 +17,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
-	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // NodeID is a custom type for a cockroach node ID. (not a raft node ID)
@@ -32,6 +33,9 @@ type NodeID int32
 func (n NodeID) String() string {
 	return strconv.FormatInt(int64(n), 10)
 }
+
+// SafeValue implements the redact.SafeValue interface.
+func (n NodeID) SafeValue() {}
 
 // StoreID is a custom type for a cockroach store ID.
 type StoreID int32
@@ -49,6 +53,9 @@ func (n StoreID) String() string {
 	return strconv.FormatInt(int64(n), 10)
 }
 
+// SafeValue implements the redact.SafeValue interface.
+func (n StoreID) SafeValue() {}
+
 // A RangeID is a unique ID associated to a Raft consensus group.
 type RangeID int64
 
@@ -56,6 +63,9 @@ type RangeID int64
 func (r RangeID) String() string {
 	return strconv.FormatInt(int64(r), 10)
 }
+
+// SafeValue implements the redact.SafeValue interface.
+func (r RangeID) SafeValue() {}
 
 // RangeIDSlice implements sort.Interface.
 type RangeIDSlice []RangeID
@@ -71,6 +81,9 @@ type ReplicaID int32
 func (r ReplicaID) String() string {
 	return strconv.FormatInt(int64(r), 10)
 }
+
+// SafeValue implements the redact.SafeValue interface.
+func (r ReplicaID) SafeValue() {}
 
 // Equals returns whether the Attributes lists are equivalent. Attributes lists
 // are treated as sets, meaning that ordering and duplicates are ignored.
@@ -100,11 +113,24 @@ func (a Attributes) String() string {
 	return strings.Join(a.Attrs, ",")
 }
 
+// RangeGeneration is a custom type for a range generation. Range generation
+// counters are incremented on every split, merge, and every replica change,
+// i.e., whenever the span of the range or replica set changes.
+//
+// See the comment on RangeDescriptor.Generation for more.
+type RangeGeneration int64
+
+// String implements the fmt.Stringer interface.
+func (g RangeGeneration) String() string {
+	return strconv.FormatInt(int64(g), 10)
+}
+
+// SafeValue implements the redact.SafeValue interface.
+func (g RangeGeneration) SafeValue() {}
+
 // NewRangeDescriptor returns a RangeDescriptor populated from the input.
-func NewRangeDescriptor(
-	rangeID RangeID, start, end RKey, replicas ReplicaDescriptors,
-) *RangeDescriptor {
-	repls := append([]ReplicaDescriptor(nil), replicas.All()...)
+func NewRangeDescriptor(rangeID RangeID, start, end RKey, replicas ReplicaSet) *RangeDescriptor {
+	repls := append([]ReplicaDescriptor(nil), replicas.Descriptors()...)
 	for i := range repls {
 		repls[i].ReplicaID = ReplicaID(i + 1)
 	}
@@ -114,8 +140,58 @@ func NewRangeDescriptor(
 		EndKey:        end,
 		NextReplicaID: ReplicaID(len(repls) + 1),
 	}
-	desc.SetReplicas(MakeReplicaDescriptors(repls))
+	desc.SetReplicas(MakeReplicaSet(repls))
 	return desc
+}
+
+// Equal compares two descriptors for equality. This was copied over from the
+// gogoproto generated version in order to ignore deprecated fields.
+func (r *RangeDescriptor) Equal(other *RangeDescriptor) bool {
+	if other == nil {
+		return r == nil
+	}
+	if r == nil {
+		return false
+	}
+	if r.RangeID != other.RangeID {
+		return false
+	}
+	if r.Generation != other.Generation {
+		return false
+	}
+	if !bytes.Equal(r.StartKey, other.StartKey) {
+		return false
+	}
+	if !bytes.Equal(r.EndKey, other.EndKey) {
+		return false
+	}
+	if len(r.InternalReplicas) != len(other.InternalReplicas) {
+		return false
+	}
+	for i := range r.InternalReplicas {
+		if !r.InternalReplicas[i].Equal(&other.InternalReplicas[i]) {
+			return false
+		}
+	}
+	if r.NextReplicaID != other.NextReplicaID {
+		return false
+	}
+	if !r.StickyBit.Equal(other.StickyBit) {
+		return false
+	}
+	return true
+}
+
+// GetRangeID returns the RangeDescriptor's ID.
+// The method implements the batcheval.ImmutableRangeState interface.
+func (r *RangeDescriptor) GetRangeID() RangeID {
+	return r.RangeID
+}
+
+// GetStartKey returns the RangeDescriptor's start key.
+// The method implements the batcheval.ImmutableRangeState interface.
+func (r *RangeDescriptor) GetStartKey() RKey {
+	return r.StartKey
 }
 
 // RSpan returns the RangeDescriptor's resolved span.
@@ -143,13 +219,13 @@ func (r *RangeDescriptor) ContainsKeyRange(start, end RKey) bool {
 
 // Replicas returns the set of nodes/stores on which replicas of this range are
 // stored.
-func (r *RangeDescriptor) Replicas() ReplicaDescriptors {
-	return MakeReplicaDescriptors(r.InternalReplicas)
+func (r *RangeDescriptor) Replicas() ReplicaSet {
+	return MakeReplicaSet(r.InternalReplicas)
 }
 
 // SetReplicas overwrites the set of nodes/stores on which replicas of this
 // range are stored.
-func (r *RangeDescriptor) SetReplicas(replicas ReplicaDescriptors) {
+func (r *RangeDescriptor) SetReplicas(replicas ReplicaSet) {
 	r.InternalReplicas = replicas.AsProto()
 }
 
@@ -212,7 +288,7 @@ func (r *RangeDescriptor) RemoveReplica(nodeID NodeID, storeID StoreID) (Replica
 // GetReplicaDescriptor returns the replica which matches the specified store
 // ID.
 func (r *RangeDescriptor) GetReplicaDescriptor(storeID StoreID) (ReplicaDescriptor, bool) {
-	for _, repDesc := range r.Replicas().All() {
+	for _, repDesc := range r.Replicas().Descriptors() {
 		if repDesc.StoreID == storeID {
 			return repDesc, true
 		}
@@ -223,7 +299,7 @@ func (r *RangeDescriptor) GetReplicaDescriptor(storeID StoreID) (ReplicaDescript
 // GetReplicaDescriptorByID returns the replica which matches the specified store
 // ID.
 func (r *RangeDescriptor) GetReplicaDescriptorByID(replicaID ReplicaID) (ReplicaDescriptor, bool) {
-	for _, repDesc := range r.Replicas().All() {
+	for _, repDesc := range r.Replicas().Descriptors() {
 		if repDesc.ReplicaID == replicaID {
 			return repDesc, true
 		}
@@ -238,28 +314,10 @@ func (r *RangeDescriptor) IsInitialized() bool {
 	return len(r.EndKey) != 0
 }
 
-// GetGeneration returns the generation of this RangeDescriptor.
-func (r *RangeDescriptor) GetGeneration() int64 {
-	if r.Generation != nil {
-		return *r.Generation
-	}
-	return 0
-}
-
 // IncrementGeneration increments the generation of this RangeDescriptor.
+// This method mutates the receiver; do not call it with shared RangeDescriptors.
 func (r *RangeDescriptor) IncrementGeneration() {
-	// Create a new *int64 for the new generation. We permit shallow copies of
-	// RangeDescriptors, so we need to be careful not to mutate the
-	// potentially-shared generation counter.
-	r.Generation = proto.Int64(r.GetGeneration() + 1)
-}
-
-// GetGenerationComparable returns if the generation of this RangeDescriptor is comparable.
-func (r *RangeDescriptor) GetGenerationComparable() bool {
-	if r.GenerationComparable == nil {
-		return false
-	}
-	return *r.GenerationComparable
+	r.Generation++
 }
 
 // GetStickyBit returns the sticky bit of this RangeDescriptor.
@@ -277,7 +335,7 @@ func (r *RangeDescriptor) Validate() error {
 	}
 	seen := map[ReplicaID]struct{}{}
 	stores := map[StoreID]struct{}{}
-	for i, rep := range r.Replicas().All() {
+	for i, rep := range r.Replicas().Descriptors() {
 		if err := rep.Validate(); err != nil {
 			return errors.Errorf("replica %d is invalid: %s", i, err)
 		}
@@ -300,54 +358,60 @@ func (r *RangeDescriptor) Validate() error {
 }
 
 func (r RangeDescriptor) String() string {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "r%d:", r.RangeID)
+	return redact.StringWithoutMarkers(r)
+}
 
+// SafeFormat implements the redact.SafeFormatter interface.
+func (r RangeDescriptor) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("r%d:", r.RangeID)
 	if !r.IsInitialized() {
-		buf.WriteString("{-}")
+		w.SafeString("{-}")
 	} else {
-		buf.WriteString(r.RSpan().String())
+		w.Print(r.RSpan())
 	}
-	buf.WriteString(" [")
+	w.SafeString(" [")
 
-	if allReplicas := r.Replicas().All(); len(allReplicas) > 0 {
+	if allReplicas := r.Replicas().Descriptors(); len(allReplicas) > 0 {
 		for i, rep := range allReplicas {
 			if i > 0 {
-				buf.WriteString(", ")
+				w.SafeString(", ")
 			}
-			buf.WriteString(rep.String())
+			w.Print(rep)
 		}
 	} else {
-		buf.WriteString("<no replicas>")
+		w.SafeString("<no replicas>")
 	}
-	fmt.Fprintf(&buf, ", next=%d, gen=%d", r.NextReplicaID, r.GetGeneration())
-	if !r.GetGenerationComparable() {
-		buf.WriteString("?")
-	}
+	w.Printf(", next=%d, gen=%d", r.NextReplicaID, r.Generation)
 	if s := r.GetStickyBit(); !s.IsEmpty() {
-		fmt.Fprintf(&buf, ", sticky=%s", s)
+		w.Printf(", sticky=%s", s)
 	}
-	buf.WriteString("]")
-
-	return buf.String()
+	w.SafeString("]")
 }
 
 func (r ReplicationTarget) String() string {
-	return fmt.Sprintf("n%d,s%d", r.NodeID, r.StoreID)
+	return redact.StringWithoutMarkers(r)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (r ReplicationTarget) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("n%d,s%d", r.NodeID, r.StoreID)
 }
 
 func (r ReplicaDescriptor) String() string {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "(n%d,s%d):", r.NodeID, r.StoreID)
+	return redact.StringWithoutMarkers(r)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (r ReplicaDescriptor) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("(n%d,s%d):", r.NodeID, r.StoreID)
 	if r.ReplicaID == 0 {
-		buf.WriteString("?")
+		w.SafeRune('?')
 	} else {
-		fmt.Fprintf(&buf, "%d", r.ReplicaID)
+		w.Print(r.ReplicaID)
 	}
 	if typ := r.GetType(); typ != VOTER_FULL {
-		buf.WriteString(typ.String())
+		w.Print(typ)
 	}
-	return buf.String()
 }
 
 // Validate performs some basic validation of the contents of a replica descriptor.
@@ -371,6 +435,9 @@ func (r ReplicaDescriptor) GetType() ReplicaType {
 	}
 	return *r.Type
 }
+
+// SafeValue implements the redact.SafeValue interface.
+func (r ReplicaType) SafeValue() {}
 
 // PercentilesFromData derives percentiles from a slice of data points.
 // Sorts the input data if it isn't already sorted.
@@ -404,17 +471,27 @@ func percentileFromSortedData(data []float64, percent float64) float64 {
 
 // String returns a string representation of the Percentiles.
 func (p Percentiles) String() string {
-	return fmt.Sprintf("p10=%.2f p25=%.2f p50=%.2f p75=%.2f p90=%.2f pMax=%.2f",
+	return redact.StringWithoutMarkers(p)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (p Percentiles) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("p10=%.2f p25=%.2f p50=%.2f p75=%.2f p90=%.2f pMax=%.2f",
 		p.P10, p.P25, p.P50, p.P75, p.P90, p.PMax)
 }
 
 // String returns a string representation of the StoreCapacity.
 func (sc StoreCapacity) String() string {
-	return fmt.Sprintf("disk (capacity=%s, available=%s, used=%s, logicalBytes=%s), "+
+	return redact.StringWithoutMarkers(sc)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (sc StoreCapacity) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("disk (capacity=%s, available=%s, used=%s, logicalBytes=%s), "+
 		"ranges=%d, leases=%d, queries=%.2f, writes=%.2f, "+
 		"bytesPerReplica={%s}, writesPerReplica={%s}",
-		humanizeutil.IBytes(sc.Capacity), humanizeutil.IBytes(sc.Available),
-		humanizeutil.IBytes(sc.Used), humanizeutil.IBytes(sc.LogicalBytes),
+		redact.Safe(humanizeutil.IBytes(sc.Capacity)), redact.Safe(humanizeutil.IBytes(sc.Available)),
+		redact.Safe(humanizeutil.IBytes(sc.Used)), redact.Safe(humanizeutil.IBytes(sc.LogicalBytes)),
 		sc.RangeCount, sc.LeaseCount, sc.QueriesPerSecond, sc.WritesPerSecond,
 		sc.BytesPerReplica, sc.WritesPerReplica)
 }
@@ -435,6 +512,36 @@ func (sc StoreCapacity) FractionUsed() float64 {
 		return float64(sc.Capacity-sc.Available) / float64(sc.Capacity)
 	}
 	return float64(sc.Used) / float64(sc.Available+sc.Used)
+}
+
+// AddressForLocality returns the network address that nodes in the specified
+// locality should use when connecting to the node described by the descriptor.
+func (n *NodeDescriptor) AddressForLocality(loc Locality) *util.UnresolvedAddr {
+	// If the provided locality has any tiers that are an exact exact match (key
+	// and value) with a tier in the node descriptor's custom LocalityAddress
+	// list, return the corresponding address. Otherwise, return the default
+	// address.
+	//
+	// O(n^2), but we expect very few locality tiers in practice.
+	for i := range n.LocalityAddress {
+		nLoc := &n.LocalityAddress[i]
+		for _, loc := range loc.Tiers {
+			if loc == nLoc.LocalityTier {
+				return &nLoc.Address
+			}
+		}
+	}
+	return &n.Address
+}
+
+// CheckedSQLAddress returns the value of SQLAddress if set. If not, either
+// because the receiver is a pre-19.2 node, or because it is using the same
+// address for both SQL and RPC, the Address is returned.
+func (n *NodeDescriptor) CheckedSQLAddress() *util.UnresolvedAddr {
+	if n.SQLAddress.IsEmpty() {
+		return &n.Address
+	}
+	return &n.SQLAddress
 }
 
 // String returns a string representation of the Tier.
@@ -590,4 +697,22 @@ var DefaultLocationInformation = []struct {
 		Latitude:  "50.44816",
 		Longitude: "3.81886",
 	},
+}
+
+// Locality returns the locality of the Store, which is the Locality of the node
+// plus an extra tier for the node itself.
+func (s StoreDescriptor) Locality() Locality {
+	return s.Node.Locality.AddTier(
+		Tier{Key: "node", Value: s.Node.NodeID.String()})
+}
+
+// AddTier creates a new Locality with a Tier at the end.
+func (l Locality) AddTier(tier Tier) Locality {
+	if len(l.Tiers) > 0 {
+		tiers := make([]Tier, len(l.Tiers), len(l.Tiers)+1)
+		copy(tiers, l.Tiers)
+		tiers = append(tiers, tier)
+		return Locality{Tiers: tiers}
+	}
+	return Locality{Tiers: []Tier{tier}}
 }

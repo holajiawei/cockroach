@@ -11,12 +11,17 @@
 package cat
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 // IndexOrdinal identifies an index (in the context of a Table).
 type IndexOrdinal = int
+
+// IndexOrdinals identifies a list of indexes (in the context of a Table).
+type IndexOrdinals = []IndexOrdinal
 
 // PrimaryIndex selects the primary index of a table when calling the
 // Table.Index method. Every table is guaranteed to have a unique primary
@@ -48,12 +53,14 @@ type Index interface {
 	// IsUnique returns true if this index is declared as UNIQUE in the schema.
 	IsUnique() bool
 
-	// IsInverted returns true if this is a JSON inverted index.
+	// IsInverted returns true if this is an inverted index.
 	IsInverted() bool
 
 	// ColumnCount returns the number of columns in the index. This includes
 	// columns that were part of the index definition (including the STORING
-	// clause), as well as implicitly added primary key columns.
+	// clause), as well as implicitly added primary key columns. It also contains
+	// implicit system columns, which are placed after all physical columns in
+	// the table.
 	ColumnCount() int
 
 	// KeyColumnCount returns the number of columns in the index that are part
@@ -115,9 +122,25 @@ type Index interface {
 	// columns is data-dependent, not schema-dependent.
 	LaxKeyColumnCount() int
 
+	// NonInvertedPrefixColumnCount returns the number of non-inverted columns
+	// in the inverted index. An inverted index only has non-inverted columns if
+	// it is a multi-column inverted index. Therefore, a non-zero value is only
+	// returned for multi-column inverted indexes. This function panics if the
+	// index is not an inverted index.
+	NonInvertedPrefixColumnCount() int
+
 	// Column returns the ith IndexColumn within the index definition, where
 	// i < ColumnCount.
 	Column(i int) IndexColumn
+
+	// VirtualInvertedColumn returns the VirtualInverted IndexColumn of the
+	// index. Panics if the index is not an inverted index.
+	VirtualInvertedColumn() IndexColumn
+
+	// Predicate returns the partial index predicate expression and true if the
+	// index is a partial index. If it is not a partial index, the empty string
+	// and false are returned.
+	Predicate() (string, bool)
 
 	// Zone returns the zone which constrains placement of the index's range
 	// replicas. If the index was not explicitly assigned to a zone, then it
@@ -165,17 +188,82 @@ type Index interface {
 	//   [ /us/seattle\x00 -               ]
 	//
 	PartitionByListPrefixes() []tree.Datums
+
+	// ImplicitPartitioningColumnCount returns the number of implicit partitioning
+	// columns at the front of the index. For example, consider the following
+	// table:
+	//
+	// CREATE TABLE t (
+	//   x INT,
+	//   y INT,
+	//   INDEX (y) PARTITION BY LIST (x) (
+	//     PARTITION p1 VALUES IN (1)
+	//   )
+	// );
+	//
+	// In this case, the number of implicit partitioning columns in the index on
+	// y is 1, since x is implicitly added to the front of the index.
+	//
+	// The implicit partitioning columns are always a prefix of the full column
+	// list, and ImplicitPartitioningColumnCount < LaxKeyColumnCount.
+	ImplicitPartitioningColumnCount() int
+
+	// InterleaveAncestorCount returns the number of interleave ancestors for this
+	// index (or zero if this is not an interleaved index). Each ancestor is an
+	// index (usually from another table) with a key that shares a prefix with
+	// the key of this index.
+	//
+	// Each ancestor contributes one or more key columns; together these pieces
+	// form a prefix of an index key.
+	//
+	// The ancestors appear in the order they appear in an encoded key. This means
+	// they are always in the far-to-near ancestor order (e.g.
+	// grand-grand-parent, grand-parent, parent).
+	//
+	//
+	// Example:
+	//   Index 1 -> /a/b
+	//   Index 2 -> /a/b/c
+	//   Index 3 -> /a/b/c/d
+	//
+	// Index 3 has two ancestors; the first is index 1 (contributing 2 key
+	// columns) and the second is index 2 (contributing 1 key column).
+	InterleaveAncestorCount() int
+
+	// InterleaveAncestor returns information about an ancestor index.
+	//
+	// numKeyCols is the number of key columns that this ancestor contributes to
+	// an encoded key. In other words: each ancestor has a shared key prefix
+	// with this index; numKeyCols is the difference the shared prefix length for
+	// this ancestor and the shared prefix length for the previous ancestor.
+	// See InterleaveAncestorCount for an example.
+	InterleaveAncestor(i int) (table, index StableID, numKeyCols int)
+
+	// InterleavedByCount returns the number of indexes (usually from other
+	// tables) that are interleaved into this index.
+	//
+	// Note that these indexes can themselves be interleaved by other indexes, but
+	// this list contains only those for which this index is a direct interleave
+	// parent.
+	InterleavedByCount() int
+
+	// InterleavedBy returns information about an index that is interleaved into
+	// this index; see InterleavedByCount.
+	InterleavedBy(i int) (table, index StableID)
+
+	// GeoConfig returns a geospatial index configuration. If non-nil, it
+	// describes the configuration for this geospatial inverted index.
+	GeoConfig() *geoindex.Config
+
+	// Version returns the IndexDescriptorVersion of the index.
+	Version() descpb.IndexDescriptorVersion
 }
 
 // IndexColumn describes a single column that is part of an index definition.
 type IndexColumn struct {
 	// Column is a reference to the column returned by Table.Column, given the
 	// column ordinal.
-	Column
-
-	// Ordinal is the ordinal position of the indexed column in the table being
-	// indexed. It is always >= 0 and < Table.ColumnCount.
-	Ordinal int
+	*Column
 
 	// Descending is true if the index is ordered from greatest to least on
 	// this column, rather than least to greatest.

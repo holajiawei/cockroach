@@ -15,10 +15,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 type metadataForwarder interface {
@@ -27,36 +28,43 @@ type metadataForwarder interface {
 
 type planNodeToRowSource struct {
 	execinfra.ProcessorBase
+	execinfra.StreamingProcessor
 
+	input   execinfra.RowSource
 	started bool
 
 	fastPath bool
 
 	node        planNode
 	params      runParams
-	outputTypes []types.T
+	outputTypes []*types.T
 
 	firstNotWrapped planNode
 
 	// run time state machine values
-	row sqlbase.EncDatumRow
+	row rowenc.EncDatumRow
 }
+
+var _ execinfra.OpNode = &planNodeToRowSource{}
 
 func makePlanNodeToRowSource(
 	source planNode, params runParams, fastPath bool,
 ) (*planNodeToRowSource, error) {
-	nodeColumns := planColumns(source)
-
-	types := make([]types.T, len(nodeColumns))
-	for i := range nodeColumns {
-		types[i] = *nodeColumns[i].Typ
+	var typs []*types.T
+	if fastPath {
+		// If our node is a "fast path node", it means that we're set up to
+		// just return a row count meaning we'll output a single row with a
+		// single INT column.
+		typs = []*types.T{types.Int}
+	} else {
+		typs = getTypesFromResultColumns(planColumns(source))
 	}
-	row := make(sqlbase.EncDatumRow, len(nodeColumns))
+	row := make(rowenc.EncDatumRow, len(typs))
 
 	return &planNodeToRowSource{
 		node:        source,
 		params:      params,
-		outputTypes: types,
+		outputTypes: typs,
 		row:         row,
 		fastPath:    fastPath,
 	}, nil
@@ -66,13 +74,13 @@ var _ execinfra.LocalProcessor = &planNodeToRowSource{}
 
 // InitWithOutput implements the LocalProcessor interface.
 func (p *planNodeToRowSource) InitWithOutput(
-	post *execinfrapb.PostProcessSpec, output execinfra.RowReceiver,
+	flowCtx *execinfra.FlowCtx, post *execinfrapb.PostProcessSpec, output execinfra.RowReceiver,
 ) error {
 	return p.InitWithEvalCtx(
 		p,
 		post,
 		p.outputTypes,
-		nil, /* flowCtx */
+		flowCtx,
 		p.params.EvalContext(),
 		0, /* processorID */
 		output,
@@ -92,6 +100,7 @@ func (p *planNodeToRowSource) SetInput(ctx context.Context, input execinfra.RowS
 		// tree had no DistSQL-plannable subtrees.
 		return nil
 	}
+	p.input = input
 	p.AddInputToDrain(input)
 	// Search the plan we're wrapping for firstNotWrapped, which is the planNode
 	// that DistSQL planning resumed in. Replace that planNode with input,
@@ -122,13 +131,12 @@ func (p *planNodeToRowSource) Start(ctx context.Context) context.Context {
 	return ctx
 }
 
-func (p *planNodeToRowSource) InternalClose() {
-	if p.ProcessorBase.InternalClose() {
-		p.started = true
-	}
+func (p *planNodeToRowSource) InternalClose() bool {
+	p.started = true
+	return p.ProcessorBase.InternalClose()
 }
 
-func (p *planNodeToRowSource) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
+func (p *planNodeToRowSource) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	if p.State == execinfra.StateRunning && p.fastPath {
 		var count int
 		// If our node is a "fast path node", it means that we're set up to just
@@ -164,7 +172,7 @@ func (p *planNodeToRowSource) Next() (sqlbase.EncDatumRow, *execinfrapb.Producer
 		p.MoveToDraining(nil /* err */)
 		// Return the row count the only way we can: as a single-column row with
 		// the count inside.
-		return sqlbase.EncDatumRow{sqlbase.EncDatum{Datum: tree.NewDInt(tree.DInt(count))}}, nil
+		return rowenc.EncDatumRow{rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(count))}}, nil
 	}
 
 	for p.State == execinfra.StateRunning {
@@ -176,7 +184,7 @@ func (p *planNodeToRowSource) Next() (sqlbase.EncDatumRow, *execinfrapb.Producer
 
 		for i, datum := range p.node.Values() {
 			if datum != nil {
-				p.row[i] = sqlbase.DatumToEncDatum(&p.outputTypes[i], datum)
+				p.row[i] = rowenc.DatumToEncDatum(p.outputTypes[i], datum)
 			}
 		}
 		// ProcessRow here is required to deal with projections, which won't be
@@ -188,19 +196,9 @@ func (p *planNodeToRowSource) Next() (sqlbase.EncDatumRow, *execinfrapb.Producer
 	return nil, p.DrainHelper()
 }
 
-func (p *planNodeToRowSource) ConsumerDone() {
-	p.MoveToDraining(nil /* err */)
-}
-
 func (p *planNodeToRowSource) ConsumerClosed() {
 	// The consumer is done, Next() will not be called again.
 	p.InternalClose()
-}
-
-// IsException implements the VectorizeAlwaysException interface.
-func (p *planNodeToRowSource) IsException() bool {
-	_, ok := p.node.(*setVarNode)
-	return ok
 }
 
 // forwardMetadata will be called by any upstream rowSourceToPlanNode processors
@@ -209,4 +207,25 @@ func (p *planNodeToRowSource) IsException() bool {
 // trailing metadata and expect us to forward it further.
 func (p *planNodeToRowSource) forwardMetadata(metadata *execinfrapb.ProducerMetadata) {
 	p.ProcessorBase.AppendTrailingMeta(*metadata)
+}
+
+// ChildCount is part of the execinfra.OpNode interface.
+func (p *planNodeToRowSource) ChildCount(verbose bool) int {
+	if _, ok := p.input.(execinfra.OpNode); ok {
+		return 1
+	}
+	return 0
+}
+
+// Child is part of the execinfra.OpNode interface.
+func (p *planNodeToRowSource) Child(nth int, verbose bool) execinfra.OpNode {
+	switch nth {
+	case 0:
+		if n, ok := p.input.(execinfra.OpNode); ok {
+			return n
+		}
+		panic("input to planNodeToRowSource is not an execinfra.OpNode")
+	default:
+		panic(errors.AssertionFailedf("invalid index %d", nth))
+	}
 }

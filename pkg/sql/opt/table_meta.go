@@ -32,9 +32,7 @@ const (
 )
 
 // ColumnID returns the metadata id of the column at the given ordinal position
-// in the table. This is equivalent to calling:
-//
-//   md.TableMeta(t).ColumnMeta(ord).MetaID
+// in the table.
 //
 // NOTE: This method cannot do bounds checking, so it's up to the caller to
 //       ensure that a column really does exist at this ordinal position.
@@ -42,18 +40,20 @@ func (t TableID) ColumnID(ord int) ColumnID {
 	return t.firstColID() + ColumnID(ord)
 }
 
+// IndexColumnID returns the metadata id of the idxOrd-th index column in the
+// given index.
+func (t TableID) IndexColumnID(idx cat.Index, idxOrd int) ColumnID {
+	return t.ColumnID(idx.Column(idxOrd).Ordinal())
+}
+
 // ColumnOrdinal returns the ordinal position of the given column in its base
-// table. This is equivalent to calling:
-//
-//   md.ColumnMeta(id).Ordinal()
+// table.
 //
 // NOTE: This method cannot do complete bounds checking, so it's up to the
 //       caller to ensure that this column is really in the given base table.
 func (t TableID) ColumnOrdinal(id ColumnID) int {
-	if util.RaceEnabled {
-		if id < t.firstColID() {
-			panic(errors.AssertionFailedf("ordinal cannot be negative"))
-		}
+	if util.CrdbTestBuild && id < t.firstColID() {
+		panic(errors.AssertionFailedf("ordinal cannot be negative"))
 	}
 	return int(id - t.firstColID())
 }
@@ -112,6 +112,9 @@ var tableAnnIDCount TableAnnID
 const maxTableAnnIDCount = 2
 
 // TableMeta stores information about one of the tables stored in the metadata.
+//
+// NOTE: Metadata.DuplicateTable must be kept in sync with changes to this
+// struct.
 type TableMeta struct {
 	// MetaID is the identifier for this table that is unique within the query
 	// metadata.
@@ -132,17 +135,30 @@ type TableMeta struct {
 	// the consistency of foreign keys.
 	IgnoreForeignKeys bool
 
-	// Constraints stores the list of validated check constraints on the table
-	// stored in the ScalarExpr form so they can possibly be used as filters
-	// in certain queries. See comment above GenerateConstrainedScans for more
-	// detail.
-	Constraints []ScalarExpr
+	// Constraints stores a *FiltersExpr containing filters that are known to
+	// evaluate to true on the table data. This list is extracted from validated
+	// check constraints; specifically, those check constraints that we can prove
+	// never evaluate to NULL (as NULL is treated differently in check constraints
+	// and filters).
+	//
+	// If nil, there are no check constraints.
+	//
+	// See comment above GenerateConstrainedScans for more detail.
+	Constraints ScalarExpr
 
-	// ComputedCols stores ScalarExprs for each computed column on the table,
-	// indexed by ColumnID. These will be used when building mutation statements
-	// and constraining indexes. See comment above GenerateConstrainedScans for
-	// more detail.
+	// ComputedCols stores ScalarExprs for computed columns on the table, indexed
+	// by ColumnID. These will be used as "known truths" about data when
+	// constraining indexes. See comment above GenerateConstrainedScans for more
+	// detail.
+	//
+	// Computed columns with non-immutable operators are omitted.
 	ComputedCols map[ColumnID]ScalarExpr
+
+	// partialIndexPredicates is a map from index ordinals on the table to
+	// *FiltersExprs representing the predicate on the corresponding partial
+	// index. If an index is not a partial index, it will not have an entry in
+	// the map.
+	partialIndexPredicates map[cat.IndexOrdinal]ScalarExpr
 
 	// anns annotates the table metadata with arbitrary data.
 	anns [maxTableAnnIDCount]interface{}
@@ -156,36 +172,69 @@ func (tm *TableMeta) clearAnnotations() {
 	}
 }
 
-// IndexColumns returns the metadata IDs for the set of columns in the given
-// index.
+// IndexColumns returns the set of table columns in the given index.
 // TODO(justin): cache this value in the table metadata.
 func (tm *TableMeta) IndexColumns(indexOrd int) ColSet {
 	index := tm.Table.Index(indexOrd)
 
 	var indexCols ColSet
 	for i, n := 0, index.ColumnCount(); i < n; i++ {
-		ord := index.Column(i).Ordinal
+		ord := index.Column(i).Ordinal()
 		indexCols.Add(tm.MetaID.ColumnID(ord))
 	}
 	return indexCols
 }
 
-// IndexKeyColumns returns the metadata IDs for the set of strict key columns in
-// the given index.
+// IndexColumnsMapVirtual returns the set of table columns in the given index.
+// Virtual inverted index columns are mapped to their source column.
+func (tm *TableMeta) IndexColumnsMapVirtual(indexOrd int) ColSet {
+	index := tm.Table.Index(indexOrd)
+
+	var indexCols ColSet
+	for i, n := 0, index.ColumnCount(); i < n; i++ {
+		col := index.Column(i)
+		ord := col.Ordinal()
+		if col.Kind() == cat.VirtualInverted {
+			ord = col.InvertedSourceColumnOrdinal()
+		}
+		indexCols.Add(tm.MetaID.ColumnID(ord))
+	}
+	return indexCols
+}
+
+// IndexKeyColumns returns the set of strict key columns in the given index.
 func (tm *TableMeta) IndexKeyColumns(indexOrd int) ColSet {
 	index := tm.Table.Index(indexOrd)
 
 	var indexCols ColSet
 	for i, n := 0, index.KeyColumnCount(); i < n; i++ {
-		ord := index.Column(i).Ordinal
+		ord := index.Column(i).Ordinal()
 		indexCols.Add(tm.MetaID.ColumnID(ord))
 	}
 	return indexCols
 }
 
-// AddConstraint adds a valid table constraint to the table's metadata.
-func (tm *TableMeta) AddConstraint(constraint ScalarExpr) {
-	tm.Constraints = append(tm.Constraints, constraint)
+// IndexKeyColumnsMapVirtual returns the set of strict key columns in the given
+// index. Inverted index columns are mapped to their source column.
+func (tm *TableMeta) IndexKeyColumnsMapVirtual(indexOrd int) ColSet {
+	index := tm.Table.Index(indexOrd)
+
+	var indexCols ColSet
+	for i, n := 0, index.KeyColumnCount(); i < n; i++ {
+		col := index.Column(i)
+		ord := col.Ordinal()
+		if col.Kind() == cat.VirtualInverted {
+			ord = col.InvertedSourceColumnOrdinal()
+		}
+		indexCols.Add(tm.MetaID.ColumnID(ord))
+	}
+	return indexCols
+}
+
+// SetConstraints sets the filters derived from check constraints; see
+// TableMeta.Constraint. The argument must be a *FiltersExpr.
+func (tm *TableMeta) SetConstraints(constraints ScalarExpr) {
+	tm.Constraints = constraints
 }
 
 // AddComputedCol adds a computed column expression to the table's metadata.
@@ -194,6 +243,53 @@ func (tm *TableMeta) AddComputedCol(colID ColumnID, computedCol ScalarExpr) {
 		tm.ComputedCols = make(map[ColumnID]ScalarExpr)
 	}
 	tm.ComputedCols[colID] = computedCol
+}
+
+// AddPartialIndexPredicate adds a partial index predicate to the table's
+// metadata.
+func (tm *TableMeta) AddPartialIndexPredicate(ord cat.IndexOrdinal, pred ScalarExpr) {
+	if tm.partialIndexPredicates == nil {
+		tm.partialIndexPredicates = make(map[cat.IndexOrdinal]ScalarExpr)
+	}
+	tm.partialIndexPredicates[ord] = pred
+}
+
+// PartialIndexPredicate returns the given index's predicate scalar expression,
+// if the index is a partial index. Returns ok=false if the index is not a
+// partial index. Panics if the index is a partial index but a predicate scalar
+// expression does not exist in the table metadata.
+func (tm *TableMeta) PartialIndexPredicate(ord cat.IndexOrdinal) (pred ScalarExpr, ok bool) {
+	if _, isPartialIndex := tm.Table.Index(ord).Predicate(); !isPartialIndex {
+		return nil, false
+	}
+	pred, ok = tm.partialIndexPredicates[ord]
+	if !ok {
+		panic(errors.AssertionFailedf("partial index predicate does not exist in table metadata"))
+	}
+	return pred, true
+}
+
+// PartialIndexPredicatesForFormattingOnly returns the partialIndexPredicates
+// map.
+//
+// WARNING: The returned map is NOT a source-of-truth for determining if an
+// index is a partial index. This function should only be used to show the
+// partial index expressions that have been built for a table when formatting
+// opt expressions. Use PartialIndexPredicate in all other cases.
+func (tm *TableMeta) PartialIndexPredicatesForFormattingOnly() map[cat.IndexOrdinal]ScalarExpr {
+	return tm.partialIndexPredicates
+}
+
+// VirtualComputedColumns returns the set of virtual computed table columns.
+func (tm *TableMeta) VirtualComputedColumns() ColSet {
+	var virtualCols ColSet
+	for col := range tm.ComputedCols {
+		ord := tm.MetaID.ColumnOrdinal(col)
+		if tm.Table.Column(ord).IsVirtualComputed() {
+			virtualCols.Add(col)
+		}
+	}
+	return virtualCols
 }
 
 // TableAnnotation returns the given annotation that is associated with the

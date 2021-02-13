@@ -14,18 +14,20 @@ import (
 	"crypto/sha512"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
-	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
-	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // ExportRequestTargetFileSize controls the target file size for SSTs created
@@ -46,6 +48,8 @@ var ExportRequestMaxAllowedFileSizeOverage = settings.RegisterByteSizeSetting(
 	64<<20, /* 64 MiB */
 )
 
+const maxUploadRetries = 5
+
 func init() {
 	batcheval.RegisterReadOnlyCommand(roachpb.Export, declareKeysExport, evalExport)
 	ExportRequestTargetFileSize.SetVisibility(settings.Reserved)
@@ -53,42 +57,33 @@ func init() {
 }
 
 func declareKeysExport(
-	desc *roachpb.RangeDescriptor,
+	rs batcheval.ImmutableRangeState,
 	header roachpb.Header,
 	req roachpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
 ) {
-	batcheval.DefaultDeclareIsolatedKeys(desc, header, req, latchSpans, lockSpans)
+	batcheval.DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans)
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeLastGCKey(header.RangeID)})
 }
 
 // evalExport dumps the requested keys into files of non-overlapping key ranges
 // in a format suitable for bulk ingest.
 func evalExport(
-	ctx context.Context, batch engine.Reader, cArgs batcheval.CommandArgs, resp roachpb.Response,
+	ctx context.Context, batch storage.Reader, cArgs batcheval.CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.ExportRequest)
 	h := cArgs.Header
 	reply := resp.(*roachpb.ExportResponse)
 
 	ctx, span := tracing.ChildSpan(ctx, fmt.Sprintf("Export [%s,%s)", args.Key, args.EndKey))
-	defer tracing.FinishSpan(span)
+	defer span.Finish()
 
-	// If the startTime is zero, then we're doing a full backup and the gc
-	// threshold is irrelevant for MVCC_Lastest backups. Otherwise, make sure
-	// startTime is after the gc threshold. If it's not, the mvcc tombstones could
-	// have been deleted and the resulting RocksDB tombstones compacted, which
-	// means we'd miss deletions in the incremental backup. For MVCC_All backups
-	// with no start time, they'll only be capturing the *revisions* since the
-	// gc threshold, so noting that in the reply allows the BACKUP to correctly
-	// note the supported time bounds for RESTORE AS OF SYSTEM TIME.
-	gcThreshold := cArgs.EvalCtx.GetGCThreshold()
-	if !args.StartTime.IsEmpty() {
-		if args.StartTime.LessEq(gcThreshold) {
-			return result.Result{}, errors.Errorf("start timestamp %v must be after replica GC threshold %v", args.StartTime, gcThreshold)
-		}
-	} else if args.MVCCFilter == roachpb.MVCCFilter_All {
-		reply.StartTime = gcThreshold
+	// For MVCC_All backups with no start time, they'll only be capturing the
+	// *revisions* since the gc threshold, so noting that in the reply allows the
+	// BACKUP to correctly note the supported time bounds for RESTORE AS OF SYSTEM
+	// TIME.
+	if args.MVCCFilter == roachpb.MVCCFilter_All {
+		reply.StartTime = cArgs.EvalCtx.GetGCThreshold()
 	}
 
 	if err := cArgs.EvalCtx.GetLimiters().ConcurrentExportRequests.Begin(ctx); err != nil {
@@ -103,6 +98,17 @@ func evalExport(
 	} else {
 		// Requests that don't write to export storage are expected to be small.
 		log.Eventf(ctx, "export [%s,%s)", args.Key, args.EndKey)
+	}
+
+	if makeExternalStorage {
+		// TODO(dt): this blanket ban means we must do all uploads from the caller
+		// which is nice and simple but imposes extra copies/overhead/cost. We might
+		// want to instead allow *some* forms of external storage for *some* tenants
+		// e.g. allow some tenants to dial out to s3 directly -- if we do though we
+		// would need to continue to restrict unsafe ones like userfile here.
+		if _, ok := roachpb.TenantFromContext(ctx); ok {
+			return result.Result{}, errors.Errorf("requests on behalf of tenants are not allowed to contact external storage")
+		}
 	}
 
 	// To get the store to export to, first try to match the locality of this node
@@ -139,30 +145,29 @@ func evalExport(
 		return result.Result{}, errors.Errorf("unknown MVCC filter: %s", args.MVCCFilter)
 	}
 
-	io := engine.IterOptions{
-		UpperBound: args.EndKey,
-	}
-
-	// Time-bound iterators only make sense to use if the start time is set.
-	if args.EnableTimeBoundIteratorOptimization && !args.StartTime.IsEmpty() {
-		// The call to startTime.Next() converts our exclusive start bound into the
-		// inclusive start bound that MinTimestampHint expects. This is strictly a
-		// performance optimization; omitting the call would still return correct
-		// results.
-		io.MinTimestampHint = args.StartTime.Next()
-		io.MaxTimestampHint = h.Timestamp
-	}
-
 	e := spanset.GetDBEngine(batch, roachpb.Span{Key: args.Key, EndKey: args.EndKey})
 	targetSize := uint64(args.TargetFileSize)
+	// TODO(adityamaru): Remove this once we are able to set tenant specific
+	// cluster settings. This takes the minimum of the system tenant's cluster
+	// setting and the target size sent as part of the ExportRequest from the
+	// tenant.
+	clusterSettingTargetSize := uint64(ExportRequestTargetFileSize.Get(&cArgs.EvalCtx.ClusterSettings().SV))
+	if targetSize > clusterSettingTargetSize {
+		targetSize = clusterSettingTargetSize
+	}
+
 	var maxSize uint64
 	allowedOverage := ExportRequestMaxAllowedFileSizeOverage.Get(&cArgs.EvalCtx.ClusterSettings().SV)
 	if targetSize > 0 && allowedOverage > 0 {
 		maxSize = targetSize + uint64(allowedOverage)
 	}
+
+	// Time-bound iterators only make sense to use if the start time is set.
+	useTBI := args.EnableTimeBoundIteratorOptimization && !args.StartTime.IsEmpty()
+	var curSizeOfExportedSSTs int64
 	for start := args.Key; start != nil; {
-		data, summary, resume, err := e.ExportToSst(start, args.EndKey, args.StartTime,
-			h.Timestamp, exportAllRevisions, targetSize, maxSize, io)
+		data, summary, resume, err := e.ExportMVCCToSst(start, args.EndKey, args.StartTime,
+			h.Timestamp, exportAllRevisions, targetSize, maxSize, useTBI)
 		if err != nil {
 			return result.Result{}, err
 		}
@@ -184,6 +189,7 @@ func evalExport(
 		}
 
 		if args.Encryption != nil {
+			// TODO(dt): cluster version gate use EncryptFileChunked.
 			data, err = EncryptFile(data, args.Encryption.Key)
 			if err != nil {
 				return result.Result{}, err
@@ -204,8 +210,19 @@ func evalExport(
 		}
 
 		if exportStore != nil {
-			exported.Path = fmt.Sprintf("%d.sst", builtins.GenerateUniqueInt(cArgs.EvalCtx.NodeID()))
-			if err := exportStore.WriteFile(ctx, exported.Path, bytes.NewReader(data)); err != nil {
+			// TODO(dt): don't reach out into a SQL builtin here; this code lives in KV.
+			// Create a unique int differently.
+			nodeID := cArgs.EvalCtx.NodeID()
+			exported.Path = fmt.Sprintf("%d.sst", builtins.GenerateUniqueInt(base.SQLInstanceID(nodeID)))
+			if err := retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), maxUploadRetries, func() error {
+				// We blindly retry any error here because we expect the caller to have
+				// verified the target is writable before sending ExportRequests for it.
+				if err := exportStore.WriteFile(ctx, exported.Path, bytes.NewReader(data)); err != nil {
+					log.VEventf(ctx, 1, "failed to put file: %+v", err)
+					return err
+				}
+				return nil
+			}); err != nil {
 				return result.Result{}, err
 			}
 		}
@@ -214,6 +231,49 @@ func evalExport(
 		}
 		reply.Files = append(reply.Files, exported)
 		start = resume
+
+		// If we are not returning the SSTs to the processor, there is no need to
+		// paginate the ExportRequest since the reply size will not grow large
+		// enough to cause an OOM.
+		if args.ReturnSST && h.TargetBytes > 0 {
+			curSizeOfExportedSSTs += summary.DataSize
+			// There could be a situation where the size of exported SSTs is larger
+			// than the TargetBytes. In such a scenario, we want to report back
+			// TargetBytes as the size of the processed SSTs otherwise the DistSender
+			// will error out with an "exceeded limit". In every other case we want to
+			// report back the actual size so that the DistSender can shrink the limit
+			// for subsequent range requests.
+			// This is semantically OK for two reasons:
+			//
+			// - DistSender does not parallelize requests with TargetBytes > 0.
+			//
+			// - DistSender uses NumBytes to shrink the limit for subsequent requests.
+			// By returning TargetBytes, no more requests will be processed (and there
+			// are no parallel running requests) which is what we expect.
+			//
+			// The ResumeSpan is what is used as the source of truth by the caller
+			// issuing the request, and that contains accurate information about what
+			// is left to be exported.
+			targetSize := h.TargetBytes
+			if curSizeOfExportedSSTs < targetSize {
+				targetSize = curSizeOfExportedSSTs
+			}
+			reply.NumBytes = targetSize
+			reply.ResumeReason = roachpb.RESUME_KEY_LIMIT
+			// NB: This condition means that we will allow another SST to be created
+			// even if we have less room in our TargetBytes than the target size of
+			// the next SST. In the worst case this could lead to us exceeding our
+			// TargetBytes by SST target size + overage.
+			if reply.NumBytes == h.TargetBytes {
+				if resume != nil {
+					reply.ResumeSpan = &roachpb.Span{
+						Key:    resume,
+						EndKey: args.EndKey,
+					}
+				}
+				break
+			}
+		}
 	}
 
 	return result.Result{}, nil

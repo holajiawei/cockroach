@@ -15,16 +15,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -35,7 +35,7 @@ const (
 var (
 	// rangeLogTTL is the TTL for rows in system.rangelog. If non zero, range log
 	// entries are periodically garbage collected.
-	rangeLogTTL = settings.RegisterPublicDurationSetting(
+	rangeLogTTL = settings.RegisterDurationSetting(
 		"server.rangelog.ttl",
 		fmt.Sprintf(
 			"if nonzero, range log entries older than this duration are deleted every %s. "+
@@ -43,19 +43,19 @@ var (
 			systemLogGCPeriod,
 		),
 		30*24*time.Hour, // 30 days
-	)
+	).WithPublic()
 
 	// eventLogTTL is the TTL for rows in system.eventlog. If non zero, event log
 	// entries are periodically garbage collected.
-	eventLogTTL = settings.RegisterPublicDurationSetting(
+	eventLogTTL = settings.RegisterDurationSetting(
 		"server.eventlog.ttl",
 		fmt.Sprintf(
-			"if nonzero, event log entries older than this duration are deleted every %s. "+
+			"if nonzero, entries in system.eventlog older than this duration are deleted every %s. "+
 				"Should not be lowered below 24 hours.",
 			systemLogGCPeriod,
 		),
 		90*24*time.Hour, // 90 days
-	)
+	).WithPublic()
 )
 
 // gcSystemLog deletes entries in the given system log table between
@@ -78,25 +78,25 @@ func (s *Server) gcSystemLog(
 		return timestampLowerBound, 0, err
 	}
 
-	if !repl.IsFirstRange() || !repl.OwnsValidLease(s.clock.Now()) {
+	if !repl.IsFirstRange() || !repl.OwnsValidLease(ctx, s.clock.NowAsClockTimestamp()) {
 		return timestampLowerBound, 0, nil
 	}
 
 	deleteStmt := fmt.Sprintf(
-		`SELECT count(1), max(timestamp) FROM 
+		`SELECT count(1), max(timestamp) FROM
 [DELETE FROM system.%s WHERE timestamp >= $1 AND timestamp <= $2 LIMIT 1000 RETURNING timestamp]`,
 		table,
 	)
 
 	for {
 		var rowsAffected int64
-		err := s.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			var err error
-			row, err := s.internalExecutor.QueryRowEx(
+			row, err := s.sqlServer.internalExecutor.QueryRowEx(
 				ctx,
 				table+"-gc",
 				txn,
-				sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 				deleteStmt,
 				timestampLowerBound,
 				timestampUpperBound,
@@ -164,9 +164,9 @@ func (s *Server) startSystemLogsGC(ctx context.Context) {
 		},
 	}
 
-	s.stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = s.stopper.RunAsyncTask(ctx, "system-log-gc", func(ctx context.Context) {
 		period := systemLogGCPeriod
-		if storeKnobs, ok := s.cfg.TestingKnobs.Store.(*storage.StoreTestingKnobs); ok && storeKnobs.SystemLogsGCPeriod != 0 {
+		if storeKnobs, ok := s.cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs); ok && storeKnobs.SystemLogsGCPeriod != 0 {
 			period = storeKnobs.SystemLogsGCPeriod
 		}
 
@@ -202,15 +202,15 @@ func (s *Server) startSystemLogsGC(ctx context.Context) {
 					}
 				}
 
-				if storeKnobs, ok := s.cfg.TestingKnobs.Store.(*storage.StoreTestingKnobs); ok && storeKnobs.SystemLogsGCGCDone != nil {
+				if storeKnobs, ok := s.cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs); ok && storeKnobs.SystemLogsGCGCDone != nil {
 					select {
 					case storeKnobs.SystemLogsGCGCDone <- struct{}{}:
-					case <-s.stopper.ShouldStop():
+					case <-s.stopper.ShouldQuiesce():
 						// Test has finished.
 						return
 					}
 				}
-			case <-s.stopper.ShouldStop():
+			case <-s.stopper.ShouldQuiesce():
 				return
 			}
 		}

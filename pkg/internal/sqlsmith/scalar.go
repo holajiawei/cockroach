@@ -11,10 +11,8 @@
 package sqlsmith
 
 import (
-	"fmt"
-
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -109,10 +107,7 @@ func makeScalarSample(
 }
 
 func makeCaseExpr(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
-	typ, ok := s.pickAnyType(typ)
-	if !ok {
-		return nil, false
-	}
+	typ = s.pickAnyType(typ)
 	condition := makeScalar(s, types.Bool, refs)
 	trueExpr := makeScalar(s, typ, refs)
 	falseExpr := makeScalar(s, typ, refs)
@@ -132,10 +127,7 @@ func makeCoalesceExpr(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, b
 	if s.vectorizable {
 		return nil, false
 	}
-	typ, ok := s.pickAnyType(typ)
-	if !ok {
-		return nil, false
-	}
+	typ = s.pickAnyType(typ)
 	firstExpr := makeScalar(s, typ, refs)
 	secondExpr := makeScalar(s, typ, refs)
 	return tree.NewTypedCoalesceExpr(
@@ -148,19 +140,7 @@ func makeCoalesceExpr(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, b
 }
 
 func makeConstExpr(s *Smither, typ *types.T, refs colRefs) tree.TypedExpr {
-	typ, ok := s.pickAnyType(typ)
-	if !ok {
-		// We want to panic here instead of return "nil, false" because
-		// this function should never have a requested type that
-		// is disallowed. If we do, it indicates that some function
-		// upstream (like a binary operator, func arguments, etc.) has
-		// not properly checked its types with allowedType(). We panic
-		// here so we can fix that other function. We want to keep the
-		// return signature to this function as is (i.e., it doesn't
-		// have an "ok bool" return like the others do) so that it is
-		// guaranteed to always succeed.
-		panic(fmt.Errorf("bad type %v", typ))
-	}
+	typ = s.pickAnyType(typ)
 
 	if s.avoidConsts {
 		if expr, ok := makeColRef(s, typ, refs); ok {
@@ -178,9 +158,9 @@ func makeConstDatum(s *Smither, typ *types.T) tree.Datum {
 	if s.vectorizable {
 		nullChance = 0
 	}
-	datum = sqlbase.RandDatumWithNullChance(s.rnd, typ, nullChance)
+	datum = rowenc.RandDatumWithNullChance(s.rnd, typ, nullChance)
 	if f := datum.ResolvedType().Family(); f != types.UnknownFamily && s.simpleDatums {
-		datum = sqlbase.RandDatumSimple(s.rnd, typ)
+		datum = rowenc.RandDatumSimple(s.rnd, typ)
 	}
 	s.lock.Unlock()
 
@@ -298,19 +278,13 @@ var vecBinOps = map[tree.BinaryOperator]bool{
 }
 
 func makeBinOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
-	typ, ok := s.pickAnyType(typ)
-	if !ok {
-		return nil, false
-	}
+	typ = s.pickAnyType(typ)
 	ops := operators[typ.Oid()]
 	if len(ops) == 0 {
 		return nil, false
 	}
 	n := s.rnd.Intn(len(ops))
 	op := ops[n]
-	if !s.allowedType(op.LeftType, op.RightType) {
-		return nil, false
-	}
 	if s.vectorizable && !vecBinOps[op.Operator] {
 		return nil, false
 	}
@@ -353,10 +327,7 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 	if s.vectorizable {
 		return nil, false
 	}
-	typ, ok := s.pickAnyType(typ)
-	if !ok {
-		return nil, false
-	}
+	typ = s.pickAnyType(typ)
 
 	class := ctx.fnClass
 	// Turn off window functions most of the time because they are
@@ -370,7 +341,7 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 		return nil, false
 	}
 	fn := fns[s.rnd.Intn(len(fns))]
-	if s.disableImpureFns && fn.def.Impure {
+	if s.disableImpureFns && fn.overload.Volatility > tree.VolatilityImmutable {
 		return nil, false
 	}
 	for _, ignore := range s.ignoreFNs {
@@ -381,9 +352,6 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 
 	args := make(tree.TypedExprs, 0)
 	for _, argTyp := range fn.overload.Types.Types() {
-		if !s.allowedType(argTyp) {
-			return nil, false
-		}
 		var arg tree.TypedExpr
 		// If we're a GROUP BY or window function, try to choose a col ref for the arguments.
 		if class == tree.AggregateClass || class == tree.WindowClass {
@@ -415,16 +383,21 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 		s.sample(len(refs), 2, func(i int) {
 			parts = append(parts, refs[i].item)
 		})
-		var order tree.OrderBy
+		var (
+			order      tree.OrderBy
+			orderTypes []*types.T
+		)
 		s.sample(len(refs)-len(parts), 2, func(i int) {
+			ref := refs[i+len(parts)]
 			order = append(order, &tree.Order{
-				Expr:      refs[i+len(parts)].item,
+				Expr:      ref.item,
 				Direction: s.randDirection(),
 			})
+			orderTypes = append(orderTypes, ref.typ)
 		})
 		var frame *tree.WindowFrame
 		if s.coin() {
-			frame = makeWindowFrame(s, refs, order)
+			frame = makeWindowFrame(s, refs, orderTypes)
 		}
 		window = &tree.WindowDef{
 			Partitions: parts,
@@ -457,11 +430,11 @@ func randWindowFrameMode(s *Smither) tree.WindowFrameMode {
 	return windowFrameModes[s.rnd.Intn(len(windowFrameModes))]
 }
 
-func makeWindowFrame(s *Smither, refs colRefs, orderBy tree.OrderBy) *tree.WindowFrame {
+func makeWindowFrame(s *Smither, refs colRefs, orderTypes []*types.T) *tree.WindowFrame {
 	var frameMode tree.WindowFrameMode
 	for {
 		frameMode = randWindowFrameMode(s)
-		if len(orderBy) > 0 || frameMode != tree.GROUPS {
+		if len(orderTypes) > 0 || frameMode != tree.GROUPS {
 			// GROUPS mode requires an ORDER BY clause, so if it is not present and
 			// GROUPS mode was randomly chosen, we need to generate again; otherwise,
 			// we're done.
@@ -472,13 +445,19 @@ func makeWindowFrame(s *Smither, refs colRefs, orderBy tree.OrderBy) *tree.Windo
 	// bound can be omitted.
 	var startBound tree.WindowFrameBound
 	var endBound *tree.WindowFrameBound
-	if frameMode == tree.RANGE {
-		// RANGE mode is special in that if a bound is of type OffsetPreceding or
-		// OffsetFollowing, it requires that ORDER BY clause of the window function
-		// have exactly one column that can be only of the following types:
-		// DInt, DFloat, DDecimal, DInterval; so for now let's avoid this
-		// complication and not choose offset bound types.
-		// TODO(yuzefovich): fix this.
+	// RANGE mode is special in that if a bound is of type OffsetPreceding or
+	// OffsetFollowing, it requires that ORDER BY clause of the window function
+	// have exactly one column that can be only of the following types:
+	// Int, Float, Decimal, Interval.
+	allowRangeWithOffsets := false
+	if len(orderTypes) == 1 {
+		switch orderTypes[0].Family() {
+		case types.IntFamily, types.FloatFamily,
+			types.DecimalFamily, types.IntervalFamily:
+			allowRangeWithOffsets = true
+		}
+	}
+	if frameMode == tree.RANGE && !allowRangeWithOffsets {
 		if s.coin() {
 			startBound.BoundType = tree.UnboundedPreceding
 		} else {
@@ -519,10 +498,15 @@ func makeWindowFrame(s *Smither, refs colRefs, orderBy tree.OrderBy) *tree.Windo
 		}
 		// We will set offsets regardless of the bound type, but they will only be
 		// used when a bound is either OffsetPreceding or OffsetFollowing. Both
-		// ROWS and GROUPS mode need non-negative integers as bounds.
-		startBound.OffsetExpr = makeScalar(s, types.Int, refs)
+		// ROWS and GROUPS mode need non-negative integers as bounds whereas RANGE
+		// mode takes the type as the single ORDER BY clause has.
+		typ := types.Int
+		if frameMode == tree.RANGE {
+			typ = orderTypes[0]
+		}
+		startBound.OffsetExpr = makeScalar(s, typ, refs)
 		if endBound != nil {
-			endBound.OffsetExpr = makeScalar(s, types.Int, refs)
+			endBound.OffsetExpr = makeScalar(s, typ, refs)
 		}
 	}
 	return &tree.WindowFrame{
@@ -584,7 +568,7 @@ func makeIn(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 		subq := &tree.Subquery{
 			Select: &tree.ParenSelect{Select: selectStmt},
 		}
-		subq.SetType(types.MakeTuple([]types.T{*t}))
+		subq.SetType(types.MakeTuple([]*types.T{t}))
 		rhs = subq
 	}
 	op := tree.In
@@ -635,7 +619,7 @@ func makeTuple(s *Smither, typ *types.T, refs colRefs) *tree.Tuple {
 			exprs[i] = makeScalar(s, typ, refs)
 		}
 	}
-	return tree.NewTypedTuple(types.MakeTuple([]types.T{*typ}), exprs)
+	return tree.NewTypedTuple(types.MakeTuple([]*types.T{typ}), exprs)
 }
 
 func makeScalarSubquery(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {

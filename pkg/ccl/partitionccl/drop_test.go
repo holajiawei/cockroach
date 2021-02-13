@@ -15,15 +15,18 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func subzoneExists(cfg *zonepb.ZoneConfig, index uint32, partition string) bool {
@@ -37,19 +40,21 @@ func subzoneExists(cfg *zonepb.ZoneConfig, index uint32, partition string) bool 
 
 func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	const numRows = 100
+
+	defer gcjob.SetSmallMaxGCIntervalForTest()()
 
 	asyncNotification := make(chan struct{})
 
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			AsyncExecNotification: func() error {
+		GCJob: &sql.GCJobTestingKnobs{
+			RunBeforeResume: func(_ int64) error {
 				<-asyncNotification
 				return nil
 			},
-			AsyncExecQuickly: true,
 		},
 	}
 	s, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
@@ -64,12 +69,12 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 		PARTITION p1 VALUES IN (1),
 		PARTITION p2 VALUES IN (2)
 	)`)
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	indexDesc, _, err := tableDesc.FindIndexByName("i")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	index, err := tableDesc.FindIndexWithName("i")
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexSpan := tableDesc.IndexSpan(indexDesc.ID)
+	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, index.GetID())
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 
 	// Set zone configs on the primary index, secondary index, and one partition
@@ -86,7 +91,7 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 	// All zone configs should still exist.
 	var buf []byte
 	cfg := &zonepb.ZoneConfig{}
-	sqlDB.QueryRow(t, "SELECT config FROM system.zones WHERE id = $1", tableDesc.ID).Scan(&buf)
+	sqlDB.QueryRow(t, "SELECT config FROM system.zones WHERE id = $1", tableDesc.GetID()).Scan(&buf)
 	if err := protoutil.Unmarshal(buf, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -111,20 +116,20 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 			t.Fatalf(`zone config for %s still exists`, target)
 		}
 	}
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	if _, _, err := tableDesc.FindIndexByName("i"); err == nil {
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	if _, err := tableDesc.FindIndexWithName("i"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
 	close(asyncNotification)
 
 	// Wait for index drop to complete so zone configs are updated.
 	testutils.SucceedsSoon(t, func() error {
-		if kvs, err := kvDB.Scan(context.TODO(), indexSpan.Key, indexSpan.EndKey, 0); err != nil {
+		if kvs, err := kvDB.Scan(context.Background(), indexSpan.Key, indexSpan.EndKey, 0); err != nil {
 			return err
 		} else if l := 0; len(kvs) != l {
 			return errors.Errorf("expected %d key value pairs, but got %d", l, len(kvs))
 		}
-		sqlDB.QueryRow(t, "SELECT config FROM system.zones WHERE id = $1", tableDesc.ID).Scan(&buf)
+		sqlDB.QueryRow(t, "SELECT config FROM system.zones WHERE id = $1", tableDesc.GetID()).Scan(&buf)
 		if err := protoutil.Unmarshal(buf, cfg); err != nil {
 			return err
 		}

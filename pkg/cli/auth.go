@@ -43,7 +43,13 @@ The user for which the HTTP session is opened can be arbitrary.
 }
 
 func runLogin(cmd *cobra.Command, args []string) error {
+	// In CockroachDB SQL, unlike in PostgreSQL, usernames are
+	// case-insensitive. Therefore we need to normalize the username
+	// here, so that the normalized username is retained in the session
+	// table: the APIs extract the username from the session table
+	// without further normalization.
 	username := tree.Name(args[0]).Normalize()
+
 	id, httpCookie, err := createAuthSessionToken(username)
 	if err != nil {
 		return err
@@ -64,16 +70,16 @@ func runLogin(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		checkInteractive()
+		checkInteractive(os.Stdin)
 		if cliCtx.isInteractive {
 			fmt.Fprintf(stderr, `#
 # Example uses:
 #
-#     curl [-k] --cookie '%s' https://...
+#     curl [-k] --cookie '%[1]s' https://...
 #
-#     wget [--no-check-certificate] --header='Cookie: %s' https://...
+#     wget [--no-check-certificate] --header='Cookie: %[1]s' https://...
 #
-`, hC, hC)
+`, hC)
 		}
 	}
 
@@ -132,7 +138,7 @@ RETURNING id
 
 	// Spell out the cookie.
 	sCookie := &serverpb.SessionCookie{ID: id, Secret: secret}
-	httpCookie, err = server.EncodeSessionCookie(sCookie)
+	httpCookie, err = server.EncodeSessionCookie(sCookie, false /* forHTTPSOnly */)
 	return id, httpCookie, err
 }
 

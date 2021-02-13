@@ -21,8 +21,8 @@ import (
 	"math/big"
 	"unsafe"
 
-	"github.com/cockroachdb/apd"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/errors"
 )
 
 // EncodeDecimalAscending returns the resulting byte slice with the encoded decimal
@@ -152,7 +152,7 @@ func decimalEandM(d *apd.Decimal, tmp []byte) (int, []byte) {
 // The mantissa m can be stored in the spare capacity of appendTo.
 func encodeEandM(appendTo []byte, negative bool, e int, m []byte) []byte {
 	var buf []byte
-	if n := len(m) + maxVarintSize + 2; n <= cap(appendTo)-len(appendTo) {
+	if n := len(m) + MaxVarintLen + 2; n <= cap(appendTo)-len(appendTo) {
 		buf = appendTo[len(appendTo) : len(appendTo)+n]
 	} else {
 		buf = make([]byte, n)
@@ -624,6 +624,7 @@ func DecodeNonsortingDecimal(buf []byte, tmp []byte) (apd.Decimal, error) {
 // DecodeIntoNonsortingDecimal is like DecodeNonsortingDecimal, but it operates
 // on the passed-in *apd.Decimal instead of producing a new one.
 func DecodeIntoNonsortingDecimal(dec *apd.Decimal, buf []byte, tmp []byte) error {
+	*dec = apd.Decimal{}
 	switch buf[0] {
 	case decimalNaN:
 		dec.Form = apd.NaN
@@ -709,9 +710,9 @@ func decodeNonsortingDecimalValueWithoutExp(dec *apd.Decimal, buf, tmp []byte) {
 func UpperBoundNonsortingDecimalSize(d *apd.Decimal) int {
 	// Makeup of upper bound size:
 	// - 1 byte for the prefix
-	// - maxVarintSize for the exponent
+	// - MaxVarintLen for the exponent
 	// - WordLen for the big.Int bytes
-	return 1 + maxVarintSize + WordLen(d.Coeff.Bits())
+	return 1 + MaxVarintLen + WordLen(d.Coeff.Bits())
 }
 
 // upperBoundNonsortingDecimalUnscaledSize is the same as
@@ -726,9 +727,9 @@ func upperBoundNonsortingDecimalUnscaledSize(unscaledLen int) int {
 	unscaledLenWordRounded := int(unscaledLenBase2Words) * bigWordSize
 	// Makeup of upper bound size:
 	// - 1 byte for the prefix
-	// - maxVarintSize for the exponent
+	// - MaxVarintLen for the exponent
 	// - unscaledLenWordRounded for the big.Int bytes
-	return 1 + maxVarintSize + unscaledLenWordRounded
+	return 1 + MaxVarintLen + unscaledLenWordRounded
 }
 
 // Taken from math/big/arith.go.

@@ -12,11 +12,11 @@ package colcontainer
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
 )
@@ -27,6 +27,7 @@ type PartitionedQueue interface {
 	// partition at that index does not exist, a new one is created. Existing
 	// partitions may not be Enqueued to after calling
 	// CloseAllOpenWriteFileDescriptors.
+	// WARNING: Selection vectors are ignored.
 	Enqueue(ctx context.Context, partitionIdx int, batch coldata.Batch) error
 	// Dequeue removes and returns the batch from the front of the
 	// partitionIdx'th partition. If the partition is empty, or no partition at
@@ -36,7 +37,7 @@ type PartitionedQueue interface {
 	// CloseAllOpenWriteFileDescriptors notifies the PartitionedQueue that it can
 	// close all open write file descriptors. After this point, only new
 	// partitions may be Enqueued to.
-	CloseAllOpenWriteFileDescriptors() error
+	CloseAllOpenWriteFileDescriptors(ctx context.Context) error
 	// CloseAllOpenReadFileDescriptors closes the open read file descriptors
 	// belonging to partitions. These partitions may still be Dequeued from,
 	// although this will trigger files to be reopened.
@@ -45,9 +46,9 @@ type PartitionedQueue interface {
 	// from and have either been temporarily closed through
 	// CloseAllOpenReadFileDescriptors or have returned a coldata.ZeroBatch from
 	// Dequeue. This close removes the underlying files.
-	CloseInactiveReadPartitions() error
+	CloseInactiveReadPartitions(ctx context.Context) error
 	// Close closes all partitions created.
-	Close() error
+	Close(ctx context.Context) error
 }
 
 // partitionState is the state a partition is in.
@@ -104,7 +105,7 @@ const (
 
 // PartitionedDiskQueue is a PartitionedQueue whose partitions are on-disk.
 type PartitionedDiskQueue struct {
-	typs     []coltypes.T
+	typs     []*types.T
 	strategy PartitionerStrategy
 	cfg      DiskQueueCfg
 
@@ -117,27 +118,28 @@ type PartitionedDiskQueue struct {
 
 	numOpenFDs  int
 	fdSemaphore semaphore.Semaphore
+	diskAcc     *mon.BoundAccount
 }
+
+var _ PartitionedQueue = &PartitionedDiskQueue{}
 
 // NewPartitionedDiskQueue creates a PartitionedDiskQueue whose partitions are
 // all on-disk queues. Note that diskQueues will be lazily created when
 // enqueueing to a new partition. Each new partition will use
 // cfg.BufferSizeBytes, so memory usage may increase in an unbounded fashion if
 // used unmethodically. The file descriptors are acquired through fdSemaphore.
+// If fdSemaphore is nil, the partitioned disk queue will not Acquire or Release
+// file descriptors. Do this if the caller knows that it will use a constant
+// maximum number of file descriptors and wishes to acquire these up front.
 // Note that actual file descriptors open may be less than, but never more than
 // the number acquired through the semaphore.
 func NewPartitionedDiskQueue(
-	typs []coltypes.T,
+	typs []*types.T,
 	cfg DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
 	partitionerStrategy PartitionerStrategy,
+	diskAcc *mon.BoundAccount,
 ) *PartitionedDiskQueue {
-	if len(typs) == 0 {
-		// DiskQueues cannot serialize zero length schemas, so catch this error
-		// early.
-		// TODO(asubiotto): We could support this, but not sure we need to.
-		execerror.VectorizedInternalPanic("zero length schema unsupported")
-	}
 	return &PartitionedDiskQueue{
 		typs:                     typs,
 		strategy:                 partitionerStrategy,
@@ -146,6 +148,7 @@ func NewPartitionedDiskQueue(
 		partitions:               make([]partition, 0),
 		lastEnqueuedPartitionIdx: -1,
 		fdSemaphore:              fdSemaphore,
+		diskAcc:                  diskAcc,
 	}
 }
 
@@ -163,15 +166,15 @@ const (
 // having to re-enter the semaphore. The argument should only be releaseFD if
 // reopening a different file in a different scope.
 func (p *PartitionedDiskQueue) closeWritePartition(
-	idx int, releaseFDOption closeWritePartitionArgument,
+	ctx context.Context, idx int, releaseFDOption closeWritePartitionArgument,
 ) error {
 	if p.partitions[idx].state != partitionStateWriting {
-		execerror.VectorizedInternalPanic(fmt.Sprintf("illegal state change from %d to partitionStateClosedForWriting, only partitionStateWriting allowed", p.partitions[idx].state))
+		colexecerror.InternalError(errors.AssertionFailedf("illegal state change from %d to partitionStateClosedForWriting, only partitionStateWriting allowed", p.partitions[idx].state))
 	}
-	if err := p.partitions[idx].Enqueue(coldata.ZeroBatch); err != nil {
+	if err := p.partitions[idx].Enqueue(ctx, coldata.ZeroBatch); err != nil {
 		return err
 	}
-	if releaseFDOption == releaseFD {
+	if releaseFDOption == releaseFD && p.fdSemaphore != nil {
 		p.fdSemaphore.Release(1)
 		p.numOpenFDs--
 	}
@@ -181,18 +184,23 @@ func (p *PartitionedDiskQueue) closeWritePartition(
 
 func (p *PartitionedDiskQueue) closeReadPartition(idx int) error {
 	if p.partitions[idx].state != partitionStateReading {
-		execerror.VectorizedInternalPanic(fmt.Sprintf("illegal state change from %d to partitionStateClosedForReading, only partitionStateReading allowed", p.partitions[idx].state))
+		colexecerror.InternalError(errors.AssertionFailedf("illegal state change from %d to partitionStateClosedForReading, only partitionStateReading allowed", p.partitions[idx].state))
 	}
 	if err := p.partitions[idx].CloseRead(); err != nil {
 		return err
 	}
-	p.fdSemaphore.Release(1)
-	p.numOpenFDs--
+	if p.fdSemaphore != nil {
+		p.fdSemaphore.Release(1)
+		p.numOpenFDs--
+	}
 	p.partitions[idx].state = partitionStateClosedForReading
 	return nil
 }
 
 func (p *PartitionedDiskQueue) acquireNewFD(ctx context.Context) error {
+	if p.fdSemaphore == nil {
+		return nil
+	}
 	if err := p.fdSemaphore.Acquire(ctx, 1); err != nil {
 		return err
 	}
@@ -217,7 +225,7 @@ func (p *PartitionedDiskQueue) Enqueue(
 				// Close the last enqueued partition. No need to release or acquire a new
 				// file descriptor, since the acquired FD will represent the new
 				// partition's FD opened in Enqueue below.
-				if err := p.closeWritePartition(idxToClose, retainFD); err != nil {
+				if err := p.closeWritePartition(ctx, idxToClose, retainFD); err != nil {
 					return err
 				}
 				needToAcquireFD = false
@@ -237,7 +245,7 @@ func (p *PartitionedDiskQueue) Enqueue(
 			}
 		}
 		// Partition has not been created yet.
-		q, err := NewDiskQueue(p.typs, p.cfg)
+		q, err := NewDiskQueue(ctx, p.typs, p.cfg, p.diskAcc)
 		if err != nil {
 			return err
 		}
@@ -252,7 +260,7 @@ func (p *PartitionedDiskQueue) Enqueue(
 		return errors.New("Enqueue illegally called after Dequeue or CloseAllOpenWriteFileDescriptors")
 	}
 	p.lastEnqueuedPartitionIdx = partitionIdx
-	return p.partitions[idx].Enqueue(batch)
+	return p.partitions[idx].Enqueue(ctx, batch)
 }
 
 // Dequeue dequeues a batch from partition partitionIdx, returns a
@@ -270,7 +278,7 @@ func (p *PartitionedDiskQueue) Dequeue(
 	case partitionStateWriting:
 		// Close this partition for writing. However, we keep a file descriptor
 		// acquired for the read file descriptor opened for Dequeue.
-		if err := p.closeWritePartition(idx, retainFD); err != nil {
+		if err := p.closeWritePartition(ctx, idx, retainFD); err != nil {
 			return err
 		}
 		p.partitions[idx].state = partitionStateReading
@@ -286,9 +294,9 @@ func (p *PartitionedDiskQueue) Dequeue(
 	case partitionStatePermanentlyClosed:
 		return errors.Errorf("partition at index %d permanently closed, cannot Dequeue", partitionIdx)
 	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled state %d", state))
+		colexecerror.InternalError(errors.AssertionFailedf("unhandled state %d", state))
 	}
-	notEmpty, err := p.partitions[idx].Dequeue(batch)
+	notEmpty, err := p.partitions[idx].Dequeue(ctx, batch)
 	if err != nil {
 		return err
 	}
@@ -303,7 +311,8 @@ func (p *PartitionedDiskQueue) Dequeue(
 		// Dequeue but more batches will be added in the future (i.e. a zero batch
 		// was never enqueued). Since we require partitions to be closed for writing
 		// before reading, this state is unexpected.
-		execerror.VectorizedInternalPanic("DiskQueue unexpectedly returned that more data will be added")
+		colexecerror.InternalError(
+			errors.AssertionFailedf("DiskQueue unexpectedly returned that more data will be added"))
 	}
 	return nil
 }
@@ -311,13 +320,13 @@ func (p *PartitionedDiskQueue) Dequeue(
 // CloseAllOpenWriteFileDescriptors closes all open write file descriptors
 // belonging to partitions that are being Enqueued to. Once this method is
 // called, existing partitions may not be enqueued to again.
-func (p *PartitionedDiskQueue) CloseAllOpenWriteFileDescriptors() error {
+func (p *PartitionedDiskQueue) CloseAllOpenWriteFileDescriptors(ctx context.Context) error {
 	for i, q := range p.partitions {
 		if q.state != partitionStateWriting {
 			continue
 		}
 		// closeWritePartition will Release the file descriptor.
-		if err := p.closeWritePartition(i, releaseFD); err != nil {
+		if err := p.closeWritePartition(ctx, i, releaseFD); err != nil {
 			return err
 		}
 	}
@@ -344,13 +353,13 @@ func (p *PartitionedDiskQueue) CloseAllOpenReadFileDescriptors() error {
 // and either Dequeued a coldata.ZeroBatch or were closed through
 // CloseAllOpenReadFileDescriptors. This method call Closes the underlying
 // DiskQueue to remove its files, so a partition may never be used again.
-func (p *PartitionedDiskQueue) CloseInactiveReadPartitions() error {
+func (p *PartitionedDiskQueue) CloseInactiveReadPartitions(ctx context.Context) error {
 	var lastErr error
 	for i, q := range p.partitions {
 		if q.state != partitionStateClosedForReading {
 			continue
 		}
-		lastErr = q.Close()
+		lastErr = q.Close(ctx)
 		p.partitions[i].state = partitionStatePermanentlyClosed
 	}
 	return lastErr
@@ -359,17 +368,19 @@ func (p *PartitionedDiskQueue) CloseInactiveReadPartitions() error {
 // Close closes all the PartitionedDiskQueue's partitions. If an error is
 // encountered, the PartitionedDiskQueue will attempt to close all partitions
 // anyway and return the last error encountered.
-func (p *PartitionedDiskQueue) Close() error {
+func (p *PartitionedDiskQueue) Close(ctx context.Context) error {
 	var lastErr error
 	for i, q := range p.partitions {
 		if q.state == partitionStatePermanentlyClosed {
 			// Already closed.
 			continue
 		}
-		lastErr = q.Close()
+		lastErr = q.Close(ctx)
 		p.partitions[i].state = partitionStatePermanentlyClosed
 	}
 	if p.numOpenFDs != 0 {
+		// Note that if p.numOpenFDs is non-zero, it must be the case that
+		// fdSemaphore is non-nil.
 		p.fdSemaphore.Release(p.numOpenFDs)
 		p.numOpenFDs = 0
 	}

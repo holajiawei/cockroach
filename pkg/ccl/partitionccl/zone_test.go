@@ -20,21 +20,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 func TestValidIndexPartitionSetShowZones(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `
@@ -232,9 +234,10 @@ func TestValidIndexPartitionSetShowZones(t *testing.T) {
 
 func TestInvalidIndexPartitionSetShowZones(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	for i, tc := range []struct {
 		query string
@@ -273,6 +276,7 @@ func TestInvalidIndexPartitionSetShowZones(t *testing.T) {
 
 func TestGenerateSubzoneSpans(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	rng, _ := randutil.NewPseudoRand()
 
 	partitioningTests := allPartitioningTests(rng)
@@ -289,7 +293,7 @@ func TestGenerateSubzoneSpans(t *testing.T) {
 			clusterID := uuid.MakeV4()
 			hasNewSubzones := false
 			spans, err := sql.GenerateSubzoneSpans(
-				cluster.NoSettings, clusterID, test.parsed.tableDesc, test.parsed.subzones, hasNewSubzones)
+				cluster.NoSettings, clusterID, keys.SystemSQLCodec, test.parsed.tableDesc, test.parsed.subzones, hasNewSubzones)
 			if err != nil {
 				t.Fatalf("generating subzone spans: %+v", err)
 			}
@@ -297,13 +301,14 @@ func TestGenerateSubzoneSpans(t *testing.T) {
 			var actual []string
 			for _, span := range spans {
 				subzone := test.parsed.subzones[span.SubzoneIndex]
-				idxDesc, err := test.parsed.tableDesc.FindIndexByID(sqlbase.IndexID(subzone.IndexID))
+				idx, err := test.parsed.tableDesc.FindIndexWithID(descpb.IndexID(subzone.IndexID))
 				if err != nil {
 					t.Fatalf("could not find index with ID %d: %+v", subzone.IndexID, err)
 				}
 
 				directions := []encoding.Direction{encoding.Ascending /* index ID */}
-				for _, cd := range idxDesc.ColumnDirections {
+				for i := 0; i < idx.NumColumns(); i++ {
+					cd := idx.GetColumnDirection(i)
 					ed, err := cd.ToEncodingDirection()
 					if err != nil {
 						t.Fatal(err)
@@ -315,7 +320,7 @@ func TestGenerateSubzoneSpans(t *testing.T) {
 				if len(subzone.PartitionName) > 0 {
 					subzoneShort = "." + subzone.PartitionName
 				} else {
-					subzoneShort = "@" + idxDesc.Name
+					subzoneShort = "@" + idx.GetName()
 				}
 
 				// Verify that we're always doing the space savings when we can.

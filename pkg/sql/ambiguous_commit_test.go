@@ -13,28 +13,32 @@ package sql_test
 import (
 	"bytes"
 	"context"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/mutations"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
 type interceptingTransport struct {
-	kv.Transport
+	kvcoord.Transport
 	sendNext func(context.Context, roachpb.BatchRequest) (*roachpb.BatchResponse, error)
 }
 
@@ -58,6 +62,14 @@ func (t *interceptingTransport) SendNext(
 // duplicate key violations. See #6053, #7604, and #10023.
 func TestAmbiguousCommit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	if mutations.MaxBatchSize(false /* forceProductionMaxBatchSize */) == 1 {
+		// This test relies on the fact that the mutation batch consisting of a
+		// single row also contains an EndTxn which is the case only when the
+		// max batch size is at least 2, so we'll skip it.
+		skip.UnderMetamorphic(t)
+	}
 
 	testutils.RunTrueAndFalse(t, "ambiguousSuccess", func(t *testing.T, ambiguousSuccess bool) {
 		var params base.TestServerArgs
@@ -67,7 +79,7 @@ func TestAmbiguousCommit(t *testing.T) {
 		translateToRPCError := roachpb.NewError(errors.Errorf("%s: RPC error: success=%t", t.Name(), ambiguousSuccess))
 
 		maybeRPCError := func(req *roachpb.ConditionalPutRequest) *roachpb.Error {
-			tsk, ok := tableStartKey.Load().([]byte)
+			tsk, ok := tableStartKey.Load().(roachpb.Key)
 			if !ok {
 				return nil
 			}
@@ -80,11 +92,11 @@ func TestAmbiguousCommit(t *testing.T) {
 			return nil
 		}
 
-		params.Knobs.KVClient = &kv.ClientTestingKnobs{
+		params.Knobs.KVClient = &kvcoord.ClientTestingKnobs{
 			TransportFactory: func(
-				opts kv.SendOptions, nodeDialer *nodedialer.Dialer, replicas kv.ReplicaSlice,
-			) (kv.Transport, error) {
-				transport, err := kv.GRPCTransportFactory(opts, nodeDialer, replicas)
+				opts kvcoord.SendOptions, nodeDialer *nodedialer.Dialer, replicas kvcoord.ReplicaSlice,
+			) (kvcoord.Transport, error) {
+				transport, err := kvcoord.GRPCTransportFactory(opts, nodeDialer, replicas)
 				return &interceptingTransport{
 					Transport: transport,
 					sendNext: func(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
@@ -96,7 +108,7 @@ func TestAmbiguousCommit(t *testing.T) {
 							//
 							// For the rest, compare and perhaps inject an
 							// RPC error ourselves.
-							if err == nil && br.Error.Equal(translateToRPCError) {
+							if err == nil && reflect.DeepEqual(br.Error, translateToRPCError) {
 								// Translate the injected error into an RPC
 								// error to simulate an ambiguous result.
 								return nil, br.Error.GoError()
@@ -119,8 +131,10 @@ func TestAmbiguousCommit(t *testing.T) {
 		}
 
 		if ambiguousSuccess {
-			params.Knobs.Store = &storage.StoreTestingKnobs{
-				TestingResponseFilter: func(args roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
+			params.Knobs.Store = &kvserver.StoreTestingKnobs{
+				TestingResponseFilter: func(
+					ctx context.Context, args roachpb.BatchRequest, _ *roachpb.BatchResponse,
+				) *roachpb.Error {
 					if req, ok := args.GetArg(roachpb.ConditionalPut); ok {
 						return maybeRPCError(req.(*roachpb.ConditionalPutRequest))
 					}
@@ -136,7 +150,7 @@ func TestAmbiguousCommit(t *testing.T) {
 
 		const numReplicas = 3
 		tc := testcluster.StartTestCluster(t, numReplicas, testClusterArgs)
-		defer tc.Stopper().Stop(context.TODO())
+		defer tc.Stopper().Stop(context.Background())
 
 		// Avoid distSQL so we can reliably hydrate the intended dist
 		// sender's cache below.
@@ -156,10 +170,10 @@ func TestAmbiguousCommit(t *testing.T) {
 		}
 
 		tableID := sqlutils.QueryTableID(t, sqlDB, "test", "public", "t")
-		tableStartKey.Store(keys.MakeTablePrefix(tableID))
+		tableStartKey.Store(keys.SystemSQLCodec.TablePrefix(tableID))
 
 		// Wait for new table to split & replication.
-		if err := tc.WaitForSplitAndInitialization(tableStartKey.Load().([]byte)); err != nil {
+		if err := tc.WaitForSplitAndInitialization(tableStartKey.Load().(roachpb.Key)); err != nil {
 			t.Fatal(err)
 		}
 
@@ -172,8 +186,8 @@ func TestAmbiguousCommit(t *testing.T) {
 		}
 
 		if _, err := sqlDB.Exec(`INSERT INTO test.t (v) VALUES (1)`); ambiguousSuccess {
-			if pqErr, ok := err.(*pq.Error); ok {
-				if pqErr.Code != pgcode.StatementCompletionUnknown {
+			if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
+				if pgcode.MakeCode(string(pqErr.Code)) != pgcode.StatementCompletionUnknown {
 					t.Errorf("expected code %q, got %q (err: %s)",
 						pgcode.StatementCompletionUnknown, pqErr.Code, err)
 				}

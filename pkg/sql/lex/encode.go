@@ -23,14 +23,16 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
-	"fmt"
+	"unicode"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/stringencoding"
 	"github.com/cockroachdb/errors"
+	"golang.org/x/text/language"
 )
 
 var mustQuoteMap = map[byte]bool{
@@ -40,35 +42,10 @@ var mustQuoteMap = map[byte]bool{
 	'}': true,
 }
 
-// EncodeFlags influence the formatting of strings and identifiers.
-type EncodeFlags int
-
-// HasFlags tests whether the given flags are set.
-func (f EncodeFlags) HasFlags(subset EncodeFlags) bool {
-	return f&subset == subset
-}
-
-const (
-	// EncNoFlags indicates nothing special should happen while encoding.
-	EncNoFlags EncodeFlags = 0
-
-	// EncBareStrings indicates that strings will be rendered without
-	// wrapping quotes if they contain no special characters.
-	EncBareStrings EncodeFlags = 1 << iota
-
-	// EncBareIdentifiers indicates that identifiers will be rendered
-	// without wrapping quotes.
-	EncBareIdentifiers
-
-	// EncFirstFreeFlagBit needs to remain unused; it is used as base
-	// bit offset for tree.FmtFlags.
-	EncFirstFreeFlagBit
-)
-
 // EncodeSQLString writes a string literal to buf. All unicode and
 // non-printable characters are escaped.
 func EncodeSQLString(buf *bytes.Buffer, in string) {
-	EncodeSQLStringWithFlags(buf, in, EncNoFlags)
+	EncodeSQLStringWithFlags(buf, in, lexbase.EncNoFlags)
 }
 
 // EscapeSQLString returns an escaped SQL representation of the given
@@ -85,11 +62,11 @@ func EscapeSQLString(in string) string {
 // the output format: if encodeBareString is set, the output string
 // will not be wrapped in quotes if the strings contains no special
 // characters.
-func EncodeSQLStringWithFlags(buf *bytes.Buffer, in string, flags EncodeFlags) {
+func EncodeSQLStringWithFlags(buf *bytes.Buffer, in string, flags lexbase.EncodeFlags) {
 	// See http://www.postgresql.org/docs/9.4/static/sql-syntax-lexical.html
 	start := 0
 	escapedString := false
-	bareStrings := flags.HasFlags(EncBareStrings)
+	bareStrings := flags.HasFlags(lexbase.EncBareStrings)
 	// Loop through each unicode code point.
 	for i, r := range in {
 		if i < start {
@@ -132,58 +109,15 @@ func EncodeSQLStringWithFlags(buf *bytes.Buffer, in string, flags EncodeFlags) {
 	}
 }
 
-// EncodeUnrestrictedSQLIdent writes the identifier in s to buf.
-// The identifier is only quoted if the flags don't tell otherwise and
-// the identifier contains special characters.
-func EncodeUnrestrictedSQLIdent(buf *bytes.Buffer, s string, flags EncodeFlags) {
-	if flags.HasFlags(EncBareIdentifiers) || isBareIdentifier(s) {
-		buf.WriteString(s)
-		return
-	}
-	EncodeEscapedSQLIdent(buf, s)
-}
-
-// EncodeRestrictedSQLIdent writes the identifier in s to buf. The
-// identifier is quoted if either the flags ask for it, the identifier
-// contains special characters, or the identifier is a reserved SQL
-// keyword.
-func EncodeRestrictedSQLIdent(buf *bytes.Buffer, s string, flags EncodeFlags) {
-	if flags.HasFlags(EncBareIdentifiers) || (!isReservedKeyword(s) && isBareIdentifier(s)) {
-		buf.WriteString(s)
-		return
-	}
-	EncodeEscapedSQLIdent(buf, s)
-}
-
-// EncodeEscapedSQLIdent writes the identifier in s to buf. The
-// identifier is always quoted. Double quotes inside the identifier
-// are escaped.
-func EncodeEscapedSQLIdent(buf *bytes.Buffer, s string) {
-	buf.WriteByte('"')
-	start := 0
-	for i, n := 0, len(s); i < n; i++ {
-		ch := s[i]
-		// The only character that requires escaping is a double quote.
-		if ch == '"' {
-			if start != i {
-				buf.WriteString(s[start:i])
-			}
-			start = i + 1
-			buf.WriteByte(ch)
-			buf.WriteByte(ch) // add extra copy of ch
-		}
-	}
-	if start < len(s) {
-		buf.WriteString(s[start:])
-	}
-	buf.WriteByte('"')
-}
-
 // EncodeLocaleName writes the locale identifier in s to buf. Any dash
 // characters are mapped to underscore characters. Underscore characters do not
 // need to be quoted, and they are considered equivalent to dash characters by
 // the CLDR standard: http://cldr.unicode.org/.
 func EncodeLocaleName(buf *bytes.Buffer, s string) {
+	// If possible, try to normalize the case of the locale name.
+	if normalized, err := language.Parse(s); err == nil {
+		s = normalized.String()
+	}
 	for i, n := 0, len(s); i < n; i++ {
 		ch := s[i]
 		if ch == '-' {
@@ -192,6 +126,33 @@ func EncodeLocaleName(buf *bytes.Buffer, s string) {
 			buf.WriteByte(ch)
 		}
 	}
+}
+
+// LocaleNamesAreEqual checks for equality of two locale names. The comparison
+// is case-insensitive and treats '-' and '_' as the same.
+func LocaleNamesAreEqual(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for i, n := 0, len(a); i < n; i++ {
+		ai, bi := a[i], b[i]
+		if ai == bi {
+			continue
+		}
+		if ai == '-' && bi == '_' {
+			continue
+		}
+		if ai == '_' && bi == '-' {
+			continue
+		}
+		if unicode.ToLower(rune(ai)) != unicode.ToLower(rune(bi)) {
+			return false
+		}
+	}
+	return true
 }
 
 // EncodeSQLBytes encodes the SQL byte array in 'in' to buf, to a
@@ -236,10 +197,10 @@ func EncodeSQLBytes(buf *bytes.Buffer, in string) {
 // prefix the output with "\x". This is suitable e.g. for the encode()
 // built-in.
 func EncodeByteArrayToRawBytes(
-	data string, be sessiondata.BytesEncodeFormat, skipHexPrefix bool,
+	data string, be sessiondatapb.BytesEncodeFormat, skipHexPrefix bool,
 ) string {
 	switch be {
-	case sessiondata.BytesEncodeHex:
+	case sessiondatapb.BytesEncodeHex:
 		head := 2
 		if skipHexPrefix {
 			head = 0
@@ -252,7 +213,7 @@ func EncodeByteArrayToRawBytes(
 		hex.Encode(res[head:], []byte(data))
 		return string(res)
 
-	case sessiondata.BytesEncodeEscape:
+	case sessiondatapb.BytesEncodeEscape:
 		// PostgreSQL does not allow all the escapes formats recognized by
 		// CockroachDB's scanner. It only recognizes octal and \\ for the
 		// backslash itself.
@@ -274,11 +235,11 @@ func EncodeByteArrayToRawBytes(
 		}
 		return string(res)
 
-	case sessiondata.BytesEncodeBase64:
+	case sessiondatapb.BytesEncodeBase64:
 		return base64.StdEncoding.EncodeToString([]byte(data))
 
 	default:
-		panic(fmt.Sprintf("unhandled format: %s", be))
+		panic(errors.AssertionFailedf("unhandled format: %s", be))
 	}
 }
 
@@ -287,12 +248,12 @@ func EncodeByteArrayToRawBytes(
 // When using the Hex format, the caller is responsible for skipping the
 // "\x" prefix, if any. See DecodeRawBytesToByteArrayAuto() below for
 // an alternative.
-func DecodeRawBytesToByteArray(data string, be sessiondata.BytesEncodeFormat) ([]byte, error) {
+func DecodeRawBytesToByteArray(data string, be sessiondatapb.BytesEncodeFormat) ([]byte, error) {
 	switch be {
-	case sessiondata.BytesEncodeHex:
+	case sessiondatapb.BytesEncodeHex:
 		return hex.DecodeString(data)
 
-	case sessiondata.BytesEncodeEscape:
+	case sessiondatapb.BytesEncodeEscape:
 		// PostgreSQL does not allow all the escapes formats recognized by
 		// CockroachDB's scanner. It only recognizes octal and \\ for the
 		// backslash itself.
@@ -331,7 +292,7 @@ func DecodeRawBytesToByteArray(data string, be sessiondata.BytesEncodeFormat) ([
 		}
 		return res, nil
 
-	case sessiondata.BytesEncodeBase64:
+	case sessiondatapb.BytesEncodeBase64:
 		return base64.StdEncoding.DecodeString(data)
 
 	default:
@@ -344,7 +305,7 @@ func DecodeRawBytesToByteArray(data string, be sessiondata.BytesEncodeFormat) ([
 // and escape.
 func DecodeRawBytesToByteArrayAuto(data []byte) ([]byte, error) {
 	if len(data) >= 2 && data[0] == '\\' && (data[1] == 'x' || data[1] == 'X') {
-		return DecodeRawBytesToByteArray(string(data[2:]), sessiondata.BytesEncodeHex)
+		return DecodeRawBytesToByteArray(string(data[2:]), sessiondatapb.BytesEncodeHex)
 	}
-	return DecodeRawBytesToByteArray(string(data), sessiondata.BytesEncodeEscape)
+	return DecodeRawBytesToByteArray(string(data), sessiondatapb.BytesEncodeEscape)
 }

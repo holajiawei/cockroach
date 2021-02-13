@@ -13,10 +13,13 @@ import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
 import roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
-import sqlbase "github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+import descpb "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 import hlc "github.com/cockroachdb/cockroach/pkg/util/hlc"
 
 import time "time"
+import github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+import github_com_cockroachdb_cockroach_pkg_security "github.com/cockroachdb/cockroach/pkg/security"
+import github_com_cockroachdb_cockroach_pkg_ccl_streamingccl "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 
 import github_com_gogo_protobuf_sortkeys "github.com/gogo/protobuf/sortkeys"
 import encoding_binary "encoding/binary"
@@ -34,6 +37,44 @@ var _ = time.Kitchen
 // A compilation error at this line likely means your copy of the
 // proto package needs to be updated.
 const _ = proto.GoGoProtoPackageIsVersion2 // please upgrade the proto package
+
+// FileCompression list of the compression codecs which are currently
+// supported for CSVWriter spec
+type FileCompression int32
+
+const (
+	FileCompression_None FileCompression = 0
+	FileCompression_Gzip FileCompression = 1
+)
+
+var FileCompression_name = map[int32]string{
+	0: "None",
+	1: "Gzip",
+}
+var FileCompression_value = map[string]int32{
+	"None": 0,
+	"Gzip": 1,
+}
+
+func (x FileCompression) Enum() *FileCompression {
+	p := new(FileCompression)
+	*p = x
+	return p
+}
+func (x FileCompression) String() string {
+	return proto.EnumName(FileCompression_name, int32(x))
+}
+func (x *FileCompression) UnmarshalJSON(data []byte) error {
+	value, err := proto.UnmarshalJSONEnum(FileCompression_value, data, "FileCompression")
+	if err != nil {
+		return err
+	}
+	*x = FileCompression(value)
+	return nil
+}
+func (FileCompression) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{0}
+}
 
 type BackfillerSpec_Type int32
 
@@ -71,7 +112,7 @@ func (x *BackfillerSpec_Type) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (BackfillerSpec_Type) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_processors_bulk_io_bc986c92ca21a758, []int{0, 0}
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{0, 0}
 }
 
 // BackfillerSpec is the specification for a "schema change backfiller".
@@ -83,8 +124,8 @@ func (BackfillerSpec_Type) EnumDescriptor() ([]byte, []int) {
 // descriptor in the database, and doesn't emit any rows nor support
 // any post-processing.
 type BackfillerSpec struct {
-	Type  BackfillerSpec_Type     `protobuf:"varint,1,opt,name=type,enum=cockroach.sql.distsqlrun.BackfillerSpec_Type" json:"type"`
-	Table sqlbase.TableDescriptor `protobuf:"bytes,2,opt,name=table" json:"table"`
+	Type  BackfillerSpec_Type    `protobuf:"varint,1,opt,name=type,enum=cockroach.sql.distsqlrun.BackfillerSpec_Type" json:"type"`
+	Table descpb.TableDescriptor `protobuf:"bytes,2,opt,name=table" json:"table"`
 	// Sections of the table to be backfilled.
 	Spans []TableReaderSpan `protobuf:"bytes,3,rep,name=spans" json:"spans"`
 	// Run the backfill for approximately this duration.
@@ -95,19 +136,19 @@ type BackfillerSpec struct {
 	// along with a backfill for the rows. This is the maximum number
 	// of entries backfilled per chunk.
 	ChunkSize int64 `protobuf:"varint,5,opt,name=chunk_size,json=chunkSize" json:"chunk_size"`
-	// Any other (leased) table descriptors necessary for the
-	// backfiller to do its job, such as the descriptors for tables with fk
-	// relationships to the table being modified.
-	OtherTables []sqlbase.TableDescriptor `protobuf:"bytes,6,rep,name=other_tables,json=otherTables" json:"other_tables"`
 	// The timestamp to perform index backfill historical scans at.
 	ReadAsOf hlc.Timestamp `protobuf:"bytes,7,opt,name=readAsOf" json:"readAsOf"`
+	// IndexesToBackfill is the set of indexes to backfill. This is populated only
+	// starting in 21.1, prior to that the implied index set are those containing
+	// the mutation ID of the first mutation on the table descriptor.
+	IndexesToBackfill []github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.IndexID `protobuf:"varint,8,rep,name=indexes_to_backfill,json=indexesToBackfill,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.IndexID" json:"indexes_to_backfill,omitempty"`
 }
 
 func (m *BackfillerSpec) Reset()         { *m = BackfillerSpec{} }
 func (m *BackfillerSpec) String() string { return proto.CompactTextString(m) }
 func (*BackfillerSpec) ProtoMessage()    {}
 func (*BackfillerSpec) Descriptor() ([]byte, []int) {
-	return fileDescriptor_processors_bulk_io_bc986c92ca21a758, []int{0}
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{0}
 }
 func (m *BackfillerSpec) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -147,7 +188,7 @@ func (m *JobProgress) Reset()         { *m = JobProgress{} }
 func (m *JobProgress) String() string { return proto.CompactTextString(m) }
 func (*JobProgress) ProtoMessage()    {}
 func (*JobProgress) Descriptor() ([]byte, []int) {
-	return fileDescriptor_processors_bulk_io_bc986c92ca21a758, []int{1}
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{1}
 }
 func (m *JobProgress) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -201,13 +242,16 @@ type ReadImportDataSpec struct {
 	WalltimeNanos int64 `protobuf:"varint,11,opt,name=walltimeNanos" json:"walltimeNanos"`
 	// If set, specifies reader parallelism; 0 implies "use default".
 	ReaderParallelism int32 `protobuf:"varint,13,opt,name=readerParallelism" json:"readerParallelism"`
+	// User who initiated the import. This is used to check access privileges
+	// when using FileTable ExternalStorage.
+	UserProto github_com_cockroachdb_cockroach_pkg_security.SQLUsernameProto `protobuf:"bytes,15,opt,name=user_proto,json=userProto,casttype=github.com/cockroachdb/cockroach/pkg/security.SQLUsernameProto" json:"user_proto"`
 }
 
 func (m *ReadImportDataSpec) Reset()         { *m = ReadImportDataSpec{} }
 func (m *ReadImportDataSpec) String() string { return proto.CompactTextString(m) }
 func (*ReadImportDataSpec) ProtoMessage()    {}
 func (*ReadImportDataSpec) Descriptor() ([]byte, []int) {
-	return fileDescriptor_processors_bulk_io_bc986c92ca21a758, []int{2}
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{2}
 }
 func (m *ReadImportDataSpec) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -233,7 +277,7 @@ func (m *ReadImportDataSpec) XXX_DiscardUnknown() {
 var xxx_messageInfo_ReadImportDataSpec proto.InternalMessageInfo
 
 type ReadImportDataSpec_ImportTable struct {
-	Desc *sqlbase.TableDescriptor `protobuf:"bytes,1,opt,name=desc" json:"desc,omitempty"`
+	Desc *descpb.TableDescriptor `protobuf:"bytes,1,opt,name=desc" json:"desc,omitempty"`
 	// targetCols is used to store the target columns for each existing table
 	// being imported into. These are the columns for which the processor should
 	// read and emit data (ignoring data for any other tables or columns outside
@@ -245,7 +289,7 @@ func (m *ReadImportDataSpec_ImportTable) Reset()         { *m = ReadImportDataSp
 func (m *ReadImportDataSpec_ImportTable) String() string { return proto.CompactTextString(m) }
 func (*ReadImportDataSpec_ImportTable) ProtoMessage()    {}
 func (*ReadImportDataSpec_ImportTable) Descriptor() ([]byte, []int) {
-	return fileDescriptor_processors_bulk_io_bc986c92ca21a758, []int{2, 0}
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{2, 0}
 }
 func (m *ReadImportDataSpec_ImportTable) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -270,6 +314,278 @@ func (m *ReadImportDataSpec_ImportTable) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_ReadImportDataSpec_ImportTable proto.InternalMessageInfo
 
+type StreamIngestionDataSpec struct {
+	// PartitionAddresses locate the partitions that produce events to be
+	// ingested.
+	PartitionAddresses []github_com_cockroachdb_cockroach_pkg_ccl_streamingccl.PartitionAddress `protobuf:"bytes,1,rep,name=partition_addresses,json=partitionAddresses,customtype=github.com/cockroachdb/cockroach/pkg/ccl/streamingccl.PartitionAddress" json:"partition_addresses"`
+	// The processor will ingest events from StartTime onwards.
+	StartTime hlc.Timestamp `protobuf:"bytes,2,opt,name=start_time,json=startTime" json:"start_time"`
+	// StreamAddress locate the stream so that a stream client can be initialized.
+	StreamAddress github_com_cockroachdb_cockroach_pkg_ccl_streamingccl.StreamAddress `protobuf:"bytes,3,opt,name=stream_address,json=streamAddress,customtype=github.com/cockroachdb/cockroach/pkg/ccl/streamingccl.StreamAddress" json:"stream_address"`
+}
+
+func (m *StreamIngestionDataSpec) Reset()         { *m = StreamIngestionDataSpec{} }
+func (m *StreamIngestionDataSpec) String() string { return proto.CompactTextString(m) }
+func (*StreamIngestionDataSpec) ProtoMessage()    {}
+func (*StreamIngestionDataSpec) Descriptor() ([]byte, []int) {
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{3}
+}
+func (m *StreamIngestionDataSpec) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *StreamIngestionDataSpec) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *StreamIngestionDataSpec) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_StreamIngestionDataSpec.Merge(dst, src)
+}
+func (m *StreamIngestionDataSpec) XXX_Size() int {
+	return m.Size()
+}
+func (m *StreamIngestionDataSpec) XXX_DiscardUnknown() {
+	xxx_messageInfo_StreamIngestionDataSpec.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_StreamIngestionDataSpec proto.InternalMessageInfo
+
+type StreamIngestionFrontierSpec struct {
+	// HighWaterAtStart is set by the ingestion job when initializing the frontier
+	// processor. It is used as sanity check by the frontier processor to ensure
+	// that it does not receive updates at a timestamp lower than this field. This
+	// consequently prevents the job progress from regressing during ingestion.
+	HighWaterAtStart hlc.Timestamp `protobuf:"bytes,1,opt,name=high_water_at_start,json=highWaterAtStart" json:"high_water_at_start"`
+	// TrackedSpans is the entire span set being watched. The spans do not really
+	// represent KV spans but uniquely identify the partitions in the ingestion
+	// stream. Once all the partitions in the ingestion stream have been resolved
+	// at a certain timestamp, then it's safe to resolve the ingestion at that
+	// timestamp.
+	TrackedSpans []roachpb.Span `protobuf:"bytes,2,rep,name=tracked_spans,json=trackedSpans" json:"tracked_spans"`
+}
+
+func (m *StreamIngestionFrontierSpec) Reset()         { *m = StreamIngestionFrontierSpec{} }
+func (m *StreamIngestionFrontierSpec) String() string { return proto.CompactTextString(m) }
+func (*StreamIngestionFrontierSpec) ProtoMessage()    {}
+func (*StreamIngestionFrontierSpec) Descriptor() ([]byte, []int) {
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{4}
+}
+func (m *StreamIngestionFrontierSpec) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *StreamIngestionFrontierSpec) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *StreamIngestionFrontierSpec) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_StreamIngestionFrontierSpec.Merge(dst, src)
+}
+func (m *StreamIngestionFrontierSpec) XXX_Size() int {
+	return m.Size()
+}
+func (m *StreamIngestionFrontierSpec) XXX_DiscardUnknown() {
+	xxx_messageInfo_StreamIngestionFrontierSpec.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_StreamIngestionFrontierSpec proto.InternalMessageInfo
+
+type BackupDataSpec struct {
+	Spans            []roachpb.Span                 `protobuf:"bytes,1,rep,name=spans" json:"spans"`
+	IntroducedSpans  []roachpb.Span                 `protobuf:"bytes,2,rep,name=introduced_spans,json=introducedSpans" json:"introduced_spans"`
+	DefaultURI       string                         `protobuf:"bytes,3,opt,name=default_uri,json=defaultUri" json:"default_uri"`
+	URIsByLocalityKV map[string]string              `protobuf:"bytes,4,rep,name=uris_by_locality_kv,json=urisByLocalityKv" json:"uris_by_locality_kv,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	MVCCFilter       roachpb.MVCCFilter             `protobuf:"varint,5,opt,name=mvcc_filter,json=mvccFilter,enum=cockroach.roachpb.MVCCFilter" json:"mvcc_filter"`
+	Encryption       *roachpb.FileEncryptionOptions `protobuf:"bytes,6,opt,name=encryption" json:"encryption,omitempty"`
+	BackupStartTime  hlc.Timestamp                  `protobuf:"bytes,7,opt,name=backup_start_time,json=backupStartTime" json:"backup_start_time"`
+	BackupEndTime    hlc.Timestamp                  `protobuf:"bytes,8,opt,name=backup_end_time,json=backupEndTime" json:"backup_end_time"`
+	// PKIDs is used to convert result from an ExportRequest into row count
+	// information passed back to track progress in the backup job.
+	PKIDs map[uint64]bool `protobuf:"bytes,9,rep,name=pk_ids,json=pkIds" json:"pk_ids,omitempty" protobuf_key:"varint,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	// User who initiated the backup. This is used to check access privileges
+	// when using FileTable ExternalStorage.
+	UserProto github_com_cockroachdb_cockroach_pkg_security.SQLUsernameProto `protobuf:"bytes,10,opt,name=user_proto,json=userProto,casttype=github.com/cockroachdb/cockroach/pkg/security.SQLUsernameProto" json:"user_proto"`
+}
+
+func (m *BackupDataSpec) Reset()         { *m = BackupDataSpec{} }
+func (m *BackupDataSpec) String() string { return proto.CompactTextString(m) }
+func (*BackupDataSpec) ProtoMessage()    {}
+func (*BackupDataSpec) Descriptor() ([]byte, []int) {
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{5}
+}
+func (m *BackupDataSpec) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *BackupDataSpec) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *BackupDataSpec) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_BackupDataSpec.Merge(dst, src)
+}
+func (m *BackupDataSpec) XXX_Size() int {
+	return m.Size()
+}
+func (m *BackupDataSpec) XXX_DiscardUnknown() {
+	xxx_messageInfo_BackupDataSpec.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_BackupDataSpec proto.InternalMessageInfo
+
+// RestoreDataEntry will be specified at planning time to the SplitAndScatter
+// processors, then those processors will stream these, encoded as bytes in rows
+// to the RestoreDataProcessors.
+// This field has a subset of the importEntry struct defined in restore.
+type RestoreSpanEntry struct {
+	Span        roachpb.Span                 `protobuf:"bytes,1,opt,name=span" json:"span"`
+	Files       []roachpb.ImportRequest_File `protobuf:"bytes,2,rep,name=files" json:"files"`
+	ProgressIdx int64                        `protobuf:"varint,3,opt,name=progressIdx" json:"progressIdx"`
+}
+
+func (m *RestoreSpanEntry) Reset()         { *m = RestoreSpanEntry{} }
+func (m *RestoreSpanEntry) String() string { return proto.CompactTextString(m) }
+func (*RestoreSpanEntry) ProtoMessage()    {}
+func (*RestoreSpanEntry) Descriptor() ([]byte, []int) {
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{6}
+}
+func (m *RestoreSpanEntry) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RestoreSpanEntry) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *RestoreSpanEntry) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RestoreSpanEntry.Merge(dst, src)
+}
+func (m *RestoreSpanEntry) XXX_Size() int {
+	return m.Size()
+}
+func (m *RestoreSpanEntry) XXX_DiscardUnknown() {
+	xxx_messageInfo_RestoreSpanEntry.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RestoreSpanEntry proto.InternalMessageInfo
+
+type RestoreDataSpec struct {
+	RestoreTime hlc.Timestamp                      `protobuf:"bytes,1,opt,name=restore_time,json=restoreTime" json:"restore_time"`
+	Encryption  *roachpb.FileEncryptionOptions     `protobuf:"bytes,2,opt,name=encryption" json:"encryption,omitempty"`
+	Rekeys      []roachpb.ImportRequest_TableRekey `protobuf:"bytes,3,rep,name=rekeys" json:"rekeys"`
+	// PKIDs is used to convert result from an ExportRequest into row count
+	// information passed back to track progress in the backup job.
+	PKIDs map[uint64]bool `protobuf:"bytes,4,rep,name=pk_ids,json=pkIds" json:"pk_ids,omitempty" protobuf_key:"varint,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+}
+
+func (m *RestoreDataSpec) Reset()         { *m = RestoreDataSpec{} }
+func (m *RestoreDataSpec) String() string { return proto.CompactTextString(m) }
+func (*RestoreDataSpec) ProtoMessage()    {}
+func (*RestoreDataSpec) Descriptor() ([]byte, []int) {
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{7}
+}
+func (m *RestoreDataSpec) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RestoreDataSpec) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *RestoreDataSpec) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RestoreDataSpec.Merge(dst, src)
+}
+func (m *RestoreDataSpec) XXX_Size() int {
+	return m.Size()
+}
+func (m *RestoreDataSpec) XXX_DiscardUnknown() {
+	xxx_messageInfo_RestoreDataSpec.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RestoreDataSpec proto.InternalMessageInfo
+
+type SplitAndScatterSpec struct {
+	Chunks []SplitAndScatterSpec_RestoreEntryChunk `protobuf:"bytes,1,rep,name=chunks" json:"chunks"`
+	Rekeys []roachpb.ImportRequest_TableRekey      `protobuf:"bytes,2,rep,name=rekeys" json:"rekeys"`
+}
+
+func (m *SplitAndScatterSpec) Reset()         { *m = SplitAndScatterSpec{} }
+func (m *SplitAndScatterSpec) String() string { return proto.CompactTextString(m) }
+func (*SplitAndScatterSpec) ProtoMessage()    {}
+func (*SplitAndScatterSpec) Descriptor() ([]byte, []int) {
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{8}
+}
+func (m *SplitAndScatterSpec) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SplitAndScatterSpec) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SplitAndScatterSpec) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SplitAndScatterSpec.Merge(dst, src)
+}
+func (m *SplitAndScatterSpec) XXX_Size() int {
+	return m.Size()
+}
+func (m *SplitAndScatterSpec) XXX_DiscardUnknown() {
+	xxx_messageInfo_SplitAndScatterSpec.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SplitAndScatterSpec proto.InternalMessageInfo
+
+type SplitAndScatterSpec_RestoreEntryChunk struct {
+	Entries []RestoreSpanEntry `protobuf:"bytes,1,rep,name=entries" json:"entries"`
+}
+
+func (m *SplitAndScatterSpec_RestoreEntryChunk) Reset()         { *m = SplitAndScatterSpec_RestoreEntryChunk{} }
+func (m *SplitAndScatterSpec_RestoreEntryChunk) String() string { return proto.CompactTextString(m) }
+func (*SplitAndScatterSpec_RestoreEntryChunk) ProtoMessage()    {}
+func (*SplitAndScatterSpec_RestoreEntryChunk) Descriptor() ([]byte, []int) {
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{8, 0}
+}
+func (m *SplitAndScatterSpec_RestoreEntryChunk) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SplitAndScatterSpec_RestoreEntryChunk) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SplitAndScatterSpec_RestoreEntryChunk) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SplitAndScatterSpec_RestoreEntryChunk.Merge(dst, src)
+}
+func (m *SplitAndScatterSpec_RestoreEntryChunk) XXX_Size() int {
+	return m.Size()
+}
+func (m *SplitAndScatterSpec_RestoreEntryChunk) XXX_DiscardUnknown() {
+	xxx_messageInfo_SplitAndScatterSpec_RestoreEntryChunk.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SplitAndScatterSpec_RestoreEntryChunk proto.InternalMessageInfo
+
 // CSVWriterSpec is the specification for a processor that consumes rows and
 // writes them to CSV files at uri. It outputs a row per file written with
 // the file name, row count and byte size.
@@ -281,13 +597,18 @@ type CSVWriterSpec struct {
 	Options     roachpb.CSVOptions `protobuf:"bytes,3,opt,name=options" json:"options"`
 	// chunk_rows is num rows to write per file. 0 = no limit.
 	ChunkRows int64 `protobuf:"varint,4,opt,name=chunk_rows,json=chunkRows" json:"chunk_rows"`
+	// compression_codec specifies compression used for exported file.
+	CompressionCodec FileCompression `protobuf:"varint,5,opt,name=compression_codec,json=compressionCodec,enum=cockroach.sql.distsqlrun.FileCompression" json:"compression_codec"`
+	// User who initiated the export. This is used to check access privileges
+	// when using FileTable ExternalStorage.
+	UserProto github_com_cockroachdb_cockroach_pkg_security.SQLUsernameProto `protobuf:"bytes,6,opt,name=user_proto,json=userProto,casttype=github.com/cockroachdb/cockroach/pkg/security.SQLUsernameProto" json:"user_proto"`
 }
 
 func (m *CSVWriterSpec) Reset()         { *m = CSVWriterSpec{} }
 func (m *CSVWriterSpec) String() string { return proto.CompactTextString(m) }
 func (*CSVWriterSpec) ProtoMessage()    {}
 func (*CSVWriterSpec) Descriptor() ([]byte, []int) {
-	return fileDescriptor_processors_bulk_io_bc986c92ca21a758, []int{3}
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{9}
 }
 func (m *CSVWriterSpec) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -315,14 +636,14 @@ var xxx_messageInfo_CSVWriterSpec proto.InternalMessageInfo
 // BulkRowWriterSpec is the specification for a processor that consumes rows and
 // writes them to a target table using AddSSTable. It outputs a BulkOpSummary.
 type BulkRowWriterSpec struct {
-	Table sqlbase.TableDescriptor `protobuf:"bytes,1,opt,name=table" json:"table"`
+	Table descpb.TableDescriptor `protobuf:"bytes,1,opt,name=table" json:"table"`
 }
 
 func (m *BulkRowWriterSpec) Reset()         { *m = BulkRowWriterSpec{} }
 func (m *BulkRowWriterSpec) String() string { return proto.CompactTextString(m) }
 func (*BulkRowWriterSpec) ProtoMessage()    {}
 func (*BulkRowWriterSpec) Descriptor() ([]byte, []int) {
-	return fileDescriptor_processors_bulk_io_bc986c92ca21a758, []int{4}
+	return fileDescriptor_processors_bulk_io_ac83a229416c6ca4, []int{10}
 }
 func (m *BulkRowWriterSpec) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -355,8 +676,19 @@ func init() {
 	proto.RegisterMapType((map[string]*ReadImportDataSpec_ImportTable)(nil), "cockroach.sql.distsqlrun.ReadImportDataSpec.TablesEntry")
 	proto.RegisterMapType((map[int32]string)(nil), "cockroach.sql.distsqlrun.ReadImportDataSpec.UriEntry")
 	proto.RegisterType((*ReadImportDataSpec_ImportTable)(nil), "cockroach.sql.distsqlrun.ReadImportDataSpec.ImportTable")
+	proto.RegisterType((*StreamIngestionDataSpec)(nil), "cockroach.sql.distsqlrun.StreamIngestionDataSpec")
+	proto.RegisterType((*StreamIngestionFrontierSpec)(nil), "cockroach.sql.distsqlrun.StreamIngestionFrontierSpec")
+	proto.RegisterType((*BackupDataSpec)(nil), "cockroach.sql.distsqlrun.BackupDataSpec")
+	proto.RegisterMapType((map[uint64]bool)(nil), "cockroach.sql.distsqlrun.BackupDataSpec.PkIdsEntry")
+	proto.RegisterMapType((map[string]string)(nil), "cockroach.sql.distsqlrun.BackupDataSpec.UrisByLocalityKvEntry")
+	proto.RegisterType((*RestoreSpanEntry)(nil), "cockroach.sql.distsqlrun.RestoreSpanEntry")
+	proto.RegisterType((*RestoreDataSpec)(nil), "cockroach.sql.distsqlrun.RestoreDataSpec")
+	proto.RegisterMapType((map[uint64]bool)(nil), "cockroach.sql.distsqlrun.RestoreDataSpec.PkIdsEntry")
+	proto.RegisterType((*SplitAndScatterSpec)(nil), "cockroach.sql.distsqlrun.SplitAndScatterSpec")
+	proto.RegisterType((*SplitAndScatterSpec_RestoreEntryChunk)(nil), "cockroach.sql.distsqlrun.SplitAndScatterSpec.RestoreEntryChunk")
 	proto.RegisterType((*CSVWriterSpec)(nil), "cockroach.sql.distsqlrun.CSVWriterSpec")
 	proto.RegisterType((*BulkRowWriterSpec)(nil), "cockroach.sql.distsqlrun.BulkRowWriterSpec")
+	proto.RegisterEnum("cockroach.sql.distsqlrun.FileCompression", FileCompression_name, FileCompression_value)
 	proto.RegisterEnum("cockroach.sql.distsqlrun.BackfillerSpec_Type", BackfillerSpec_Type_name, BackfillerSpec_Type_value)
 }
 func (m *BackfillerSpec) Marshal() (dAtA []byte, err error) {
@@ -403,18 +735,6 @@ func (m *BackfillerSpec) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x28
 	i++
 	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.ChunkSize))
-	if len(m.OtherTables) > 0 {
-		for _, msg := range m.OtherTables {
-			dAtA[i] = 0x32
-			i++
-			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(dAtA[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
 	dAtA[i] = 0x3a
 	i++
 	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.ReadAsOf.Size()))
@@ -423,6 +743,13 @@ func (m *BackfillerSpec) MarshalTo(dAtA []byte) (int, error) {
 		return 0, err
 	}
 	i += n2
+	if len(m.IndexesToBackfill) > 0 {
+		for _, num := range m.IndexesToBackfill {
+			dAtA[i] = 0x40
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(num))
+		}
+	}
 	return i, nil
 }
 
@@ -576,6 +903,10 @@ func (m *ReadImportDataSpec) MarshalTo(dAtA []byte) (int, error) {
 			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(v))
 		}
 	}
+	dAtA[i] = 0x7a
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(len(m.UserProto)))
+	i += copy(dAtA[i:], m.UserProto)
 	return i, nil
 }
 
@@ -622,6 +953,401 @@ func (m *ReadImportDataSpec_ImportTable) MarshalTo(dAtA []byte) (int, error) {
 	return i, nil
 }
 
+func (m *StreamIngestionDataSpec) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *StreamIngestionDataSpec) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.PartitionAddresses) > 0 {
+		for _, s := range m.PartitionAddresses {
+			dAtA[i] = 0xa
+			i++
+			l = len(s)
+			for l >= 1<<7 {
+				dAtA[i] = uint8(uint64(l)&0x7f | 0x80)
+				l >>= 7
+				i++
+			}
+			dAtA[i] = uint8(l)
+			i++
+			i += copy(dAtA[i:], s)
+		}
+	}
+	dAtA[i] = 0x12
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.StartTime.Size()))
+	n7, err := m.StartTime.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n7
+	dAtA[i] = 0x1a
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(len(m.StreamAddress)))
+	i += copy(dAtA[i:], m.StreamAddress)
+	return i, nil
+}
+
+func (m *StreamIngestionFrontierSpec) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *StreamIngestionFrontierSpec) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0xa
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.HighWaterAtStart.Size()))
+	n8, err := m.HighWaterAtStart.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n8
+	if len(m.TrackedSpans) > 0 {
+		for _, msg := range m.TrackedSpans {
+			dAtA[i] = 0x12
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	return i, nil
+}
+
+func (m *BackupDataSpec) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *BackupDataSpec) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.Spans) > 0 {
+		for _, msg := range m.Spans {
+			dAtA[i] = 0xa
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.IntroducedSpans) > 0 {
+		for _, msg := range m.IntroducedSpans {
+			dAtA[i] = 0x12
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	dAtA[i] = 0x1a
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(len(m.DefaultURI)))
+	i += copy(dAtA[i:], m.DefaultURI)
+	if len(m.URIsByLocalityKV) > 0 {
+		keysForURIsByLocalityKV := make([]string, 0, len(m.URIsByLocalityKV))
+		for k := range m.URIsByLocalityKV {
+			keysForURIsByLocalityKV = append(keysForURIsByLocalityKV, string(k))
+		}
+		github_com_gogo_protobuf_sortkeys.Strings(keysForURIsByLocalityKV)
+		for _, k := range keysForURIsByLocalityKV {
+			dAtA[i] = 0x22
+			i++
+			v := m.URIsByLocalityKV[string(k)]
+			mapSize := 1 + len(k) + sovProcessorsBulkIo(uint64(len(k))) + 1 + len(v) + sovProcessorsBulkIo(uint64(len(v)))
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(mapSize))
+			dAtA[i] = 0xa
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(len(k)))
+			i += copy(dAtA[i:], k)
+			dAtA[i] = 0x12
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(len(v)))
+			i += copy(dAtA[i:], v)
+		}
+	}
+	dAtA[i] = 0x28
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.MVCCFilter))
+	if m.Encryption != nil {
+		dAtA[i] = 0x32
+		i++
+		i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.Encryption.Size()))
+		n9, err := m.Encryption.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n9
+	}
+	dAtA[i] = 0x3a
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.BackupStartTime.Size()))
+	n10, err := m.BackupStartTime.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n10
+	dAtA[i] = 0x42
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.BackupEndTime.Size()))
+	n11, err := m.BackupEndTime.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n11
+	if len(m.PKIDs) > 0 {
+		keysForPKIDs := make([]uint64, 0, len(m.PKIDs))
+		for k := range m.PKIDs {
+			keysForPKIDs = append(keysForPKIDs, uint64(k))
+		}
+		github_com_gogo_protobuf_sortkeys.Uint64s(keysForPKIDs)
+		for _, k := range keysForPKIDs {
+			dAtA[i] = 0x4a
+			i++
+			v := m.PKIDs[uint64(k)]
+			mapSize := 1 + sovProcessorsBulkIo(uint64(k)) + 1 + 1
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(mapSize))
+			dAtA[i] = 0x8
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(k))
+			dAtA[i] = 0x10
+			i++
+			if v {
+				dAtA[i] = 1
+			} else {
+				dAtA[i] = 0
+			}
+			i++
+		}
+	}
+	dAtA[i] = 0x52
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(len(m.UserProto)))
+	i += copy(dAtA[i:], m.UserProto)
+	return i, nil
+}
+
+func (m *RestoreSpanEntry) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *RestoreSpanEntry) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0xa
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.Span.Size()))
+	n12, err := m.Span.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n12
+	if len(m.Files) > 0 {
+		for _, msg := range m.Files {
+			dAtA[i] = 0x12
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	dAtA[i] = 0x18
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.ProgressIdx))
+	return i, nil
+}
+
+func (m *RestoreDataSpec) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *RestoreDataSpec) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0xa
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.RestoreTime.Size()))
+	n13, err := m.RestoreTime.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n13
+	if m.Encryption != nil {
+		dAtA[i] = 0x12
+		i++
+		i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.Encryption.Size()))
+		n14, err := m.Encryption.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n14
+	}
+	if len(m.Rekeys) > 0 {
+		for _, msg := range m.Rekeys {
+			dAtA[i] = 0x1a
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.PKIDs) > 0 {
+		keysForPKIDs := make([]uint64, 0, len(m.PKIDs))
+		for k := range m.PKIDs {
+			keysForPKIDs = append(keysForPKIDs, uint64(k))
+		}
+		github_com_gogo_protobuf_sortkeys.Uint64s(keysForPKIDs)
+		for _, k := range keysForPKIDs {
+			dAtA[i] = 0x22
+			i++
+			v := m.PKIDs[uint64(k)]
+			mapSize := 1 + sovProcessorsBulkIo(uint64(k)) + 1 + 1
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(mapSize))
+			dAtA[i] = 0x8
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(k))
+			dAtA[i] = 0x10
+			i++
+			if v {
+				dAtA[i] = 1
+			} else {
+				dAtA[i] = 0
+			}
+			i++
+		}
+	}
+	return i, nil
+}
+
+func (m *SplitAndScatterSpec) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SplitAndScatterSpec) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.Chunks) > 0 {
+		for _, msg := range m.Chunks {
+			dAtA[i] = 0xa
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.Rekeys) > 0 {
+		for _, msg := range m.Rekeys {
+			dAtA[i] = 0x12
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	return i, nil
+}
+
+func (m *SplitAndScatterSpec_RestoreEntryChunk) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SplitAndScatterSpec_RestoreEntryChunk) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.Entries) > 0 {
+		for _, msg := range m.Entries {
+			dAtA[i] = 0xa
+			i++
+			i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	return i, nil
+}
+
 func (m *CSVWriterSpec) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
@@ -648,14 +1374,21 @@ func (m *CSVWriterSpec) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x1a
 	i++
 	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.Options.Size()))
-	n7, err := m.Options.MarshalTo(dAtA[i:])
+	n15, err := m.Options.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n7
+	i += n15
 	dAtA[i] = 0x20
 	i++
 	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.ChunkRows))
+	dAtA[i] = 0x28
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.CompressionCodec))
+	dAtA[i] = 0x32
+	i++
+	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(len(m.UserProto)))
+	i += copy(dAtA[i:], m.UserProto)
 	return i, nil
 }
 
@@ -677,11 +1410,11 @@ func (m *BulkRowWriterSpec) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintProcessorsBulkIo(dAtA, i, uint64(m.Table.Size()))
-	n8, err := m.Table.MarshalTo(dAtA[i:])
+	n16, err := m.Table.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n8
+	i += n16
 	return i, nil
 }
 
@@ -711,14 +1444,13 @@ func (m *BackfillerSpec) Size() (n int) {
 	}
 	n += 1 + sovProcessorsBulkIo(uint64(m.Duration))
 	n += 1 + sovProcessorsBulkIo(uint64(m.ChunkSize))
-	if len(m.OtherTables) > 0 {
-		for _, e := range m.OtherTables {
-			l = e.Size()
-			n += 1 + l + sovProcessorsBulkIo(uint64(l))
-		}
-	}
 	l = m.ReadAsOf.Size()
 	n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	if len(m.IndexesToBackfill) > 0 {
+		for _, e := range m.IndexesToBackfill {
+			n += 1 + sovProcessorsBulkIo(uint64(e))
+		}
+	}
 	return n
 }
 
@@ -777,6 +1509,8 @@ func (m *ReadImportDataSpec) Size() (n int) {
 			n += mapEntrySize + 1 + sovProcessorsBulkIo(uint64(mapEntrySize))
 		}
 	}
+	l = len(m.UserProto)
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
 	return n
 }
 
@@ -799,6 +1533,175 @@ func (m *ReadImportDataSpec_ImportTable) Size() (n int) {
 	return n
 }
 
+func (m *StreamIngestionDataSpec) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.PartitionAddresses) > 0 {
+		for _, s := range m.PartitionAddresses {
+			l = len(s)
+			n += 1 + l + sovProcessorsBulkIo(uint64(l))
+		}
+	}
+	l = m.StartTime.Size()
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	l = len(m.StreamAddress)
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	return n
+}
+
+func (m *StreamIngestionFrontierSpec) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = m.HighWaterAtStart.Size()
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	if len(m.TrackedSpans) > 0 {
+		for _, e := range m.TrackedSpans {
+			l = e.Size()
+			n += 1 + l + sovProcessorsBulkIo(uint64(l))
+		}
+	}
+	return n
+}
+
+func (m *BackupDataSpec) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Spans) > 0 {
+		for _, e := range m.Spans {
+			l = e.Size()
+			n += 1 + l + sovProcessorsBulkIo(uint64(l))
+		}
+	}
+	if len(m.IntroducedSpans) > 0 {
+		for _, e := range m.IntroducedSpans {
+			l = e.Size()
+			n += 1 + l + sovProcessorsBulkIo(uint64(l))
+		}
+	}
+	l = len(m.DefaultURI)
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	if len(m.URIsByLocalityKV) > 0 {
+		for k, v := range m.URIsByLocalityKV {
+			_ = k
+			_ = v
+			mapEntrySize := 1 + len(k) + sovProcessorsBulkIo(uint64(len(k))) + 1 + len(v) + sovProcessorsBulkIo(uint64(len(v)))
+			n += mapEntrySize + 1 + sovProcessorsBulkIo(uint64(mapEntrySize))
+		}
+	}
+	n += 1 + sovProcessorsBulkIo(uint64(m.MVCCFilter))
+	if m.Encryption != nil {
+		l = m.Encryption.Size()
+		n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	}
+	l = m.BackupStartTime.Size()
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	l = m.BackupEndTime.Size()
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	if len(m.PKIDs) > 0 {
+		for k, v := range m.PKIDs {
+			_ = k
+			_ = v
+			mapEntrySize := 1 + sovProcessorsBulkIo(uint64(k)) + 1 + 1
+			n += mapEntrySize + 1 + sovProcessorsBulkIo(uint64(mapEntrySize))
+		}
+	}
+	l = len(m.UserProto)
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	return n
+}
+
+func (m *RestoreSpanEntry) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = m.Span.Size()
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	if len(m.Files) > 0 {
+		for _, e := range m.Files {
+			l = e.Size()
+			n += 1 + l + sovProcessorsBulkIo(uint64(l))
+		}
+	}
+	n += 1 + sovProcessorsBulkIo(uint64(m.ProgressIdx))
+	return n
+}
+
+func (m *RestoreDataSpec) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = m.RestoreTime.Size()
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	if m.Encryption != nil {
+		l = m.Encryption.Size()
+		n += 1 + l + sovProcessorsBulkIo(uint64(l))
+	}
+	if len(m.Rekeys) > 0 {
+		for _, e := range m.Rekeys {
+			l = e.Size()
+			n += 1 + l + sovProcessorsBulkIo(uint64(l))
+		}
+	}
+	if len(m.PKIDs) > 0 {
+		for k, v := range m.PKIDs {
+			_ = k
+			_ = v
+			mapEntrySize := 1 + sovProcessorsBulkIo(uint64(k)) + 1 + 1
+			n += mapEntrySize + 1 + sovProcessorsBulkIo(uint64(mapEntrySize))
+		}
+	}
+	return n
+}
+
+func (m *SplitAndScatterSpec) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Chunks) > 0 {
+		for _, e := range m.Chunks {
+			l = e.Size()
+			n += 1 + l + sovProcessorsBulkIo(uint64(l))
+		}
+	}
+	if len(m.Rekeys) > 0 {
+		for _, e := range m.Rekeys {
+			l = e.Size()
+			n += 1 + l + sovProcessorsBulkIo(uint64(l))
+		}
+	}
+	return n
+}
+
+func (m *SplitAndScatterSpec_RestoreEntryChunk) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Entries) > 0 {
+		for _, e := range m.Entries {
+			l = e.Size()
+			n += 1 + l + sovProcessorsBulkIo(uint64(l))
+		}
+	}
+	return n
+}
+
 func (m *CSVWriterSpec) Size() (n int) {
 	if m == nil {
 		return 0
@@ -812,6 +1715,9 @@ func (m *CSVWriterSpec) Size() (n int) {
 	l = m.Options.Size()
 	n += 1 + l + sovProcessorsBulkIo(uint64(l))
 	n += 1 + sovProcessorsBulkIo(uint64(m.ChunkRows))
+	n += 1 + sovProcessorsBulkIo(uint64(m.CompressionCodec))
+	l = len(m.UserProto)
+	n += 1 + l + sovProcessorsBulkIo(uint64(l))
 	return n
 }
 
@@ -986,37 +1892,6 @@ func (m *BackfillerSpec) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
-		case 6:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field OtherTables", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowProcessorsBulkIo
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthProcessorsBulkIo
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.OtherTables = append(m.OtherTables, sqlbase.TableDescriptor{})
-			if err := m.OtherTables[len(m.OtherTables)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
 		case 7:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field ReadAsOf", wireType)
@@ -1047,13 +1922,86 @@ func (m *BackfillerSpec) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 8:
+			if wireType == 0 {
+				var v github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.IndexID
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowProcessorsBulkIo
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.IndexID(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.IndexesToBackfill = append(m.IndexesToBackfill, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowProcessorsBulkIo
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthProcessorsBulkIo
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.IndexesToBackfill) == 0 {
+					m.IndexesToBackfill = make([]github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.IndexID, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.IndexID
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowProcessorsBulkIo
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.IndexID(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.IndexesToBackfill = append(m.IndexesToBackfill, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field IndexesToBackfill", wireType)
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthProcessorsBulkIo
 			}
 			if (iNdEx + skippy) > l {
@@ -1152,7 +2100,7 @@ func (m *JobProgress) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthProcessorsBulkIo
 			}
 			if (iNdEx + skippy) > l {
@@ -1341,7 +2289,7 @@ func (m *ReadImportDataSpec) Unmarshal(dAtA []byte) error {
 					if err != nil {
 						return err
 					}
-					if skippy < 0 {
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
 						return ErrInvalidLengthProcessorsBulkIo
 					}
 					if (iNdEx + skippy) > postIndex {
@@ -1494,7 +2442,7 @@ func (m *ReadImportDataSpec) Unmarshal(dAtA []byte) error {
 					if err != nil {
 						return err
 					}
-					if skippy < 0 {
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
 						return ErrInvalidLengthProcessorsBulkIo
 					}
 					if (iNdEx + skippy) > postIndex {
@@ -1648,7 +2596,7 @@ func (m *ReadImportDataSpec) Unmarshal(dAtA []byte) error {
 					if err != nil {
 						return err
 					}
-					if skippy < 0 {
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
 						return ErrInvalidLengthProcessorsBulkIo
 					}
 					if (iNdEx + skippy) > postIndex {
@@ -1659,13 +2607,42 @@ func (m *ReadImportDataSpec) Unmarshal(dAtA []byte) error {
 			}
 			m.ResumePos[mapkey] = mapvalue
 			iNdEx = postIndex
+		case 15:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field UserProto", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.UserProto = github_com_cockroachdb_cockroach_pkg_security.SQLUsernameProto(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthProcessorsBulkIo
 			}
 			if (iNdEx + skippy) > l {
@@ -1736,7 +2713,7 @@ func (m *ReadImportDataSpec_ImportTable) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if m.Desc == nil {
-				m.Desc = &sqlbase.TableDescriptor{}
+				m.Desc = &descpb.TableDescriptor{}
 			}
 			if err := m.Desc.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
@@ -1777,7 +2754,1319 @@ func (m *ReadImportDataSpec_ImportTable) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *StreamIngestionDataSpec) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowProcessorsBulkIo
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: StreamIngestionDataSpec: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: StreamIngestionDataSpec: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PartitionAddresses", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.PartitionAddresses = append(m.PartitionAddresses, github_com_cockroachdb_cockroach_pkg_ccl_streamingccl.PartitionAddress(dAtA[iNdEx:postIndex]))
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StartTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.StartTime.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StreamAddress", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.StreamAddress = github_com_cockroachdb_cockroach_pkg_ccl_streamingccl.StreamAddress(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *StreamIngestionFrontierSpec) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowProcessorsBulkIo
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: StreamIngestionFrontierSpec: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: StreamIngestionFrontierSpec: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field HighWaterAtStart", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.HighWaterAtStart.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field TrackedSpans", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.TrackedSpans = append(m.TrackedSpans, roachpb.Span{})
+			if err := m.TrackedSpans[len(m.TrackedSpans)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *BackupDataSpec) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowProcessorsBulkIo
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: BackupDataSpec: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: BackupDataSpec: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Spans", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Spans = append(m.Spans, roachpb.Span{})
+			if err := m.Spans[len(m.Spans)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IntroducedSpans", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.IntroducedSpans = append(m.IntroducedSpans, roachpb.Span{})
+			if err := m.IntroducedSpans[len(m.IntroducedSpans)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DefaultURI", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.DefaultURI = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field URIsByLocalityKV", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.URIsByLocalityKV == nil {
+				m.URIsByLocalityKV = make(map[string]string)
+			}
+			var mapkey string
+			var mapvalue string
+			for iNdEx < postIndex {
+				entryPreIndex := iNdEx
+				var wire uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowProcessorsBulkIo
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					wire |= (uint64(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				fieldNum := int32(wire >> 3)
+				if fieldNum == 1 {
+					var stringLenmapkey uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowProcessorsBulkIo
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						stringLenmapkey |= (uint64(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					intStringLenmapkey := int(stringLenmapkey)
+					if intStringLenmapkey < 0 {
+						return ErrInvalidLengthProcessorsBulkIo
+					}
+					postStringIndexmapkey := iNdEx + intStringLenmapkey
+					if postStringIndexmapkey > l {
+						return io.ErrUnexpectedEOF
+					}
+					mapkey = string(dAtA[iNdEx:postStringIndexmapkey])
+					iNdEx = postStringIndexmapkey
+				} else if fieldNum == 2 {
+					var stringLenmapvalue uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowProcessorsBulkIo
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						stringLenmapvalue |= (uint64(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					intStringLenmapvalue := int(stringLenmapvalue)
+					if intStringLenmapvalue < 0 {
+						return ErrInvalidLengthProcessorsBulkIo
+					}
+					postStringIndexmapvalue := iNdEx + intStringLenmapvalue
+					if postStringIndexmapvalue > l {
+						return io.ErrUnexpectedEOF
+					}
+					mapvalue = string(dAtA[iNdEx:postStringIndexmapvalue])
+					iNdEx = postStringIndexmapvalue
+				} else {
+					iNdEx = entryPreIndex
+					skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
+					if err != nil {
+						return err
+					}
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
+						return ErrInvalidLengthProcessorsBulkIo
+					}
+					if (iNdEx + skippy) > postIndex {
+						return io.ErrUnexpectedEOF
+					}
+					iNdEx += skippy
+				}
+			}
+			m.URIsByLocalityKV[mapkey] = mapvalue
+			iNdEx = postIndex
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MVCCFilter", wireType)
+			}
+			m.MVCCFilter = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.MVCCFilter |= (roachpb.MVCCFilter(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Encryption", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Encryption == nil {
+				m.Encryption = &roachpb.FileEncryptionOptions{}
+			}
+			if err := m.Encryption.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 7:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field BackupStartTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.BackupStartTime.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 8:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field BackupEndTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.BackupEndTime.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 9:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PKIDs", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.PKIDs == nil {
+				m.PKIDs = make(map[uint64]bool)
+			}
+			var mapkey uint64
+			var mapvalue bool
+			for iNdEx < postIndex {
+				entryPreIndex := iNdEx
+				var wire uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowProcessorsBulkIo
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					wire |= (uint64(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				fieldNum := int32(wire >> 3)
+				if fieldNum == 1 {
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowProcessorsBulkIo
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						mapkey |= (uint64(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+				} else if fieldNum == 2 {
+					var mapvaluetemp int
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowProcessorsBulkIo
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						mapvaluetemp |= (int(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					mapvalue = bool(mapvaluetemp != 0)
+				} else {
+					iNdEx = entryPreIndex
+					skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
+					if err != nil {
+						return err
+					}
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
+						return ErrInvalidLengthProcessorsBulkIo
+					}
+					if (iNdEx + skippy) > postIndex {
+						return io.ErrUnexpectedEOF
+					}
+					iNdEx += skippy
+				}
+			}
+			m.PKIDs[mapkey] = mapvalue
+			iNdEx = postIndex
+		case 10:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field UserProto", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.UserProto = github_com_cockroachdb_cockroach_pkg_security.SQLUsernameProto(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *RestoreSpanEntry) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowProcessorsBulkIo
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: RestoreSpanEntry: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: RestoreSpanEntry: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Span", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Span.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Files", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Files = append(m.Files, roachpb.ImportRequest_File{})
+			if err := m.Files[len(m.Files)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ProgressIdx", wireType)
+			}
+			m.ProgressIdx = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ProgressIdx |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *RestoreDataSpec) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowProcessorsBulkIo
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: RestoreDataSpec: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: RestoreDataSpec: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RestoreTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.RestoreTime.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Encryption", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Encryption == nil {
+				m.Encryption = &roachpb.FileEncryptionOptions{}
+			}
+			if err := m.Encryption.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Rekeys", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Rekeys = append(m.Rekeys, roachpb.ImportRequest_TableRekey{})
+			if err := m.Rekeys[len(m.Rekeys)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PKIDs", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.PKIDs == nil {
+				m.PKIDs = make(map[uint64]bool)
+			}
+			var mapkey uint64
+			var mapvalue bool
+			for iNdEx < postIndex {
+				entryPreIndex := iNdEx
+				var wire uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowProcessorsBulkIo
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					wire |= (uint64(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				fieldNum := int32(wire >> 3)
+				if fieldNum == 1 {
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowProcessorsBulkIo
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						mapkey |= (uint64(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+				} else if fieldNum == 2 {
+					var mapvaluetemp int
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowProcessorsBulkIo
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						mapvaluetemp |= (int(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					mapvalue = bool(mapvaluetemp != 0)
+				} else {
+					iNdEx = entryPreIndex
+					skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
+					if err != nil {
+						return err
+					}
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
+						return ErrInvalidLengthProcessorsBulkIo
+					}
+					if (iNdEx + skippy) > postIndex {
+						return io.ErrUnexpectedEOF
+					}
+					iNdEx += skippy
+				}
+			}
+			m.PKIDs[mapkey] = mapvalue
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SplitAndScatterSpec) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowProcessorsBulkIo
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: SplitAndScatterSpec: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: SplitAndScatterSpec: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Chunks", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Chunks = append(m.Chunks, SplitAndScatterSpec_RestoreEntryChunk{})
+			if err := m.Chunks[len(m.Chunks)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Rekeys", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Rekeys = append(m.Rekeys, roachpb.ImportRequest_TableRekey{})
+			if err := m.Rekeys[len(m.Rekeys)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SplitAndScatterSpec_RestoreEntryChunk) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowProcessorsBulkIo
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: RestoreEntryChunk: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: RestoreEntryChunk: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Entries", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Entries = append(m.Entries, RestoreSpanEntry{})
+			if err := m.Entries[len(m.Entries)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthProcessorsBulkIo
 			}
 			if (iNdEx + skippy) > l {
@@ -1928,13 +4217,61 @@ func (m *CSVWriterSpec) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CompressionCodec", wireType)
+			}
+			m.CompressionCodec = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.CompressionCodec |= (FileCompression(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field UserProto", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProcessorsBulkIo
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthProcessorsBulkIo
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.UserProto = github_com_cockroachdb_cockroach_pkg_security.SQLUsernameProto(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipProcessorsBulkIo(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthProcessorsBulkIo
 			}
 			if (iNdEx + skippy) > l {
@@ -2014,7 +4351,7 @@ func (m *BulkRowWriterSpec) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthProcessorsBulkIo
 			}
 			if (iNdEx + skippy) > l {
@@ -2135,74 +4472,127 @@ var (
 )
 
 func init() {
-	proto.RegisterFile("sql/execinfrapb/processors_bulk_io.proto", fileDescriptor_processors_bulk_io_bc986c92ca21a758)
+	proto.RegisterFile("sql/execinfrapb/processors_bulk_io.proto", fileDescriptor_processors_bulk_io_ac83a229416c6ca4)
 }
 
-var fileDescriptor_processors_bulk_io_bc986c92ca21a758 = []byte{
-	// 1029 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x9c, 0x55, 0x4f, 0x6f, 0xdb, 0xb6,
-	0x1b, 0xb6, 0x6c, 0xd9, 0x91, 0x5f, 0xc5, 0x81, 0x4b, 0xf4, 0x57, 0xe8, 0x17, 0x6c, 0x8e, 0xe1,
-	0xb5, 0x9d, 0x57, 0xa0, 0x32, 0x16, 0x60, 0x43, 0xb1, 0xad, 0xe8, 0xe6, 0xa4, 0x09, 0xec, 0x61,
-	0x4d, 0xa0, 0x64, 0x29, 0xd0, 0x8b, 0x41, 0x49, 0x8c, 0xc3, 0x98, 0x16, 0x15, 0x92, 0x6a, 0xea,
-	0x7e, 0x8a, 0x7d, 0xa8, 0x1d, 0x72, 0xec, 0xb1, 0xa7, 0x60, 0x4d, 0xbe, 0x45, 0x4f, 0x83, 0x28,
-	0x29, 0x53, 0x56, 0x64, 0x43, 0x76, 0x49, 0x64, 0xbe, 0xef, 0xf3, 0xf0, 0x79, 0xff, 0x12, 0xfa,
-	0xf2, 0x84, 0x0d, 0xc8, 0x1b, 0x12, 0xd0, 0xe8, 0x50, 0xe0, 0xd8, 0x1f, 0xc4, 0x82, 0x07, 0x44,
-	0x4a, 0x2e, 0xe4, 0xc4, 0x4f, 0xd8, 0x6c, 0x42, 0xb9, 0x1b, 0x0b, 0xae, 0x38, 0x72, 0x02, 0x1e,
-	0xcc, 0x04, 0xc7, 0xc1, 0x91, 0x2b, 0x4f, 0x98, 0x1b, 0x52, 0xa9, 0xe4, 0x09, 0x13, 0x49, 0xb4,
-	0x7a, 0xef, 0x98, 0xfb, 0x72, 0x90, 0xfe, 0x89, 0x7d, 0xfd, 0x2f, 0x43, 0xac, 0x3a, 0xda, 0x3b,
-	0xf6, 0x07, 0x94, 0x3f, 0x3e, 0xe4, 0x62, 0x8e, 0x55, 0x61, 0xf9, 0x2c, 0xbd, 0x55, 0x9e, 0x30,
-	0x1f, 0x4b, 0x32, 0x90, 0x4a, 0x24, 0x81, 0x4a, 0x04, 0x09, 0x73, 0xeb, 0x83, 0x7f, 0xd2, 0x84,
-	0x25, 0x29, 0xe8, 0x13, 0x45, 0xd9, 0xe0, 0x88, 0x05, 0x03, 0x45, 0xe7, 0x44, 0x2a, 0x3c, 0x8f,
-	0x73, 0xcb, 0xdd, 0x29, 0x9f, 0x72, 0xfd, 0x39, 0x48, 0xbf, 0xb2, 0xd3, 0xde, 0xc7, 0x1a, 0xac,
-	0x0c, 0x71, 0x30, 0x3b, 0xa4, 0x8c, 0x11, 0xb1, 0x17, 0x93, 0x00, 0x6d, 0x83, 0xa9, 0x16, 0x31,
-	0x71, 0x8c, 0xae, 0xd1, 0x5f, 0x59, 0x7f, 0xec, 0xde, 0x14, 0xa2, 0x7b, 0x1d, 0xe7, 0xee, 0x2f,
-	0x62, 0x32, 0x34, 0xcf, 0xce, 0xd7, 0x2a, 0x9e, 0x26, 0x40, 0x43, 0xa8, 0x2b, 0xec, 0x33, 0xe2,
-	0x54, 0xbb, 0x46, 0xdf, 0x5e, 0x7f, 0xf8, 0x37, 0xa6, 0x3c, 0x54, 0x77, 0x3f, 0xf5, 0xd9, 0x24,
-	0x32, 0x10, 0x34, 0x56, 0x5c, 0xe4, 0x14, 0x19, 0x14, 0x3d, 0x87, 0xba, 0x8c, 0x71, 0x24, 0x9d,
-	0x5a, 0xb7, 0xd6, 0xb7, 0xd7, 0xbf, 0xba, 0x59, 0x8d, 0xa6, 0xf1, 0x08, 0x0e, 0x53, 0x39, 0x38,
-	0x2a, 0x68, 0x34, 0x1a, 0x7d, 0x0d, 0x56, 0x98, 0x08, 0xac, 0x28, 0x8f, 0x1c, 0xb3, 0x6b, 0xf4,
-	0x6b, 0xc3, 0xff, 0xa5, 0xe6, 0x8f, 0xe7, 0x6b, 0xad, 0x34, 0x4f, 0xee, 0x66, 0x6e, 0xf4, 0xae,
-	0xdc, 0xd0, 0x17, 0x00, 0xc1, 0x51, 0x12, 0xcd, 0x26, 0x92, 0xbe, 0x25, 0x4e, 0x5d, 0x83, 0x32,
-	0xce, 0xa6, 0x3e, 0xdf, 0xa3, 0x6f, 0x09, 0xda, 0x81, 0x65, 0xae, 0x8e, 0x88, 0x98, 0x68, 0xb5,
-	0xd2, 0x69, 0x68, 0x95, 0xb7, 0x8b, 0xd4, 0xd6, 0x0c, 0xda, 0x26, 0xd1, 0x33, 0xb0, 0x04, 0xc1,
-	0xe1, 0x4f, 0x72, 0xe7, 0xd0, 0x59, 0xd2, 0x69, 0xfb, 0xbc, 0x44, 0x96, 0x16, 0xd7, 0x3d, 0x62,
-	0x81, 0xbb, 0x5f, 0x14, 0x37, 0xe7, 0xb8, 0x02, 0xf5, 0x1e, 0x81, 0x99, 0x16, 0x02, 0xd9, 0xb0,
-	0x34, 0x8a, 0x5e, 0x63, 0x46, 0xc3, 0x76, 0x05, 0x01, 0x34, 0x36, 0x38, 0x4b, 0xe6, 0x51, 0xdb,
-	0x40, 0x4d, 0xa8, 0x8f, 0xa2, 0x90, 0xbc, 0x69, 0x57, 0x7b, 0xa7, 0x60, 0x8f, 0xb9, 0xbf, 0x2b,
-	0xf8, 0x54, 0x10, 0x29, 0xd1, 0x7d, 0x68, 0x1c, 0x73, 0x7f, 0x42, 0x43, 0x5d, 0xfa, 0xda, 0xb0,
-	0x95, 0x52, 0x5f, 0x9c, 0xaf, 0xd5, 0xc7, 0xdc, 0x1f, 0x6d, 0x7a, 0xf5, 0x63, 0xee, 0x8f, 0x42,
-	0xd4, 0x87, 0xe5, 0x80, 0x47, 0x4a, 0x50, 0x3f, 0xd1, 0xe9, 0x4c, 0x8b, 0x5b, 0xcd, 0x65, 0x5c,
-	0xb3, 0x20, 0x07, 0x4c, 0xc9, 0xb8, 0x72, 0x6a, 0x5d, 0xa3, 0x5f, 0x2f, 0x3a, 0x23, 0x3d, 0xe9,
-	0x7d, 0x58, 0x02, 0x94, 0x96, 0x6a, 0x34, 0x8f, 0xb9, 0x50, 0x9b, 0x58, 0x61, 0xdd, 0x79, 0x0f,
-	0xc0, 0x96, 0x78, 0x1e, 0x33, 0x92, 0xe5, 0xbc, 0x5a, 0xc2, 0x41, 0x66, 0xd0, 0x49, 0xdf, 0x06,
-	0x2b, 0xce, 0x35, 0x3b, 0x0d, 0x9d, 0xa3, 0x07, 0x37, 0xb7, 0x45, 0x29, 0xc0, 0x22, 0x57, 0x05,
-	0x18, 0x6d, 0x43, 0x2d, 0x11, 0xd4, 0x59, 0xd2, 0x45, 0xfb, 0xe6, 0x66, 0x8e, 0x4f, 0xa5, 0xba,
-	0xbf, 0x0a, 0xfa, 0x3c, 0x52, 0x62, 0xe1, 0xa5, 0x0c, 0xe8, 0x29, 0x34, 0xb2, 0x59, 0x76, 0x2c,
-	0xad, 0x67, 0xad, 0xc4, 0x95, 0xcf, 0xbb, 0x3b, 0xda, 0xd9, 0xa2, 0x8c, 0x6c, 0x69, 0xb7, 0x5c,
-	0x49, 0x0e, 0x42, 0x07, 0xd0, 0xc8, 0xfb, 0xa7, 0xa9, 0xa5, 0x3c, 0xb9, 0x95, 0x94, 0xac, 0x73,
-	0xb4, 0x1a, 0xcd, 0x6b, 0x78, 0x39, 0x1b, 0x7a, 0x06, 0xff, 0x97, 0x33, 0x1a, 0x4f, 0xe6, 0x54,
-	0x4a, 0x1a, 0x4d, 0x27, 0x87, 0x5c, 0x10, 0x3a, 0x8d, 0x26, 0x33, 0xb2, 0x90, 0x0e, 0x74, 0x8d,
-	0xbe, 0x95, 0x0b, 0xb9, 0x97, 0xba, 0xfd, 0x92, 0x79, 0x6d, 0x65, 0x4e, 0x3f, 0x93, 0x85, 0x44,
-	0x8f, 0xa0, 0x75, 0x8a, 0x19, 0x4b, 0x47, 0xe4, 0x05, 0x8e, 0xb8, 0x74, 0xec, 0xd2, 0x18, 0x5c,
-	0x37, 0xa1, 0x75, 0xb8, 0x23, 0xf4, 0xf4, 0xed, 0x62, 0x81, 0x19, 0x23, 0x8c, 0xca, 0xb9, 0xd3,
-	0x2a, 0x95, 0xf0, 0x53, 0x33, 0x7a, 0x05, 0x20, 0x88, 0x4c, 0xe6, 0x64, 0x12, 0x73, 0xe9, 0xac,
-	0xe8, 0xe0, 0xbf, 0xbf, 0x55, 0xf0, 0x9e, 0x86, 0xef, 0xf2, 0x2c, 0x7e, 0xaf, 0x29, 0x8a, 0xdf,
-	0xab, 0x09, 0xd8, 0x99, 0xaf, 0xce, 0x0f, 0xfa, 0x11, 0xcc, 0x90, 0xc8, 0x40, 0xb7, 0xf6, 0xed,
-	0x26, 0xd4, 0xf0, 0x34, 0x12, 0xdd, 0x07, 0x50, 0x58, 0x4c, 0x89, 0xda, 0xe0, 0x4c, 0x3a, 0xd5,
-	0x6e, 0xad, 0xdf, 0xcc, 0xed, 0xa5, 0xf3, 0x55, 0x09, 0x76, 0xa9, 0x20, 0xa8, 0x0d, 0xb5, 0x19,
-	0x59, 0xe8, 0x5b, 0x9b, 0x5e, 0xfa, 0x89, 0x5e, 0x40, 0xfd, 0x35, 0x66, 0x49, 0xb1, 0x15, 0x6f,
-	0x57, 0xeb, 0x52, 0x44, 0x5e, 0x46, 0xf3, 0x5d, 0xf5, 0x89, 0xb1, 0xfa, 0x2d, 0x58, 0x45, 0x43,
-	0x96, 0x6f, 0xac, 0x67, 0x37, 0xde, 0x2d, 0xdf, 0xd8, 0x2c, 0xe3, 0x7e, 0x80, 0x95, 0xeb, 0x09,
-	0xfc, 0x37, 0x74, 0xad, 0x84, 0x1e, 0x9b, 0x96, 0xd1, 0xae, 0x8e, 0x4d, 0xab, 0xd6, 0x36, 0xc7,
-	0xa6, 0x65, 0xb6, 0xeb, 0x63, 0xd3, 0xaa, 0xb7, 0x1b, 0x63, 0xd3, 0x5a, 0x6e, 0xb7, 0x7a, 0xbf,
-	0x1b, 0xd0, 0xda, 0xd8, 0x3b, 0x78, 0x29, 0xa8, 0xca, 0x1f, 0x96, 0x87, 0x60, 0x87, 0x44, 0x2a,
-	0x1a, 0x65, 0x7b, 0x58, 0xe7, 0xa4, 0xd8, 0x81, 0x25, 0x03, 0xfa, 0x12, 0x96, 0x23, 0x9c, 0xf6,
-	0x04, 0x56, 0x8a, 0x88, 0x6c, 0xc3, 0x5c, 0x39, 0xa6, 0x96, 0xdd, 0xcc, 0x80, 0x9e, 0xc2, 0x12,
-	0x8f, 0x53, 0x88, 0xd4, 0x3b, 0xe6, 0xfa, 0xae, 0x2c, 0xe6, 0x6e, 0x63, 0xef, 0x60, 0x27, 0x73,
-	0xca, 0x29, 0x0a, 0xcc, 0x5f, 0x1b, 0x5e, 0xf0, 0x53, 0x99, 0x3f, 0x0b, 0xe5, 0x0d, 0xef, 0xf1,
-	0x53, 0xd9, 0x7b, 0x09, 0x77, 0x86, 0x09, 0x4b, 0xbf, 0x4b, 0x91, 0x5c, 0xbd, 0x6c, 0xc6, 0x7f,
-	0x7e, 0xd9, 0x86, 0x8f, 0xcf, 0x3e, 0x74, 0x2a, 0x67, 0x17, 0x1d, 0xe3, 0xdd, 0x45, 0xc7, 0x78,
-	0x7f, 0xd1, 0x31, 0xfe, 0xb8, 0xe8, 0x18, 0xbf, 0x5d, 0x76, 0x2a, 0xef, 0x2e, 0x3b, 0x95, 0xf7,
-	0x97, 0x9d, 0xca, 0x2b, 0xbb, 0xf4, 0xdc, 0xff, 0x19, 0x00, 0x00, 0xff, 0xff, 0x9f, 0x6b, 0x78,
-	0x71, 0x94, 0x08, 0x00, 0x00,
+var fileDescriptor_processors_bulk_io_ac83a229416c6ca4 = []byte{
+	// 1886 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xb4, 0x58, 0x4d, 0x6f, 0x1b, 0xc7,
+	0xf9, 0xd7, 0xf2, 0x4d, 0xe4, 0x43, 0x53, 0xa6, 0xc6, 0x4e, 0xb2, 0x7f, 0xfd, 0x51, 0x49, 0x60,
+	0x62, 0x97, 0x75, 0x61, 0x12, 0xb1, 0xdb, 0xc2, 0x68, 0x9b, 0xb8, 0x22, 0x65, 0x39, 0x94, 0x12,
+	0x5b, 0x5d, 0x5a, 0x32, 0x10, 0xb4, 0x58, 0x0c, 0x77, 0x47, 0xd4, 0x98, 0xcb, 0x9d, 0xd5, 0xcc,
+	0xac, 0x64, 0xfa, 0xd2, 0x02, 0x3d, 0xf5, 0xd6, 0x8f, 0xd0, 0x43, 0x3f, 0x40, 0x2f, 0xfd, 0x04,
+	0xbd, 0xf8, 0x18, 0xf4, 0x14, 0xf4, 0x20, 0xb4, 0xf2, 0xb7, 0xc8, 0xa9, 0x98, 0xd9, 0x59, 0x6a,
+	0x25, 0x4b, 0xb2, 0x14, 0x23, 0x17, 0x69, 0x39, 0x33, 0xbf, 0xdf, 0x3e, 0xef, 0xcf, 0x33, 0x0b,
+	0x4d, 0xb1, 0x17, 0xb4, 0xc9, 0x4b, 0xe2, 0xd1, 0x70, 0x87, 0xe3, 0x68, 0xd0, 0x8e, 0x38, 0xf3,
+	0x88, 0x10, 0x8c, 0x0b, 0x77, 0x10, 0x07, 0x23, 0x97, 0xb2, 0x56, 0xc4, 0x99, 0x64, 0xc8, 0xf6,
+	0x98, 0x37, 0xe2, 0x0c, 0x7b, 0xbb, 0x2d, 0xb1, 0x17, 0xb4, 0x7c, 0x2a, 0xa4, 0xd8, 0x0b, 0x78,
+	0x1c, 0x2e, 0x7c, 0xf8, 0x82, 0x0d, 0x44, 0x5b, 0xfd, 0x89, 0x06, 0xfa, 0x5f, 0x82, 0x58, 0xb0,
+	0xf5, 0xe9, 0x68, 0xd0, 0xa6, 0xec, 0xee, 0x0e, 0xe3, 0x63, 0x2c, 0xd3, 0x9d, 0x8f, 0xd5, 0x5b,
+	0x3d, 0x2c, 0x71, 0xc0, 0x86, 0x6d, 0x9f, 0x08, 0x2f, 0x1a, 0xb4, 0x85, 0xe4, 0xb1, 0x27, 0x63,
+	0x4e, 0x7c, 0x73, 0xe8, 0xd6, 0x45, 0xa2, 0x61, 0x41, 0xd2, 0xb7, 0xc4, 0x92, 0x06, 0xed, 0xdd,
+	0xc0, 0x6b, 0x4b, 0x3a, 0x26, 0x42, 0xe2, 0x71, 0x64, 0x76, 0x6e, 0x0e, 0xd9, 0x90, 0xe9, 0xc7,
+	0xb6, 0x7a, 0x32, 0xab, 0x28, 0x95, 0xca, 0xc7, 0x12, 0x9b, 0xb5, 0xf9, 0x74, 0x0d, 0x47, 0x34,
+	0x59, 0x6a, 0xfc, 0xad, 0x00, 0x73, 0x1d, 0xec, 0x8d, 0x76, 0x68, 0x10, 0x10, 0xde, 0x8f, 0x88,
+	0x87, 0x1e, 0x43, 0x41, 0x4e, 0x22, 0x62, 0x5b, 0xcb, 0x56, 0x73, 0xee, 0xde, 0xdd, 0xd6, 0x79,
+	0x06, 0x69, 0x9d, 0xc4, 0xb5, 0x9e, 0x4d, 0x22, 0xd2, 0x29, 0xbc, 0x3e, 0x5c, 0x9a, 0x71, 0x34,
+	0x01, 0xea, 0x40, 0x51, 0xe2, 0x41, 0x40, 0xec, 0xdc, 0xb2, 0xd5, 0xac, 0xde, 0xbb, 0x7d, 0x8a,
+	0x49, 0xec, 0x05, 0x5a, 0xbf, 0x67, 0xea, 0xcc, 0x2a, 0x11, 0x1e, 0xa7, 0x91, 0x64, 0xdc, 0x50,
+	0x24, 0x50, 0xf4, 0x08, 0x8a, 0x22, 0xc2, 0xa1, 0xb0, 0xf3, 0xcb, 0xf9, 0x66, 0xf5, 0xde, 0x4f,
+	0xce, 0x97, 0x46, 0xd3, 0x38, 0x04, 0xfb, 0x4a, 0x1c, 0x1c, 0xa6, 0x34, 0x1a, 0x8d, 0x3e, 0x85,
+	0xb2, 0x1f, 0x73, 0x2c, 0x29, 0x0b, 0xed, 0xc2, 0xb2, 0xd5, 0xcc, 0x77, 0x3e, 0x50, 0xdb, 0xdf,
+	0x1d, 0x2e, 0xd5, 0x94, 0x39, 0x5b, 0xab, 0x66, 0xd3, 0x99, 0x1e, 0x43, 0x1f, 0x03, 0x78, 0xbb,
+	0x71, 0x38, 0x72, 0x05, 0x7d, 0x45, 0xec, 0xa2, 0x06, 0x25, 0x9c, 0x15, 0xbd, 0xde, 0xa7, 0xaf,
+	0x08, 0x7a, 0x08, 0x65, 0x4e, 0xb0, 0xbf, 0x22, 0x9e, 0xee, 0xd8, 0xb3, 0x5a, 0xcb, 0x1f, 0x65,
+	0x24, 0x54, 0x2e, 0x6b, 0xed, 0x06, 0x5e, 0xeb, 0x59, 0xea, 0x32, 0xc3, 0x30, 0x05, 0x21, 0x01,
+	0x37, 0x68, 0xe8, 0x93, 0x97, 0x44, 0xb8, 0x92, 0xb9, 0x03, 0x63, 0x51, 0xbb, 0xbc, 0x9c, 0x6f,
+	0xd6, 0x3a, 0xdd, 0xef, 0x0e, 0x97, 0x1e, 0x0e, 0xa9, 0xdc, 0x8d, 0x07, 0x2d, 0x8f, 0x8d, 0xdb,
+	0x53, 0x66, 0x7f, 0x70, 0xfc, 0xdc, 0x8e, 0x46, 0xc3, 0xf6, 0xdb, 0x81, 0xd6, 0xea, 0x29, 0xda,
+	0xde, 0xaa, 0x33, 0x6f, 0xf8, 0x9f, 0xb1, 0xd4, 0x5f, 0x8d, 0x3b, 0x50, 0x50, 0xce, 0x42, 0x55,
+	0x98, 0xed, 0x85, 0xfb, 0x38, 0xa0, 0x7e, 0x7d, 0x06, 0x01, 0x94, 0xba, 0x2c, 0x88, 0xc7, 0x61,
+	0xdd, 0x42, 0x15, 0x28, 0x6a, 0x78, 0x3d, 0xb7, 0x5e, 0x28, 0x97, 0xea, 0xb3, 0x8d, 0x03, 0xa8,
+	0xae, 0xb3, 0xc1, 0x26, 0x67, 0x43, 0x4e, 0x84, 0x40, 0x9f, 0x40, 0xe9, 0x05, 0x1b, 0xb8, 0xd4,
+	0xd7, 0x41, 0x92, 0xef, 0xd4, 0x94, 0x56, 0x47, 0x87, 0x4b, 0xc5, 0x75, 0x36, 0xe8, 0xad, 0x3a,
+	0xc5, 0x17, 0x6c, 0xd0, 0xf3, 0x51, 0x13, 0xae, 0x79, 0x2c, 0x94, 0x9c, 0x0e, 0x62, 0x6d, 0x78,
+	0x15, 0x06, 0x39, 0x63, 0x81, 0x13, 0x3b, 0xc8, 0x86, 0x82, 0x08, 0x98, 0xb4, 0xf3, 0xcb, 0x56,
+	0xb3, 0x98, 0xc6, 0x90, 0x5a, 0x69, 0xbc, 0x2e, 0x03, 0x52, 0x4e, 0xed, 0x8d, 0x23, 0xc6, 0xe5,
+	0x2a, 0x96, 0x58, 0xc7, 0xe8, 0x2d, 0xa8, 0x0a, 0x3c, 0x8e, 0x02, 0x92, 0x78, 0x27, 0x97, 0xc1,
+	0x41, 0xb2, 0xa1, 0xdd, 0xf3, 0x18, 0xca, 0x91, 0x91, 0xd9, 0x2e, 0x69, 0xf7, 0xdc, 0x3a, 0x3f,
+	0x80, 0x32, 0x0a, 0xa6, 0x6e, 0x4a, 0xc1, 0xe8, 0x31, 0xe4, 0x63, 0x4e, 0xed, 0x59, 0x1d, 0x84,
+	0x3f, 0x3f, 0x9f, 0xe3, 0x6d, 0x51, 0x5b, 0x5b, 0x9c, 0x3e, 0x0a, 0x25, 0x9f, 0x38, 0x8a, 0x01,
+	0x7d, 0x06, 0xa5, 0xa4, 0x46, 0xd8, 0x65, 0x2d, 0xcf, 0x52, 0x86, 0xcb, 0x64, 0x67, 0xab, 0xf7,
+	0x74, 0x8d, 0x06, 0x64, 0x4d, 0x1f, 0x33, 0x92, 0x18, 0x10, 0xda, 0x86, 0x92, 0xce, 0x0b, 0x61,
+	0x57, 0xb4, 0x28, 0x0f, 0xae, 0x24, 0x8a, 0x4e, 0x11, 0xa1, 0xa5, 0xd1, 0xbc, 0x96, 0x63, 0xd8,
+	0xd0, 0x43, 0xf8, 0x3f, 0x31, 0xa2, 0x91, 0x3b, 0xa6, 0x42, 0xd0, 0x70, 0xe8, 0xee, 0x30, 0x4e,
+	0xe8, 0x30, 0x74, 0x47, 0x64, 0x22, 0x6c, 0x58, 0xb6, 0x9a, 0x65, 0x23, 0xc8, 0x87, 0xea, 0xd8,
+	0x57, 0xc9, 0xa9, 0xb5, 0xe4, 0xd0, 0x06, 0x99, 0x08, 0x74, 0x07, 0x6a, 0x07, 0x38, 0x08, 0x54,
+	0x32, 0x3d, 0xc1, 0x21, 0x13, 0x76, 0x35, 0x93, 0x30, 0x27, 0xb7, 0xd0, 0x3d, 0x98, 0xe7, 0x3a,
+	0x4f, 0x37, 0x31, 0xc7, 0x41, 0x40, 0x02, 0x2a, 0xc6, 0x76, 0x2d, 0xe3, 0xc2, 0xb7, 0xb7, 0xd1,
+	0xd7, 0x00, 0x9c, 0x88, 0x78, 0x4c, 0xdc, 0x88, 0x09, 0x7b, 0x4e, 0x2b, 0xff, 0xab, 0x2b, 0x29,
+	0xef, 0x68, 0xf8, 0x26, 0x4b, 0xf4, 0x77, 0x2a, 0x3c, 0xfd, 0x8d, 0x08, 0x40, 0x2c, 0x08, 0x77,
+	0x75, 0x45, 0xb4, 0xaf, 0x2f, 0x5b, 0xcd, 0x4a, 0x67, 0xcd, 0x94, 0x87, 0xcf, 0x2f, 0x97, 0x7e,
+	0xc4, 0x8b, 0x39, 0x95, 0x93, 0x56, 0xff, 0xb7, 0x5f, 0x6e, 0x09, 0xc2, 0x43, 0x3c, 0x26, 0x9b,
+	0x8a, 0xcd, 0xa9, 0x28, 0x66, 0xfd, 0xb8, 0x10, 0x43, 0x35, 0x11, 0x49, 0xbb, 0x01, 0xfd, 0x06,
+	0x0a, 0x2a, 0x53, 0x75, 0x06, 0x5d, 0xad, 0x38, 0x5a, 0x8e, 0x46, 0xa2, 0x4f, 0x00, 0x24, 0xe6,
+	0x43, 0x22, 0xbb, 0x2c, 0x10, 0x76, 0x6e, 0x39, 0xdf, 0xac, 0x98, 0xfd, 0xcc, 0xfa, 0x82, 0x80,
+	0x6a, 0xc6, 0xef, 0xa8, 0x0e, 0xf9, 0x11, 0x99, 0xe8, 0xb7, 0x56, 0x1c, 0xf5, 0x88, 0x9e, 0x40,
+	0x71, 0x1f, 0x07, 0x71, 0x5a, 0xa6, 0xaf, 0x16, 0x52, 0x19, 0x8d, 0x9c, 0x84, 0xe6, 0x97, 0xb9,
+	0x07, 0xd6, 0xc2, 0x2f, 0xa0, 0x9c, 0xc6, 0x7d, 0xf6, 0x8d, 0xc5, 0xe4, 0x8d, 0x37, 0xb3, 0x6f,
+	0xac, 0x64, 0x71, 0xbf, 0x86, 0xb9, 0x93, 0x7e, 0x7a, 0x17, 0x3a, 0x9f, 0x41, 0xaf, 0x17, 0xca,
+	0x96, 0xae, 0x58, 0xf9, 0x7a, 0x61, 0xbd, 0x50, 0x2e, 0xd4, 0x8b, 0xeb, 0x85, 0x72, 0xb1, 0x5e,
+	0x5a, 0x2f, 0x94, 0xaf, 0xd5, 0x6b, 0x8d, 0x7f, 0xe5, 0xe0, 0xa3, 0xbe, 0xe4, 0x04, 0x8f, 0x7b,
+	0xe1, 0x90, 0x08, 0x55, 0x78, 0xa6, 0xf5, 0xe4, 0x0f, 0x70, 0x23, 0xc2, 0x5c, 0x52, 0xb5, 0xe8,
+	0x62, 0xdf, 0x57, 0x49, 0x4f, 0x84, 0x6d, 0x69, 0x9b, 0x3e, 0x51, 0xb1, 0xf0, 0xef, 0xc3, 0xa5,
+	0xb5, 0x4b, 0xc5, 0x82, 0xe7, 0x05, 0xaa, 0xc9, 0x13, 0x3c, 0xa6, 0xe1, 0xd0, 0xf3, 0x82, 0xd6,
+	0x66, 0x4a, 0xbc, 0x92, 0xf0, 0x3a, 0x28, 0x3a, 0xb5, 0x42, 0x04, 0xea, 0x00, 0x08, 0x89, 0xb9,
+	0x74, 0x55, 0x9a, 0x18, 0x4f, 0x5c, 0xaa, 0x95, 0x54, 0x34, 0x4c, 0xad, 0x22, 0x0e, 0x73, 0xc9,
+	0x8b, 0x53, 0x0d, 0x74, 0x3d, 0xad, 0x74, 0x36, 0x8c, 0xfc, 0xdd, 0xef, 0x27, 0x7f, 0x62, 0xb3,
+	0x54, 0xf8, 0x9a, 0xc8, 0xfe, 0x6c, 0xfc, 0xc3, 0x82, 0xff, 0x3f, 0x65, 0xd4, 0x35, 0xce, 0x42,
+	0x49, 0xcd, 0x30, 0xe1, 0xc0, 0x8d, 0x5d, 0x3a, 0xdc, 0x75, 0x0f, 0xb0, 0x24, 0xdc, 0xc5, 0xd2,
+	0xd5, 0xe2, 0x9a, 0xa0, 0xbf, 0x94, 0x82, 0x75, 0x85, 0x7f, 0xae, 0xe0, 0x2b, 0xb2, 0xaf, 0xc0,
+	0xa8, 0x03, 0x35, 0xc9, 0xb1, 0x37, 0x22, 0xbe, 0x9b, 0xcc, 0x06, 0x39, 0x5d, 0x0e, 0x3e, 0x3a,
+	0xa3, 0x94, 0x66, 0x26, 0x81, 0x6b, 0x06, 0xa3, 0x96, 0x44, 0xe3, 0x9f, 0xb3, 0xc9, 0xdc, 0x13,
+	0x47, 0xd3, 0x18, 0xb8, 0x9f, 0x8e, 0x1a, 0xd6, 0x65, 0xe8, 0xcc, 0x60, 0xf1, 0x05, 0xd4, 0x69,
+	0x28, 0x39, 0xf3, 0x63, 0xef, 0x6a, 0xe2, 0x5c, 0x3f, 0x86, 0x69, 0x89, 0xd0, 0x7d, 0xa8, 0xfa,
+	0x64, 0x07, 0xc7, 0x81, 0x74, 0x55, 0xab, 0x49, 0x5c, 0x87, 0x4c, 0x63, 0x85, 0xd5, 0x64, 0x6b,
+	0xcb, 0xe9, 0x39, 0x60, 0x8e, 0x6d, 0x71, 0x8a, 0xfe, 0x64, 0xc1, 0x8d, 0x98, 0x53, 0xe1, 0x0e,
+	0x26, 0x6e, 0xc0, 0x3c, 0x1c, 0x50, 0x39, 0x71, 0x47, 0xfb, 0x76, 0x41, 0x8b, 0xf0, 0xf9, 0xc5,
+	0xb3, 0xdb, 0xb1, 0xee, 0xaa, 0x49, 0x89, 0xce, 0xe4, 0x4b, 0xc3, 0xb0, 0xb1, 0x9f, 0xf4, 0x88,
+	0x9b, 0x47, 0x87, 0x4b, 0xf5, 0x2d, 0xa7, 0x97, 0xdd, 0xda, 0x76, 0xea, 0xf1, 0xa9, 0xc3, 0xc8,
+	0x81, 0xea, 0x78, 0xdf, 0xf3, 0xdc, 0x1d, 0x1a, 0x48, 0xc2, 0xf5, 0xac, 0x34, 0x77, 0xc2, 0xb9,
+	0xa9, 0xfe, 0x5f, 0x6d, 0x77, 0xbb, 0x6b, 0xfa, 0xd0, 0xb1, 0x66, 0xc7, 0x6b, 0x0e, 0x28, 0x96,
+	0xe4, 0x19, 0x7d, 0x01, 0x40, 0x42, 0x8f, 0x4f, 0x22, 0x3d, 0x3a, 0x24, 0xcd, 0xbb, 0x79, 0x06,
+	0xa5, 0x6a, 0x95, 0x8f, 0xa6, 0x07, 0x9f, 0xea, 0xbf, 0xc2, 0xc9, 0x60, 0xd1, 0x53, 0x98, 0x1f,
+	0x68, 0x6d, 0xdd, 0x4c, 0x86, 0x5d, 0x61, 0x58, 0xbb, 0x9e, 0xa0, 0xfb, 0xd3, 0x3c, 0xdb, 0x00,
+	0xb3, 0xe4, 0x92, 0xd0, 0x4f, 0xe8, 0xca, 0x97, 0xa7, 0xab, 0x25, 0xd8, 0x47, 0xa1, 0xaf, 0xc9,
+	0xb6, 0xa0, 0x14, 0x8d, 0x5c, 0xea, 0xa7, 0x1d, 0xfd, 0xfe, 0xa5, 0x7d, 0xb6, 0x39, 0xea, 0xf9,
+	0xa6, 0x99, 0x57, 0xd4, 0xec, 0xb5, 0xb9, 0xd1, 0x5b, 0x15, 0x4e, 0x31, 0x52, 0xcb, 0xa7, 0x7a,
+	0x1a, 0xfc, 0x50, 0x3d, 0xad, 0x0b, 0x1f, 0x9c, 0x19, 0x3a, 0x67, 0xb4, 0x99, 0xf3, 0x8b, 0xfe,
+	0x03, 0x80, 0x63, 0x5d, 0xb2, 0xc8, 0xc2, 0x19, 0xc8, 0x72, 0x06, 0xd9, 0xf8, 0xbb, 0x05, 0x75,
+	0x87, 0x08, 0xc9, 0x38, 0x51, 0x49, 0x94, 0x10, 0x7c, 0x0a, 0x05, 0x95, 0x87, 0xa6, 0xc6, 0xbc,
+	0x23, 0x0d, 0xf5, 0x51, 0xb4, 0x02, 0xc5, 0x1d, 0xaa, 0xa6, 0xaa, 0x24, 0x75, 0x6f, 0x9d, 0x35,
+	0x94, 0xe9, 0x46, 0xe7, 0x90, 0xbd, 0x98, 0x08, 0xa9, 0xa3, 0x2e, 0x2d, 0x04, 0x1a, 0x89, 0x6e,
+	0x43, 0x35, 0x9d, 0x16, 0x7b, 0xfe, 0x4b, 0x9d, 0xbe, 0xe9, 0xf8, 0x93, 0xdd, 0x68, 0xfc, 0x31,
+	0x0f, 0xd7, 0x8d, 0xc8, 0xd3, 0xca, 0xb3, 0x06, 0xd7, 0x78, 0xb2, 0x94, 0x44, 0xd3, 0x15, 0xaa,
+	0x63, 0xd5, 0x00, 0x75, 0x2c, 0x9d, 0xcc, 0x99, 0xdc, 0x7b, 0xe4, 0x4c, 0x0f, 0x4a, 0x9c, 0xe8,
+	0xe1, 0x2f, 0xb9, 0x77, 0xfd, 0xf4, 0x9d, 0x16, 0x31, 0xd7, 0xaf, 0x11, 0x99, 0xa4, 0x23, 0x6b,
+	0x42, 0xa0, 0x46, 0x56, 0x13, 0xe0, 0x49, 0x51, 0xfa, 0xd9, 0x45, 0xf3, 0xc5, 0x09, 0xbb, 0x5c,
+	0x18, 0xe1, 0xef, 0x11, 0x35, 0x7f, 0xcd, 0xc1, 0x8d, 0x7e, 0x14, 0x50, 0xb9, 0x12, 0xfa, 0x7d,
+	0x0f, 0x4b, 0x69, 0x7a, 0xd5, 0xef, 0xa1, 0xa4, 0x6f, 0x76, 0x69, 0x07, 0x78, 0x78, 0xbe, 0xa4,
+	0x67, 0xc0, 0x53, 0xe9, 0xb5, 0x3c, 0x5d, 0xc5, 0x93, 0x1a, 0x22, 0x21, 0xcd, 0xd8, 0x34, 0xf7,
+	0x9e, 0x36, 0x5d, 0x70, 0x61, 0xfe, 0xad, 0xb7, 0xa1, 0x75, 0x98, 0x25, 0xea, 0x4e, 0x45, 0x52,
+	0xf9, 0xef, 0xbc, 0xd3, 0xd2, 0xd3, 0xa4, 0x31, 0xfc, 0x29, 0x41, 0xe3, 0xcf, 0x79, 0xa8, 0x75,
+	0xfb, 0xdb, 0xcf, 0x39, 0x4d, 0x8d, 0x73, 0x5b, 0xb5, 0x27, 0x21, 0x69, 0x98, 0x5c, 0xa2, 0x75,
+	0x62, 0xa7, 0x31, 0x98, 0xd9, 0x40, 0x3f, 0x86, 0x6b, 0xaa, 0x52, 0xb8, 0x91, 0x36, 0x4c, 0x12,
+	0x85, 0xd3, 0x83, 0xba, 0x86, 0x24, 0x1b, 0xe8, 0x33, 0x98, 0x65, 0x49, 0xe4, 0xe9, 0x64, 0xa9,
+	0x9e, 0xd9, 0x30, 0xba, 0xfd, 0x6d, 0x13, 0x9e, 0xa9, 0x84, 0x06, 0x73, 0x7c, 0x3d, 0xe7, 0xec,
+	0x40, 0x98, 0x3b, 0x7d, 0xf6, 0x7a, 0xee, 0xb0, 0x03, 0x81, 0x7e, 0x07, 0xf3, 0x1e, 0x1b, 0x47,
+	0x2a, 0xf7, 0xd4, 0x60, 0xe7, 0x31, 0x9f, 0x78, 0xa6, 0x3d, 0x5d, 0xf0, 0x25, 0x41, 0xa5, 0x47,
+	0xf7, 0x18, 0x96, 0xce, 0x21, 0x19, 0xa6, 0xae, 0x22, 0x3a, 0x55, 0x63, 0x4b, 0x3f, 0x50, 0x8d,
+	0x6d, 0x3c, 0x87, 0xf9, 0x4e, 0x1c, 0x28, 0x85, 0x32, 0xee, 0x98, 0x7e, 0x5b, 0xb1, 0xbe, 0xf7,
+	0xb7, 0x95, 0x3b, 0xb7, 0xe0, 0xfa, 0x29, 0x55, 0x51, 0x19, 0x0a, 0x4f, 0x58, 0x48, 0xea, 0x33,
+	0xea, 0xe9, 0xf1, 0x2b, 0x1a, 0xd5, 0xad, 0xce, 0xdd, 0xd7, 0xff, 0x5d, 0x9c, 0x79, 0x7d, 0xb4,
+	0x68, 0x7d, 0x73, 0xb4, 0x68, 0x7d, 0x7b, 0xb4, 0x68, 0xfd, 0xe7, 0x68, 0xd1, 0xfa, 0xcb, 0x9b,
+	0xc5, 0x99, 0x6f, 0xde, 0x2c, 0xce, 0x7c, 0xfb, 0x66, 0x71, 0xe6, 0xeb, 0x6a, 0xe6, 0xf3, 0xd5,
+	0xff, 0x02, 0x00, 0x00, 0xff, 0xff, 0x47, 0x83, 0x27, 0x38, 0x6b, 0x13, 0x00, 0x00,
 }

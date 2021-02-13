@@ -12,27 +12,38 @@ package sql_test
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx/pgtype"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -41,17 +52,18 @@ import (
 // entries.
 func TestGetAllNamesInternal(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, _ /* sqlDB */, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	err := kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		batch := txn.NewBatch()
-		batch.Put(sqlbase.NewTableKey(999, 444, "bob").Key(), 9999)
-		batch.Put(sqlbase.NewDeprecatedTableKey(1000, "alice").Key(), 10000)
-		batch.Put(sqlbase.NewDeprecatedTableKey(999, "overwrite_me_old_value").Key(), 9999)
+		batch.Put(catalogkeys.NewTableKey(999, 444, "bob").Key(keys.SystemSQLCodec), 9999)
+		batch.Put(catalogkeys.NewDeprecatedTableKey(1000, "alice").Key(keys.SystemSQLCodec), 10000)
+		batch.Put(catalogkeys.NewDeprecatedTableKey(999, "overwrite_me_old_value").Key(keys.SystemSQLCodec), 9999)
 		return txn.CommitInBatch(ctx, batch)
 	})
 	require.NoError(t, err)
@@ -68,6 +80,7 @@ func TestGetAllNamesInternal(t *testing.T) {
 // is in the replicas column
 func TestRangeLocalityBasedOnNodeIDs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 
@@ -83,11 +96,11 @@ func TestRangeLocalityBasedOnNodeIDs(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	assert.EqualValues(t, 1, tc.Servers[len(tc.Servers)-1].GetFirstStoreID())
 
-	// Set to 2 so the the next store id will be 3.
+	// Set to 2 so the next store id will be 3.
 	assert.NoError(t, tc.Servers[0].DB().Put(ctx, keys.StoreIDGenerator, 2))
 
 	// NodeID=2, StoreID=3
-	tc.AddServer(t,
+	tc.AddAndStartServer(t,
 		base.TestServerArgs{
 			Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "node", Value: "2"}}},
 		},
@@ -98,7 +111,7 @@ func TestRangeLocalityBasedOnNodeIDs(t *testing.T) {
 	assert.NoError(t, tc.Servers[0].DB().Put(ctx, keys.StoreIDGenerator, 1))
 
 	// NodeID=3, StoreID=2
-	tc.AddServer(t,
+	tc.AddAndStartServer(t,
 		base.TestServerArgs{
 			Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "node", Value: "3"}}},
 		},
@@ -119,10 +132,11 @@ func TestRangeLocalityBasedOnNodeIDs(t *testing.T) {
 
 func TestGossipAlertsTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	params, _ := tests.CreateTestServerParams()
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-	ctx := context.TODO()
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
 
 	if err := s.GossipI().(*gossip.Gossip).AddInfoProto(gossip.MakeNodeHealthAlertKey(456), &statuspb.HealthCheckResult{
 		Alerts: []statuspb.HealthAlert{{
@@ -137,7 +151,7 @@ func TestGossipAlertsTable(t *testing.T) {
 
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
 	row, err := ie.QueryRowEx(ctx, "test", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		"SELECT * FROM crdb_internal.gossip_alerts WHERE store_id = 123")
 	if err != nil {
 		t.Fatal(err)
@@ -157,14 +171,16 @@ func TestGossipAlertsTable(t *testing.T) {
 // shows up properly in metadata post-2.1.
 func TestOldBitColumnMetadata(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
-	defer sql.TestDisableTableLeases()()
+	defer lease.TestingDisableTableLeases()()
 
+	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(ctx)
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -176,7 +192,8 @@ CREATE TABLE t.test (k INT);
 	// We now want to create a pre-2.1 table descriptor with an
 	// old-style bit column. We're going to edit the table descriptor
 	// manually, without going through SQL.
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(
+		kvDB, keys.SystemSQLCodec, "t", "test")
 	for i := range tableDesc.Columns {
 		if tableDesc.Columns[i].Name == "k" {
 			tableDesc.Columns[i].Type.InternalType.VisibleType = 4 // Pre-2.1 BIT.
@@ -197,7 +214,7 @@ CREATE TABLE t.test (k INT);
 		t.Fatal(err)
 	}
 	colDef := alterCmd.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
-	col, _, _, err := sqlbase.MakeColumnDefDescs(colDef, nil)
+	col, _, _, err := tabledesc.MakeColumnDefDescs(ctx, colDef, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,11 +225,11 @@ CREATE TABLE t.test (k INT);
 	tableDesc.Columns = append(tableDesc.Columns, *col)
 
 	// Write the modified descriptor.
-	if err := kvDB.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
-		if err := txn.SetSystemConfigTrigger(); err != nil {
+	if err := kvDB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
+		if err := txn.SetSystemConfigTrigger(true /* forSystemTenant */); err != nil {
 			return err
 		}
-		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(tableDesc.ID), sqlbase.WrapDescriptor(tableDesc))
+		return txn.Put(ctx, catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), tableDesc.DescriptorProto())
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +286,7 @@ SELECT column_name, character_maximum_length, numeric_precision, numeric_precisi
 	}
 
 	// And verify that this has re-set the fields.
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	found := false
 	for i := range tableDesc.Columns {
 		col := &tableDesc.Columns[i]
@@ -288,5 +305,202 @@ SELECT column_name, character_maximum_length, numeric_precision, numeric_precisi
 	if !found {
 		t.Fatal("column disappeared")
 	}
+}
 
+func TestClusterQueriesTxnData(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.t (x INT);
+INSERT INTO t.t VALUES (1);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqlDB.Exec(`BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Look up the schema first so only the read txn is recorded in
+	// kv trace logs. We explicitly specify the schema to avoid an extra failed
+	// lease acquisition, which occurs in a separate transaction, to work around
+	// a current limitation in schema resolution. See #53301.
+	if _, err := sqlDB.Exec(`SELECT * FROM t.public.t`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqlDB.Exec(
+		`SET tracing=on,kv; SELECT * FROM t.public.t; SET TRACING=off`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The log messages we are looking for are structured like
+	// [....,txn=<txnID>], so search for those and extract the id.
+	row := sqlDB.QueryRow(`
+SELECT 
+	string_to_array(regexp_extract(tag, 'txn=[a-zA-Z0-9]*'), '=')[2] 
+FROM 
+	[SHOW KV TRACE FOR SESSION] 
+WHERE
+  tag LIKE '%txn=%' LIMIT 1`)
+	var txnID string
+	if err := row.Scan(&txnID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now, run a SHOW QUERIES statement, in the same transaction.
+	// The txn_id we find there should be the same as the one we parsed,
+	// and the txn_start time should be before the start time of the statement.
+	row = sqlDB.QueryRow(`
+SELECT
+	txn_id, start
+FROM
+  crdb_internal.cluster_queries
+WHERE
+	query LIKE '%SHOW CLUSTER QUERIES%'`)
+
+	var (
+		foundTxnID string
+		txnStart   time.Time
+		queryStart time.Time
+	)
+	if err := row.Scan(&foundTxnID, &queryStart); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(foundTxnID, txnID) {
+		t.Errorf("expected to find txn id with prefix %s, but found %s", txnID, foundTxnID)
+	}
+
+	// Find the transaction start time and ensure that the query started after it.
+	row = sqlDB.QueryRow(`SELECT start FROM crdb_internal.node_transactions WHERE id = $1`, foundTxnID)
+	if err := row.Scan(&txnStart); err != nil {
+		t.Fatal(err)
+	}
+	if txnStart.After(queryStart) {
+		t.Error("expected txn to start before query")
+	}
+}
+
+// TestCrdbInternalJobsOOM verifies that the memory budget works correctly for
+// crdb_internal.jobs.
+func TestCrdbInternalJobsOOM(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// The budget needs to be large enough to establish the initial database
+	// connection, but small enough to overflow easily. It's set to be comfortably
+	// large enough that the server can start up with a bit of
+	// extra space to overflow.
+	const lowMemoryBudget = 250000
+	const fieldSize = 10000
+	const numRows = 10
+	const statement = "SELECT count(*) FROM crdb_internal.jobs"
+
+	insertRows := func(sqlDB *gosql.DB) {
+		for i := 0; i < numRows; i++ {
+			if _, err := sqlDB.Exec(`
+INSERT INTO system.jobs(id, status, payload, progress)
+VALUES ($1, 'StatusRunning', repeat('a', $2)::BYTES, repeat('a', $2)::BYTES)`, i, fieldSize); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	t.Run("over budget jobs table", func(t *testing.T) {
+		s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+			SQLMemoryPoolSize: lowMemoryBudget,
+		})
+		defer s.Stopper().Stop(context.Background())
+
+		insertRows(sqlDB)
+		_, err := sqlDB.Exec(statement)
+		if err == nil {
+			t.Fatalf("Expected \"%s\" to consume too much memory, found no error", statement)
+		}
+		if pErr := (*pq.Error)(nil); !(errors.As(err, &pErr) &&
+			pgcode.MakeCode(string(pErr.Code)) == pgcode.OutOfMemory) {
+			t.Fatalf("Expected \"%s\" to consume too much memory, found unexpected error %+v", statement, pErr)
+		}
+	})
+
+	t.Run("under budget jobs table", func(t *testing.T) {
+		s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+			SQLMemoryPoolSize: 2 * lowMemoryBudget,
+		})
+		defer s.Stopper().Stop(context.Background())
+
+		insertRows(sqlDB)
+		if _, err := sqlDB.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// TestInvalidObjects table descriptors that don't validate will show up in
+// table `crdb_internal.invalid_objects`.
+func TestInvalidObjects(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// The descriptor changes made must have an immediate effect
+	// so disable leases on tables.
+	defer lease.TestingDisableTableLeases()()
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		Store: &kvserver.StoreTestingKnobs{
+			DisableMergeQueue: true,
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	var id int
+	var dbName, schemaName, objName, errStr string
+	// No inconsistency should be found so this should return ErrNoRow.
+	require.Error(t, sqlDB.QueryRow(`SELECT * FROM "".crdb_internal.invalid_objects`).
+		Scan(&id, dbName, schemaName, objName, errStr))
+
+	// Now introduce an inconsistency.
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT);
+CREATE TABLE fktbl (id INT PRIMARY KEY);
+CREATE TABLE tbl (customer INT NOT NULL REFERENCES fktbl (id));
+INSERT INTO system.users VALUES ('node', NULL, true);
+GRANT node TO root;
+DELETE FROM system.descriptor WHERE id=52;
+DELETE FROM system.descriptor WHERE id=54;
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	require.NoError(t, sqlDB.QueryRow(`SELECT id FROM system.descriptor ORDER BY id DESC LIMIT 1`).
+		Scan(&id))
+	require.Equal(t, 55, id)
+
+	rows, err := sqlDB.Query(`SELECT * FROM "".crdb_internal.invalid_objects ORDER BY id`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	require.True(t, rows.Next())
+	require.NoError(t, rows.Scan(&id, &dbName, &schemaName, &objName, &errStr))
+	require.Equal(t, 53, id)
+	require.Equal(t, "", dbName)
+	require.Equal(t, "", schemaName)
+	require.Equal(t, "desc 53: parentID 52 does not exist", errStr)
+
+	require.True(t, rows.Next())
+	require.NoError(t, rows.Scan(&id, &dbName, &schemaName, &objName, &errStr))
+	require.Equal(t, 55, id)
+	require.Equal(t, "defaultdb", dbName)
+	require.Equal(t, "public", schemaName)
+	require.Equal(t, "desc 55: invalid foreign key: missing table=54: descriptor not found", errStr)
+
+	require.False(t, rows.Next())
 }

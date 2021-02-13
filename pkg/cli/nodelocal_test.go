@@ -26,14 +26,14 @@ func Example_nodelocal() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
-	file, cleanUp := createTestFile()
+	file, cleanUp := createTestFile("test.csv", "content")
 	defer cleanUp()
 
 	c.Run(fmt.Sprintf("nodelocal upload %s /test/file1.csv", file))
 	c.Run(fmt.Sprintf("nodelocal upload %s /test/file2.csv", file))
 	c.Run(fmt.Sprintf("nodelocal upload %s /test/file1.csv", file))
 	c.Run(fmt.Sprintf("nodelocal upload %s /test/../../file1.csv", file))
-	c.Run(fmt.Sprintf("nodelocal upload notexist.csv /test/file1.csv"))
+	c.Run("nodelocal upload notexist.csv /test/file1.csv")
 
 	// Output:
 	// nodelocal upload test.csv /test/file1.csv
@@ -43,10 +43,29 @@ func Example_nodelocal() {
 	// nodelocal upload test.csv /test/file1.csv
 	// ERROR: destination file already exists for /test/file1.csv
 	// nodelocal upload test.csv /test/../../file1.csv
-	// ERROR: current transaction is aborted, commands ignored until end of transaction block
-	// SQLSTATE: 25P02
+	// ERROR: local file access to paths outside of external-io-dir is not allowed: ../file1.csv
 	// nodelocal upload notexist.csv /test/file1.csv
 	// ERROR: open notexist.csv: no such file or directory
+}
+
+func Example_nodelocal_disabled() {
+	c := newCLITest(cliTestParams{noNodelocal: true})
+	defer c.cleanup()
+
+	file, cleanUp := createTestFile("test.csv", "non-empty-file")
+	defer cleanUp()
+
+	empty, cleanUpEmpty := createTestFile("empty.csv", "")
+	defer cleanUpEmpty()
+
+	c.Run(fmt.Sprintf("nodelocal upload %s /test/file1.csv", empty))
+	c.Run(fmt.Sprintf("nodelocal upload %s /test/file1.csv", file))
+
+	// Output:
+	// nodelocal upload empty.csv /test/file1.csv
+	// ERROR: local file access is disabled
+	// nodelocal upload test.csv /test/file1.csv
+	// ERROR: local file access is disabled
 }
 
 func TestNodeLocalFileUpload(t *testing.T) {
@@ -62,6 +81,10 @@ func TestNodeLocalFileUpload(t *testing.T) {
 		name        string
 		fileContent []byte
 	}{
+		{
+			"empty",
+			[]byte{},
+		},
 		{
 			"exactly-one-chunk",
 			make([]byte, chunkSize),
@@ -102,13 +125,16 @@ func TestNodeLocalFileUpload(t *testing.T) {
 	}
 }
 
-func createTestFile() (string, func()) {
-	filePath := "test.csv"
-	err := ioutil.WriteFile(filePath, []byte("file content"), 0666)
+func createTestFile(name, content string) (string, func()) {
+	tmpDir, err := ioutil.TempDir("", "")
+	tmpFile := filepath.Join(tmpDir, testTempFilePrefix+name)
+	if err == nil {
+		err = ioutil.WriteFile(tmpFile, []byte(content), 0666)
+	}
 	if err != nil {
 		return "", func() {}
 	}
-	return filePath, func() {
-		_ = os.Remove(filePath)
+	return tmpFile, func() {
+		_ = os.RemoveAll(tmpDir)
 	}
 }

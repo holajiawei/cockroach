@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// dupFD is used to initialize OrigStderr (see stderr_redirect.go).
 func dupFD(fd uintptr) (uintptr, error) {
 	// Warning: failing to set FD_CLOEXEC causes the duplicated file descriptor
 	// to leak into subprocesses created by exec.Command. If the file descriptor
@@ -31,13 +32,26 @@ func dupFD(fd uintptr) (uintptr, error) {
 	// subprocesses that hold references to the stdin or stderr pipes, go test
 	// will hang until the subprocesses exit, rather defeating the purpose of
 	// a timeout.
-	nfd, _, errno := unix.Syscall(unix.SYS_FCNTL, fd, unix.F_DUPFD_CLOEXEC, 0)
-	if errno != 0 {
-		return 0, errno
+	nfd, err := unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return 0, err
 	}
-	return nfd, nil
+	return uintptr(nfd), nil
 }
 
+// redirectStderr is used to redirect internal writes to fd 2 to the
+// specified file. This is needed to ensure that harcoded writes to fd
+// 2 by e.g. the Go runtime are redirected to a log file of our
+// choosing.
+//
+// We also override os.Stderr for those other parts of Go which use
+// that and not fd 2 directly.
 func redirectStderr(f *os.File) error {
-	return unix.Dup2(int(f.Fd()), unix.Stderr)
+	osStderrMu.Lock()
+	defer osStderrMu.Unlock()
+	if err := unix.Dup2(int(f.Fd()), unix.Stderr); err != nil {
+		return err
+	}
+	os.Stderr = f
+	return nil
 }

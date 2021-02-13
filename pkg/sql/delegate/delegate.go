@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 )
 
 // Certain statements (most SHOW variants) are just syntactic sugar for a more
@@ -41,6 +42,12 @@ func TryDelegate(
 
 	case *tree.ShowDatabases:
 		return d.delegateShowDatabases(t)
+
+	case *tree.ShowEnums:
+		return d.delegateShowEnums(t)
+
+	case *tree.ShowTypes:
+		return d.delegateShowTypes()
 
 	case *tree.ShowCreate:
 		return d.delegateShowCreate(t)
@@ -75,11 +82,17 @@ func TryDelegate(
 	case *tree.ShowRangeForRow:
 		return d.delegateShowRangeForRow(t)
 
+	case *tree.ShowSurvivalGoal:
+		return d.delegateShowSurvivalGoal(t)
+
+	case *tree.ShowRegions:
+		return d.delegateShowRegions(t)
+
 	case *tree.ShowRoleGrants:
 		return d.delegateShowRoleGrants(t)
 
 	case *tree.ShowRoles:
-		return d.delegateShowRoles(t)
+		return d.delegateShowRoles()
 
 	case *tree.ShowSchemas:
 		return d.delegateShowSchemas(t)
@@ -96,8 +109,11 @@ func TryDelegate(
 	case *tree.ShowTables:
 		return d.delegateShowTables(t)
 
+	case *tree.ShowTransactions:
+		return d.delegateShowTransactions(t)
+
 	case *tree.ShowUsers:
-		return d.delegateShowUsers(t)
+		return d.delegateShowRoles()
 
 	case *tree.ShowVar:
 		return d.delegateShowVar(t)
@@ -107,6 +123,21 @@ func TryDelegate(
 
 	case *tree.ShowTransactionStatus:
 		return d.delegateShowVar(&tree.ShowVar{Name: "transaction_status"})
+
+	case *tree.ShowSchedules:
+		return d.delegateShowSchedules(t)
+
+	case *tree.ControlJobsForSchedules:
+		return d.delegateJobControl(t)
+
+	case *tree.ShowLastQueryStatistics:
+		return nil, unimplemented.New(
+			"show last query statistics",
+			"cannot use SHOW LAST QUERY STATISTICS as a statement source",
+		)
+
+	case *tree.ShowSavepointStatus:
+		return nil, unimplemented.NewWithIssue(47333, "cannot use SHOW SAVEPOINT STATUS as a statement source")
 
 	default:
 		return nil, nil

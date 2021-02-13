@@ -13,18 +13,20 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // delayedNode wraps a planNode in cases where the planNode
 // constructor must be delayed during query execution (as opposed to
 // SQL prepare) for resource tracking purposes.
 type delayedNode struct {
-	name        string
-	columns     sqlbase.ResultColumns
-	constructor nodeConstructor
-	plan        planNode
+	name            string
+	columns         colinfo.ResultColumns
+	indexConstraint *constraint.Constraint
+	constructor     nodeConstructor
+	plan            planNode
 }
 
 type nodeConstructor func(context.Context, *planner) (planNode, error)
@@ -53,7 +55,7 @@ func (d *delayedNode) startExec(params runParams) error {
 
 	// Recursively invoke startExec on new plan. Normally, startExec doesn't
 	// recurse - calling children is handled by the planNode walker. The reason
-	// this won't suffice here is that the the child of this node doesn't exist
+	// this won't suffice here is that the child of this node doesn't exist
 	// until after startExec is invoked.
 	return startExec(params, plan)
 }

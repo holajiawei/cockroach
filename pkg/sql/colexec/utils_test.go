@@ -13,7 +13,6 @@ package colexec
 import (
 	"context"
 	"fmt"
-	"io"
 	"math"
 	"math/rand"
 	"reflect"
@@ -22,16 +21,29 @@ import (
 	"testing"
 	"testing/quick"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/errors"
 	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,6 +61,10 @@ func (t tuple) String() string {
 		}
 		if d, ok := t[i].(apd.Decimal); ok {
 			sb.WriteString(d.String())
+		} else if d, ok := t[i].(*apd.Decimal); ok {
+			sb.WriteString(d.String())
+		} else if d, ok := t[i].([]byte); ok {
+			sb.WriteString(string(d))
 		} else {
 			sb.WriteString(fmt.Sprintf("%v", t[i]))
 		}
@@ -57,7 +73,7 @@ func (t tuple) String() string {
 	return sb.String()
 }
 
-func (t tuple) less(other tuple) bool {
+func (t tuple) less(other tuple, evalCtx *tree.EvalContext, tupleFromOtherSet tuple) bool {
 	for i := range t {
 		// If either side is nil, we short circuit the comparison. For nil, we
 		// define: nil < {any_none_nil}
@@ -67,6 +83,15 @@ func (t tuple) less(other tuple) bool {
 			return true
 		} else if t[i] != nil && other[i] == nil {
 			return false
+		}
+		// Check whether we have datum-backed values.
+		if d1, ok := t[i].(tree.Datum); ok {
+			d2 := other[i].(tree.Datum)
+			cmp := d1.Compare(evalCtx, d2)
+			if cmp == 0 {
+				continue
+			}
+			return cmp < 0
 		}
 
 		lhsVal := reflect.ValueOf(t[i])
@@ -86,7 +111,7 @@ func (t tuple) less(other tuple) bool {
 			}
 		}
 
-		// coltypes.Bytes is represented as []uint8.
+		// types.Bytes is represented as []uint8.
 		if lhsVal.Type().String() == "[]uint8" {
 			lhsStr := string(lhsVal.Interface().([]uint8))
 			rhsStr := string(rhsVal.Interface().([]uint8))
@@ -114,19 +139,71 @@ func (t tuple) less(other tuple) bool {
 		case "bool":
 			return lhsVal.Bool() == false && rhsVal.Bool() == true
 		case "string":
-			return lhsVal.String() < rhsVal.String()
+			lString, rString := lhsVal.String(), rhsVal.String()
+			if tupleFromOtherSet != nil && len(tupleFromOtherSet) > i {
+				if d, ok := tupleFromOtherSet[i].(tree.Datum); ok {
+					// The tuple from the other set has a datum value, so we
+					// will convert the string to datum. See the comment on
+					// tuples.sort for more details.
+					d1 := stringToDatum(lString, d.ResolvedType(), evalCtx)
+					d2 := stringToDatum(rString, d.ResolvedType(), evalCtx)
+					cmp := d1.Compare(evalCtx, d2)
+					if cmp == 0 {
+						continue
+					}
+					return cmp < 0
+				}
+			}
+			return lString < rString
 		default:
-			execerror.VectorizedInternalPanic(fmt.Sprintf("Unhandled comparison type: %s", typ))
+			colexecerror.InternalError(errors.AssertionFailedf("Unhandled comparison type: %s", typ))
 		}
 	}
 	return false
 }
 
+func (t tuple) clone() tuple {
+	b := make(tuple, len(t))
+	for i := range b {
+		b[i] = t[i]
+	}
+
+	return b
+}
+
 // tuples represents a table with any-type columns.
 type tuples []tuple
 
-// sort returns a copy of sorted tuples.
-func (t tuples) sort() tuples {
+func (t tuples) clone() tuples {
+	b := make(tuples, len(t))
+	for i := range b {
+		b[i] = t[i].clone()
+	}
+	return b
+}
+
+func (t tuples) String() string {
+	var sb strings.Builder
+	sb.WriteString("[")
+	for i := range t {
+		if i != 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(t[i].String())
+	}
+	sb.WriteString("]")
+	return sb.String()
+}
+
+// sort returns a copy of sorted tuples. tupleFromOtherSet is any tuple that
+// comes from other tuples and is used to determine the desired types.
+//
+// Currently, this function is only used in order to speed up the comparison of
+// the expected tuple set with the actual one, and it is possible that we have
+// tree.Datum in the latter but strings in the former. In order to use the same
+// ordering when sorting the strings, we need to peek into the actual tuple to
+// determine whether we want to convert the string to datum before comparison.
+func (t tuples) sort(evalCtx *tree.EvalContext, tupleFromOtherSet tuple) tuples {
 	b := make(tuples, len(t))
 	for i := range b {
 		b[i] = make(tuple, len(t[i]))
@@ -135,7 +212,7 @@ func (t tuples) sort() tuples {
 	sort.SliceStable(b, func(i, j int) bool {
 		lhs := b[i]
 		rhs := b[j]
-		return lhs.less(rhs)
+		return lhs.less(rhs, evalCtx, tupleFromOtherSet)
 	})
 	return b
 }
@@ -151,8 +228,6 @@ const (
 	unorderedVerifier
 )
 
-type verifierFn func(output *opTestOutput) error
-
 // maybeHasNulls is a helper function that returns whether any of the columns in b
 // (maybe) have nulls.
 func maybeHasNulls(b coldata.Batch) bool {
@@ -167,14 +242,7 @@ func maybeHasNulls(b coldata.Batch) bool {
 	return false
 }
 
-type testRunner func(*testing.T, []tuples, [][]coltypes.T, tuples, interface{}, func([]Operator) (Operator, error))
-
-// variableOutputBatchSizeInitializer is implemented by operators that can be
-// initialized with variable output size batches. This allows runTests to
-// increase test coverage of these operators.
-type variableOutputBatchSizeInitializer interface {
-	initWithOutputBatchSize(int)
-}
+type testRunner func(*testing.T, []tuples, [][]*types.T, tuples, verifierType, func([]colexecbase.Operator) (colexecbase.Operator, error))
 
 // runTests is a helper that automatically runs your tests with varied batch
 // sizes and with and without a random selection vector.
@@ -186,8 +254,8 @@ func runTests(
 	t *testing.T,
 	tups []tuples,
 	expected tuples,
-	verifier interface{},
-	constructor func(inputs []Operator) (Operator, error),
+	verifier verifierType,
+	constructor func(inputs []colexecbase.Operator) (colexecbase.Operator, error),
 ) {
 	runTestsWithTyps(t, tups, nil /* typs */, expected, verifier, constructor)
 }
@@ -200,14 +268,18 @@ func runTests(
 func runTestsWithTyps(
 	t *testing.T,
 	tups []tuples,
-	typs [][]coltypes.T,
+	typs [][]*types.T,
 	expected tuples,
-	verifier interface{},
-	constructor func(inputs []Operator) (Operator, error),
+	verifier verifierType,
+	constructor func(inputs []colexecbase.Operator) (colexecbase.Operator, error),
 ) {
 	runTestsWithoutAllNullsInjection(t, tups, typs, expected, verifier, constructor)
 
-	t.Run("allNullsInjection", func(t *testing.T) {
+	{
+		ctx := context.Background()
+		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+		defer evalCtx.Stop(ctx)
+		log.Info(ctx, "allNullsInjection")
 		// This test replaces all values in the input tuples with nulls and ensures
 		// that the output is different from the "original" output (i.e. from the
 		// one that is returned without nulls injection).
@@ -223,9 +295,9 @@ func runTestsWithTyps(
 				}
 			}
 		}
-		opConstructor := func(injectAllNulls bool) Operator {
-			inputSources := make([]Operator, len(tups))
-			var inputTypes []coltypes.T
+		opConstructor := func(injectAllNulls bool) colexecbase.Operator {
+			inputSources := make([]colexecbase.Operator, len(tups))
+			var inputTypes []*types.T
 			for i, tup := range tups {
 				if typs != nil {
 					inputTypes = typs[i]
@@ -241,7 +313,6 @@ func runTestsWithTyps(
 			op.Init()
 			return op
 		}
-		ctx := context.Background()
 		originalOp := opConstructor(false /* injectAllNulls */)
 		opWithNulls := opConstructor(true /* injectAllNulls */)
 		foundDifference := false
@@ -261,7 +332,7 @@ func runTestsWithTyps(
 				originalTuples = append(originalTuples, getTupleFromBatch(originalBatch, i))
 				tuplesWithNulls = append(tuplesWithNulls, getTupleFromBatch(batchWithNulls, i))
 			}
-			if err := assertTuplesSetsEqual(originalTuples, tuplesWithNulls); err != nil {
+			if err := assertTuplesSetsEqual(originalTuples, tuplesWithNulls, evalCtx); err != nil {
 				// err is non-nil which means that the batches are different.
 				foundDifference = true
 				break
@@ -276,13 +347,13 @@ func runTestsWithTyps(
 				"non-nulls in the input tuples, we expect for all nulls injection to "+
 				"change the output")
 		}
-		if c, ok := originalOp.(io.Closer); ok {
-			require.NoError(t, c.Close())
+		if c, ok := originalOp.(colexecbase.Closer); ok {
+			require.NoError(t, c.Close(ctx))
 		}
-		if c, ok := opWithNulls.(io.Closer); ok {
-			require.NoError(t, c.Close())
+		if c, ok := opWithNulls.(colexecbase.Closer); ok {
+			require.NoError(t, c.Close(ctx))
 		}
-	})
+	}
 }
 
 // runTestsWithoutAllNullsInjection is the same as runTests, but it skips the
@@ -293,31 +364,22 @@ func runTestsWithTyps(
 func runTestsWithoutAllNullsInjection(
 	t *testing.T,
 	tups []tuples,
-	typs [][]coltypes.T,
+	typs [][]*types.T,
 	expected tuples,
-	verifier interface{},
-	constructor func(inputs []Operator) (Operator, error),
+	verifier verifierType,
+	constructor func(inputs []colexecbase.Operator) (colexecbase.Operator, error),
 ) {
+	ctx := context.Background()
+	verifyFn := (*opTestOutput).VerifyAnyOrder
 	skipVerifySelAndNullsResets := true
-	var verifyFn verifierFn
-	switch v := verifier.(type) {
-	case verifierType:
-		switch v {
-		case orderedVerifier:
-			verifyFn = (*opTestOutput).Verify
-			// Note that this test makes sense only if we expect tuples to be
-			// returned in the same order (otherwise the second batch's selection
-			// vector or nulls info can be different and that is totally valid).
-			skipVerifySelAndNullsResets = false
-		case unorderedVerifier:
-			verifyFn = (*opTestOutput).VerifyAnyOrder
-		default:
-			execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected verifierType %d", v))
-		}
-	case verifierFn:
-		verifyFn = v
+	if verifier == orderedVerifier {
+		verifyFn = (*opTestOutput).Verify
+		// Note that this test makes sense only if we expect tuples to be
+		// returned in the same order (otherwise the second batch's selection
+		// vector or nulls info can be different and that is totally valid).
+		skipVerifySelAndNullsResets = false
 	}
-	runTestsWithFn(t, tups, typs, func(t *testing.T, inputs []Operator) {
+	runTestsWithFn(t, tups, typs, func(t *testing.T, inputs []colexecbase.Operator) {
 		op, err := constructor(inputs)
 		if err != nil {
 			t.Fatal(err)
@@ -326,97 +388,97 @@ func runTestsWithoutAllNullsInjection(
 		if err := verifyFn(out); err != nil {
 			t.Fatal(err)
 		}
+		if isOperatorChainResettable(op) {
+			log.Info(ctx, "reusing after reset")
+			out.reset(ctx)
+			if err := verifyFn(out); err != nil {
+				t.Fatal(err)
+			}
+		}
 	})
 
 	if !skipVerifySelAndNullsResets {
-		t.Run("verifySelAndNullResets", func(t *testing.T) {
-			// This test ensures that operators that "own their own batches", such as
-			// any operator that has to reshape its output, are not affected by
-			// downstream modification of batches.
-			// We run the main loop twice: once to determine what the operator would
-			// output on its second Next call (we need the first call to Next to get a
-			// reference to a batch to modify), and a second time to modify the batch
-			// and verify that this does not change the operator output.
-			// NOTE: this test makes sense only if the operator returns two non-zero
-			// length batches (if not, we short-circuit the test since the operator
-			// doesn't have to restore anything on a zero-length batch).
-			var (
-				secondBatchHasSelection, secondBatchHasNulls bool
-				inputTypes                                   []coltypes.T
-			)
-			for round := 0; round < 2; round++ {
-				inputSources := make([]Operator, len(tups))
-				for i, tup := range tups {
-					if typs != nil {
-						inputTypes = typs[i]
-					}
-					inputSources[i] = newOpTestInput(1 /* batchSize */, tup, inputTypes)
+		log.Info(ctx, "verifySelAndNullResets")
+		// This test ensures that operators that "own their own batches", such as
+		// any operator that has to reshape its output, are not affected by
+		// downstream modification of batches.
+		// We run the main loop twice: once to determine what the operator would
+		// output on its second Next call (we need the first call to Next to get a
+		// reference to a batch to modify), and a second time to modify the batch
+		// and verify that this does not change the operator output.
+		// NOTE: this test makes sense only if the operator returns two non-zero
+		// length batches (if not, we short-circuit the test since the operator
+		// doesn't have to restore anything on a zero-length batch).
+		var (
+			secondBatchHasSelection, secondBatchHasNulls bool
+			inputTypes                                   []*types.T
+		)
+		for round := 0; round < 2; round++ {
+			inputSources := make([]colexecbase.Operator, len(tups))
+			for i, tup := range tups {
+				if typs != nil {
+					inputTypes = typs[i]
 				}
-				op, err := constructor(inputSources)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if vbsiOp, ok := op.(variableOutputBatchSizeInitializer); ok {
-					// initialize the operator with a very small output batch size to
-					// increase the likelihood that multiple batches will be output.
-					vbsiOp.initWithOutputBatchSize(1)
+				inputSources[i] = newOpTestInput(1 /* batchSize */, tup, inputTypes)
+			}
+			op, err := constructor(inputSources)
+			if err != nil {
+				t.Fatal(err)
+			}
+			op.Init()
+			b := op.Next(ctx)
+			if b.Length() == 0 {
+				return
+			}
+			if round == 1 {
+				if secondBatchHasSelection {
+					b.SetSelection(false)
 				} else {
-					op.Init()
+					b.SetSelection(true)
 				}
-				ctx := context.Background()
-				b := op.Next(ctx)
-				if b.Length() == 0 {
-					return
-				}
-				if round == 1 {
-					if secondBatchHasSelection {
-						b.SetSelection(false)
-					} else {
-						b.SetSelection(true)
+				if secondBatchHasNulls {
+					// ResetInternalBatch will throw away the null information.
+					b.ResetInternalBatch()
+				} else {
+					for i := 0; i < b.Width(); i++ {
+						b.ColVec(i).Nulls().SetNulls()
 					}
-					if secondBatchHasNulls {
-						// ResetInternalBatch will throw away the null information.
-						b.ResetInternalBatch()
-					} else {
-						for i := 0; i < b.Width(); i++ {
-							b.ColVec(i).Nulls().SetNulls()
-						}
-					}
-				}
-				b = op.Next(ctx)
-				if b.Length() == 0 {
-					return
-				}
-				if round == 0 {
-					secondBatchHasSelection = b.Selection() != nil
-					secondBatchHasNulls = maybeHasNulls(b)
-				}
-				if round == 1 {
-					if secondBatchHasSelection {
-						assert.NotNil(t, b.Selection())
-					} else {
-						assert.Nil(t, b.Selection())
-					}
-					if secondBatchHasNulls {
-						assert.True(t, maybeHasNulls(b))
-					} else {
-						assert.False(t, maybeHasNulls(b))
-					}
-				}
-				if c, ok := op.(io.Closer); ok {
-					// Some operators need an explicit Close if not drained completely of
-					// input.
-					assert.NoError(t, c.Close())
 				}
 			}
-		})
+			b = op.Next(ctx)
+			if b.Length() == 0 {
+				return
+			}
+			if round == 0 {
+				secondBatchHasSelection = b.Selection() != nil
+				secondBatchHasNulls = maybeHasNulls(b)
+			}
+			if round == 1 {
+				if secondBatchHasSelection {
+					assert.NotNil(t, b.Selection())
+				} else {
+					assert.Nil(t, b.Selection())
+				}
+				if secondBatchHasNulls {
+					assert.True(t, maybeHasNulls(b))
+				} else {
+					assert.False(t, maybeHasNulls(b))
+				}
+			}
+			if c, ok := op.(colexecbase.Closer); ok {
+				// Some operators need an explicit Close if not drained completely of
+				// input.
+				assert.NoError(t, c.Close(ctx))
+			}
+		}
 	}
 
-	t.Run("randomNullsInjection", func(t *testing.T) {
+	{
+		log.Info(ctx, "randomNullsInjection")
 		// This test randomly injects nulls in the input tuples and ensures that
 		// the operator doesn't panic.
-		inputSources := make([]Operator, len(tups))
-		var inputTypes []coltypes.T
+		inputSources := make([]colexecbase.Operator, len(tups))
+		var inputTypes []*types.T
 		for i, tup := range tups {
 			if typs != nil {
 				inputTypes = typs[i]
@@ -430,10 +492,9 @@ func runTestsWithoutAllNullsInjection(
 			t.Fatal(err)
 		}
 		op.Init()
-		ctx := context.Background()
 		for b := op.Next(ctx); b.Length() > 0; b = op.Next(ctx) {
 		}
-	})
+	}
 }
 
 // runTestsWithFn is like runTests, but the input function is responsible for
@@ -451,10 +512,11 @@ func runTestsWithoutAllNullsInjection(
 // - test is a function that takes a list of input Operators and performs
 //   testing with t.
 func runTestsWithFn(
-	t *testing.T, tups []tuples, typs [][]coltypes.T, test func(t *testing.T, inputs []Operator),
+	t *testing.T,
+	tups []tuples,
+	typs [][]*types.T,
+	test func(t *testing.T, inputs []colexecbase.Operator),
 ) {
-	rng, _ := randutil.NewPseudoRand()
-
 	// Run tests over batchSizes of 1, (sometimes) a batch size that is small but
 	// greater than 1, and a full coldata.BatchSize().
 	batchSizes := make([]int, 0, 3)
@@ -467,26 +529,26 @@ func runTestsWithFn(
 
 	for _, batchSize := range batchSizes {
 		for _, useSel := range []bool{false, true} {
-			t.Run(fmt.Sprintf("batchSize=%d/sel=%t", batchSize, useSel), func(t *testing.T) {
-				inputSources := make([]Operator, len(tups))
-				var inputTypes []coltypes.T
-				if useSel {
-					for i, tup := range tups {
-						if typs != nil {
-							inputTypes = typs[i]
-						}
-						inputSources[i] = newOpTestSelInput(rng, batchSize, tup, inputTypes)
+			log.Infof(context.Background(), "batchSize=%d/sel=%t", batchSize, useSel)
+			inputSources := make([]colexecbase.Operator, len(tups))
+			var inputTypes []*types.T
+			if useSel {
+				for i, tup := range tups {
+					if typs != nil {
+						inputTypes = typs[i]
 					}
-				} else {
-					for i, tup := range tups {
-						if typs != nil {
-							inputTypes = typs[i]
-						}
-						inputSources[i] = newOpTestInput(batchSize, tup, inputTypes)
-					}
+					rng, _ := randutil.NewPseudoRand()
+					inputSources[i] = newOpTestSelInput(rng, batchSize, tup, inputTypes)
 				}
-				test(t, inputSources)
-			})
+			} else {
+				for i, tup := range tups {
+					if typs != nil {
+						inputTypes = typs[i]
+					}
+					inputSources[i] = newOpTestInput(batchSize, tup, inputTypes)
+				}
+			}
+			test(t, inputSources)
 		}
 	}
 }
@@ -496,23 +558,44 @@ func runTestsWithFn(
 // function that takes a list of input Operators, which will give back the
 // tuples provided in batches.
 func runTestsWithFixedSel(
-	t *testing.T, tups []tuples, sel []int, test func(t *testing.T, inputs []Operator),
+	t *testing.T,
+	tups []tuples,
+	typs []*types.T,
+	sel []int,
+	test func(t *testing.T, inputs []colexecbase.Operator),
 ) {
 	for _, batchSize := range []int{1, 2, 3, 16, 1024} {
-		t.Run(fmt.Sprintf("batchSize=%d/fixedSel", batchSize), func(t *testing.T) {
-			inputSources := make([]Operator, len(tups))
-			for i, tup := range tups {
-				inputSources[i] = newOpFixedSelTestInput(sel, batchSize, tup)
-			}
-			test(t, inputSources)
-		})
+		log.Infof(context.Background(), "batchSize=%d/fixedSel", batchSize)
+		inputSources := make([]colexecbase.Operator, len(tups))
+		for i, tup := range tups {
+			inputSources[i] = newOpFixedSelTestInput(sel, batchSize, tup, typs)
+		}
+		test(t, inputSources)
 	}
+}
+
+func stringToDatum(val string, typ *types.T, evalCtx *tree.EvalContext) tree.Datum {
+	expr, err := parser.ParseExpr(val)
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
+	semaCtx := tree.MakeSemaContext()
+	typedExpr, err := tree.TypeCheck(context.Background(), expr, &semaCtx, typ)
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
+	d, err := typedExpr.Eval(evalCtx)
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
+	return d
 }
 
 // setColVal is a test helper function to set the given value at the equivalent
 // col[idx]. This function is slow due to reflection.
-func setColVal(vec coldata.Vec, idx int, val interface{}) {
-	if vec.Type() == coltypes.Bytes {
+func setColVal(vec coldata.Vec, idx int, val interface{}, evalCtx *tree.EvalContext) {
+	canonicalTypeFamily := vec.CanonicalTypeFamily()
+	if canonicalTypeFamily == types.BytesFamily {
 		var (
 			bytesVal []byte
 			ok       bool
@@ -522,36 +605,88 @@ func setColVal(vec coldata.Vec, idx int, val interface{}) {
 			bytesVal = []byte(val.(string))
 		}
 		vec.Bytes().Set(idx, bytesVal)
-		return
+	} else if canonicalTypeFamily == types.DecimalFamily {
+		// setColVal is used in multiple places, therefore val can be either a float
+		// or apd.Decimal.
+		if decimalVal, ok := val.(apd.Decimal); ok {
+			vec.Decimal()[idx].Set(&decimalVal)
+		} else {
+			floatVal := val.(float64)
+			decimalVal, _, err := apd.NewFromString(fmt.Sprintf("%f", floatVal))
+			if err != nil {
+				colexecerror.InternalError(
+					errors.AssertionFailedf("unable to set decimal %f: %v", floatVal, err))
+			}
+			// .Set is used here instead of assignment to ensure the pointer address
+			// of the underlying storage for apd.Decimal remains the same. This can
+			// cause the code that does not properly use execgen package to fail.
+			vec.Decimal()[idx].Set(decimalVal)
+		}
+	} else if canonicalTypeFamily == typeconv.DatumVecCanonicalTypeFamily {
+		switch v := val.(type) {
+		case *coldataext.Datum:
+			vec.Datum().Set(idx, v)
+		case tree.Datum:
+			vec.Datum().Set(idx, v)
+		case string:
+			vec.Datum().Set(idx, stringToDatum(v, vec.Type(), evalCtx))
+		case json.JSON:
+			vec.Datum().Set(idx, &tree.DJSON{JSON: v})
+		default:
+			colexecerror.InternalError(errors.AssertionFailedf("unexpected type %T of datum-backed value: %v", v, v))
+		}
+	} else {
+		reflect.ValueOf(vec.Col()).Index(idx).Set(reflect.ValueOf(val).Convert(reflect.TypeOf(vec.Col()).Elem()))
 	}
-	reflect.ValueOf(vec.Col()).Index(idx).Set(reflect.ValueOf(val).Convert(reflect.TypeOf(vec.Col()).Elem()))
 }
 
-// opTestInput is an Operator that columnarizes test input in the form of tuples
-// of arbitrary Go coltypes. It's meant to be used in Operator unit tests in
-// conjunction with opTestOutput like the following:
+// extrapolateTypesFromTuples determines the type schema based on the input
+// tuples.
+func extrapolateTypesFromTuples(tups tuples) []*types.T {
+	typs := make([]*types.T, len(tups[0]))
+	for i := range typs {
+		// Default type for test cases is Int64 in case the entire column is
+		// null and the type is indeterminate.
+		typs[i] = types.Int
+		for _, tup := range tups {
+			if tup[i] != nil {
+				typs[i] = typeconv.UnsafeFromGoType(tup[i])
+				break
+			}
+		}
+	}
+	return typs
+}
+
+// opTestInput is an Operator that columnarizes test input in the form of
+// tuples of arbitrary Go types. It's meant to be used in Operator unit tests
+// in conjunction with opTestOutput like the following:
 //
 // inputTuples := tuples{
 //   {1,2,3.3,true},
 //   {5,6,7.0,false},
 // }
-// tupleSource := newOpTestInput(inputTuples, coltypes.Bool)
+// tupleSource := newOpTestInput(inputTuples, types.Bool)
 // opUnderTest := newFooOp(tupleSource, ...)
 // output := newOpTestOutput(opUnderTest, expectedOutputTuples)
 // if err := output.Verify(); err != nil {
 //     t.Fatal(err)
 // }
 type opTestInput struct {
-	ZeroInputNode
+	colexecbase.ZeroInputNode
 
-	typs []coltypes.T
+	typs []*types.T
 
 	batchSize int
 	tuples    tuples
-	batch     coldata.Batch
-	useSel    bool
-	rng       *rand.Rand
-	selection []int
+	// initialTuples are tuples passed in into the constructor, and we keep the
+	// reference to them in order to be able to reset the operator.
+	initialTuples tuples
+	batch         coldata.Batch
+	useSel        bool
+	rng           *rand.Rand
+	selection     []int
+	evalCtx       *tree.EvalContext
 
 	// injectAllNulls determines whether opTestInput will replace all values in
 	// the input tuples with nulls.
@@ -562,29 +697,31 @@ type opTestInput struct {
 	injectRandomNulls bool
 }
 
-var _ Operator = &opTestInput{}
+var _ ResettableOperator = &opTestInput{}
 
 // newOpTestInput returns a new opTestInput with the given input tuples and the
 // given type schema. If typs is nil, the input tuples are translated into
 // types automatically, using simple rules (e.g. integers always become Int64).
-func newOpTestInput(batchSize int, tuples tuples, typs []coltypes.T) *opTestInput {
+func newOpTestInput(batchSize int, tuples tuples, typs []*types.T) *opTestInput {
 	ret := &opTestInput{
-		batchSize: batchSize,
-		tuples:    tuples,
-		typs:      typs,
+		batchSize:     batchSize,
+		tuples:        tuples,
+		initialTuples: tuples,
+		typs:          typs,
+		evalCtx:       tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 	return ret
 }
 
-func newOpTestSelInput(
-	rng *rand.Rand, batchSize int, tuples tuples, typs []coltypes.T,
-) *opTestInput {
+func newOpTestSelInput(rng *rand.Rand, batchSize int, tuples tuples, typs []*types.T) *opTestInput {
 	ret := &opTestInput{
-		useSel:    true,
-		rng:       rng,
-		batchSize: batchSize,
-		tuples:    tuples,
-		typs:      typs,
+		useSel:        true,
+		rng:           rng,
+		batchSize:     batchSize,
+		tuples:        tuples,
+		initialTuples: tuples,
+		typs:          typs,
+		evalCtx:       tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 	return ret
 }
@@ -592,25 +729,11 @@ func newOpTestSelInput(
 func (s *opTestInput) Init() {
 	if s.typs == nil {
 		if len(s.tuples) == 0 {
-			execerror.VectorizedInternalPanic("empty tuple source with no specified types")
+			colexecerror.InternalError(errors.AssertionFailedf("empty tuple source with no specified types"))
 		}
-
-		// The type schema was not provided, so we need to determine it based on
-		// the input tuple.
-		s.typs = make([]coltypes.T, len(s.tuples[0]))
-		for i := range s.typs {
-			// Default type for test cases is Int64 in case the entire column is null
-			// and the type is indeterminate.
-			s.typs[i] = coltypes.Int64
-			for _, tup := range s.tuples {
-				if tup[i] != nil {
-					s.typs[i] = coltypes.FromGoType(tup[i])
-					break
-				}
-			}
-		}
+		s.typs = extrapolateTypesFromTuples(s.tuples)
 	}
-	s.batch = testAllocator.NewMemBatch(s.typs)
+	s.batch = testAllocator.NewMemBatchWithMaxCapacity(s.typs)
 
 	s.selection = make([]int, coldata.BatchSize())
 	for i := range s.selection {
@@ -633,7 +756,7 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 	tupleLen := len(tups[0])
 	for i := range tups {
 		if len(tups[i]) != tupleLen {
-			execerror.VectorizedInternalPanic(fmt.Sprintf("mismatched tuple lens: found %+v expected %d vals",
+			colexecerror.InternalError(errors.AssertionFailedf("mismatched tuple lens: found %+v expected %d vals",
 				tups[i], tupleLen))
 		}
 	}
@@ -674,16 +797,15 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 
 	// Reset nulls for all columns in this batch.
 	for _, colVec := range s.batch.ColVecs() {
-		if colVec.Type() != coltypes.Unhandled {
+		if colVec.CanonicalTypeFamily() != types.UnknownFamily {
 			colVec.Nulls().UnsetNulls()
 		}
 	}
 
-	rng := rand.New(rand.NewSource(123))
+	rng, _ := randutil.NewPseudoRand()
 
 	for i := range s.typs {
 		vec := s.batch.ColVec(i)
-		typ := vec.Type()
 		// Automatically convert the Go values into exec.Type slice elements using
 		// reflection. This is slow, but acceptable for tests.
 		col := reflect.ValueOf(vec.Col())
@@ -700,25 +822,54 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 					// NULL. For the other 50% of cases we leave the data unset which
 					// exercises other scenarios (like division by zero when the value is
 					// actually NULL).
-					if typ == coltypes.Decimal {
+					canonicalTypeFamily := vec.CanonicalTypeFamily()
+					switch canonicalTypeFamily {
+					case types.DecimalFamily:
 						d := apd.Decimal{}
 						_, err := d.SetFloat64(rng.Float64())
 						if err != nil {
-							execerror.VectorizedInternalPanic(fmt.Sprintf("%v", err))
+							colexecerror.InternalError(errors.AssertionFailedf("%v", err))
 						}
 						col.Index(outputIdx).Set(reflect.ValueOf(d))
-					} else if typ == coltypes.Bytes {
+					case types.BytesFamily:
 						newBytes := make([]byte, rng.Intn(16)+1)
 						rng.Read(newBytes)
-						setColVal(vec, outputIdx, newBytes)
-					} else if val, ok := quick.Value(reflect.TypeOf(vec.Col()).Elem(), rng); ok {
-						setColVal(vec, outputIdx, val.Interface())
-					} else {
-						execerror.VectorizedInternalPanic(fmt.Sprintf("could not generate a random value of type %T\n.", vec.Type()))
+						setColVal(vec, outputIdx, newBytes, s.evalCtx)
+					case types.IntervalFamily:
+						setColVal(vec, outputIdx, duration.MakeDuration(rng.Int63(), rng.Int63(), rng.Int63()), s.evalCtx)
+					case typeconv.DatumVecCanonicalTypeFamily:
+						switch vec.Type().Family() {
+						case types.CollatedStringFamily:
+							collatedStringType := types.MakeCollatedString(types.String, *rowenc.RandCollationLocale(rng))
+							randomBytes := make([]byte, rng.Intn(16)+1)
+							rng.Read(randomBytes)
+							d, err := tree.NewDCollatedString(string(randomBytes), collatedStringType.Locale(), &tree.CollationEnvironment{})
+							if err != nil {
+								colexecerror.InternalError(err)
+							}
+							setColVal(vec, outputIdx, d, s.evalCtx)
+						case types.JsonFamily:
+							newBytes := make([]byte, rng.Intn(16)+1)
+							rng.Read(newBytes)
+							j := json.FromString(string(newBytes))
+							setColVal(vec, outputIdx, j, s.evalCtx)
+						case types.TimeTZFamily:
+							setColVal(vec, outputIdx, tree.NewDTimeTZFromOffset(timeofday.FromInt(rng.Int63()), rng.Int31()), s.evalCtx)
+						case types.TupleFamily:
+							setColVal(vec, outputIdx, stringToDatum("(NULL)", vec.Type(), s.evalCtx), s.evalCtx)
+						default:
+							colexecerror.InternalError(errors.AssertionFailedf("unexpected datum-backed type: %s", vec.Type()))
+						}
+					default:
+						if val, ok := quick.Value(reflect.TypeOf(vec.Col()).Elem(), rng); ok {
+							setColVal(vec, outputIdx, val.Interface(), s.evalCtx)
+						} else {
+							colexecerror.InternalError(errors.AssertionFailedf("could not generate a random value of type %s", vec.Type()))
+						}
 					}
 				}
 			} else {
-				setColVal(vec, outputIdx, tups[j][i])
+				setColVal(vec, outputIdx, tups[j][i], s.evalCtx)
 			}
 		}
 	}
@@ -727,59 +878,57 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 	return s.batch
 }
 
-type opFixedSelTestInput struct {
-	ZeroInputNode
+func (s *opTestInput) reset(context.Context) {
+	s.tuples = s.initialTuples
+}
 
-	typs []coltypes.T
+type opFixedSelTestInput struct {
+	colexecbase.ZeroInputNode
+
+	typs []*types.T
 
 	batchSize int
 	tuples    tuples
 	batch     coldata.Batch
 	sel       []int
+	evalCtx   *tree.EvalContext
 	// idx is the index of the tuple to be emitted next. We need to maintain it
 	// in case the provided selection vector or provided tuples (if sel is nil)
 	// is longer than requested batch size.
 	idx int
 }
 
-var _ Operator = &opFixedSelTestInput{}
+var _ ResettableOperator = &opFixedSelTestInput{}
 
 // newOpFixedSelTestInput returns a new opFixedSelTestInput with the given
 // input tuples and selection vector. The input tuples are translated into
 // types automatically, using simple rules (e.g. integers always become Int64).
-func newOpFixedSelTestInput(sel []int, batchSize int, tuples tuples) *opFixedSelTestInput {
+func newOpFixedSelTestInput(
+	sel []int, batchSize int, tuples tuples, typs []*types.T,
+) *opFixedSelTestInput {
 	ret := &opFixedSelTestInput{
 		batchSize: batchSize,
 		sel:       sel,
 		tuples:    tuples,
+		typs:      typs,
+		evalCtx:   tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 	return ret
 }
 
 func (s *opFixedSelTestInput) Init() {
-	if len(s.tuples) == 0 {
-		execerror.VectorizedInternalPanic("empty tuple source")
-	}
-
-	typs := make([]coltypes.T, len(s.tuples[0]))
-	for i := range typs {
-		// Default type for test cases is Int64 in case the entire column is null
-		// and the type is indeterminate.
-		typs[i] = coltypes.Int64
-		for _, tup := range s.tuples {
-			if tup[i] != nil {
-				typs[i] = coltypes.FromGoType(tup[i])
-				break
-			}
+	if s.typs == nil {
+		if len(s.tuples) == 0 {
+			colexecerror.InternalError(errors.AssertionFailedf("empty tuple source with no specified types"))
 		}
+		s.typs = extrapolateTypesFromTuples(s.tuples)
 	}
 
-	s.typs = typs
-	s.batch = testAllocator.NewMemBatch(s.typs)
+	s.batch = testAllocator.NewMemBatchWithMaxCapacity(s.typs)
 	tupleLen := len(s.tuples[0])
 	for _, i := range s.sel {
 		if len(s.tuples[i]) != tupleLen {
-			execerror.VectorizedInternalPanic(fmt.Sprintf("mismatched tuple lens: found %+v expected %d vals",
+			colexecerror.InternalError(errors.AssertionFailedf("mismatched tuple lens: found %+v expected %d vals",
 				s.tuples[i], tupleLen))
 		}
 	}
@@ -802,7 +951,7 @@ func (s *opFixedSelTestInput) Init() {
 				if s.tuples[j][i] == nil {
 					vec.Nulls().SetNull(j)
 				} else {
-					setColVal(vec, j, s.tuples[j][i])
+					setColVal(vec, j, s.tuples[j][i], s.evalCtx)
 				}
 			}
 		}
@@ -828,7 +977,7 @@ func (s *opFixedSelTestInput) Next(context.Context) coldata.Batch {
 				} else {
 					// Automatically convert the Go values into exec.Type slice elements using
 					// reflection. This is slow, but acceptable for tests.
-					setColVal(vec, j, s.tuples[s.idx+j][i])
+					setColVal(vec, j, s.tuples[s.idx+j][i], s.evalCtx)
 				}
 			}
 		}
@@ -849,11 +998,16 @@ func (s *opFixedSelTestInput) Next(context.Context) coldata.Batch {
 	return s.batch
 }
 
+func (s *opFixedSelTestInput) reset(context.Context) {
+	s.idx = 0
+}
+
 // opTestOutput is a test verification struct that ensures its input batches
 // match some expected output tuples.
 type opTestOutput struct {
 	OneInputNode
 	expected tuples
+	evalCtx  *tree.EvalContext
 
 	curIdx int
 	batch  coldata.Batch
@@ -861,12 +1015,13 @@ type opTestOutput struct {
 
 // newOpTestOutput returns a new opTestOutput, initialized with the given input
 // to verify that the output is exactly equal to the expected tuples.
-func newOpTestOutput(input Operator, expected tuples) *opTestOutput {
+func newOpTestOutput(input colexecbase.Operator, expected tuples) *opTestOutput {
 	input.Init()
 
 	return &opTestOutput{
 		OneInputNode: NewOneInputNode(input),
 		expected:     expected,
+		evalCtx:      tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 }
 
@@ -886,11 +1041,13 @@ func getTupleFromBatch(batch coldata.Batch, tupleIdx int) tuple {
 			var val reflect.Value
 			if colBytes, ok := vec.Col().(*coldata.Bytes); ok {
 				val = reflect.ValueOf(append([]byte(nil), colBytes.Get(tupleIdx)...))
-			} else if vec.Type() == coltypes.Decimal {
+			} else if vec.CanonicalTypeFamily() == types.DecimalFamily {
 				colDec := vec.Decimal()
 				var newDec apd.Decimal
 				newDec.Set(&colDec[tupleIdx])
 				val = reflect.ValueOf(newDec)
+			} else if vec.CanonicalTypeFamily() == typeconv.DatumVecCanonicalTypeFamily {
+				val = reflect.ValueOf(vec.Datum().Get(tupleIdx).(*coldataext.Datum).Datum)
 			} else {
 				val = reflect.ValueOf(vec.Col()).Index(tupleIdx)
 			}
@@ -914,6 +1071,14 @@ func (r *opTestOutput) next(ctx context.Context) tuple {
 	return ret
 }
 
+func (r *opTestOutput) reset(ctx context.Context) {
+	if r, ok := r.input.(resetter); ok {
+		r.reset(ctx)
+	}
+	r.curIdx = 0
+	r.batch = nil
+}
+
 // Verify ensures that the input to this opTestOutput produced the same results
 // and in the same order as the ones expected in the opTestOutput's expected
 // tuples, using a slow, reflection-based comparison method, returning an error
@@ -928,7 +1093,7 @@ func (r *opTestOutput) Verify() error {
 		}
 		actual = append(actual, tup)
 	}
-	return assertTuplesOrderedEqual(r.expected, actual)
+	return assertTuplesOrderedEqual(r.expected, actual, r.evalCtx)
 }
 
 // VerifyAnyOrder ensures that the input to this opTestOutput produced the same
@@ -946,13 +1111,13 @@ func (r *opTestOutput) VerifyAnyOrder() error {
 		}
 		actual = append(actual, tup)
 	}
-	return assertTuplesSetsEqual(r.expected, actual)
+	return assertTuplesSetsEqual(r.expected, actual, r.evalCtx)
 }
 
 // tupleEquals checks that two tuples are equal, using a slow,
 // reflection-based method to do the comparison. Reflection is used so that
 // values can be compared in a type-agnostic way.
-func tupleEquals(expected tuple, actual tuple) bool {
+func tupleEquals(expected tuple, actual tuple, evalCtx *tree.EvalContext) bool {
 	if len(expected) != len(actual) {
 		return false
 	}
@@ -972,6 +1137,39 @@ func tupleEquals(expected tuple, actual tuple) bool {
 					}
 				}
 			}
+			// Special case for decimals.
+			if d1, ok := actual[i].(apd.Decimal); ok {
+				if f2, ok := expected[i].(float64); ok {
+					d2, _, err := apd.NewFromString(fmt.Sprintf("%f", f2))
+					if err == nil && d1.Cmp(d2) == 0 {
+						continue
+					} else {
+						return false
+					}
+				}
+			}
+			// Special case for datum-backed types.
+			if d1, ok := actual[i].(tree.Datum); ok {
+				if d, ok := d1.(*coldataext.Datum); ok {
+					d1 = d.Datum
+				}
+				var d2 tree.Datum
+				switch d := expected[i].(type) {
+				case *coldataext.Datum:
+					d2 = d.Datum
+				case tree.Datum:
+					d2 = d
+				case string:
+					d2 = stringToDatum(d, d1.ResolvedType(), evalCtx)
+				default:
+					return false
+				}
+				if d1.Compare(evalCtx, d2) == 0 {
+					continue
+				}
+				return false
+			}
+			// Default case.
 			if !reflect.DeepEqual(
 				reflect.ValueOf(actual[i]).Convert(reflect.TypeOf(expected[i])).Interface(),
 				expected[i],
@@ -1008,23 +1206,30 @@ func makeError(expected tuples, actual tuples) error {
 }
 
 // assertTuplesSetsEqual asserts that two sets of tuples are equal.
-func assertTuplesSetsEqual(expected tuples, actual tuples) error {
+func assertTuplesSetsEqual(expected tuples, actual tuples, evalCtx *tree.EvalContext) error {
 	if len(expected) != len(actual) {
 		return makeError(expected, actual)
 	}
-	actual = actual.sort()
-	expected = expected.sort()
-	return assertTuplesOrderedEqual(expected, actual)
+	var tupleFromOtherSet tuple
+	if len(expected) > 0 {
+		tupleFromOtherSet = expected[0]
+	}
+	actual = actual.sort(evalCtx, tupleFromOtherSet)
+	if len(actual) > 0 {
+		tupleFromOtherSet = actual[0]
+	}
+	expected = expected.sort(evalCtx, tupleFromOtherSet)
+	return assertTuplesOrderedEqual(expected, actual, evalCtx)
 }
 
 // assertTuplesOrderedEqual asserts that two permutations of tuples are equal
 // in order.
-func assertTuplesOrderedEqual(expected tuples, actual tuples) error {
+func assertTuplesOrderedEqual(expected tuples, actual tuples, evalCtx *tree.EvalContext) error {
 	if len(expected) != len(actual) {
 		return errors.Errorf("expected %+v, actual %+v", expected, actual)
 	}
 	for i := range expected {
-		if !tupleEquals(expected[i], actual[i]) {
+		if !tupleEquals(expected[i], actual[i], evalCtx) {
 			return makeError(expected, actual)
 		}
 	}
@@ -1034,20 +1239,22 @@ func assertTuplesOrderedEqual(expected tuples, actual tuples) error {
 // finiteBatchSource is an Operator that returns the same batch a specified
 // number of times.
 type finiteBatchSource struct {
-	ZeroInputNode
+	colexecbase.ZeroInputNode
 
-	repeatableBatch *RepeatableBatchSource
+	repeatableBatch *colexecbase.RepeatableBatchSource
 
 	usableCount int
 }
 
-var _ Operator = &finiteBatchSource{}
+var _ colexecbase.Operator = &finiteBatchSource{}
 
 // newFiniteBatchSource returns a new Operator initialized to return its input
 // batch a specified number of times.
-func newFiniteBatchSource(batch coldata.Batch, usableCount int) *finiteBatchSource {
+func newFiniteBatchSource(
+	batch coldata.Batch, typs []*types.T, usableCount int,
+) *finiteBatchSource {
 	return &finiteBatchSource{
-		repeatableBatch: NewRepeatableBatchSource(testAllocator, batch),
+		repeatableBatch: colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs),
 		usableCount:     usableCount,
 	}
 }
@@ -1073,19 +1280,21 @@ func (f *finiteBatchSource) reset(usableCount int) {
 // (except for the first) the batch is returned to emulate source that is
 // already ordered on matchLen columns.
 type finiteChunksSource struct {
-	ZeroInputNode
-	repeatableBatch *RepeatableBatchSource
+	colexecbase.ZeroInputNode
+	repeatableBatch *colexecbase.RepeatableBatchSource
 
 	usableCount int
 	matchLen    int
 	adjustment  []int64
 }
 
-var _ Operator = &finiteChunksSource{}
+var _ colexecbase.Operator = &finiteChunksSource{}
 
-func newFiniteChunksSource(batch coldata.Batch, usableCount int, matchLen int) *finiteChunksSource {
+func newFiniteChunksSource(
+	batch coldata.Batch, typs []*types.T, usableCount int, matchLen int,
+) *finiteChunksSource {
 	return &finiteChunksSource{
-		repeatableBatch: NewRepeatableBatchSource(testAllocator, batch),
+		repeatableBatch: colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs),
 		usableCount:     usableCount,
 		matchLen:        matchLen,
 	}
@@ -1100,7 +1309,7 @@ func (f *finiteChunksSource) Next(ctx context.Context) coldata.Batch {
 	if f.usableCount > 0 {
 		f.usableCount--
 		batch := f.repeatableBatch.Next(ctx)
-		if f.adjustment[0] == 0 {
+		if f.matchLen > 0 && f.adjustment[0] == 0 {
 			// We need to calculate the difference between the first and the last
 			// tuples in batch in first matchLen columns so that in the following
 			// calls to Next() the batch is adjusted such that tuples in consecutive
@@ -1116,6 +1325,12 @@ func (f *finiteChunksSource) Next(ctx context.Context) coldata.Batch {
 				for j := range int64Vec {
 					int64Vec[j] += f.adjustment[i]
 				}
+				// We need to update the adjustments because RepeatableBatchSource
+				// returns the original batch that it was instantiated with, and we
+				// want to have constantly non-decreasing vectors.
+				firstValue := batch.ColVec(i).Int64()[0]
+				lastValue := batch.ColVec(i).Int64()[batch.Length()-1]
+				f.adjustment[i] += lastValue - firstValue + 1
 			}
 		}
 		return batch
@@ -1125,6 +1340,7 @@ func (f *finiteChunksSource) Next(ctx context.Context) coldata.Batch {
 
 func TestOpTestInputOutput(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	inputs := []tuples{
 		{
 			{1, 2, 100},
@@ -1133,7 +1349,7 @@ func TestOpTestInputOutput(t *testing.T) {
 			{1, 5, 0},
 		},
 	}
-	runTestsWithFn(t, inputs, nil /* typs */, func(t *testing.T, sources []Operator) {
+	runTestsWithFn(t, inputs, nil /* typs */, func(t *testing.T, sources []colexecbase.Operator) {
 		out := newOpTestOutput(sources[0], inputs[0])
 
 		if err := out.Verify(); err != nil {
@@ -1144,13 +1360,15 @@ func TestOpTestInputOutput(t *testing.T) {
 
 func TestRepeatableBatchSource(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Int64})
+	defer log.Scope(t).Close(t)
+	typs := []*types.T{types.Int}
+	batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	batchLen := 10
 	if coldata.BatchSize() < batchLen {
 		batchLen = coldata.BatchSize()
 	}
 	batch.SetLength(batchLen)
-	input := NewRepeatableBatchSource(testAllocator, batch)
+	input := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
 
 	b := input.Next(context.Background())
 	b.SetLength(0)
@@ -1167,18 +1385,20 @@ func TestRepeatableBatchSource(t *testing.T) {
 
 func TestRepeatableBatchSourceWithFixedSel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Int64})
+	defer log.Scope(t).Close(t)
+	typs := []*types.T{types.Int}
+	batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	rng, _ := randutil.NewPseudoRand()
 	batchSize := 10
 	if batchSize > coldata.BatchSize() {
 		batchSize = coldata.BatchSize()
 	}
-	sel := randomSel(rng, batchSize, 0 /* probOfOmitting */)
+	sel := coldatatestutils.RandomSel(rng, batchSize, 0 /* probOfOmitting */)
 	batchLen := len(sel)
 	batch.SetLength(batchLen)
 	batch.SetSelection(true)
 	copy(batch.Selection(), sel)
-	input := NewRepeatableBatchSource(testAllocator, batch)
+	input := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
 	b := input.Next(context.Background())
 
 	b.SetLength(0)
@@ -1197,7 +1417,7 @@ func TestRepeatableBatchSourceWithFixedSel(t *testing.T) {
 		}
 	}
 
-	newSel := randomSel(rng, 10 /* batchSize */, 0.2 /* probOfOmitting */)
+	newSel := coldatatestutils.RandomSel(rng, 10 /* batchSize */, 0.2 /* probOfOmitting */)
 	newBatchLen := len(sel)
 	b.SetLength(newBatchLen)
 	b.SetSelection(true)
@@ -1220,8 +1440,8 @@ func TestRepeatableBatchSourceWithFixedSel(t *testing.T) {
 // chunkingBatchSource is a batch source that takes unlimited-size columns and
 // chunks them into BatchSize()-sized chunks when Nexted.
 type chunkingBatchSource struct {
-	ZeroInputNode
-	typs []coltypes.T
+	colexecbase.ZeroInputNode
+	typs []*types.T
 	cols []coldata.Vec
 	len  int
 
@@ -1229,11 +1449,11 @@ type chunkingBatchSource struct {
 	batch  coldata.Batch
 }
 
-var _ Operator = &chunkingBatchSource{}
+var _ ResettableOperator = &chunkingBatchSource{}
 
 // newChunkingBatchSource returns a new chunkingBatchSource with the given
 // column types, columns, and length.
-func newChunkingBatchSource(typs []coltypes.T, cols []coldata.Vec, len int) *chunkingBatchSource {
+func newChunkingBatchSource(typs []*types.T, cols []coldata.Vec, len int) *chunkingBatchSource {
 	return &chunkingBatchSource{
 		typs: typs,
 		cols: cols,
@@ -1242,7 +1462,7 @@ func newChunkingBatchSource(typs []coltypes.T, cols []coldata.Vec, len int) *chu
 }
 
 func (c *chunkingBatchSource) Init() {
-	c.batch = testAllocator.NewMemBatch(c.typs)
+	c.batch = testAllocator.NewMemBatchWithMaxCapacity(c.typs)
 	for i := range c.cols {
 		c.batch.ColVec(i).SetCol(c.cols[i].Col())
 		c.batch.ColVec(i).SetNulls(c.cols[i].Nulls())
@@ -1262,17 +1482,20 @@ func (c *chunkingBatchSource) Next(context.Context) coldata.Batch {
 	if lastIdx > c.len {
 		lastIdx = c.len
 	}
-	for i, vec := range c.batch.ColVecs() {
-		vec.SetCol(c.cols[i].Window(c.typs[i], c.curIdx, lastIdx).Col())
+	for i := range c.typs {
+		// Note that new vectors could be appended to the batch, but we are not
+		// responsible for updating those, so we iterate only up to len(c.typs)
+		// as per out initialization.
+		c.batch.ColVec(i).SetCol(c.cols[i].Window(c.curIdx, lastIdx).Col())
 		nullsSlice := c.cols[i].Nulls().Slice(c.curIdx, lastIdx)
-		vec.SetNulls(&nullsSlice)
+		c.batch.ColVec(i).SetNulls(&nullsSlice)
 	}
 	c.batch.SetLength(lastIdx - c.curIdx)
 	c.curIdx = lastIdx
 	return c.batch
 }
 
-func (c *chunkingBatchSource) reset() {
+func (c *chunkingBatchSource) reset(context.Context) {
 	c.curIdx = 0
 }
 
@@ -1281,30 +1504,25 @@ func (c *chunkingBatchSource) reset() {
 // called.
 type joinTestCase struct {
 	description           string
-	joinType              sqlbase.JoinType
-	leftTuples            []tuple
-	leftTypes             []coltypes.T
+	joinType              descpb.JoinType
+	leftTuples            tuples
+	leftTypes             []*types.T
 	leftOutCols           []uint32
 	leftEqCols            []uint32
 	leftDirections        []execinfrapb.Ordering_Column_Direction
-	rightTuples           []tuple
-	rightTypes            []coltypes.T
+	rightTuples           tuples
+	rightTypes            []*types.T
 	rightOutCols          []uint32
 	rightEqCols           []uint32
 	rightDirections       []execinfrapb.Ordering_Column_Direction
 	leftEqColsAreKey      bool
 	rightEqColsAreKey     bool
-	expected              []tuple
-	outputBatchSize       int
+	expected              tuples
 	skipAllNullsInjection bool
 	onExpr                execinfrapb.Expression
 }
 
 func (tc *joinTestCase) init() {
-	if tc.outputBatchSize == 0 {
-		tc.outputBatchSize = coldata.BatchSize()
-	}
-
 	if len(tc.leftDirections) == 0 {
 		tc.leftDirections = make([]execinfrapb.Ordering_Column_Direction, len(tc.leftTypes))
 		for i := range tc.leftDirections {
@@ -1320,12 +1538,188 @@ func (tc *joinTestCase) init() {
 	}
 }
 
+// mirror attempts to create a "mirror" test case of tc and returns nil if it
+// can't (a "mirror" test case is derived from the original one by swapping the
+// inputs and adjusting all of the corresponding fields accordingly). Currently
+// it works only for LEFT SEMI and LEFT ANTI join types.
+// TODO(yuzefovich): extend this to other join types when possible.
+func (tc *joinTestCase) mirror() *joinTestCase {
+	switch tc.joinType {
+	case descpb.LeftSemiJoin, descpb.LeftAntiJoin:
+	default:
+		return nil
+	}
+	mirroringCase := *tc
+	mirroringCase.description = strings.NewReplacer(
+		"LEFT", "RIGHT",
+		"RIGHT", "LEFT",
+		"left", "right",
+		"right", "left",
+	).Replace(tc.description)
+	if tc.joinType == descpb.LeftSemiJoin {
+		mirroringCase.joinType = descpb.RightSemiJoin
+	} else {
+		mirroringCase.joinType = descpb.RightAntiJoin
+	}
+	mirroringCase.leftTuples, mirroringCase.rightTuples = mirroringCase.rightTuples, mirroringCase.leftTuples
+	mirroringCase.leftTypes, mirroringCase.rightTypes = mirroringCase.rightTypes, mirroringCase.leftTypes
+	mirroringCase.leftOutCols, mirroringCase.rightOutCols = mirroringCase.rightOutCols, mirroringCase.leftOutCols
+	mirroringCase.leftEqCols, mirroringCase.rightEqCols = mirroringCase.rightEqCols, mirroringCase.leftEqCols
+	mirroringCase.leftDirections, mirroringCase.rightDirections = mirroringCase.rightDirections, mirroringCase.leftDirections
+	mirroringCase.leftEqColsAreKey, mirroringCase.rightEqColsAreKey = mirroringCase.rightEqColsAreKey, mirroringCase.leftEqColsAreKey
+	// TODO(yuzefovich): once we support ON expression in more join types, this
+	// method will need to update non-empty ON expressions as well.
+	return &mirroringCase
+}
+
+// withMirrors will add all "mirror" test cases.
+func withMirrors(testCases []*joinTestCase) []*joinTestCase {
+	numOrigTestCases := len(testCases)
+	for _, c := range testCases[:numOrigTestCases] {
+		if mirror := c.mirror(); mirror != nil {
+			testCases = append(testCases, mirror)
+		}
+	}
+	return testCases
+}
+
+// mutateTypes returns a slice of joinTestCases with varied types. Assumes
+// the input is made up of just int64s. Calling this
+func (tc *joinTestCase) mutateTypes() []*joinTestCase {
+	ret := []*joinTestCase{tc}
+
+	for _, typ := range []*types.T{types.Decimal, types.Bytes} {
+		if typ.Identical(types.Bytes) {
+			// Skip test cases with ON conditions for now, since those expect
+			// numeric inputs.
+			if !tc.onExpr.Empty() {
+				continue
+			}
+		}
+		newTc := *tc
+		newTc.leftTypes = make([]*types.T, len(tc.leftTypes))
+		newTc.rightTypes = make([]*types.T, len(tc.rightTypes))
+		copy(newTc.leftTypes, tc.leftTypes)
+		copy(newTc.rightTypes, tc.rightTypes)
+		for _, typs := range [][]*types.T{newTc.leftTypes, newTc.rightTypes} {
+			for i := range typs {
+				if !typ.Identical(types.Int) {
+					// We currently can only mutate test cases that are made up of int64
+					// only.
+					return ret
+				}
+				typs[i] = typ
+			}
+		}
+		newTc.leftTuples = tc.leftTuples.clone()
+		newTc.rightTuples = tc.rightTuples.clone()
+		newTc.expected = tc.expected.clone()
+
+		for _, tups := range []tuples{newTc.leftTuples, newTc.rightTuples, newTc.expected} {
+			for i := range tups {
+				for j := range tups[i] {
+					if tups[i][j] == nil {
+						continue
+					}
+					switch typeconv.TypeFamilyToCanonicalTypeFamily(typ.Family()) {
+					case types.DecimalFamily:
+						var d apd.Decimal
+						_, _ = d.SetFloat64(float64(tups[i][j].(int)))
+						tups[i][j] = d
+					case types.BytesFamily:
+						tups[i][j] = fmt.Sprintf("%.10d", tups[i][j].(int))
+					}
+				}
+			}
+		}
+		ret = append(ret, &newTc)
+	}
+	return ret
+}
+
 type sortTestCase struct {
 	description string
 	tuples      tuples
 	expected    tuples
-	logTypes    []types.T
+	typs        []*types.T
 	ordCols     []execinfrapb.Ordering_Column
 	matchLen    int
-	k           uint16
+	k           uint64
+}
+
+// Mock typing context for the typechecker.
+type mockTypeContext struct {
+	typs []*types.T
+}
+
+func (p *mockTypeContext) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
+	return tree.DNull.Eval(ctx)
+}
+
+func (p *mockTypeContext) IndexedVarResolvedType(idx int) *types.T {
+	return p.typs[idx]
+}
+
+func (p *mockTypeContext) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
+	n := tree.Name(fmt.Sprintf("$%d", idx))
+	return &n
+}
+
+// createTestProjectingOperator creates a projecting operator that performs
+// projectingExpr on input that has inputTypes as its output columns. It does
+// so by making a noop processor core with post-processing step that passes
+// through all input columns and renders an additional column using
+// projectingExpr to create the render; then, the processor core is used to
+// plan all necessary infrastructure using NewColOperator call.
+// - canFallbackToRowexec determines whether NewColOperator will be able to use
+// rowexec.NewProcessor to instantiate a wrapped rowexec processor. This should
+// be false unless we expect that for some unit tests we will not be able to
+// plan the "pure" vectorized operators.
+func createTestProjectingOperator(
+	ctx context.Context,
+	flowCtx *execinfra.FlowCtx,
+	input colexecbase.Operator,
+	inputTypes []*types.T,
+	projectingExpr string,
+	canFallbackToRowexec bool,
+) (colexecbase.Operator, error) {
+	expr, err := parser.ParseExpr(projectingExpr)
+	if err != nil {
+		return nil, err
+	}
+	p := &mockTypeContext{typs: inputTypes}
+	semaCtx := tree.MakeSemaContext()
+	semaCtx.IVarContainer = p
+	typedExpr, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
+	if err != nil {
+		return nil, err
+	}
+	renderExprs := make([]execinfrapb.Expression, len(inputTypes)+1)
+	for i := range inputTypes {
+		renderExprs[i].Expr = fmt.Sprintf("@%d", i+1)
+	}
+	renderExprs[len(inputTypes)].LocalExpr = typedExpr
+	spec := &execinfrapb.ProcessorSpec{
+		Input: []execinfrapb.InputSyncSpec{{ColumnTypes: inputTypes}},
+		Core: execinfrapb.ProcessorCoreUnion{
+			Noop: &execinfrapb.NoopCoreSpec{},
+		},
+		Post: execinfrapb.PostProcessSpec{
+			RenderExprs: renderExprs,
+		},
+		ResultTypes: append(inputTypes, typedExpr.ResolvedType()),
+	}
+	args := &NewColOperatorArgs{
+		Spec:                spec,
+		Inputs:              []colexecbase.Operator{input},
+		StreamingMemAccount: testMemAcc,
+	}
+	if canFallbackToRowexec {
+		args.ProcessorConstructor = rowexec.NewProcessor
+	}
+	result, err := TestNewColOperator(ctx, flowCtx, args)
+	if err != nil {
+		return nil, err
+	}
+	return result.Op, nil
 }

@@ -15,13 +15,20 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // This test creates table/database descriptors that have entries in the
@@ -30,16 +37,18 @@ import (
 // cluster version has not been finalized yet.
 func TestNamespaceTableSemantics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-	ctx := context.TODO()
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
+	codec := keys.SystemSQLCodec
 
 	// IDs to map (parentID, name) to. Actual ID value is irrelevant to the test.
 	idCounter := keys.MinNonPredefinedUserDescID
 
 	// Database name.
-	dKey := sqlbase.NewDeprecatedDatabaseKey("test").Key()
+	dKey := catalogkeys.NewDeprecatedDatabaseKey("test").Key(codec)
 	if gr, err := kvDB.Get(ctx, dKey); err != nil {
 		t.Fatal(err)
 	} else if gr.Exists() {
@@ -55,7 +64,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	// Creating the database should fail, because an entry was explicitly added to
 	// the system.namespace_deprecated table.
 	_, err := sqlDB.Exec(`CREATE DATABASE test`)
-	if !testutils.IsError(err, sqlbase.NewDatabaseAlreadyExistsError("test").Error()) {
+	if !testutils.IsError(err, sqlerrors.NewDatabaseAlreadyExistsError("test").Error()) {
 		t.Fatalf("unexpected error %v", err)
 	}
 
@@ -79,6 +88,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	if _, err := sqlDB.Exec(`CREATE DATABASE test`); err != nil {
 		t.Fatal(err)
 	}
+	idCounter++
 
 	// Ensure the new entry is added to the new namespace table.
 	if gr, err := kvDB.Get(ctx, dKey); err != nil {
@@ -86,7 +96,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	} else if gr.Exists() {
 		t.Fatal("database key unexpectedly found in the deprecated system.namespace")
 	}
-	newDKey := sqlbase.NewDatabaseKey("test").Key()
+	newDKey := catalogkeys.NewDatabaseKey("test").Key(codec)
 	if gr, err := kvDB.Get(ctx, newDKey); err != nil {
 		t.Fatal(err)
 	} else if !gr.Exists() {
@@ -94,7 +104,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	}
 
 	txn := kvDB.NewTxn(ctx, "lookup-test-db-id")
-	found, dbID, err := sqlbase.LookupDatabaseID(ctx, txn, "test")
+	found, dbID, err := catalogkv.LookupDatabaseID(ctx, txn, codec, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,26 +113,58 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	}
 
 	// Simulate the same test for a table and sequence.
-	tKey := sqlbase.NewDeprecatedTableKey(dbID, "rel").Key()
+	tKey := catalogkeys.NewDeprecatedTableKey(dbID, "rel").Key(codec)
 	if err := kvDB.CPut(ctx, tKey, idCounter, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// TODO (rohany): This is pretty hacky, but needs to be done in order
+	//  for the exact errors to show up below.
+	// The tests below ensure that namespace collisions are detected against
+	// the deprecated namespace key entry for (dbID, "rel"). Just writing
+	// the key in the namespace table worked until the create table functions
+	// perform a lookup into system.descriptor to see what kind of object they
+	// collided with, now that user defined types are present. To make sure
+	// everything is working as expected, we need to bump the ID generator
+	// counter to be in line with idCounter, and write a dummy table descriptor
+	// into system.descriptor so that conflicts against this fake entry are
+	// correctly detected.
+	if _, err := kvDB.Inc(ctx, codec.DescIDSequenceKey(), 1); err != nil {
+		t.Fatal(err)
+	}
+	mKey := catalogkeys.MakeDescMetadataKey(codec, descpb.ID(idCounter))
+	// Fill the dummy descriptor with garbage.
+	desc := tabledesc.InitTableDescriptor(
+		descpb.ID(idCounter),
+		dbID,
+		keys.PublicSchemaID,
+		"rel",
+		hlc.Timestamp{},
+		&descpb.PrivilegeDescriptor{},
+		tree.PersistencePermanent,
+	)
+	if err := desc.AllocateIDs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := kvDB.Put(ctx, mKey, desc.DescriptorProto()); err != nil {
 		t.Fatal(err)
 	}
 
 	// Creating a table should fail now, because an entry was explicitly added to
 	// the old system.namespace_deprecated table.
 	_, err = sqlDB.Exec(`CREATE TABLE test.public.rel(a int)`)
-	if !testutils.IsError(err, sqlbase.NewRelationAlreadyExistsError("rel").Error()) {
+	if !testutils.IsError(err, sqlerrors.NewRelationAlreadyExistsError("rel").Error()) {
 		t.Fatalf("unexpected error %v", err)
 	}
 	// Same applies to a table which doesn't explicitly specify the public schema,
 	// as that is the default.
 	_, err = sqlDB.Exec(`CREATE TABLE test.rel(a int)`)
-	if !testutils.IsError(err, sqlbase.NewRelationAlreadyExistsError("rel").Error()) {
+	if !testutils.IsError(err, sqlerrors.NewRelationAlreadyExistsError("rel").Error()) {
 		t.Fatalf("unexpected error %v", err)
 	}
 	// Can not create a sequence with the same name either.
 	_, err = sqlDB.Exec(`CREATE SEQUENCE test.rel`)
-	if !testutils.IsError(err, sqlbase.NewRelationAlreadyExistsError("rel").Error()) {
+	if !testutils.IsError(err, sqlerrors.NewRelationAlreadyExistsError("rel").Error()) {
 		t.Fatalf("unexpected error %v", err)
 	}
 
@@ -131,7 +173,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = sqlDB.Exec(`ALTER TABLE rel2 RENAME TO rel`)
-	if testutils.IsError(err, sqlbase.NewRelationAlreadyExistsError("rel").Error()) {
+	if testutils.IsError(err, sqlerrors.NewRelationAlreadyExistsError("rel").Error()) {
 		t.Fatalf("unexpected error %v", err)
 	}
 
@@ -140,7 +182,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = sqlDB.Exec(`ALTER SEQUENCE rel2 RENAME TO rel`)
-	if !testutils.IsError(err, sqlbase.NewRelationAlreadyExistsError("rel").Error()) {
+	if !testutils.IsError(err, sqlerrors.NewRelationAlreadyExistsError("rel").Error()) {
 		t.Fatalf("unexpected error %v", err)
 	}
 
@@ -160,7 +202,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	} else if gr.Exists() {
 		t.Fatal("table key unexpectedly found in the deprecated system.namespace")
 	}
-	newTKey := sqlbase.NewPublicTableKey(dbID, "rel").Key()
+	newTKey := catalogkeys.NewPublicTableKey(dbID, "rel").Key(codec)
 	if gr, err := kvDB.Get(ctx, newTKey); err != nil {
 		t.Fatal(err)
 	} else if !gr.Exists() {

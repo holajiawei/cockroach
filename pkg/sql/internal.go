@@ -13,18 +13,25 @@ package sql
 import (
 	"context"
 	"math"
+	"strings"
 	"sync"
+	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -60,21 +67,39 @@ type InternalExecutor struct {
 	// the executor will run on copies of this data.
 	sessionData *sessiondata.SessionData
 
-	// The internal executor uses its own TableCollection. A TableCollection
-	// is a schema cache for each transaction and contains data like the schema
-	// modified by a transaction. Occasionally an internal executor is called
-	// within the context of a transaction that has modified the schema, the
-	// internal executor should see the modified schema. This interface allows
-	// the internal executor to modify its TableCollection to match the
-	// TableCollection of the parent executor.
-	tcModifier tableCollectionModifier
+	// syntheticDescriptors stores the synthetic descriptors to be injected into
+	// each query/statement's descs.Collection upon initialization.
+	//
+	// Warning: Not safe for concurrent use from multiple goroutines.
+	syntheticDescriptors []catalog.Descriptor
+}
+
+// WithSyntheticDescriptors sets the synthetic descriptors before running the
+// the provided closure and resets them afterward. Used for queries/statements
+// that need to use in-memory synthetic descriptors different from descriptors
+// written to disk. These descriptors override all other descriptors on the
+// immutable resolution path.
+//
+// Warning: Not safe for concurrent use from multiple goroutines. This API is
+// flawed in that the internal executor is meant to function as a stateless
+// wrapper, and creates a new connExecutor and descs.Collection on each query/
+// statement, so these descriptors should really be specified at a per-query/
+// statement level. See #34304.
+func (ie *InternalExecutor) WithSyntheticDescriptors(
+	descs []catalog.Descriptor, run func() error,
+) error {
+	ie.syntheticDescriptors = descs
+	defer func() {
+		ie.syntheticDescriptors = nil
+	}()
+	return run()
 }
 
 // MakeInternalExecutor creates an InternalExecutor.
 func MakeInternalExecutor(
 	ctx context.Context, s *Server, memMetrics MemoryMetrics, settings *cluster.Settings,
 ) InternalExecutor {
-	monitor := mon.MakeUnlimitedMonitor(
+	monitor := mon.NewUnlimitedMonitor(
 		ctx,
 		"internal SQL executor",
 		mon.MemoryResource,
@@ -85,7 +110,7 @@ func MakeInternalExecutor(
 	)
 	return InternalExecutor{
 		s:          s,
-		mon:        &monitor,
+		mon:        monitor,
 		memMetrics: memMetrics,
 	}
 }
@@ -100,65 +125,85 @@ func (ie *InternalExecutor) SetSessionData(sessionData *sessiondata.SessionData)
 }
 
 // initConnEx creates a connExecutor and runs it on a separate goroutine. It
-// returns a StmtBuf into which commands can be pushed and a WaitGroup that will
-// be signaled when connEx.run() returns.
+// takes in a StmtBuf into which commands can be pushed and a WaitGroup that
+// will be signaled when connEx.run() returns.
 //
 // If txn is not nil, the statement will be executed in the respective txn.
+//
+// ch is used by the connExecutor goroutine to send the rows and will be closed
+// once the goroutine exits its run() loop.
 //
 // sd will constitute the executor's session state.
 func (ie *InternalExecutor) initConnEx(
 	ctx context.Context,
-	txn *client.Txn,
+	txn *kv.Txn,
+	ch chan ieIteratorResult,
 	sd *sessiondata.SessionData,
-	sdMut sessionDataMutator,
+	stmtBuf *StmtBuf,
+	wg *sync.WaitGroup,
 	syncCallback func([]resWithPos),
 	errCallback func(error),
-) (*StmtBuf, *sync.WaitGroup, error) {
+) {
 	clientComm := &internalClientComm{
-		sync: syncCallback,
+		ch: ch,
 		// init lastDelivered below the position of the first result (0).
 		lastDelivered: -1,
+		sync:          syncCallback,
 	}
 
-	stmtBuf := NewStmtBuf()
+	// When the connEx is serving an internal executor, it can inherit the
+	// application name from an outer session. This happens e.g. during ::regproc
+	// casts and built-in functions that use SQL internally. In that case, we do
+	// not want to record statistics against the outer application name directly;
+	// instead we want to use a separate bucket. However we will still want to
+	// have separate buckets for different applications so that we can measure
+	// their respective "pressure" on internal queries. Hence the choice here to
+	// add the delegate prefix to the current app name.
+	var appStatsBucketName string
+	if !strings.HasPrefix(sd.ApplicationName, catconstants.InternalAppNamePrefix) {
+		appStatsBucketName = catconstants.DelegatedAppNamePrefix + sd.ApplicationName
+	} else {
+		// If this is already an "internal app", don't put more prefix.
+		appStatsBucketName = sd.ApplicationName
+	}
+	appStats := ie.s.sqlStats.getStatsForApplication(appStatsBucketName)
+
 	var ex *connExecutor
-	var err error
 	if txn == nil {
-		ex, err = ie.s.newConnExecutor(
+		ex = ie.s.newConnExecutor(
 			ctx,
-			sd, &sdMut,
+			sd,
+			nil, /* sdDefaults */
 			stmtBuf,
 			clientComm,
 			ie.memMetrics,
 			&ie.s.InternalMetrics,
-			dontResetSessionDataToDefaults,
+			appStats,
 		)
 	} else {
-		ex, err = ie.s.newConnExecutorWithTxn(
+		ex = ie.s.newConnExecutorWithTxn(
 			ctx,
-			sd, &sdMut,
+			sd,
+			nil, /* sdDefaults */
 			stmtBuf,
 			clientComm,
 			ie.mon,
 			ie.memMetrics,
 			&ie.s.InternalMetrics,
 			txn,
-			ie.tcModifier,
-			dontResetSessionDataToDefaults,
+			ie.syntheticDescriptors,
+			appStats,
 		)
-	}
-	if err != nil {
-		return nil, nil, err
 	}
 	ex.executorType = executorTypeInternal
 
-	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		if err := ex.run(ctx, ie.mon, mon.BoundAccount{} /*reserved*/, nil /* cancel */); err != nil {
 			sqltelemetry.RecordError(ctx, err, &ex.server.cfg.Settings.SV)
 			errCallback(err)
 		}
+		close(ch)
 		closeMode := normalClose
 		if txn != nil {
 			closeMode = externalTxnClose
@@ -166,7 +211,154 @@ func (ie *InternalExecutor) initConnEx(
 		ex.close(ctx, closeMode)
 		wg.Done()
 	}()
-	return stmtBuf, &wg, nil
+}
+
+type ieIteratorResult struct {
+	// Exactly one of these 4 fields will be set.
+	row                   tree.Datums
+	rowsAffectedIncrement *int
+	cols                  colinfo.ResultColumns
+	err                   error
+}
+
+type rowsIterator struct {
+	// ch is the channel on which the connExecutor goroutine sends the rows (in
+	// streamingCommandResult.AddRow). The iterator goroutine receives rows (or
+	// other metadata) and will block on this channel if it is empty. The
+	// channel will be closed when the connExecutor goroutine exits its run()
+	// loop.
+	ch           chan ieIteratorResult
+	rowsAffected int
+	resultCols   colinfo.ResultColumns
+
+	lastRow tree.Datums
+	lastErr error
+	done    bool
+
+	// errCallback is an optional callback that will be called exactly once
+	// before an error is returned by Next() or Close().
+	errCallback func(err error) error
+
+	// stmtBuf will be closed on Close(). This is necessary in order to tell
+	// the connExecutor's goroutine to exit when the iterator's user wants to
+	// short-circuit the iteration (i.e. before Next() returns false).
+	stmtBuf *StmtBuf
+
+	// wg can be used to wait for the connExecutor's goroutine to exit.
+	wg *sync.WaitGroup
+
+	// sp will finished on Close().
+	sp *tracing.Span
+}
+
+var _ sqlutil.InternalRows = &rowsIterator{}
+
+func (r *rowsIterator) Next(ctx context.Context) (_ bool, retErr error) {
+	if r.done {
+		return false, r.lastErr
+	}
+
+	// Due to recursive calls to Next() below, this deferred function might get
+	// executed multiple times, yet it is not a problem because Close() is
+	// idempotent and we're unsetting the error callback.
+	defer func() {
+		// If the iterator has just reached its terminal state, we'll close it
+		// automatically.
+		if r.done {
+			// We can ignore the returned error because Close() will update
+			// r.lastErr if necessary.
+			_ /* err */ = r.Close()
+		}
+		if r.errCallback != nil {
+			r.lastErr = r.errCallback(r.lastErr)
+			r.errCallback = nil
+		}
+		retErr = r.lastErr
+	}()
+
+	select {
+	case next, ok := <-r.ch:
+		if !ok {
+			r.done = true
+			return false, nil
+		}
+		if next.row != nil {
+			r.rowsAffected++
+			// No need to make a copy because streamingCommandResult does that
+			// for us.
+			r.lastRow = next.row
+			return true, nil
+		}
+		if next.rowsAffectedIncrement != nil {
+			r.rowsAffected += *next.rowsAffectedIncrement
+			return r.Next(ctx)
+		}
+		if next.cols != nil {
+			// Ignore the result columns if they are already set on the
+			// iterator: it is possible for ROWS statement type to be executed
+			// in a 'rows affected' mode, in such case the correct columns are
+			// set manually when instantiating an iterator, but the result
+			// columns of the statement are also sent by SetColumns() (we need
+			// to keep the former).
+			if r.resultCols == nil {
+				r.resultCols = next.cols
+			}
+			return r.Next(ctx)
+		}
+		if next.err == nil {
+			next.err = errors.AssertionFailedf("unexpectedly empty ieIteratorResult object")
+		}
+		r.lastErr = next.err
+		r.done = true
+		return false, r.lastErr
+
+	case <-ctx.Done():
+		r.lastErr = ctx.Err()
+		r.done = true
+		return false, r.lastErr
+	}
+}
+
+func (r *rowsIterator) Cur() tree.Datums {
+	return r.lastRow
+}
+
+func (r *rowsIterator) Close() error {
+	// Closing the stmtBuf will tell the connExecutor to stop executing commands
+	// (if it hasn't exited yet).
+	r.stmtBuf.Close()
+	// We need to finish the span but only after the connExecutor goroutine is
+	// done.
+	defer func() {
+		if r.sp != nil {
+			r.wg.Wait()
+			r.sp.Finish()
+			r.sp = nil
+		}
+	}()
+
+	// We also need to exhaust the channel since the connExecutor goroutine
+	// might be blocked on sending the row in AddRow().
+	// TODO(yuzefovich): at the moment, the connExecutor goroutine will not stop
+	// execution of the current command right away when the stmtBuf is closed
+	// (e.g. if it is currently executing ExecStmt command, all rows will still
+	// be pushed into the channel). Improve this.
+	for res := range r.ch {
+		// We are only interested in possible errors if we haven't already seen
+		// one. All other things are simply ignored.
+		if res.err != nil && r.lastErr == nil {
+			r.lastErr = res.err
+			if r.errCallback != nil {
+				r.lastErr = r.errCallback(r.lastErr)
+				r.errCallback = nil
+			}
+		}
+	}
+	return r.lastErr
+}
+
+func (r *rowsIterator) Types() colinfo.ResultColumns {
+	return r.resultCols
 }
 
 // Query executes the supplied SQL statement and returns the resulting rows.
@@ -178,7 +370,7 @@ func (ie *InternalExecutor) initConnEx(
 // Query is deprecated because it may transparently execute a query as root. Use
 // QueryEx instead.
 func (ie *InternalExecutor) Query(
-	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
+	ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
 ) ([]tree.Datums, error) {
 	return ie.QueryEx(ctx, opName, txn, ie.maybeRootSessionDataOverride(opName), stmt, qargs...)
 }
@@ -191,12 +383,12 @@ func (ie *InternalExecutor) Query(
 func (ie *InternalExecutor) QueryEx(
 	ctx context.Context,
 	opName string,
-	txn *client.Txn,
-	session sqlbase.InternalExecutorSessionDataOverride,
+	txn *kv.Txn,
+	session sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
 ) ([]tree.Datums, error) {
-	datums, _, err := ie.queryInternal(ctx, opName, txn, session, stmt, qargs...)
+	datums, _, err := ie.queryInternalBuffered(ctx, opName, txn, session, stmt, 0 /* limit */, qargs...)
 	return datums, err
 }
 
@@ -205,27 +397,43 @@ func (ie *InternalExecutor) QueryEx(
 func (ie *InternalExecutor) QueryWithCols(
 	ctx context.Context,
 	opName string,
-	txn *client.Txn,
-	session sqlbase.InternalExecutorSessionDataOverride,
+	txn *kv.Txn,
+	session sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
-) ([]tree.Datums, sqlbase.ResultColumns, error) {
-	return ie.queryInternal(ctx, opName, txn, session, stmt, qargs...)
+) ([]tree.Datums, colinfo.ResultColumns, error) {
+	return ie.queryInternalBuffered(ctx, opName, txn, session, stmt, 0 /* limit */, qargs...)
 }
 
-func (ie *InternalExecutor) queryInternal(
+func (ie *InternalExecutor) queryInternalBuffered(
 	ctx context.Context,
 	opName string,
-	txn *client.Txn,
-	sessionDataOverride sqlbase.InternalExecutorSessionDataOverride,
+	txn *kv.Txn,
+	sessionDataOverride sessiondata.InternalExecutorOverride,
 	stmt string,
+	// Non-zero limit specifies the limit on the number of rows returned.
+	limit int,
 	qargs ...interface{},
-) ([]tree.Datums, sqlbase.ResultColumns, error) {
-	res, err := ie.execInternal(ctx, opName, txn, sessionDataOverride, stmt, qargs...)
+) ([]tree.Datums, colinfo.ResultColumns, error) {
+	it, err := ie.execInternal(ctx, opName, txn, sessionDataOverride, stmt, qargs...)
 	if err != nil {
 		return nil, nil, err
 	}
-	return res.rows, res.cols, res.err
+	var rows []tree.Datums
+	var ok bool
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+		rows = append(rows, it.Cur())
+		if limit != 0 && len(rows) == limit {
+			// We have accumulated the requested number of rows, so we can
+			// short-circuit the iteration.
+			err = it.Close()
+			break
+		}
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return rows, it.Types(), nil
 }
 
 // QueryRow is like Query, except it returns a single row, or nil if not row is
@@ -233,7 +441,7 @@ func (ie *InternalExecutor) queryInternal(
 //
 // QueryRow is deprecated (like Query). Use QueryRowEx() instead.
 func (ie *InternalExecutor) QueryRow(
-	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
+	ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
 ) (tree.Datums, error) {
 	return ie.QueryRowEx(ctx, opName, txn, ie.maybeRootSessionDataOverride(opName), stmt, qargs...)
 }
@@ -246,12 +454,12 @@ func (ie *InternalExecutor) QueryRow(
 func (ie *InternalExecutor) QueryRowEx(
 	ctx context.Context,
 	opName string,
-	txn *client.Txn,
-	session sqlbase.InternalExecutorSessionDataOverride,
+	txn *kv.Txn,
+	session sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
 ) (tree.Datums, error) {
-	rows, err := ie.QueryEx(ctx, opName, txn, session, stmt, qargs...)
+	rows, _, err := ie.queryInternalBuffered(ctx, opName, txn, session, stmt, 2 /* limit */, qargs...)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +482,7 @@ func (ie *InternalExecutor) QueryRowEx(
 // Exec is deprecated because it may transparently execute a query as root. Use
 // ExecEx instead.
 func (ie *InternalExecutor) Exec(
-	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
+	ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
 ) (int, error) {
 	return ie.ExecEx(ctx, opName, txn, ie.maybeRootSessionDataOverride(opName), stmt, qargs...)
 }
@@ -287,29 +495,56 @@ func (ie *InternalExecutor) Exec(
 func (ie *InternalExecutor) ExecEx(
 	ctx context.Context,
 	opName string,
-	txn *client.Txn,
-	session sqlbase.InternalExecutorSessionDataOverride,
+	txn *kv.Txn,
+	session sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
 ) (int, error) {
-	res, err := ie.execInternal(ctx, opName, txn, session, stmt, qargs...)
+	it, err := ie.execInternal(ctx, opName, txn, session, stmt, qargs...)
 	if err != nil {
 		return 0, err
 	}
-	return res.rowsAffected, res.err
+	// We need to exhaust the iterator so that it can count the number of rows
+	// affected.
+	var ok bool
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+	}
+	if err != nil {
+		return 0, err
+	}
+	return it.rowsAffected, nil
 }
 
-type result struct {
-	rows         []tree.Datums
-	rowsAffected int
-	cols         sqlbase.ResultColumns
-	err          error
+// QueryIterator executes the query, returning an iterator that can be used
+// to get the results. If the call is successful, the returned iterator
+// *must* be closed.
+//
+// QueryIterator is deprecated because it may transparently execute a query
+// as root. Use QueryIteratorEx instead.
+func (ie *InternalExecutor) QueryIterator(
+	ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
+) (sqlutil.InternalRows, error) {
+	return ie.QueryIteratorEx(ctx, opName, txn, ie.maybeRootSessionDataOverride(opName), stmt, qargs...)
+}
+
+// QueryIteratorEx executes the query, returning an iterator that can be used
+// to get the results. If the call is successful, the returned iterator
+// *must* be closed.
+func (ie *InternalExecutor) QueryIteratorEx(
+	ctx context.Context,
+	opName string,
+	txn *kv.Txn,
+	session sessiondata.InternalExecutorOverride,
+	stmt string,
+	qargs ...interface{},
+) (sqlutil.InternalRows, error) {
+	return ie.execInternal(ctx, opName, txn, session, stmt, qargs...)
 }
 
 // applyOverrides overrides the respective fields from sd for all the fields set on o.
-func applyOverrides(o sqlbase.InternalExecutorSessionDataOverride, sd *sessiondata.SessionData) {
-	if o.User != "" {
-		sd.User = o.User
+func applyOverrides(o sessiondata.InternalExecutorOverride, sd *sessiondata.SessionData) {
+	if !o.User.Undefined() {
+		sd.UserProto = o.User.EncodeProto()
 	}
 	if o.Database != "" {
 		sd.Database = o.Database
@@ -317,26 +552,46 @@ func applyOverrides(o sqlbase.InternalExecutorSessionDataOverride, sd *sessionda
 	if o.ApplicationName != "" {
 		sd.ApplicationName = o.ApplicationName
 	}
+	if o.SearchPath != nil {
+		sd.SearchPath = *o.SearchPath
+	}
+	if o.DatabaseIDToTempSchemaID != nil {
+		sd.DatabaseIDToTempSchemaID = o.DatabaseIDToTempSchemaID
+	}
 }
 
 func (ie *InternalExecutor) maybeRootSessionDataOverride(
 	opName string,
-) sqlbase.InternalExecutorSessionDataOverride {
+) sessiondata.InternalExecutorOverride {
 	if ie.sessionData == nil {
-		return sqlbase.InternalExecutorSessionDataOverride{
-			User:            security.RootUser,
-			ApplicationName: sqlbase.InternalAppNamePrefix + "-" + opName,
+		return sessiondata.InternalExecutorOverride{
+			User:            security.RootUserName(),
+			ApplicationName: catconstants.InternalAppNamePrefix + "-" + opName,
 		}
 	}
-	o := sqlbase.InternalExecutorSessionDataOverride{}
-	if ie.sessionData.User == "" {
-		o.User = security.RootUser
+	o := sessiondata.InternalExecutorOverride{}
+	if ie.sessionData.User().Undefined() {
+		o.User = security.RootUserName()
 	}
 	if ie.sessionData.ApplicationName == "" {
-		o.ApplicationName = sqlbase.InternalAppNamePrefix + "-" + opName
+		o.ApplicationName = catconstants.InternalAppNamePrefix + "-" + opName
 	}
 	return o
 }
+
+var rowsAffectedResultColumns = colinfo.ResultColumns{
+	colinfo.ResultColumn{
+		Name: "rows_affected",
+		Typ:  types.Int,
+	},
+}
+
+var ieIteratorChannelBufferSize = util.ConstantWithMetamorphicTestRange(
+	"iterator-channel-buffer-size",
+	32, /* defaultValue */
+	1,  /* min */
+	32, /* max */
+)
 
 // execInternal executes a statement.
 //
@@ -346,11 +601,11 @@ func (ie *InternalExecutor) maybeRootSessionDataOverride(
 func (ie *InternalExecutor) execInternal(
 	ctx context.Context,
 	opName string,
-	txn *client.Txn,
-	sessionDataOverride sqlbase.InternalExecutorSessionDataOverride,
+	txn *kv.Txn,
+	sessionDataOverride sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
-) (retRes result, retErr error) {
+) (r *rowsIterator, retErr error) {
 	ctx = logtags.AddTag(ctx, "intExec", opName)
 
 	var sd *sessiondata.SessionData
@@ -362,73 +617,95 @@ func (ie *InternalExecutor) execInternal(
 		sd = ie.s.newSessionData(SessionArgs{})
 	}
 	applyOverrides(sessionDataOverride, sd)
-	if sd.User == "" {
-		return result{}, errors.AssertionFailedf("no user specified for internal query")
+	if sd.User().Undefined() {
+		return nil, errors.AssertionFailedf("no user specified for internal query")
 	}
 	if sd.ApplicationName == "" {
-		sd.ApplicationName = sqlbase.InternalAppNamePrefix + "-" + opName
+		sd.ApplicationName = catconstants.InternalAppNamePrefix + "-" + opName
 	}
-	sdMutator := ie.s.makeSessionDataMutator(sd, nil /* defaults */)
+
+	// The returned span is finished by this function in all error paths, but if
+	// an iterator is returned, then we transfer the responsibility of closing
+	// the span to the iterator. This is necessary so that the connExecutor
+	// exits before the span is finished.
+	ctx, sp := tracing.EnsureChildSpan(ctx, ie.s.cfg.AmbientCtx.Tracer, opName)
+
+	stmtBuf := NewStmtBuf()
+	var wg sync.WaitGroup
 
 	defer func() {
 		// We wrap errors with the opName, but not if they're retriable - in that
 		// case we need to leave the error intact so that it can be retried at a
 		// higher level.
-		if retErr != nil && !errIsRetriable(retErr) {
-			retErr = errors.Wrapf(retErr, opName)
-		}
-		if retRes.err != nil && !errIsRetriable(retRes.err) {
-			retRes.err = errors.Wrapf(retRes.err, opName)
+		//
+		// TODO(knz): track the callers and check whether opName could be turned
+		// into a type safe for reporting.
+		if retErr != nil {
+			if !errIsRetriable(retErr) {
+				retErr = errors.Wrapf(retErr, "%s", opName)
+			}
+			stmtBuf.Close()
+			wg.Wait()
+			sp.Finish()
+		} else {
+			// r must be non-nil here.
+			r.errCallback = func(err error) error {
+				if err != nil && !errIsRetriable(err) {
+					err = errors.Wrapf(err, "%s", opName)
+				}
+				return err
+			}
+			r.sp = sp
 		}
 	}()
-
-	ctx, sp := tracing.EnsureChildSpan(ctx, ie.s.cfg.AmbientCtx.Tracer, opName)
-	defer sp.Finish()
 
 	timeReceived := timeutil.Now()
 	parseStart := timeReceived
 	parsed, err := parser.ParseOne(stmt)
 	if err != nil {
-		return result{}, err
+		return nil, err
 	}
 	parseEnd := timeutil.Now()
+
+	// Transforms the args to datums. The datum types will be passed as type
+	// hints to the PrepareStmt command below.
+	datums, err := golangFillQueryArguments(qargs...)
+	if err != nil {
+		return nil, err
+	}
 
 	// resPos will be set to the position of the command that represents the
 	// statement we care about before that command is sent for execution.
 	var resPos CmdPos
 
-	resCh := make(chan result)
-	var resultsReceived bool
+	ch := make(chan ieIteratorResult, ieIteratorChannelBufferSize)
 	syncCallback := func(results []resWithPos) {
-		resultsReceived = true
+		// Close the stmtBuf so that the connExecutor exits its run() loop.
+		stmtBuf.Close()
 		for _, res := range results {
+			if res.Err() != nil {
+				// If we encounter an error, there's no point in looking
+				// further; the rest of the commands in the batch have been
+				// skipped.
+				ch <- ieIteratorResult{err: res.Err()}
+				return
+			}
 			if res.pos == resPos {
-				resCh <- result{rows: res.rows, rowsAffected: res.RowsAffected(), cols: res.cols, err: res.Err()}
-				return
-			}
-			if res.err != nil {
-				// If we encounter an error, there's no point in looking further; the
-				// rest of the commands in the batch have been skipped.
-				resCh <- result{err: res.Err()}
 				return
 			}
 		}
-		resCh <- result{err: errors.AssertionFailedf("missing result for pos: %d and no previous error", resPos)}
+		ch <- ieIteratorResult{err: errors.AssertionFailedf("missing result for pos: %d and no previous error", resPos)}
 	}
+	// errCallback is called if an error is returned from the connExecutor's
+	// run() loop.
 	errCallback := func(err error) {
-		if resultsReceived {
-			return
-		}
-		resCh <- result{err: err}
+		// The connExecutor exited its run() loop, so the stmtBuf must have been
+		// closed. Still, since Close() is idempotent, we'll call it here too.
+		stmtBuf.Close()
+		ch <- ieIteratorResult{err: err}
 	}
-	stmtBuf, wg, err := ie.initConnEx(ctx, txn, sd, sdMutator, syncCallback, errCallback)
-	if err != nil {
-		return result{}, err
-	}
+	ie.initConnEx(ctx, txn, ch, sd, stmtBuf, &wg, syncCallback, errCallback)
 
-	// Transforms the args to datums. The datum types will be passed as type hints
-	// to the PrepareStmt command.
-	datums := golangFillQueryArguments(qargs...)
 	typeHints := make(tree.PlaceholderTypes, len(datums))
 	for i, d := range datums {
 		// Arg numbers start from 1.
@@ -444,7 +721,7 @@ func (ie *InternalExecutor) execInternal(
 				ParseStart:   parseStart,
 				ParseEnd:     parseEnd,
 			}); err != nil {
-			return result{}, err
+			return nil, err
 		}
 	} else {
 		resPos = 2
@@ -457,25 +734,31 @@ func (ie *InternalExecutor) execInternal(
 				TypeHints:  typeHints,
 			},
 		); err != nil {
-			return result{}, err
+			return nil, err
 		}
 
 		if err := stmtBuf.Push(ctx, BindStmt{internalArgs: datums}); err != nil {
-			return result{}, err
+			return nil, err
 		}
 
 		if err := stmtBuf.Push(ctx, ExecPortal{TimeReceived: timeReceived}); err != nil {
-			return result{}, err
+			return nil, err
 		}
 	}
 	if err := stmtBuf.Push(ctx, Sync{}); err != nil {
-		return result{}, err
+		return nil, err
 	}
 
-	res := <-resCh
-	stmtBuf.Close()
-	wg.Wait()
-	return res, nil
+	var resultColumns colinfo.ResultColumns
+	if parsed.AST.StatementType() != tree.Rows {
+		resultColumns = rowsAffectedResultColumns
+	}
+	return &rowsIterator{
+		ch:         ch,
+		resultCols: resultColumns,
+		stmtBuf:    stmtBuf,
+		wg:         &wg,
+	}, nil
 }
 
 // internalClientComm is an implementation of ClientComm used by the
@@ -485,15 +768,20 @@ type internalClientComm struct {
 	// InternalExecutor.
 	results []resWithPos
 
+	// ch is the channel on which the results of the query execution (ExecStmt
+	// or ExecPortal commands) are propagated to the consumer (the iterator).
+	ch chan ieIteratorResult
+
 	lastDelivered CmdPos
 
-	// sync, if set, is called whenever a Sync is executed. It returns all the
-	// results since the previous Sync.
+	// sync, if set, is called whenever a Sync is executed.
 	sync func([]resWithPos)
 }
 
+var _ ClientComm = &internalClientComm{}
+
 type resWithPos struct {
-	*bufferedCommandResult
+	*streamingCommandResult
 	pos CmdPos
 }
 
@@ -503,7 +791,8 @@ func (icc *internalClientComm) CreateStatementResult(
 	_ RowDescOpt,
 	pos CmdPos,
 	_ []pgwirebase.FormatCode,
-	_ sessiondata.DataConversionConfig,
+	_ sessiondatapb.DataConversionConfig,
+	_ *time.Location,
 	_ int,
 	_ string,
 	_ bool,
@@ -513,15 +802,16 @@ func (icc *internalClientComm) CreateStatementResult(
 
 // createRes creates a result. onClose, if not nil, is called when the result is
 // closed.
-func (icc *internalClientComm) createRes(pos CmdPos, onClose func(error)) *bufferedCommandResult {
-	res := &bufferedCommandResult{
-		closeCallback: func(res *bufferedCommandResult, typ resCloseType, err error) {
+func (icc *internalClientComm) createRes(pos CmdPos, onClose func()) *streamingCommandResult {
+	res := &streamingCommandResult{
+		ch: icc.ch,
+		closeCallback: func(res *streamingCommandResult, typ resCloseType) {
 			if typ == discarded {
 				return
 			}
-			icc.results = append(icc.results, resWithPos{bufferedCommandResult: res, pos: pos})
+			icc.results = append(icc.results, resWithPos{streamingCommandResult: res, pos: pos})
 			if onClose != nil {
-				onClose(err)
+				onClose()
 			}
 		},
 	}
@@ -542,7 +832,7 @@ func (icc *internalClientComm) CreateBindResult(pos CmdPos) BindResult {
 //
 // The returned SyncResult will call the sync callback when its closed.
 func (icc *internalClientComm) CreateSyncResult(pos CmdPos) SyncResult {
-	return icc.createRes(pos, func(err error) {
+	return icc.createRes(pos, func() {
 		results := make([]resWithPos, len(icc.results))
 		copy(results, icc.results)
 		icc.results = icc.results[:0]
@@ -553,9 +843,7 @@ func (icc *internalClientComm) CreateSyncResult(pos CmdPos) SyncResult {
 
 // LockCommunication is part of the ClientComm interface.
 func (icc *internalClientComm) LockCommunication() ClientLock {
-	return &noopClientLock{
-		clientComm: icc,
-	}
+	return (*noopClientLock)(icc)
 }
 
 // Flush is part of the ClientComm interface.
@@ -600,26 +888,24 @@ func (icc *internalClientComm) CreateDrainResult(pos CmdPos) DrainResult {
 
 // noopClientLock is an implementation of ClientLock that says that no results
 // have been communicated to the client.
-type noopClientLock struct {
-	clientComm *internalClientComm
-}
+type noopClientLock internalClientComm
 
 // Close is part of the ClientLock interface.
 func (ncl *noopClientLock) Close() {}
 
 // ClientPos is part of the ClientLock interface.
 func (ncl *noopClientLock) ClientPos() CmdPos {
-	return ncl.clientComm.lastDelivered
+	return ncl.lastDelivered
 }
 
 // RTrim is part of the ClientLock interface.
 func (ncl *noopClientLock) RTrim(_ context.Context, pos CmdPos) {
 	var i int
 	var r resWithPos
-	for i, r = range ncl.clientComm.results {
+	for i, r = range ncl.results {
 		if r.pos >= pos {
 			break
 		}
 	}
-	ncl.clientComm.results = ncl.clientComm.results[:i]
+	ncl.results = ncl.results[:i]
 }

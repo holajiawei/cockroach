@@ -17,8 +17,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach-go/crdb"
+	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
 func registerCopy(r *testRegistry) {
@@ -44,6 +44,13 @@ func registerCopy(r *testRegistry) {
 		m.Go(func(ctx context.Context) error {
 			db := c.Conn(ctx, 1)
 			defer db.Close()
+
+			// Disable load-based splitting so that we can more accurately
+			// predict an upper-bound on the number of ranges that the cluster
+			// will end up with.
+			if err := disableLoadBasedSplitting(ctx, db); err != nil {
+				return errors.Wrap(err, "disabling load-based splitting")
+			}
 
 			t.Status("importing Bank fixture")
 			c.Run(ctx, c.Node(1), fmt.Sprintf(
@@ -164,5 +171,9 @@ func getDefaultRangeSize(
         AS range_max_bytes
 FROM
     [SHOW ZONE CONFIGURATION FOR RANGE default];`).Scan(&rangeMinBytes, &rangeMaxBytes)
+	// Older cluster versions do not contain this column. Use the old default.
+	if err != nil && strings.Contains(err.Error(), `column "raw_config_sql" does not exist`) {
+		rangeMinBytes, rangeMaxBytes, err = 32<<20 /* 32MB */, 64<<20 /* 64MB */, nil
+	}
 	return rangeMinBytes, rangeMaxBytes, err
 }

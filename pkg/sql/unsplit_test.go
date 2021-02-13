@@ -17,18 +17,19 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestUnsplitAt(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	// TODO(jeffreyxiao): Disable the merge queue due to a race condition. The
@@ -40,12 +41,12 @@ func TestUnsplitAt(t *testing.T) {
 	// merge queue should pass the expected descriptor of the RHS into the
 	// AdminMerge request.
 	params.Knobs = base.TestingKnobs{
-		Store: &storage.StoreTestingKnobs{
+		Store: &kvserver.StoreTestingKnobs{
 			DisableMergeQueue: true,
 		},
 	}
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	r := sqlutils.MakeSQLRunner(db)
 
@@ -206,7 +207,7 @@ func TestUnsplitAt(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if (rng.GetStickyBit() != hlc.Timestamp{}) {
+				if !rng.GetStickyBit().IsEmpty() {
 					t.Fatalf("%s: expected range sticky bit to be hlc.MinTimestamp, got %s", tt.unsplitStmt, rng.GetStickyBit())
 				}
 			}

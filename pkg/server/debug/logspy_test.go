@@ -26,8 +26,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func TestDebugLogSpyOptions(t *testing.T) {
@@ -73,13 +74,6 @@ func TestDebugLogSpyOptions(t *testing.T) {
 				Duration: logSpyDefaultDuration,
 			},
 		},
-		{
-			// Can't stream out too much at once.
-			vals: map[string][]string{
-				"Count": {strconv.Itoa(2 * logSpyMaxCount)},
-			},
-			expErr: (`count .* is too large .limit is .*.`),
-		},
 		// Various parse errors.
 		{
 			vals: map[string][]string{
@@ -91,7 +85,7 @@ func TestDebugLogSpyOptions(t *testing.T) {
 			vals: map[string][]string{
 				"Duration": {"very long"},
 			},
-			expErr: `time: invalid duration very long`,
+			expErr: `time: invalid duration "very long"`,
 		},
 		{
 			vals: map[string][]string{
@@ -131,7 +125,7 @@ func TestDebugLogSpyHandle(t *testing.T) {
 		if rec.Code != http.StatusInternalServerError {
 			t.Fatalf("unexpected status: %d", rec.Code)
 		}
-		exp := "while parsing options: time: invalid duration notaduration\n"
+		exp := "while parsing options: time: invalid duration \"notaduration\"\n"
 		if body := rec.Body.String(); body != exp {
 			t.Fatalf("expected: %q\ngot: %q", exp, body)
 		}
@@ -233,17 +227,17 @@ func TestDebugLogSpyRun(t *testing.T) {
 
 	f := <-send
 
-	f(log.Entry{
+	f(logpb.Entry{
 		File:    "first.go",
 		Line:    1,
 		Message: "#1",
 	})
-	f(log.Entry{
+	f(logpb.Entry{
 		File:    "nonmatching.go",
 		Line:    12345,
 		Message: "ignored because neither message nor file match",
 	})
-	f(log.Entry{
+	f(logpb.Entry{
 		File:    "second.go",
 		Line:    2,
 		Message: "#2",
@@ -256,7 +250,7 @@ func TestDebugLogSpyRun(t *testing.T) {
 		// f could be invoked arbitrarily after the operation finishes (though
 		// in reality the duration would be limited to the blink of an eye). It
 		// must not fill up a channel and block, or panic.
-		f(log.Entry{})
+		f(logpb.Entry{})
 	}
 
 	body := buf.String()
@@ -312,7 +306,7 @@ func TestDebugLogSpyBrokenConnection(t *testing.T) {
 			w.Lock()
 			defer w.Unlock()
 			for i := 0; i < 2*logSpyChanCap; i++ {
-				f(log.Entry{
+				f(logpb.Entry{
 					File:    "fake.go",
 					Line:    int64(i),
 					Message: fmt.Sprintf("foobar #%d", i),

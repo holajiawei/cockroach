@@ -24,14 +24,16 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/cgroups"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -40,9 +42,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/elastic/gosigar"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -79,9 +81,13 @@ var recordHistogramQuantiles = []quantile{
 // directly in order to simplify testing.
 type storeMetrics interface {
 	StoreID() roachpb.StoreID
-	Descriptor(bool) (*roachpb.StoreDescriptor, error)
+	Descriptor(context.Context, bool) (*roachpb.StoreDescriptor, error)
 	Registry() *metric.Registry
 }
+
+var childMetricsEnabled = settings.RegisterBoolSetting("server.child_metrics.enabled",
+	"enables the exporting of child metrics, additional prometheus time series with extra labels",
+	false)
 
 // MetricsRecorder is used to periodically record the information in a number of
 // metric registries.
@@ -93,7 +99,7 @@ type storeMetrics interface {
 type MetricsRecorder struct {
 	*HealthChecker
 	gossip       *gossip.Gossip
-	nodeLiveness *storage.NodeLiveness
+	nodeLiveness *liveness.NodeLiveness
 	rpcContext   *rpc.Context
 	settings     *cluster.Settings
 	clock        *hlc.Clock
@@ -142,7 +148,7 @@ type MetricsRecorder struct {
 // given clock.
 func NewMetricsRecorder(
 	clock *hlc.Clock,
-	nodeLiveness *storage.NodeLiveness,
+	nodeLiveness *liveness.NodeLiveness,
 	rpcContext *rpc.Context,
 	gossip *gossip.Gossip,
 	settings *cluster.Settings,
@@ -247,10 +253,10 @@ func (mr *MetricsRecorder) scrapeIntoPrometheus(pm *metric.PrometheusExporter) {
 			log.Warning(context.TODO(), "MetricsRecorder asked to scrape metrics before NodeID allocation")
 		}
 	}
-
-	pm.ScrapeRegistry(mr.mu.nodeRegistry)
+	includeChildMetrics := childMetricsEnabled.Get(&mr.settings.SV)
+	pm.ScrapeRegistry(mr.mu.nodeRegistry, includeChildMetrics)
 	for _, reg := range mr.mu.storeRegistries {
-		pm.ScrapeRegistry(reg)
+		pm.ScrapeRegistry(reg, includeChildMetrics)
 	}
 }
 
@@ -380,7 +386,7 @@ func (mr *MetricsRecorder) getNetworkActivity(
 			address, err := mr.gossip.GetNodeIDAddress(nodeID)
 			if err != nil {
 				if entry.IsLive {
-					log.Warning(ctx, err.Error())
+					log.Warningf(ctx, "%v", err)
 				}
 				continue
 			}
@@ -427,7 +433,7 @@ func (mr *MetricsRecorder) GenerateNodeStatus(ctx context.Context) *statuspb.Nod
 
 	systemMemory, _, err := GetTotalMemoryWithoutLogging()
 	if err != nil {
-		log.Error(ctx, "could not get total system memory:", err)
+		log.Errorf(ctx, "could not get total system memory: %v", err)
 	}
 
 	// Generate a node status with no store data.
@@ -457,9 +463,9 @@ func (mr *MetricsRecorder) GenerateNodeStatus(ctx context.Context) *statuspb.Nod
 		})
 
 		// Gather descriptor from store.
-		descriptor, err := mr.mu.stores[storeID].Descriptor(false /* useCached */)
+		descriptor, err := mr.mu.stores[storeID].Descriptor(ctx, false /* useCached */)
 		if err != nil {
-			log.Errorf(ctx, "Could not record status summaries: Store %d could not return descriptor, error: %s", storeID, err)
+			log.Errorf(ctx, "could not record status summaries: Store %d could not return descriptor, error: %s", storeID, err)
 			continue
 		}
 
@@ -481,21 +487,42 @@ func (mr *MetricsRecorder) GenerateNodeStatus(ctx context.Context) *statuspb.Nod
 	return nodeStat
 }
 
-// WriteNodeStatus writes the supplied summary to the given client.
+// WriteNodeStatus writes the supplied summary to the given client. If mustExist
+// is true, the key must already exist and must not change while being updated,
+// otherwise an error is returned -- if false, the status is always written.
 func (mr *MetricsRecorder) WriteNodeStatus(
-	ctx context.Context, db *client.DB, nodeStatus statuspb.NodeStatus,
+	ctx context.Context, db *kv.DB, nodeStatus statuspb.NodeStatus, mustExist bool,
 ) error {
 	mr.writeSummaryMu.Lock()
 	defer mr.writeSummaryMu.Unlock()
 	key := keys.NodeStatusKey(nodeStatus.Desc.NodeID)
-	// We use PutInline to store only a single version of the node status.
+	// We use an inline value to store only a single version of the node status.
 	// There's not much point in keeping the historical versions as we keep
 	// all of the constituent data as timeseries. Further, due to the size
 	// of the build info in the node status, writing one of these every 10s
 	// will generate more versions than will easily fit into a range over
 	// the course of a day.
-	if err := db.PutInline(ctx, key, &nodeStatus); err != nil {
-		return err
+	if mustExist && mr.settings.Version.IsActive(ctx, clusterversion.CPutInline) {
+		entry, err := db.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		if entry.Value == nil {
+			return errors.New("status entry not found, node may have been decommissioned")
+		}
+		err = db.CPutInline(kv.CtxForCPutInline(ctx), key, &nodeStatus, entry.Value.TagAndDataBytes())
+		if detail := (*roachpb.ConditionFailedError)(nil); errors.As(err, &detail) {
+			if detail.ActualValue == nil {
+				return errors.New("status entry not found, node may have been decommissioned")
+			}
+			return errors.New("status entry unexpectedly changed during update")
+		} else if err != nil {
+			return err
+		}
+	} else {
+		if err := db.PutInline(ctx, key, &nodeStatus); err != nil {
+			return err
+		}
 	}
 	if log.V(2) {
 		statusJSON, err := json.Marshal(&nodeStatus)
@@ -517,19 +544,22 @@ type registryRecorder struct {
 }
 
 func extractValue(mtr interface{}) (float64, error) {
-	// TODO(tschottdorf|mrtracy): consider moving this switch to an interface
-	// implemented by the individual metric types.
+	// TODO(tschottdorf,ajwerner): consider moving this switch to a single
+	// interface implemented by the individual metric types.
+	type (
+		float64Valuer interface{ Value() float64 }
+		int64Valuer   interface{ Value() int64 }
+		int64Counter  interface{ Count() int64 }
+	)
 	switch mtr := mtr.(type) {
 	case float64:
 		return mtr, nil
-	case *metric.Counter:
-		return float64(mtr.Count()), nil
-	case *metric.Gauge:
+	case float64Valuer:
+		return mtr.Value(), nil
+	case int64Valuer:
 		return float64(mtr.Value()), nil
-	case *metric.Rate:
-		return mtr.Value(), nil
-	case *metric.GaugeFloat64:
-		return mtr.Value(), nil
+	case int64Counter:
+		return float64(mtr.Count()), nil
 	default:
 		return 0, errors.Errorf("cannot extract value for type %T", mtr)
 	}
@@ -563,7 +593,7 @@ func eachRecordableValue(reg *metric.Registry, fn func(string, float64)) {
 		} else {
 			val, err := extractValue(mtr)
 			if err != nil {
-				log.Warning(context.TODO(), err)
+				log.Warningf(context.TODO(), "%v", err)
 				return
 			}
 			fn(name, val)
@@ -594,7 +624,7 @@ func GetTotalMemory(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	if warning != "" {
-		log.Infof(ctx, warning)
+		log.Infof(ctx, "%s", warning)
 	}
 	return memory, nil
 }

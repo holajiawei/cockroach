@@ -14,9 +14,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // StreamDecoder converts a sequence of ProducerMessage to rows and metadata
@@ -47,7 +47,7 @@ type StreamDecoder struct {
 	data         []byte
 	numEmptyRows int
 	metadata     []execinfrapb.ProducerMetadata
-	rowAlloc     sqlbase.EncDatumRowAlloc
+	rowAlloc     rowenc.EncDatumRowAlloc
 
 	headerReceived bool
 	typingReceived bool
@@ -119,8 +119,8 @@ func (sd *StreamDecoder) AddMessage(ctx context.Context, msg *execinfrapb.Produc
 // A decoding error may be returned. Note that these are separate from error
 // coming from the upstream (through ProducerMetadata.Err).
 func (sd *StreamDecoder) GetRow(
-	rowBuf sqlbase.EncDatumRow,
-) (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata, error) {
+	rowBuf rowenc.EncDatumRow,
+) (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata, error) {
 	if len(sd.metadata) != 0 {
 		r := &sd.metadata[0]
 		sd.metadata = sd.metadata[1:]
@@ -129,7 +129,7 @@ func (sd *StreamDecoder) GetRow(
 
 	if sd.numEmptyRows > 0 {
 		sd.numEmptyRows--
-		row := make(sqlbase.EncDatumRow, 0) // this doesn't actually allocate.
+		row := make(rowenc.EncDatumRow, 0) // this doesn't actually allocate.
 		return row, nil, nil
 	}
 
@@ -144,8 +144,8 @@ func (sd *StreamDecoder) GetRow(
 	}
 	for i := range rowBuf {
 		var err error
-		rowBuf[i], sd.data, err = sqlbase.EncDatumFromBuffer(
-			&sd.typing[i].Type, sd.typing[i].Encoding, sd.data,
+		rowBuf[i], sd.data, err = rowenc.EncDatumFromBuffer(
+			sd.typing[i].Type, sd.typing[i].Encoding, sd.data,
 		)
 		if err != nil {
 			// Reset sd because it is no longer usable.
@@ -158,8 +158,8 @@ func (sd *StreamDecoder) GetRow(
 
 // Types returns the types of the columns; can only be used after we received at
 // least one row.
-func (sd *StreamDecoder) Types() []types.T {
-	types := make([]types.T, len(sd.typing))
+func (sd *StreamDecoder) Types() []*types.T {
+	types := make([]*types.T, len(sd.typing))
 	for i := range types {
 		types[i] = sd.typing[i].Type
 	}

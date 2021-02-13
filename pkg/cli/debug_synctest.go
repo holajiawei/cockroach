@@ -23,10 +23,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -58,7 +58,7 @@ type scriptNemesis string
 func (sn scriptNemesis) exec(arg string) error {
 	b, err := exec.Command(string(sn), arg).CombinedOutput()
 	if err != nil {
-		return errors.Wrap(err, string(b))
+		return errors.WithDetailf(err, "command output:\n%s", string(b))
 	}
 	fmt.Fprintf(stderr, "%s %s: %s", sn, arg, b)
 	return nil
@@ -133,18 +133,18 @@ func runSyncer(
 		return encoding.EncodeUvarintAscending(buf[:0:0], uint64(seq))
 	}
 
-	check := func(kv engine.MVCCKeyValue) (bool, error) {
+	check := func(kv storage.MVCCKeyValue) error {
 		expKey := key()
 		if !bytes.Equal(kv.Key.Key, expKey) {
-			return false, errors.Errorf(
+			return errors.Errorf(
 				"found unexpected key %q (expected %q)", kv.Key.Key, expKey,
 			)
 		}
-		return false, nil // want more
+		return nil // want more
 	}
 
 	fmt.Fprintf(stderr, "verifying existing sequence numbers...")
-	if err := db.Iterate(roachpb.KeyMin, roachpb.KeyMax, check); err != nil {
+	if err := db.MVCCIterate(roachpb.KeyMin, roachpb.KeyMax, storage.MVCCKeyAndIntentsIterKind, check); err != nil {
 		return 0, err
 	}
 	// We must not lose writes, but sometimes we get extra ones (i.e. we caught an
@@ -156,7 +156,7 @@ func runSyncer(
 
 	waitFailure := time.After(time.Duration(rand.Int63n(5 * time.Second.Nanoseconds())))
 
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	if err := stopper.RunAsyncTask(ctx, "syncer", func(ctx context.Context) {
 		<-waitFailure
 		if err := nemesis.On(); err != nil {
 			panic(err)
@@ -167,7 +167,9 @@ func runSyncer(
 			}
 		}()
 		<-stopper.ShouldQuiesce()
-	})
+	}); err != nil {
+		return 0, err
+	}
 
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, drainSignals...)
@@ -184,10 +186,10 @@ func runSyncer(
 			}
 		}()
 
-		k, v := engine.MakeMVCCMetadataKey(key()), []byte("payload")
+		k, v := key(), []byte("payload")
 		switch seq % 2 {
 		case 0:
-			if err := db.Put(k, v); err != nil {
+			if err := db.PutUnversioned(k, v); err != nil {
 				seq--
 				return seq, err
 			}
@@ -197,7 +199,7 @@ func runSyncer(
 			}
 		default:
 			b := db.NewBatch()
-			if err := b.Put(k, v); err != nil {
+			if err := b.PutUnversioned(k, v); err != nil {
 				seq--
 				return seq, err
 			}

@@ -9,7 +9,7 @@ services:
     image: ubuntu:xenial-20170214
     depends_on:
       - kdc
-    command: /cockroach/cockroach --certs-dir=/certs start --listen-addr cockroach
+    command: /cockroach/cockroach --certs-dir=/certs start-single-node --listen-addr cockroach
     environment:
       - KRB5_KTNAME=/keytab/crdb.keytab
     volumes:
@@ -30,5 +30,6 @@ services:
       - ./psql/gss_test.go:/test/gss_test.go
       - ./psql/start.sh:/start.sh
       - ../../.localcluster.certs:/certs
+      - ../../../../cockroach-linux-2.6.32-gnu-amd64:/cockroach/cockroach
 volumes:
   keytab:

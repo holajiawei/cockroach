@@ -244,6 +244,20 @@ merge transaction is careful to update the local copy of the LHS descriptor as
 its first operation, since the local copy of the LHS descriptor lives on the
 LHS.
 
+---
+**UPDATE in v21.1:**
+
+As of v21.1, the merge transaction uses a locking read on the LHS range's
+transaction record as its first course of action. This eliminates thrashing and
+livelock in the face of concurrent merge attempts, which we typically only see
+in testing scenarios but which we'd like to handle effectively. It also has the
+effect of locating the transaction record on the LHS earlier in the transaction.
+Because of this, the merge transaction no longer needs to be quite as deliberate
+about the order in which it updates descriptors later on because that order does
+not impact the location of the transaction record.
+
+---
+
 Second, the merge transaction must ensure that, when it issues the delete
 request to remove the local copy of the RHS descriptor, the resulting intent is
 actually written to disk. (See the [transfer of power](#transfer-of-power)
@@ -361,11 +375,6 @@ addressable keys in the range. This is a bald-faced lie, as the Subsume request
 only reads one key and writes no keys, but it forces synchronization with all
 latches in the span latch manager, as no other commands can possibly execute in
 parallel with a command that claims to write all keys.
-
-**TODO(benesch,nvanbenschoten):** Actually, concurrent reads at lower timestamps
-are permitted. Is this a problem? Maybe. Answering this question is difficult
-and requires reasoning about the causal chain established by the sequence of
-requests sent by the merge transaction.
 
 It provides promise 2 by flipping [a bit][merge-bit] on the replica that
 indicates that a subsumption is in progress. When the bit is active, the

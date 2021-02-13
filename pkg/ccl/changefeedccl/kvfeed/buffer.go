@@ -14,9 +14,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -41,7 +42,7 @@ type EventBufferReader interface {
 // EventBufferWriter is the write portion of the EventBuffer interface.
 type EventBufferWriter interface {
 	AddKV(ctx context.Context, kv roachpb.KeyValue, prevVal roachpb.Value, backfillTimestamp hlc.Timestamp) error
-	AddResolved(ctx context.Context, span roachpb.Span, ts hlc.Timestamp) error
+	AddResolved(ctx context.Context, span roachpb.Span, ts hlc.Timestamp, boundaryReached bool) error
 	Close(ctx context.Context)
 }
 
@@ -125,7 +126,7 @@ func (b *Event) Timestamp() hlc.Timestamp {
 	case ResolvedEvent:
 		return b.resolved.Timestamp
 	case KVEvent:
-		if b.backfillTimestamp != (hlc.Timestamp{}) {
+		if !b.backfillTimestamp.IsEmpty() {
 			return b.backfillTimestamp
 		}
 		return b.kv.Value.Timestamp
@@ -163,8 +164,10 @@ func (b *chanBuffer) AddKV(
 }
 
 // AddResolved inserts a Resolved timestamp notification in the buffer.
-func (b *chanBuffer) AddResolved(ctx context.Context, span roachpb.Span, ts hlc.Timestamp) error {
-	return b.addEvent(ctx, Event{resolved: &jobspb.ResolvedSpan{Span: span, Timestamp: ts}})
+func (b *chanBuffer) AddResolved(
+	ctx context.Context, span roachpb.Span, ts hlc.Timestamp, boundaryReached bool,
+) error {
+	return b.addEvent(ctx, Event{resolved: &jobspb.ResolvedSpan{Span: span, Timestamp: ts, BoundaryReached: boundaryReached}})
 }
 
 func (b *chanBuffer) Close(_ context.Context) {
@@ -200,14 +203,14 @@ func (b *chanBuffer) Get(ctx context.Context) (Event, error) {
 var MemBufferDefaultCapacity = envutil.EnvOrDefaultBytes(
 	"COCKROACH_CHANGEFEED_BUFFER_CAPACITY", 1<<30) // 1GB
 
-var memBufferColTypes = []types.T{
-	*types.Bytes, // KV.Key
-	*types.Bytes, // KV.Value
-	*types.Bytes, // KV.PrevValue
-	*types.Bytes, // span.Key
-	*types.Bytes, // span.EndKey
-	*types.Int,   // ts.WallTime
-	*types.Int,   // ts.Logical
+var memBufferColTypes = []*types.T{
+	types.Bytes, // KV.Key
+	types.Bytes, // KV.Value
+	types.Bytes, // KV.PrevValue
+	types.Bytes, // span.Key
+	types.Bytes, // span.EndKey
+	types.Int,   // ts.WallTime
+	types.Int,   // ts.Logical
 }
 
 // memBuffer is an in-memory buffer for changed KV and Resolved timestamp
@@ -226,7 +229,7 @@ type memBuffer struct {
 
 	allocMu struct {
 		syncutil.Mutex
-		a sqlbase.DatumAlloc
+		a rowenc.DatumAlloc
 	}
 }
 
@@ -235,7 +238,7 @@ func makeMemBuffer(acc mon.BoundAccount, metrics *Metrics) *memBuffer {
 		metrics:  metrics,
 		signalCh: make(chan struct{}, 1),
 	}
-	b.mu.entries.Init(acc, sqlbase.ColTypeInfoFromColTypes(memBufferColTypes), 0 /* rowCapacity */)
+	b.mu.entries.Init(acc, colinfo.ColTypeInfoFromColTypes(memBufferColTypes), 0 /* rowCapacity */)
 	return b
 }
 
@@ -269,7 +272,9 @@ func (b *memBuffer) AddKV(
 }
 
 // AddResolved inserts a Resolved timestamp notification in the buffer.
-func (b *memBuffer) AddResolved(ctx context.Context, span roachpb.Span, ts hlc.Timestamp) error {
+func (b *memBuffer) AddResolved(
+	ctx context.Context, span roachpb.Span, ts hlc.Timestamp, boundaryReached bool,
+) error {
 	b.allocMu.Lock()
 	row := tree.Datums{
 		tree.DNull,
@@ -340,7 +345,7 @@ func (b *memBuffer) getRow(ctx context.Context) (tree.Datums, error) {
 		b.mu.Lock()
 		if b.mu.entries.Len() > 0 {
 			row = b.mu.entries.At(0)
-			b.mu.entries.PopFirst()
+			b.mu.entries.PopFirst(ctx)
 		}
 		b.mu.Unlock()
 		if row != nil {

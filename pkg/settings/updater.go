@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // EncodeDuration encodes a duration in the format parseRaw expects.
@@ -115,8 +115,19 @@ func (u updater) Set(key, rawValue string, vt string) error {
 			return err
 		}
 		return setting.set(u.sv, d)
-	case *StateMachineSetting:
-		return setting.set(u.sv, []byte(rawValue))
+	case *DurationSettingWithExplicitUnit:
+		d, err := time.ParseDuration(rawValue)
+		if err != nil {
+			return err
+		}
+		return setting.set(u.sv, d)
+	case *VersionSetting:
+		// We intentionally avoid updating the setting through this code path.
+		// The specific setting backed by VersionSetting is the cluster version
+		// setting, changes to which are propagated through direct RPCs to each
+		// node in the cluster instead of gossip. This is done using the
+		// BumpClusterVersion RPC.
+		return nil
 	}
 	return nil
 }

@@ -12,15 +12,14 @@ package sql
 
 import (
 	"context"
-	"fmt"
-	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -32,275 +31,69 @@ import (
 // suitable; consider instead schema_accessors.go and resolver.go.
 //
 
-// databaseCache holds a cache from database name to database ID. It is
-// populated as database IDs are requested and a new cache is created whenever
-// the system config changes. As such, no attempt is made to limit its size
-// which is naturally limited by the number of database descriptors in the
-// system the periodic reset whenever the system config is gossiped.
-type databaseCache struct {
-	// databases is really a map of string -> sqlbase.ID
-	databases sync.Map
-
-	// systemConfig holds a copy of the latest system config since the last
-	// call to resetForBatch.
-	systemConfig *config.SystemConfig
-}
-
-func newDatabaseCache(cfg *config.SystemConfig) *databaseCache {
-	return &databaseCache{
-		systemConfig: cfg,
-	}
-}
-
-func (dc *databaseCache) getID(name string) sqlbase.ID {
-	val, ok := dc.databases.Load(name)
-	if !ok {
-		return sqlbase.InvalidID
-	}
-	return val.(sqlbase.ID)
-}
-
-func (dc *databaseCache) setID(name string, id sqlbase.ID) {
-	dc.databases.Store(name, id)
-}
-
-func makeDatabaseDesc(p *tree.CreateDatabase) sqlbase.DatabaseDescriptor {
-	return sqlbase.DatabaseDescriptor{
-		Name:       string(p.Name),
-		Privileges: sqlbase.NewDefaultPrivilegeDescriptor(),
-	}
-}
-
-// getDatabaseID resolves a database name into a database ID.
-// Returns InvalidID on failure.
-func getDatabaseID(
-	ctx context.Context, txn *client.Txn, name string, required bool,
-) (sqlbase.ID, error) {
-	if name == sqlbase.SystemDB.Name {
-		return sqlbase.SystemDB.ID, nil
-	}
-	found, dbID, err := sqlbase.LookupDatabaseID(ctx, txn, name)
-	if err != nil {
-		return sqlbase.InvalidID, err
-	}
-	if !found && required {
-		return dbID, sqlbase.NewUndefinedDatabaseError(name)
-	}
-	return dbID, nil
-}
-
-// getDatabaseDescByID looks up the database descriptor given its ID,
-// returning nil if the descriptor is not found. If you want the "not
-// found" condition to return an error, use mustGetDatabaseDescByID() instead.
-func getDatabaseDescByID(
-	ctx context.Context, txn *client.Txn, id sqlbase.ID,
-) (*sqlbase.DatabaseDescriptor, error) {
-	desc := &sqlbase.DatabaseDescriptor{}
-	if err := getDescriptorByID(ctx, txn, id, desc); err != nil {
-		return nil, err
-	}
-	return desc, nil
-}
-
-// MustGetDatabaseDescByID looks up the database descriptor given its ID,
-// returning an error if the descriptor is not found.
-func MustGetDatabaseDescByID(
-	ctx context.Context, txn *client.Txn, id sqlbase.ID,
-) (*sqlbase.DatabaseDescriptor, error) {
-	desc, err := getDatabaseDescByID(ctx, txn, id)
-	if err != nil {
-		return nil, err
-	}
-	if desc == nil {
-		return nil, sqlbase.NewUndefinedDatabaseError(fmt.Sprintf("[%d]", id))
-	}
-	return desc, nil
-}
-
-// getCachedDatabaseDesc looks up the database descriptor from the descriptor cache,
-// given its name. Returns nil and no error if the name is not present in the
-// cache.
-func (dc *databaseCache) getCachedDatabaseDesc(name string) (*sqlbase.DatabaseDescriptor, error) {
-	dbID, err := dc.getCachedDatabaseID(name)
-	if dbID == sqlbase.InvalidID || err != nil {
-		return nil, err
-	}
-
-	return dc.getCachedDatabaseDescByID(dbID)
-}
-
-// getCachedDatabaseDescByID looks up the database descriptor from the descriptor cache,
-// given its ID.
-func (dc *databaseCache) getCachedDatabaseDescByID(
-	id sqlbase.ID,
-) (*sqlbase.DatabaseDescriptor, error) {
-	if id == sqlbase.SystemDB.ID {
-		// We can't return a direct reference to SystemDB, because the
-		// caller expects a private object that can be modified in-place.
-		sysDB := sqlbase.MakeSystemDatabaseDesc()
-		return &sysDB, nil
-	}
-
-	descKey := sqlbase.MakeDescMetadataKey(id)
-	descVal := dc.systemConfig.GetValue(descKey)
-	if descVal == nil {
-		return nil, nil
-	}
-
-	desc := &sqlbase.Descriptor{}
-	if err := descVal.GetProto(desc); err != nil {
-		return nil, err
-	}
-
-	database := desc.GetDatabase()
-	if database == nil {
-		return nil, pgerror.Newf(pgcode.WrongObjectType, "[%d] is not a database", id)
-	}
-
-	return database, database.Validate()
-}
-
-// getDatabaseDesc returns the database descriptor given its name
-// if it exists in the cache, otherwise falls back to KV operations.
-func (dc *databaseCache) getDatabaseDesc(
-	ctx context.Context,
-	txnRunner func(context.Context, func(context.Context, *client.Txn) error) error,
-	name string,
-	required bool,
-) (*sqlbase.DatabaseDescriptor, error) {
-	// Lookup the database in the cache first, falling back to the KV store if it
-	// isn't present. The cache might cause the usage of a recently renamed
-	// database, but that's a race that could occur anyways.
-	// The cache lookup may fail.
-	desc, err := dc.getCachedDatabaseDesc(name)
-	if err != nil {
-		return nil, err
-	}
-	if desc == nil {
-		if err := txnRunner(ctx, func(ctx context.Context, txn *client.Txn) error {
-			a := UncachedPhysicalAccessor{}
-			desc, err = a.GetDatabaseDesc(ctx, txn, name,
-				tree.DatabaseLookupFlags{Required: required})
-			return err
-		}); err != nil {
-			return nil, err
-		}
-	}
-	if desc != nil {
-		dc.setID(name, desc.ID)
-	}
-	return desc, err
-}
-
-// getDatabaseDescByID returns the database descriptor given its ID
-// if it exists in the cache, otherwise falls back to KV operations.
-func (dc *databaseCache) getDatabaseDescByID(
-	ctx context.Context, txn *client.Txn, id sqlbase.ID,
-) (*sqlbase.DatabaseDescriptor, error) {
-	desc, err := dc.getCachedDatabaseDescByID(id)
-	if desc == nil || err != nil {
-		if err != nil {
-			log.VEventf(ctx, 3, "error getting database descriptor from cache: %s", err)
-		}
-		desc, err = MustGetDatabaseDescByID(ctx, txn, id)
-	}
-	return desc, err
-}
-
-// getDatabaseID returns the ID of a database given its name. It
-// uses the descriptor cache if possible, otherwise falls back to KV
-// operations.
-func (dc *databaseCache) getDatabaseID(
-	ctx context.Context,
-	txnRunner func(context.Context, func(context.Context, *client.Txn) error) error,
-	name string,
-	required bool,
-) (sqlbase.ID, error) {
-	dbID, err := dc.getCachedDatabaseID(name)
-	if err != nil {
-		return dbID, err
-	}
-	if dbID == sqlbase.InvalidID {
-		if err := txnRunner(ctx, func(ctx context.Context, txn *client.Txn) error {
-			var err error
-			dbID, err = getDatabaseID(ctx, txn, name, required)
-			return err
-		}); err != nil {
-			return sqlbase.InvalidID, err
-		}
-	}
-	dc.setID(name, dbID)
-	return dbID, nil
-}
-
-// getCachedDatabaseID returns the ID of a database given its name
-// from the cache. This method never goes to the store to resolve
-// the name to id mapping. Returns InvalidID if the name to id mapping or
-// the database descriptor are not in the cache.
-func (dc *databaseCache) getCachedDatabaseID(name string) (sqlbase.ID, error) {
-	if id := dc.getID(name); id != sqlbase.InvalidID {
-		return id, nil
-	}
-
-	if name == sqlbase.SystemDB.Name {
-		return sqlbase.SystemDB.ID, nil
-	}
-
-	var nameKey sqlbase.DescriptorKey = sqlbase.NewDatabaseKey(name)
-	nameVal := dc.systemConfig.GetValue(nameKey.Key())
-	if nameVal == nil {
-		// Try the deprecated system.namespace before returning InvalidID.
-		// TODO(solon): This can be removed in 20.2.
-		nameKey = sqlbase.NewDeprecatedDatabaseKey(name)
-		nameVal = dc.systemConfig.GetValue(nameKey.Key())
-		if nameVal == nil {
-			return sqlbase.InvalidID, nil
-		}
-	}
-
-	id, err := nameVal.GetInt()
-	return sqlbase.ID(id), err
-}
-
 // renameDatabase implements the DatabaseDescEditor interface.
 func (p *planner) renameDatabase(
-	ctx context.Context, oldDesc *sqlbase.DatabaseDescriptor, newName string,
+	ctx context.Context, desc *dbdesc.Mutable, newName string, stmt string,
 ) error {
-	oldName := oldDesc.Name
-	oldDesc.SetName(newName)
-	if err := oldDesc.Validate(); err != nil {
-		return err
-	}
+	oldName := desc.GetName()
+	desc.SetName(newName)
 
-	if exists, _, err := sqlbase.LookupDatabaseID(ctx, p.txn, newName); err == nil && exists {
+	if exists, _, err := catalogkv.LookupDatabaseID(ctx, p.txn, p.ExecCfg().Codec, newName); err == nil && exists {
 		return pgerror.Newf(pgcode.DuplicateDatabase,
 			"the new database name %q already exists", newName)
 	} else if err != nil {
 		return err
 	}
 
-	newKey := sqlbase.MakeDatabaseNameKey(ctx, p.ExecCfg().Settings, newName).Key()
-
-	descID := oldDesc.GetID()
-	descKey := sqlbase.MakeDescMetadataKey(descID)
-	descDesc := sqlbase.WrapDescriptor(oldDesc)
-
-	b := &client.Batch{}
+	b := &kv.Batch{}
+	newKey := catalogkv.MakeDatabaseNameKey(ctx, p.ExecCfg().Settings, newName).Key(p.ExecCfg().Codec)
+	descID := desc.GetID()
 	if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
 		log.VEventf(ctx, 2, "CPut %s -> %d", newKey, descID)
-		log.VEventf(ctx, 2, "Put %s -> %s", descKey, descDesc)
 	}
 	b.CPut(newKey, descID, nil)
-	b.Put(descKey, descDesc)
-	err := sqlbase.RemoveDatabaseNamespaceEntry(
-		ctx, p.txn, oldName, p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
-	)
-	if err != nil {
+
+	desc.DrainingNames = append(desc.DrainingNames, descpb.NameInfo{
+		ParentID:       keys.RootNamespaceID,
+		ParentSchemaID: keys.RootNamespaceID,
+		Name:           oldName,
+	})
+	if err := p.writeNonDropDatabaseChange(ctx, desc, stmt); err != nil {
 		return err
 	}
 
-	p.Tables().addUncommittedDatabase(oldName, descID, dbDropped)
-	p.Tables().addUncommittedDatabase(newName, descID, dbCreated)
-
 	return p.txn.Run(ctx, b)
+}
+
+// writeNonDropDatabaseChange writes an updated database descriptor, and can
+// only be called when database descriptor leasing is enabled. See
+// writeDatabaseChangeToBatch. Also queues a job to complete the schema change.
+func (p *planner) writeNonDropDatabaseChange(
+	ctx context.Context, desc *dbdesc.Mutable, jobDesc string,
+) error {
+	if err := p.createNonDropDatabaseChangeJob(ctx, desc.ID, jobDesc); err != nil {
+		return err
+	}
+	b := p.Txn().NewBatch()
+	if err := p.writeDatabaseChangeToBatch(ctx, desc, b); err != nil {
+		return err
+	}
+	return p.Txn().Run(ctx, b)
+}
+
+// writeDatabaseChangeToBatch writes an updated database descriptor, and
+// can only be called when database descriptor leasing is enabled. Does not
+// queue a job to complete the schema change.
+func (p *planner) writeDatabaseChangeToBatch(
+	ctx context.Context, desc *dbdesc.Mutable, b *kv.Batch,
+) error {
+	if err := desc.Validate(); err != nil {
+		return err
+	}
+	return p.Descriptors().WriteDescToBatch(
+		ctx,
+		p.extendedEvalCtx.Tracing.KVTracingEnabled(),
+		desc,
+		b,
+	)
 }

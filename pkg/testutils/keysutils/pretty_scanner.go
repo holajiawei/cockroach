@@ -16,8 +16,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/keysutil"
 )
@@ -25,6 +25,8 @@ import (
 // MakePrettyScannerForNamedTables create a PrettyScanner that, beside what the
 // PrettyScanner is generally able to decode, can also decode keys of the form
 // "/<table name>/<index name>/1/2/3/..." using supplied maps from names to ids.
+//
+// TODO(nvanbenschoten): support tenant SQL keys.
 func MakePrettyScannerForNamedTables(
 	tableNameToID map[string]int, idxNameToID map[string]int,
 ) keysutil.PrettyScanner {
@@ -65,7 +67,7 @@ func parseTableKeysAsAscendingInts(
 	if !ok {
 		panic(fmt.Sprintf("unknown table: %s", tableName))
 	}
-	output := roachpb.Key(keys.MakeTablePrefix(uint32(tableID)))
+	output := keys.TODOSQLCodec.TablePrefix(uint32(tableID))
 	if remainder == "" {
 		return "", output
 	}
@@ -159,7 +161,7 @@ func parseAscendingIntIndexKey(input string) (string, roachpb.Key) {
 		return origInput, nil
 	}
 	remainder := input[slashPos:] // `/something/else` -> `/else`
-	key, err := sqlbase.EncodeTableKey(nil, datum, encoding.Ascending)
+	key, err := rowenc.EncodeTableKey(nil, datum, encoding.Ascending)
 	if err != nil {
 		panic(err)
 	}

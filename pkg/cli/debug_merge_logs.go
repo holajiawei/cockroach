@@ -24,19 +24,22 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"golang.org/x/sync/errgroup"
 )
 
 type logStream interface {
 	fileInfo() *fileInfo // FileInfo for the current entry available in peek.
-	peek() (log.Entry, bool)
-	pop() (log.Entry, bool) // If called after peek, must return the same values.
+	peek() (logpb.Entry, bool)
+	pop() (logpb.Entry, bool) // If called after peek, must return the same values.
 	error() error
 }
 
 // writeLogStream pops messages off of s and writes them to out prepending
 // prefix per message and filtering messages which match filter.
-func writeLogStream(s logStream, out io.Writer, filter *regexp.Regexp, prefix string) error {
+func writeLogStream(
+	s logStream, out io.Writer, filter *regexp.Regexp, prefix string, keepRedactable bool,
+) error {
 	const chanSize = 1 << 16        // 64k
 	const maxWriteBufSize = 1 << 18 // 256kB
 
@@ -50,7 +53,7 @@ func writeLogStream(s logStream, out io.Writer, filter *regexp.Regexp, prefix st
 	}
 
 	type entryInfo struct {
-		log.Entry
+		logpb.Entry
 		*fileInfo
 	}
 	render := func(ei entryInfo, w io.Writer) (err error) {
@@ -61,7 +64,7 @@ func writeLogStream(s logStream, out io.Writer, filter *regexp.Regexp, prefix st
 		if _, err = w.Write(prefixBytes); err != nil {
 			return err
 		}
-		return ei.Format(w)
+		return log.FormatLegacyEntry(ei.Entry, w)
 	}
 
 	g, ctx := errgroup.WithContext(context.Background())
@@ -166,6 +169,7 @@ func newMergedStreamFromPatterns(
 	patterns []string,
 	filePattern, programFilter *regexp.Regexp,
 	from, to time.Time,
+	editMode log.EditSensitiveData,
 ) (logStream, error) {
 	paths, err := expandPatterns(patterns)
 	if err != nil {
@@ -176,7 +180,7 @@ func newMergedStreamFromPatterns(
 	if err != nil {
 		return nil, err
 	}
-	return newMergedStream(ctx, files, from, to)
+	return newMergedStream(ctx, files, from, to, editMode)
 }
 
 func groupIndex(re *regexp.Regexp, groupName string) int {
@@ -189,7 +193,7 @@ func groupIndex(re *regexp.Regexp, groupName string) int {
 }
 
 func newMergedStream(
-	ctx context.Context, files []fileInfo, from, to time.Time,
+	ctx context.Context, files []fileInfo, from, to time.Time, editMode log.EditSensitiveData,
 ) (*mergedStream, error) {
 	// TODO(ajwerner): think about clock movement and PID
 	const maxConcurrentFiles = 256 // should be far less than the FD limit
@@ -200,7 +204,7 @@ func newMergedStream(
 		return func() error {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			s, err := newFileLogStream(files[i], from, to)
+			s, err := newFileLogStream(files[i], from, to, editMode)
 			if s != nil {
 				res[i] = s
 			}
@@ -248,24 +252,24 @@ func (l *mergedStream) Pop() (v interface{}) {
 	return
 }
 
-func (l *mergedStream) peek() (log.Entry, bool) {
+func (l *mergedStream) peek() (logpb.Entry, bool) {
 	if len(*l) == 0 {
-		return log.Entry{}, false
+		return logpb.Entry{}, false
 	}
 	return (*l)[0].peek()
 }
 
-func (l *mergedStream) pop() (log.Entry, bool) {
+func (l *mergedStream) pop() (logpb.Entry, bool) {
 	e, ok := l.peek()
 	if !ok {
-		return log.Entry{}, false
+		return logpb.Entry{}, false
 	}
 	s := (*l)[0]
 	s.pop()
 	if _, stillOk := s.peek(); stillOk {
 		heap.Push(l, heap.Pop(l))
 	} else if err := s.error(); err != nil && err != io.EOF {
-		return log.Entry{}, false
+		return logpb.Entry{}, false
 	} else {
 		heap.Pop(l)
 	}
@@ -373,17 +377,17 @@ func newBufferedLogStream(ctx context.Context, g *errgroup.Group, s logStream) l
 type bufferedLogStream struct {
 	logStream
 	runOnce sync.Once
-	e       log.Entry
+	e       logpb.Entry
 	read    bool
 	ok      bool
-	c       chan log.Entry
+	c       chan logpb.Entry
 	ctx     context.Context
 	g       *errgroup.Group
 }
 
 func (bs *bufferedLogStream) run() {
 	const readChanSize = 512
-	bs.c = make(chan log.Entry, readChanSize)
+	bs.c = make(chan logpb.Entry, readChanSize)
 	bs.g.Go(func() error {
 		defer close(bs.c)
 		for {
@@ -403,7 +407,7 @@ func (bs *bufferedLogStream) run() {
 	})
 }
 
-func (bs *bufferedLogStream) peek() (log.Entry, bool) {
+func (bs *bufferedLogStream) peek() (logpb.Entry, bool) {
 	if bs.ok && !bs.read {
 		if bs.c == nil { // indicates that run has not been called
 			bs.runOnce.Do(bs.run)
@@ -412,12 +416,12 @@ func (bs *bufferedLogStream) peek() (log.Entry, bool) {
 		bs.read = true
 	}
 	if !bs.ok {
-		return log.Entry{}, false
+		return logpb.Entry{}, false
 	}
 	return bs.e, true
 }
 
-func (bs *bufferedLogStream) pop() (log.Entry, bool) {
+func (bs *bufferedLogStream) pop() (logpb.Entry, bool) {
 	e, ok := bs.peek()
 	bs.read = false
 	return e, ok
@@ -431,8 +435,9 @@ type fileLogStream struct {
 	f        *os.File
 	d        *log.EntryDecoder
 	read     bool
+	editMode log.EditSensitiveData
 
-	e   log.Entry
+	e   logpb.Entry
 	err error
 }
 
@@ -442,11 +447,14 @@ type fileLogStream struct {
 // encountered during the initial peek, that error is returned. The underlying
 // file is always closed before returning from this constructor so the initial
 // peek does not consume resources.
-func newFileLogStream(fi fileInfo, from, to time.Time) (logStream, error) {
+func newFileLogStream(
+	fi fileInfo, from, to time.Time, editMode log.EditSensitiveData,
+) (logStream, error) {
 	s := &fileLogStream{
-		fi:   fi,
-		from: from,
-		to:   to,
+		fi:       fi,
+		from:     from,
+		to:       to,
+		editMode: editMode,
 	}
 	if _, ok := s.peek(); !ok {
 		if err := s.error(); err != io.EOF {
@@ -469,26 +477,26 @@ func (s *fileLogStream) open() bool {
 	if s.f, s.err = os.Open(s.fi.path); s.err != nil {
 		return false
 	}
-	if s.err = seekToFirstAfterFrom(s.f, s.from); s.err != nil {
+	if s.err = seekToFirstAfterFrom(s.f, s.from, s.editMode); s.err != nil {
 		return false
 	}
-	s.d = log.NewEntryDecoder(bufio.NewReaderSize(s.f, readBufSize))
+	s.d = log.NewEntryDecoder(bufio.NewReaderSize(s.f, readBufSize), s.editMode)
 	return true
 }
 
-func (s *fileLogStream) peek() (log.Entry, bool) {
+func (s *fileLogStream) peek() (logpb.Entry, bool) {
 	for !s.read && s.err == nil {
 		justOpened := false
 		if s.d == nil {
 			if !s.open() {
-				return log.Entry{}, false
+				return logpb.Entry{}, false
 			}
 			justOpened = true
 		}
-		var e log.Entry
+		var e logpb.Entry
 		if s.err = s.d.Decode(&e); s.err != nil {
 			s.close()
-			s.e = log.Entry{}
+			s.e = logpb.Entry{}
 			break
 		}
 		// Upon re-opening the file, we'll read s.e again.
@@ -504,7 +512,7 @@ func (s *fileLogStream) peek() (log.Entry, bool) {
 		afterTo := !s.to.IsZero() && s.e.Time > s.to.UnixNano()
 		if afterTo {
 			s.close()
-			s.e = log.Entry{}
+			s.e = logpb.Entry{}
 			s.err = io.EOF
 		} else {
 			beforeFrom := !s.from.IsZero() && s.e.Time < s.from.UnixNano()
@@ -514,7 +522,7 @@ func (s *fileLogStream) peek() (log.Entry, bool) {
 	return s.e, s.err == nil
 }
 
-func (s *fileLogStream) pop() (e log.Entry, ok bool) {
+func (s *fileLogStream) pop() (e logpb.Entry, ok bool) {
 	if e, ok = s.peek(); !ok {
 		return
 	}
@@ -527,7 +535,7 @@ func (s *fileLogStream) error() error        { return s.err }
 
 // seekToFirstAfterFrom uses binary search to seek to an offset after all
 // entries which occur before from.
-func seekToFirstAfterFrom(f *os.File, from time.Time) (err error) {
+func seekToFirstAfterFrom(f *os.File, from time.Time, editMode log.EditSensitiveData) (err error) {
 	if from.IsZero() {
 		return nil
 	}
@@ -545,19 +553,21 @@ func seekToFirstAfterFrom(f *os.File, from time.Time) (err error) {
 		if _, err := f.Seek(int64(i), io.SeekStart); err != nil {
 			panic(err)
 		}
-		var e log.Entry
-		switch err := log.NewEntryDecoder(f).Decode(&e); err {
-		case nil:
-			return e.Time >= from.UnixNano()
-		default:
-			return true
+		var e logpb.Entry
+		err := log.NewEntryDecoder(f, editMode).Decode(&e)
+		if err != nil {
+			if err == io.EOF {
+				return true
+			}
+			panic(err)
 		}
+		return e.Time >= from.UnixNano()
 	})
 	if _, err := f.Seek(int64(offset), io.SeekStart); err != nil {
 		return err
 	}
-	var e log.Entry
-	if err := log.NewEntryDecoder(f).Decode(&e); err != nil {
+	var e logpb.Entry
+	if err := log.NewEntryDecoder(f, editMode).Decode(&e); err != nil {
 		return err
 	}
 	_, err = f.Seek(int64(offset), io.SeekStart)

@@ -23,10 +23,12 @@
 // guarantees.
 //
 // TODO
-// - Validate read only transactions
 // - CPut/InitPut/Increment/Delete
-// - DeleteRange/ClearRange/RevertRange/Scan/ReverseScan
-// - TransferLease
+// - DeleteRange/ClearRange/RevertRange/ReverseScan
+// - AdminRelocateRange
+// - AdminUnsplit
+// - AdminScatter
+// - CheckConsistency
 // - ExportRequest
 // - AddSSTable
 // - Root and leaf transactions

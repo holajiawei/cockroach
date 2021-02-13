@@ -11,11 +11,13 @@
 package delegate
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 )
 
 func (d *delegator) delegateShowQueries(n *tree.ShowQueries) (tree.Statement, error) {
+	sqltelemetry.IncrementShowCounter(sqltelemetry.Queries)
 	const query = `SELECT query_id, node_id, session_id, user_name, start, query, client_address, application_name, distributed, phase FROM crdb_internal.`
 	table := `node_queries`
 	if n.Cluster {
@@ -23,7 +25,7 @@ func (d *delegator) delegateShowQueries(n *tree.ShowQueries) (tree.Statement, er
 	}
 	var filter string
 	if !n.All {
-		filter = " WHERE application_name NOT LIKE '" + sqlbase.InternalAppNamePrefix + "%'"
+		filter = " WHERE application_name NOT LIKE '" + catconstants.InternalAppNamePrefix + "%'"
 	}
 	return parse(query + table + filter)
 }

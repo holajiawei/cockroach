@@ -12,18 +12,20 @@ package rowexec
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/errors"
 )
 
 type ProcessorTestConfig struct {
@@ -49,11 +51,11 @@ func DefaultProcessorTestConfig() ProcessorTestConfig {
 // schema that can be converted to sqlbase.EncDatumRows.
 type ProcessorTestCaseRows struct {
 	Rows  [][]interface{}
-	Types []types.T
+	Types []*types.T
 }
 
 // toEncDatum converts a go value to an EncDatum.
-func toEncDatum(datumType *types.T, v interface{}) sqlbase.EncDatum {
+func toEncDatum(datumType *types.T, v interface{}) rowenc.EncDatum {
 	d := func() tree.Datum {
 		switch concreteType := v.(type) {
 		case int:
@@ -68,21 +70,28 @@ func toEncDatum(datumType *types.T, v interface{}) sqlbase.EncDatum {
 		case nil:
 			return tree.DNull
 		default:
-			panic(fmt.Sprintf("type %T not supported yet", concreteType))
+			panic(errors.AssertionFailedf("type %T not supported yet", concreteType))
 		}
 	}()
-	return sqlbase.DatumToEncDatum(datumType, d)
+	// Initialize both EncDatum.Datum, and EncDatum.encoded.
+	encoded, err := rowenc.EncodeTableKey(nil, d, encoding.Ascending)
+	if err != nil {
+		panic(err)
+	}
+	encodedDatum := rowenc.EncDatumFromEncoded(descpb.DatumEncoding_ASCENDING_KEY, encoded)
+	encodedDatum.Datum = d
+	return encodedDatum
 }
 
-func (r ProcessorTestCaseRows) toEncDatumRows() sqlbase.EncDatumRows {
-	result := make(sqlbase.EncDatumRows, len(r.Rows))
+func (r ProcessorTestCaseRows) toEncDatumRows() rowenc.EncDatumRows {
+	result := make(rowenc.EncDatumRows, len(r.Rows))
 	for i, row := range r.Rows {
 		if len(row) != len(r.Types) {
 			panic("mismatched number of columns and number of types")
 		}
-		result[i] = make(sqlbase.EncDatumRow, len(row))
+		result[i] = make(rowenc.EncDatumRow, len(row))
 		for j, col := range row {
-			result[i][j] = toEncDatum(&r.Types[j], col)
+			result[i][j] = toEncDatum(r.Types[j], col)
 		}
 	}
 	return result

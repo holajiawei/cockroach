@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"context"
 	gosql "database/sql"
-	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -21,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -131,6 +131,13 @@ func (m *roachmart) Hooks() workload.Hooks {
 			return nil
 		},
 
+		PreCreate: func(db *gosql.DB) error {
+			if _, err := db.Exec(`SET CLUSTER SETTING sql.defaults.interleaved_tables.enabled = true`); err != nil {
+				return err
+			}
+			return nil
+		},
+
 		PreLoad: func(db *gosql.DB) error {
 			if _, err := db.Exec(zoneLocationsStmt); err != nil {
 				return err
@@ -200,7 +207,9 @@ func (m *roachmart) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (m *roachmart) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
+func (m *roachmart) Ops(
+	ctx context.Context, urls []string, reg *histogram.Registry,
+) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(m, m.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err

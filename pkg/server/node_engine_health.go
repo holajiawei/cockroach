@@ -12,30 +12,24 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
-
-// maxSyncDuration is the threshold above which an observed engine sync duration
-// triggers either a warning or a fatal error.
-var maxSyncDuration = envutil.EnvOrDefaultDuration("COCKROACH_ENGINE_MAX_SYNC_DURATION", 10*time.Second)
-
-// maxSyncDurationFatalOnExceeded defaults to false due to issues such as
-// https://github.com/cockroachdb/cockroach/issues/34860#issuecomment-469262019.
-// Similar problems have been known to occur during index backfill and, possibly,
-// IMPORT/RESTORE.
-var maxSyncDurationFatalOnExceeded = envutil.EnvOrDefaultBool("COCKROACH_ENGINE_MAX_SYNC_DURATION_FATAL", false)
 
 // startAssertEngineHealth starts a goroutine that periodically verifies that
 // syncing the engines is possible within maxSyncDuration. If not,
 // the process is terminated (with an attempt at a descriptive message).
-func (n *Node) startAssertEngineHealth(ctx context.Context, engines []engine.Engine) {
-	n.stopper.RunWorker(ctx, func(ctx context.Context) {
+func (n *Node) startAssertEngineHealth(
+	ctx context.Context, engines []storage.Engine, settings *cluster.Settings,
+) {
+	maxSyncDuration := storage.MaxSyncDuration.Get(&settings.SV)
+	fatalOnExceeded := storage.MaxSyncDurationFatalOnExceeded.Get(&settings.SV)
+	_ = n.stopper.RunAsyncTask(ctx, "engine-health", func(ctx context.Context) {
 		t := timeutil.NewTimer()
 		t.Reset(0)
 
@@ -44,7 +38,7 @@ func (n *Node) startAssertEngineHealth(ctx context.Context, engines []engine.Eng
 			case <-t.C:
 				t.Read = true
 				t.Reset(10 * time.Second)
-				n.assertEngineHealth(ctx, engines, maxSyncDuration)
+				n.assertEngineHealth(ctx, engines, maxSyncDuration, fatalOnExceeded)
 			case <-n.stopper.ShouldQuiesce():
 				return
 			}
@@ -54,11 +48,11 @@ func (n *Node) startAssertEngineHealth(ctx context.Context, engines []engine.Eng
 
 func guaranteedExitFatal(ctx context.Context, msg string, args ...interface{}) {
 	// NB: log.Shout sets up a timer that guarantees process termination.
-	log.Shout(ctx, log.Severity_FATAL, fmt.Sprintf(msg, args...))
+	log.Health.Shoutf(ctx, severity.FATAL, msg, args...)
 }
 
 func (n *Node) assertEngineHealth(
-	ctx context.Context, engines []engine.Engine, maxDuration time.Duration,
+	ctx context.Context, engines []storage.Engine, maxDuration time.Duration, fatalOnExceeded bool,
 ) {
 	for _, eng := range engines {
 		func() {
@@ -66,17 +60,17 @@ func (n *Node) assertEngineHealth(
 				n.metrics.DiskStalls.Inc(1)
 				stats := "\n" + eng.GetCompactionStats()
 				logger := log.Warningf
-				if maxSyncDurationFatalOnExceeded {
+				if fatalOnExceeded {
 					logger = guaranteedExitFatal
 				}
 				// NB: the disk-stall-detected roachtest matches on this message.
 				logger(ctx, "disk stall detected: unable to write to %s within %s %s",
-					eng, maxSyncDuration, stats,
+					eng, storage.MaxSyncDuration, stats,
 				)
 			})
 			defer t.Stop()
-			if err := engine.WriteSyncNoop(ctx, eng); err != nil {
-				log.Fatal(ctx, err)
+			if err := storage.WriteSyncNoop(ctx, eng); err != nil {
+				log.Fatalf(ctx, "%v", err)
 			}
 		}()
 	}

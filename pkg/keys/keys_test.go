@@ -12,6 +12,7 @@ package keys
 
 import (
 	"bytes"
+	"fmt"
 	"math"
 	"reflect"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStoreKeyEncodeDecode(t *testing.T) {
@@ -34,11 +36,6 @@ func TestStoreKeyEncodeDecode(t *testing.T) {
 		{key: StoreClusterVersionKey(), expSuffix: localStoreClusterVersionSuffix, expDetail: nil},
 		{key: StoreLastUpKey(), expSuffix: localStoreLastUpSuffix, expDetail: nil},
 		{key: StoreHLCUpperBoundKey(), expSuffix: localStoreHLCUpperBoundSuffix, expDetail: nil},
-		{
-			key:       StoreSuggestedCompactionKey(roachpb.Key("a"), roachpb.Key("z")),
-			expSuffix: localStoreSuggestedCompactionSuffix,
-			expDetail: encoding.EncodeBytesAscending(encoding.EncodeBytesAscending(nil, roachpb.Key("a")), roachpb.Key("z")),
-		},
 	}
 	for _, test := range testCases {
 		t.Run("", func(t *testing.T) {
@@ -53,20 +50,12 @@ func TestStoreKeyEncodeDecode(t *testing.T) {
 	}
 }
 
-func TestStoreSuggestedCompactionKeyDecode(t *testing.T) {
-	origStart := roachpb.Key("a")
-	origEnd := roachpb.Key("z")
-	key := StoreSuggestedCompactionKey(origStart, origEnd)
-	start, end, err := DecodeStoreSuggestedCompactionKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !start.Equal(origStart) {
-		t.Errorf("expected %s == %s", start, origStart)
-	}
-	if !end.Equal(origEnd) {
-		t.Errorf("expected %s == %s", end, origEnd)
-	}
+func TestStoreCachedSettingsKeyDecode(t *testing.T) {
+	origSettingKey := roachpb.Key("testSettingKey")
+	actualKey := StoreCachedSettingsKey(origSettingKey)
+	settingKey, err := DecodeStoreCachedSettingsKey(actualKey)
+	require.NoError(t, err)
+	require.True(t, settingKey.Equal(origSettingKey))
 }
 
 // TestLocalKeySorting is a sanity check to make sure that
@@ -77,7 +66,7 @@ func TestKeySorting(t *testing.T) {
 		roachpb.RKey("\x01").Less(roachpb.RKey("\x01\x00"))) {
 		t.Fatalf("something is seriously wrong with this machine")
 	}
-	if bytes.Compare(localPrefix, Meta1Prefix) >= 0 {
+	if bytes.Compare(LocalPrefix, Meta1Prefix) >= 0 {
 		t.Fatalf("local key spilling into replicated ranges")
 	}
 	if !bytes.Equal(roachpb.Key(""), roachpb.Key(nil)) {
@@ -151,7 +140,7 @@ func TestKeyAddressError(t *testing.T) {
 			RangeLastReplicaGCTimestampKey(0),
 		},
 		"local key .* malformed": {
-			makeKey(localPrefix, roachpb.Key("z")),
+			makeKey(LocalPrefix, roachpb.Key("z")),
 		},
 	}
 	for regexp, keyList := range testCases {
@@ -163,6 +152,70 @@ func TestKeyAddressError(t *testing.T) {
 				t.Errorf("expected addressing key %q to throw error matching %s, but got error %v",
 					key, regexp, err)
 			}
+		}
+	}
+}
+
+func TestSpanAddress(t *testing.T) {
+	testCases := []struct {
+		span       roachpb.Span
+		expAddress roachpb.RSpan
+	}{
+		// Without EndKey.
+		{
+			roachpb.Span{},
+			roachpb.RSpan{},
+		},
+		{
+			roachpb.Span{Key: roachpb.Key{}},
+			roachpb.RSpan{Key: roachpb.RKeyMin},
+		},
+		{
+			roachpb.Span{Key: roachpb.Key("123")},
+			roachpb.RSpan{Key: roachpb.RKey("123")},
+		},
+		{
+			roachpb.Span{Key: RangeDescriptorKey(roachpb.RKey("foo"))},
+			roachpb.RSpan{Key: roachpb.RKey("foo")},
+		},
+		{
+			roachpb.Span{Key: TransactionKey(roachpb.Key("baz"), uuid.MakeV4())},
+			roachpb.RSpan{Key: roachpb.RKey("baz")},
+		},
+		{
+			roachpb.Span{Key: TransactionKey(roachpb.KeyMax, uuid.MakeV4())},
+			roachpb.RSpan{Key: roachpb.RKeyMax},
+		},
+		{
+			roachpb.Span{Key: RangeDescriptorKey(roachpb.RKey(TransactionKey(roachpb.Key("doubleBaz"), uuid.MakeV4())))},
+			roachpb.RSpan{Key: roachpb.RKey("doubleBaz")},
+		},
+		// With EndKey.
+		{
+			roachpb.Span{Key: roachpb.Key("123"), EndKey: roachpb.Key("456")},
+			roachpb.RSpan{Key: roachpb.RKey("123"), EndKey: roachpb.RKey("456")},
+		},
+		{
+			roachpb.Span{Key: RangeDescriptorKey(roachpb.RKey("foo")), EndKey: RangeDescriptorKey(roachpb.RKey("fop"))},
+			roachpb.RSpan{Key: roachpb.RKey("foo"), EndKey: roachpb.RKey("fop")},
+		},
+		{
+			roachpb.Span{Key: TransactionKey(roachpb.Key("bar"), uuid.MakeV4()), EndKey: TransactionKey(roachpb.Key("baz"), uuid.MakeV4())},
+			roachpb.RSpan{Key: roachpb.RKey("bar"), EndKey: roachpb.RKey("baz")},
+		},
+		{
+			roachpb.Span{
+				Key:    RangeDescriptorKey(roachpb.RKey(TransactionKey(roachpb.Key("doubleBar"), uuid.MakeV4()))),
+				EndKey: RangeDescriptorKey(roachpb.RKey(TransactionKey(roachpb.Key("doubleBaz"), uuid.MakeV4()))),
+			},
+			roachpb.RSpan{Key: roachpb.RKey("doubleBar"), EndKey: roachpb.RKey("doubleBaz")},
+		},
+	}
+	for i, test := range testCases {
+		if spanAddr, err := SpanAddr(test.span); err != nil {
+			t.Errorf("%d: %v", i, err)
+		} else if !spanAddr.Equal(test.expAddress) {
+			t.Errorf("%d: expected address for span %q doesn't match %q", i, test.span, test.expAddress)
 		}
 	}
 }
@@ -236,7 +289,7 @@ func TestUserKey(t *testing.T) {
 }
 
 func TestSequenceKey(t *testing.T) {
-	actual := MakeSequenceKey(55)
+	actual := SystemSQLCodec.SequenceKey(55)
 	expected := []byte("\xbf\x89\x88\x88")
 	if !bytes.Equal(actual, expected) {
 		t.Errorf("expected %q (len %d), got %q (len %d)", expected, len(expected), actual, len(actual))
@@ -524,25 +577,53 @@ func TestMakeFamilyKey(t *testing.T) {
 }
 
 func TestEnsureSafeSplitKey(t *testing.T) {
-	e := func(vals ...uint64) roachpb.Key {
-		var k roachpb.Key
+	tenSysCodec := SystemSQLCodec
+	ten5Codec := MakeSQLCodec(roachpb.MakeTenantID(5))
+	encInt := encoding.EncodeUvarintAscending
+	encInts := func(c SQLCodec, vals ...uint64) roachpb.Key {
+		k := c.TenantPrefix()
 		for _, v := range vals {
-			k = encoding.EncodeUvarintAscending(k, v)
+			k = encInt(k, v)
 		}
 		return k
+	}
+	es := func(vals ...uint64) roachpb.Key {
+		return encInts(tenSysCodec, vals...)
+	}
+	e5 := func(vals ...uint64) roachpb.Key {
+		return encInts(ten5Codec, vals...)
 	}
 
 	goodData := []struct {
 		in       roachpb.Key
 		expected roachpb.Key
 	}{
-		{e(1, 2, 0), e(1, 2)},          // /Table/1/2/0 -> /Table/1/2
-		{e(1, 2, 1), e(1)},             // /Table/1/2/1 -> /Table/1
-		{e(1, 2, 2), e()},              // /Table/1/2/2 -> /Table
-		{e(1, 2, 3, 0), e(1, 2, 3)},    // /Table/1/2/3/0 -> /Table/1/2/3
-		{e(1, 2, 3, 1), e(1, 2)},       // /Table/1/2/3/1 -> /Table/1/2
-		{e(1, 2, 200, 2), e(1, 2)},     // /Table/1/2/200/2 -> /Table/1/2
-		{e(1, 2, 3, 4, 1), e(1, 2, 3)}, // /Table/1/2/3/4/1 -> /Table/1/2/3
+		{es(), es()},                     // Not a table key
+		{es(1, 2, 0), es(1, 2)},          // /Table/1/2/0 -> /Table/1/2
+		{es(1, 2, 1), es(1)},             // /Table/1/2/1 -> /Table/1
+		{es(1, 2, 2), es()},              // /Table/1/2/2 -> /Table
+		{es(1, 2, 3, 0), es(1, 2, 3)},    // /Table/1/2/3/0 -> /Table/1/2/3
+		{es(1, 2, 3, 1), es(1, 2)},       // /Table/1/2/3/1 -> /Table/1/2
+		{es(1, 2, 200, 2), es(1, 2)},     // /Table/1/2/200/2 -> /Table/1/2
+		{es(1, 2, 3, 4, 1), es(1, 2, 3)}, // /Table/1/2/3/4/1 -> /Table/1/2/3
+		// Same test cases, but for tenant 5.
+		{e5(), e5()},                     // Not a table key
+		{e5(1, 2, 0), e5(1, 2)},          // /Tenant/5/Table/1/2/0 -> /Tenant/5/Table/1/2
+		{e5(1, 2, 1), e5(1)},             // /Tenant/5/Table/1/2/1 -> /Tenant/5/Table/1
+		{e5(1, 2, 2), e5()},              // /Tenant/5/Table/1/2/2 -> /Tenant/5/Table
+		{e5(1, 2, 3, 0), e5(1, 2, 3)},    // /Tenant/5/Table/1/2/3/0 -> /Tenant/5/Table/1/2/3
+		{e5(1, 2, 3, 1), e5(1, 2)},       // /Tenant/5/Table/1/2/3/1 -> /Tenant/5/Table/1/2
+		{e5(1, 2, 200, 2), e5(1, 2)},     // /Tenant/5/Table/1/2/200/2 -> /Tenant/5/Table/1/2
+		{e5(1, 2, 3, 4, 1), e5(1, 2, 3)}, // /Tenant/5/Table/1/2/3/4/1 -> /Tenant/5/Table/1/2/3
+		// Test cases using SQL encoding functions.
+		{MakeFamilyKey(tenSysCodec.IndexPrefix(1, 2), 0), es(1, 2)},               // /Table/1/2/0 -> /Table/1/2
+		{MakeFamilyKey(tenSysCodec.IndexPrefix(1, 2), 1), es(1, 2)},               // /Table/1/2/1 -> /Table/1/2
+		{MakeFamilyKey(encInt(tenSysCodec.IndexPrefix(1, 2), 3), 0), es(1, 2, 3)}, // /Table/1/2/3/0 -> /Table/1/2/3
+		{MakeFamilyKey(encInt(tenSysCodec.IndexPrefix(1, 2), 3), 1), es(1, 2, 3)}, // /Table/1/2/3/1 -> /Table/1/2/3
+		{MakeFamilyKey(ten5Codec.IndexPrefix(1, 2), 0), e5(1, 2)},                 // /Tenant/5/Table/1/2/0 -> /Table/1/2
+		{MakeFamilyKey(ten5Codec.IndexPrefix(1, 2), 1), e5(1, 2)},                 // /Tenant/5/Table/1/2/1 -> /Table/1/2
+		{MakeFamilyKey(encInt(ten5Codec.IndexPrefix(1, 2), 3), 0), e5(1, 2, 3)},   // /Tenant/5/Table/1/2/3/0 -> /Table/1/2/3
+		{MakeFamilyKey(encInt(ten5Codec.IndexPrefix(1, 2), 3), 1), e5(1, 2, 3)},   // /Tenant/5/Table/1/2/3/1 -> /Table/1/2/3
 	}
 	for i, d := range goodData {
 		out, err := EnsureSafeSplitKey(d.in)
@@ -569,22 +650,87 @@ func TestEnsureSafeSplitKey(t *testing.T) {
 		err string
 	}{
 		// Column ID suffix size is too large.
-		{e(1), "malformed table key"},
-		{e(1, 2), "malformed table key"},
+		{es(1), "malformed table key"},
+		{es(1, 2), "malformed table key"},
 		// The table ID is invalid.
-		{e(200)[:1], "insufficient bytes to decode uvarint value"},
+		{es(200)[:1], "insufficient bytes to decode uvarint value"},
 		// The index ID is invalid.
-		{e(1, 200)[:2], "insufficient bytes to decode uvarint value"},
+		{es(1, 200)[:2], "insufficient bytes to decode uvarint value"},
 		// The column ID suffix is invalid.
-		{e(1, 2, 200)[:3], "insufficient bytes to decode uvarint value"},
+		{es(1, 2, 200)[:3], "insufficient bytes to decode uvarint value"},
 		// Exercises a former overflow bug. We decode a uint(18446744073709551610) which, if casted
 		// to int carelessly, results in -6.
-		{encoding.EncodeVarintAscending(MakeTablePrefix(999), 322434), "malformed table key"},
+		{encoding.EncodeVarintAscending(tenSysCodec.TablePrefix(999), 322434), "malformed table key"},
+		// Same test cases, but for tenant 5.
+		{e5(1), "malformed table key"},
+		{e5(1, 2), "malformed table key"},
+		{e5(200)[:3], "insufficient bytes to decode uvarint value"},
+		{e5(1, 200)[:4], "insufficient bytes to decode uvarint value"},
+		{e5(1, 2, 200)[:5], "insufficient bytes to decode uvarint value"},
+		{encoding.EncodeVarintAscending(ten5Codec.TablePrefix(999), 322434), "malformed table key"},
 	}
 	for i, d := range errorData {
 		_, err := EnsureSafeSplitKey(d.in)
 		if !testutils.IsError(err, d.err) {
 			t.Fatalf("%d: %s: expected %q, but got %v", i, d.in, d.err, err)
 		}
+	}
+}
+
+func TestTenantPrefix(t *testing.T) {
+	tIDs := []roachpb.TenantID{
+		roachpb.SystemTenantID,
+		roachpb.MakeTenantID(2),
+		roachpb.MakeTenantID(999),
+		roachpb.MakeTenantID(math.MaxUint64),
+	}
+	for _, tID := range tIDs {
+		t.Run(fmt.Sprintf("%v", tID), func(t *testing.T) {
+			// Encode tenant ID.
+			k := MakeTenantPrefix(tID)
+
+			// The system tenant has no tenant prefix.
+			if tID == roachpb.SystemTenantID {
+				require.Len(t, k, 0)
+			}
+
+			// Encode table prefix.
+			const tableID = 5
+			k = encoding.EncodeUvarintAscending(k, tableID)
+
+			// Decode tenant ID.
+			rem, retTID, err := DecodeTenantPrefix(k)
+			require.Equal(t, tID, retTID)
+			require.NoError(t, err)
+
+			// Decode table prefix.
+			rem, retTableID, err := encoding.DecodeUvarintAscending(rem)
+			require.Len(t, rem, 0)
+			require.Equal(t, uint64(tableID), retTableID)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestLockTableKeyEncodeDecode(t *testing.T) {
+	expectedPrefix := append([]byte(nil), LocalRangeLockTablePrefix...)
+	expectedPrefix = append(expectedPrefix, LockTableSingleKeyInfix...)
+	testCases := []struct {
+		key roachpb.Key
+	}{
+		{key: roachpb.Key("foo")},
+		{key: roachpb.Key("a")},
+		{key: roachpb.Key("")},
+		// Causes a doubly-local range local key.
+		{key: RangeDescriptorKey(roachpb.RKey("baz"))},
+	}
+	for _, test := range testCases {
+		t.Run("", func(t *testing.T) {
+			ltKey, _ := LockTableSingleKey(test.key, nil)
+			require.True(t, bytes.HasPrefix(ltKey, expectedPrefix))
+			k, err := DecodeLockTableSingleKey(ltKey)
+			require.NoError(t, err)
+			require.Equal(t, test.key, k)
+		})
 	}
 }

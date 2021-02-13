@@ -14,12 +14,13 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 var _ checkOperation = &physicalCheckOperation{}
@@ -27,12 +28,12 @@ var _ checkOperation = &physicalCheckOperation{}
 // physicalCheckOperation is a check on an indexes physical data.
 type physicalCheckOperation struct {
 	tableName *tree.TableName
-	tableDesc *sqlbase.ImmutableTableDescriptor
-	indexDesc *sqlbase.IndexDescriptor
+	tableDesc catalog.TableDescriptor
+	indexDesc *descpb.IndexDescriptor
 
 	// columns is a list of the columns returned in the query result
 	// tree.Datums.
-	columns []*sqlbase.ColumnDescriptor
+	columns []*descpb.ColumnDescriptor
 	// primaryColIdxs maps PrimaryIndex.Columns to the row
 	// indexes in the query result tree.Datums.
 	primaryColIdxs []int
@@ -49,9 +50,7 @@ type physicalCheckRun struct {
 }
 
 func newPhysicalCheckOperation(
-	tableName *tree.TableName,
-	tableDesc *sqlbase.ImmutableTableDescriptor,
-	indexDesc *sqlbase.IndexDescriptor,
+	tableName *tree.TableName, tableDesc catalog.TableDescriptor, indexDesc *descpb.IndexDescriptor,
 ) *physicalCheckOperation {
 	return &physicalCheckOperation{
 		tableName: tableName,
@@ -67,16 +66,13 @@ func (o *physicalCheckOperation) Start(params runParams) error {
 	ctx := params.ctx
 	// Collect all of the columns, their types, and their IDs.
 	var columnIDs []tree.ColumnID
-	colIDToIdx := make(map[sqlbase.ColumnID]int, len(o.tableDesc.Columns))
-	columns := make([]*sqlbase.ColumnDescriptor, len(columnIDs))
-	for i := range o.tableDesc.Columns {
-		colIDToIdx[o.tableDesc.Columns[i].ID] = i
-	}
+	colIDToIdx := catalog.ColumnIDToOrdinalMap(o.tableDesc.PublicColumns())
+	columns := make([]*descpb.ColumnDescriptor, len(columnIDs))
 
 	// Collect all of the columns being scanned.
-	if o.indexDesc.ID == o.tableDesc.PrimaryIndex.ID {
-		for i := range o.tableDesc.Columns {
-			columnIDs = append(columnIDs, tree.ColumnID(o.tableDesc.Columns[i].ID))
+	if o.indexDesc.ID == o.tableDesc.GetPrimaryIndexID() {
+		for _, c := range o.tableDesc.PublicColumns() {
+			columnIDs = append(columnIDs, tree.ColumnID(c.GetID()))
 		}
 	} else {
 		for _, id := range o.indexDesc.ColumnIDs {
@@ -91,8 +87,8 @@ func (o *physicalCheckOperation) Start(params runParams) error {
 	}
 
 	for i := range columnIDs {
-		idx := colIDToIdx[sqlbase.ColumnID(columnIDs[i])]
-		columns = append(columns, &o.tableDesc.Columns[idx])
+		idx := colIDToIdx.GetDefault(descpb.ColumnID(columnIDs[i]))
+		columns = append(columns, o.tableDesc.PublicColumns()[idx].ColumnDesc())
 	}
 
 	// Find the row indexes for all of the primary index columns.
@@ -112,15 +108,19 @@ func (o *physicalCheckOperation) Start(params runParams) error {
 		return err
 	}
 	scan.index = scan.specifiedIndex
-	sb := span.MakeBuilder(o.tableDesc.TableDesc(), o.indexDesc)
-	scan.spans, err = sb.UnconstrainedSpans(false /* forDelete */)
+	sb := span.MakeBuilder(params.EvalContext(), params.ExecCfg().Codec, o.tableDesc, o.indexDesc)
+	scan.spans, err = sb.UnconstrainedSpans()
 	if err != nil {
 		return err
 	}
+	scan.isFull = true
 
-	planCtx := params.extendedEvalCtx.DistSQLPlanner.NewPlanningCtx(ctx, params.extendedEvalCtx, params.p.txn)
-	physPlan, err := params.extendedEvalCtx.DistSQLPlanner.createScrubPhysicalCheck(
-		planCtx, scan, *o.tableDesc.TableDesc(), *o.indexDesc, params.p.ExecCfg().Clock.Now())
+	planCtx := params.extendedEvalCtx.DistSQLPlanner.NewPlanningCtx(ctx, params.extendedEvalCtx, params.p, params.p.txn, true /* distribute */)
+	// Since physicalCheckOperation might be only one of many check operations
+	// that scrubNode needs to perform, we need to make sure that scrubNode
+	// is not closed when this physical check operation is being cleaned up.
+	planCtx.ignoreClose = true
+	physPlan, err := params.extendedEvalCtx.DistSQLPlanner.createScrubPhysicalCheck(planCtx, scan)
 	if err != nil {
 		return err
 	}
@@ -128,7 +128,7 @@ func (o *physicalCheckOperation) Start(params runParams) error {
 	o.primaryColIdxs = primaryColIdxs
 	o.columns = columns
 	o.run.started = true
-	rows, err := scrubRunDistSQL(ctx, planCtx, params.p, &physPlan, rowexec.ScrubTypes)
+	rows, err := scrubRunDistSQL(ctx, planCtx, params.p, physPlan, rowexec.ScrubTypes)
 	if err != nil {
 		rows.Close(ctx)
 		return err
@@ -142,8 +142,11 @@ func (o *physicalCheckOperation) Next(params runParams) (tree.Datums, error) {
 	row := o.run.rows.At(o.run.rowIndex)
 	o.run.rowIndex++
 
-	timestamp := tree.MakeDTimestamp(
+	timestamp, err := tree.MakeDTimestamp(
 		params.extendedEvalCtx.GetStmtTimestamp(), time.Nanosecond)
+	if err != nil {
+		return nil, err
+	}
 
 	details, ok := row[2].(*tree.DJSON)
 	if !ok {

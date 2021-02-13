@@ -12,16 +12,18 @@ package memo
 
 import (
 	"math"
+	"math/rand"
 	"reflect"
 	"testing"
 	"time"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"golang.org/x/tools/container/intsets"
@@ -34,12 +36,12 @@ func TestInterner(t *testing.T) {
 	json2, _ := tree.ParseDJSON(`{"a": 5, "b": [1, 2]}`)
 	json3, _ := tree.ParseDJSON(`[1, 2]`)
 
-	tupTyp1 := types.MakeLabeledTuple([]types.T{*types.Int, *types.String}, []string{"a", "b"})
-	tupTyp2 := types.MakeLabeledTuple([]types.T{*types.Int, *types.String}, []string{"a", "b"})
-	tupTyp3 := types.MakeTuple([]types.T{*types.Int, *types.String})
-	tupTyp4 := types.MakeTuple([]types.T{*types.Int, *types.String, *types.Bool})
-	tupTyp5 := types.MakeLabeledTuple([]types.T{*types.Int, *types.String}, []string{"c", "d"})
-	tupTyp6 := types.MakeLabeledTuple([]types.T{*types.String, *types.Int}, []string{"c", "d"})
+	tupTyp1 := types.MakeLabeledTuple([]*types.T{types.Int, types.String}, []string{"a", "b"})
+	tupTyp2 := types.MakeLabeledTuple([]*types.T{types.Int, types.String}, []string{"a", "b"})
+	tupTyp3 := types.MakeTuple([]*types.T{types.Int, types.String})
+	tupTyp4 := types.MakeTuple([]*types.T{types.Int, types.String, types.Bool})
+	tupTyp5 := types.MakeLabeledTuple([]*types.T{types.Int, types.String}, []string{"c", "d"})
+	tupTyp6 := types.MakeLabeledTuple([]*types.T{types.String, types.Int}, []string{"c", "d"})
 
 	tup1 := tree.NewDTuple(tupTyp1, tree.NewDInt(100), tree.NewDString("foo"))
 	tup2 := tree.NewDTuple(tupTyp2, tree.NewDInt(100), tree.NewDString("foo"))
@@ -75,14 +77,21 @@ func TestInterner(t *testing.T) {
 	coll3, _ := tree.NewDCollatedString("foo", "en_US", &tree.CollationEnvironment{})
 	coll4, _ := tree.NewDCollatedString("food", "en_US", &tree.CollationEnvironment{})
 
-	tz1 := tree.MakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 123, time.UTC), 0)
-	tz2 := tree.MakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 123, time.UTC), 0)
-	tz3 := tree.MakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 124, time.UTC), 0)
-	tz4 := tree.MakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 124, time.FixedZone("PDT", -7)), 0)
+	tz1 := tree.MustMakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 123, time.UTC), 0)
+	tz2 := tree.MustMakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 123, time.UTC), 0)
+	tz3 := tree.MustMakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 124, time.UTC), 0)
+	tz4 := tree.MustMakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 124, time.FixedZone("PDT", -7)), 0)
 
-	explain1 := tree.ExplainOptions{Mode: tree.ExplainPlan, Flags: util.MakeFastIntSet(1, 2)}
-	explain2 := tree.ExplainOptions{Mode: tree.ExplainOpt, Flags: util.MakeFastIntSet(1, 2)}
-	explain3 := tree.ExplainOptions{Mode: tree.ExplainOpt, Flags: util.MakeFastIntSet(1, 2, 3)}
+	explain1 := tree.ExplainOptions{Mode: tree.ExplainPlan}
+	explain1.Flags[1] = true
+	explain1.Flags[2] = true
+	explain2 := tree.ExplainOptions{Mode: tree.ExplainOpt}
+	explain2.Flags[1] = true
+	explain2.Flags[2] = true
+	explain3 := tree.ExplainOptions{Mode: tree.ExplainOpt}
+	explain3.Flags[1] = true
+	explain3.Flags[2] = true
+	explain3.Flags[3] = true
 
 	scanNode := &ScanExpr{}
 	andExpr := &AndExpr{}
@@ -140,6 +149,16 @@ func TestInterner(t *testing.T) {
 		Function:           RankSingleton,
 		WindowsItemPrivate: WindowsItemPrivate{Col: 0, Frame: frame2},
 	}}
+
+	invSpan1 := inverted.MakeSingleValSpan([]byte("abc"))
+	invSpan2 := inverted.MakeSingleValSpan([]byte("abc"))
+	invSpan3 := inverted.Span{Start: []byte("abc"), End: []byte("def")}
+	invSpans1 := inverted.Spans{invSpan1}
+	invSpans2 := inverted.Spans{invSpan2}
+	invSpans3 := inverted.Spans{invSpan3}
+	invSpans4 := inverted.Spans{invSpan1, invSpan2}
+	invSpans5 := inverted.Spans{invSpan2, invSpan1}
+	invSpans6 := inverted.Spans{invSpan1, invSpan3}
 
 	type testVariation struct {
 		val1  interface{}
@@ -495,6 +514,14 @@ func TestInterner(t *testing.T) {
 			{val1: wins3, val2: wins4, equal: false},
 			{val1: wins1, val2: wins5, equal: false},
 		}},
+
+		{hashFn: in.hasher.HashInvertedSpans, eqFn: in.hasher.IsInvertedSpansEqual, variations: []testVariation{
+			{val1: invSpans1, val2: invSpans2, equal: true},
+			{val1: invSpans1, val2: invSpans3, equal: false},
+			{val1: invSpans2, val2: invSpans4, equal: false},
+			{val1: invSpans4, val2: invSpans5, equal: true},
+			{val1: invSpans5, val2: invSpans6, equal: false},
+		}},
 	}
 
 	computeHashValue := func(hashFn reflect.Value, val interface{}) internHash {
@@ -637,5 +664,36 @@ func TestInternerCollision(t *testing.T) {
 	// Should be no more items.
 	if in.cache.Next() {
 		t.Errorf("expected no more colliding items in cache")
+	}
+}
+
+func BenchmarkEncodeDatum(b *testing.B) {
+	r := rand.New(rand.NewSource(0))
+	datums := make([]tree.Datum, 10000)
+	for i := range datums {
+		datums[i] = rowenc.RandDatumWithNullChance(r, rowenc.RandEncodableType(r), 0)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, d := range datums {
+			encodeDatum(nil, d)
+		}
+	}
+}
+
+func BenchmarkIsDatumEqual(b *testing.B) {
+	r := rand.New(rand.NewSource(0))
+	datums := make([]tree.Datum, 1000)
+	for i := range datums {
+		datums[i] = rowenc.RandDatumWithNullChance(r, rowenc.RandEncodableType(r), 0)
+	}
+	b.ResetTimer()
+	var h hasher
+	for i := 0; i < b.N; i++ {
+		for _, d := range datums {
+			// IsDatumEqual is only called on values that hash the
+			// same, so only benchmark it on identical datums.
+			h.IsDatumEqual(d, d)
+		}
 	}
 }

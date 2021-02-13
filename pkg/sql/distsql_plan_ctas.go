@@ -13,11 +13,11 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // PlanAndRunCTAS plans and runs the CREATE TABLE AS command.
@@ -25,33 +25,29 @@ func PlanAndRunCTAS(
 	ctx context.Context,
 	dsp *DistSQLPlanner,
 	planner *planner,
-	txn *client.Txn,
+	txn *kv.Txn,
 	isLocal bool,
-	in planNode,
+	in planMaybePhysical,
 	out execinfrapb.ProcessorCoreUnion,
 	recv *DistSQLReceiver,
 ) {
-	planCtx := dsp.NewPlanningCtx(ctx, planner.ExtendedEvalContext(), txn)
-	planCtx.isLocal = isLocal
-	planCtx.planner = planner
+	planCtx := dsp.NewPlanningCtx(ctx, planner.ExtendedEvalContext(), planner, txn, !isLocal)
 	planCtx.stmtType = tree.Rows
 
-	p, err := dsp.createPlanForNode(planCtx, in)
+	physPlan, err := dsp.createPhysPlan(planCtx, in)
 	if err != nil {
 		recv.SetError(errors.Wrapf(err, "constructing distSQL plan"))
 		return
 	}
-
-	p.AddNoGroupingStage(
+	physPlan.AddNoGroupingStage(
 		out, execinfrapb.PostProcessSpec{}, rowexec.CTASPlanResultTypes, execinfrapb.Ordering{},
 	)
 
 	// The bulk row writers will emit a binary encoded BulkOpSummary.
-	p.PlanToStreamColMap = []int{0}
-	p.ResultTypes = rowexec.CTASPlanResultTypes
+	physPlan.PlanToStreamColMap = []int{0}
 
 	// Make copy of evalCtx as Run might modify it.
 	evalCtxCopy := planner.ExtendedEvalContextCopy()
-	dsp.FinalizePlan(planCtx, &p)
-	dsp.Run(planCtx, txn, &p, recv, evalCtxCopy, nil /* finishedSetupFn */)()
+	dsp.FinalizePlan(planCtx, physPlan)
+	dsp.Run(planCtx, txn, physPlan, recv, evalCtxCopy, nil /* finishedSetupFn */)()
 }

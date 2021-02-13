@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // NB: Most of the SHOW EXPERIMENTAL_FINGERPRINTS tests are in the
@@ -27,9 +28,10 @@ import (
 // functionality.
 func TestShowFingerprintsAsOfSystemTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := serverutils.StartTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 
 	sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
@@ -57,9 +59,10 @@ func TestShowFingerprintsAsOfSystemTime(t *testing.T) {
 
 func TestShowFingerprintsColumnNames(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := serverutils.StartTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 
 	sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))

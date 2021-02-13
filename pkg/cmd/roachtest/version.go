@@ -13,33 +13,26 @@ package main
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
+// TODO(tbg): remove this test. Use the harness in versionupgrade.go
+// to make a much better one, much more easily.
 func registerVersion(r *testRegistry) {
-	runVersion := func(ctx context.Context, t *test, c *cluster, version string) {
+	runVersion := func(ctx context.Context, t *test, c *cluster, binaryVersion string) {
 		nodes := c.spec.NodeCount - 1
-		goos := ifLocal(runtime.GOOS, "linux")
 
-		b, err := binfetcher.Download(ctx, binfetcher.Options{
-			Binary:  "cockroach",
-			Version: "v" + version,
-			GOOS:    goos,
-			GOARCH:  "amd64",
-		})
-		if err != nil {
+		if err := c.Stage(ctx, c.l, "release", "v"+binaryVersion, "", c.Range(1, nodes)); err != nil {
 			t.Fatal(err)
 		}
 
 		c.Put(ctx, workload, "./workload", c.Node(nodes+1))
 
-		c.Put(ctx, b, "./cockroach", c.Range(1, nodes))
 		// Force disable encryption.
 		// TODO(mberhault): allow it once version >= 2.1.
 		c.Start(ctx, t, c.Range(1, nodes), startArgsDontEncrypt)
@@ -54,8 +47,13 @@ func registerVersion(r *testRegistry) {
 
 		loadDuration := " --duration=" + (time.Duration(3*nodes+2)*stageDuration + buffer).String()
 
+		var deprecatedWorkloadsStr string
+		if !t.buildVersion.AtLeast(version.MustParse("v20.2.0")) {
+			deprecatedWorkloadsStr += " --deprecated-fk-indexes"
+		}
+
 		workloads := []string{
-			"./workload run tpcc --tolerate-errors --wait=false --drop --init --warehouses=1 " + loadDuration + " {pgurl:1-%d}",
+			"./workload run tpcc --tolerate-errors --wait=false --drop --init --warehouses=1 " + deprecatedWorkloadsStr + loadDuration + " {pgurl:1-%d}",
 			"./workload run kv --tolerate-errors --init" + loadDuration + " {pgurl:1-%d}",
 		}
 
@@ -99,7 +97,7 @@ func registerVersion(r *testRegistry) {
 					// checks had been broken for a long time. See:
 					//
 					// https://github.com/cockroachdb/cockroach/issues/37737#issuecomment-496026918
-					if !strings.HasPrefix(version, "2.") {
+					if !strings.HasPrefix(binaryVersion, "2.") {
 						if err := c.CheckReplicaDivergenceOnDB(ctx, db); err != nil {
 							return errors.Wrapf(err, "node %d", i)
 						}
@@ -174,7 +172,9 @@ func registerVersion(r *testRegistry) {
 				if err := stop(i); err != nil {
 					return err
 				}
-				c.Put(ctx, b, "./cockroach", c.Node(i))
+				if err := c.Stage(ctx, c.l, "release", "v"+binaryVersion, "", c.Node(i)); err != nil {
+					t.Fatal(err)
+				}
 				c.Start(ctx, t, c.Node(i), startArgsDontEncrypt)
 				if err := sleepAndCheck(); err != nil {
 					return err

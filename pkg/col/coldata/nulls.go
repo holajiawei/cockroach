@@ -98,8 +98,8 @@ func (n *Nulls) SetNullRange(startIdx int, endIdx int) {
 		n.nulls[eIdx] &= mask
 	}
 
-	for i := sIdx + 1; i < eIdx; i++ {
-		n.nulls[i] = 0
+	for idx := int(sIdx + 1); idx < int(eIdx); {
+		idx += copy(n.nulls[idx:eIdx], zeroedNulls[:])
 	}
 }
 
@@ -138,8 +138,8 @@ func (n *Nulls) UnsetNullRange(startIdx, endIdx int) {
 		n.nulls[eIdx] |= mask
 	}
 
-	for i := sIdx + 1; i < eIdx; i++ {
-		n.nulls[i] = onesMask
+	for idx := int(sIdx + 1); idx < int(eIdx); {
+		idx += copy(n.nulls[idx:eIdx], filledNulls[:])
 	}
 }
 
@@ -192,25 +192,16 @@ func (n *Nulls) UnsetNull(i int) {
 	n.nulls[i>>3] |= bitMask[i&7]
 }
 
-// Remove the unused warning.
-var (
-	n = Nulls{}
-	_ = n.swap
-)
-
-// swap swaps the null values at the argument indices. We implement the logic
-// directly on the byte array rather than case on the result of NullAt to avoid
-// having to take some branches.
-func (n *Nulls) swap(iIdx, jIdx int) {
-	i, j := uint64(iIdx), uint64(jIdx)
-	// Get original null values.
-	ni := (n.nulls[i/8] >> (i % 8)) & 0x1
-	nj := (n.nulls[j/8] >> (j % 8)) & 0x1
-	// Write into the correct positions.
-	iMask := bitMask[i%8]
-	jMask := bitMask[j%8]
-	n.nulls[i/8] = (n.nulls[i/8] & ^iMask) | (nj << (i % 8))
-	n.nulls[j/8] = (n.nulls[j/8] & ^jMask) | (ni << (j % 8))
+// setSmallRange is a helper that copies over a slice [startIdx, startIdx+toSet)
+// of src and puts it into this nulls starting at destIdx.
+func (n *Nulls) setSmallRange(src *Nulls, destIdx, startIdx, toSet int) {
+	for i := 0; i < toSet; i++ {
+		if src.NullAt(startIdx + i) {
+			n.SetNull(destIdx + i)
+		} else {
+			n.UnsetNull(destIdx + i)
+		}
+	}
 }
 
 // set copies over a slice [args.SrcStartIdx: args.SrcEndIdx] of
@@ -230,26 +221,56 @@ func (n *Nulls) set(args SliceArgs) {
 	if current < needed {
 		n.nulls = append(n.nulls, filledNulls[:needed-current]...)
 	}
-	// First, we unset the whole range that is overwritten. If there are any NULL
-	// values in the source, those will be copied over below, one at a time.
-	n.UnsetNullRange(args.DestIdx, args.DestIdx+toDuplicate)
 	if args.Src.MaybeHasNulls() {
+		n.maybeHasNulls = true
 		src := args.Src.Nulls()
 		if args.Sel != nil {
+			// With the selection vector present, we can't do any smarts, so we
+			// unset the whole range that is overwritten and then set new null
+			// values one at a time.
+			n.UnsetNullRange(args.DestIdx, args.DestIdx+toDuplicate)
 			for i := 0; i < toDuplicate; i++ {
 				if src.NullAt(args.Sel[args.SrcStartIdx+i]) {
 					n.SetNull(args.DestIdx + i)
 				}
 			}
 		} else {
+			if toDuplicate > 16 && args.DestIdx%8 == args.SrcStartIdx%8 {
+				// We have a special (but a very common) case when we're
+				// copying a lot of elements, and the shifts within the nulls
+				// vectors for the destination and the source ranges are the
+				// same, so we can optimize the performance here.
+				// The fact that shifts are the same allows us to copy all
+				// elements as is (except for the first and the last which are
+				// handled separately).
+				dstStart := args.DestIdx / 8
+				srcStart := args.SrcStartIdx / 8
+				srcEnd := (args.SrcEndIdx-1)/8 + 1
+				// Since the first and the last elements might not be fully
+				// included in the range to be set, we're not touching them.
+				copy(n.nulls[dstStart+1:], src.nulls[srcStart+1:srcEnd-1])
+				// Handle the first element.
+				n.setSmallRange(src, args.DestIdx, args.SrcStartIdx, 8-args.DestIdx%8)
+				// Handle the last element.
+				toSet := (args.DestIdx + toDuplicate) % 8
+				if toSet == 0 {
+					toSet = 8
+				}
+				offset := toDuplicate - toSet
+				n.setSmallRange(src, args.DestIdx+offset, args.SrcStartIdx+offset, toSet)
+				return
+			}
+			n.UnsetNullRange(args.DestIdx, args.DestIdx+toDuplicate)
 			for i := 0; i < toDuplicate; i++ {
-				// TODO(yuzefovich): this can be done more efficiently with a bitwise OR:
-				// like n.nulls[i] |= vec.nulls[i].
 				if src.NullAt(args.SrcStartIdx + i) {
 					n.SetNull(args.DestIdx + i)
 				}
 			}
 		}
+	} else {
+		// No nulls in the source, so we unset the whole range that is
+		// overwritten.
+		n.UnsetNullRange(args.DestIdx, args.DestIdx+toDuplicate)
 	}
 }
 
@@ -351,12 +372,23 @@ func (n *Nulls) Or(n2 *Nulls) *Nulls {
 	}
 }
 
-// Copy returns a copy of n which can be modified independently.
-func (n *Nulls) Copy() Nulls {
+// makeCopy returns a copy of n which can be modified independently.
+func (n *Nulls) makeCopy() Nulls {
 	c := Nulls{
 		maybeHasNulls: n.maybeHasNulls,
 		nulls:         make([]byte, len(n.nulls)),
 	}
 	copy(c.nulls, n.nulls)
 	return c
+}
+
+// Copy copies the contents of other into n.
+func (n *Nulls) Copy(other *Nulls) {
+	n.maybeHasNulls = other.maybeHasNulls
+	if cap(n.nulls) < len(other.nulls) {
+		n.nulls = make([]byte, len(other.nulls))
+	} else {
+		n.nulls = n.nulls[:len(other.nulls)]
+	}
+	copy(n.nulls, other.nulls)
 }

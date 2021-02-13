@@ -13,12 +13,15 @@ package pgwire
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -39,6 +42,9 @@ type authOptions struct {
 	// connType is the actual type of client connection (e.g. local,
 	// hostssl, hostnossl).
 	connType hba.ConnType
+	// connDetails is the event payload common to all auth/session events.
+	connDetails eventpb.CommonConnectionDetails
+
 	// auth is the current HBA configuration as returned by
 	// (*Server).GetAuthenticationConfiguration().
 	auth *hba.Conf
@@ -67,12 +73,12 @@ type authOptions struct {
 // if different from the one given initially.
 func (c *conn) handleAuthentication(
 	ctx context.Context, ac AuthConn, authOpt authOptions, execCfg *sql.ExecutorConfig,
-) error {
+) (connClose func(), _ error) {
 	if authOpt.testingSkipAuth {
-		return nil
+		return nil, nil
 	}
 	if authOpt.testingAuthHook != nil {
-		return authOpt.testingAuthHook(ctx)
+		return nil, authOpt.testingAuthHook(ctx)
 	}
 
 	sendError := func(err error) error {
@@ -82,34 +88,54 @@ func (c *conn) handleAuthentication(
 
 	// Check that the requested user exists and retrieve the hashed
 	// password in case password authentication is needed.
-	exists, pwRetrievalFn, err := sql.GetUserHashedPassword(
+	exists, canLogin, pwRetrievalFn, validUntilFn, err := sql.GetUserHashedPassword(
 		ctx, authOpt.ie, c.sessionArgs.User,
 	)
 	if err != nil {
-		return sendError(err)
+		log.Warningf(ctx, "user retrieval failed for user=%q: %+v", c.sessionArgs.User, err)
+		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_USER_RETRIEVAL_ERROR, err)
+		return nil, sendError(err)
 	}
+
 	if !exists {
-		return sendError(errors.Errorf(security.ErrPasswordUserAuthFailed, c.sessionArgs.User))
+		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_USER_NOT_FOUND, nil)
+		return nil, sendError(errors.Errorf(security.ErrPasswordUserAuthFailed, c.sessionArgs.User))
+	}
+
+	if !canLogin {
+		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_LOGIN_DISABLED, nil)
+		return nil, sendError(errors.Errorf(
+			"%s does not have login privilege", c.sessionArgs.User))
 	}
 
 	// Retrieve the authentication method.
 	tlsState, hbaEntry, methodFn, err := c.findAuthenticationMethod(authOpt)
 	if err != nil {
-		return sendError(err)
+		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_METHOD_NOT_FOUND, err)
+		return nil, sendError(err)
 	}
+
+	ac.SetAuthMethod(hbaEntry.Method.String())
+	ac.LogAuthInfof(ctx, "HBA rule: %s", hbaEntry.Input)
 
 	// Ask the method to authenticate.
-	authenticationHook, err := methodFn(ctx, ac, tlsState, pwRetrievalFn, execCfg, hbaEntry)
+	authenticationHook, err := methodFn(ctx, ac, tlsState, pwRetrievalFn,
+		validUntilFn, execCfg, hbaEntry)
+
 	if err != nil {
-		return sendError(err)
-	}
-	if err := authenticationHook(c.sessionArgs.User, true /* public */); err != nil {
-		return sendError(err)
+		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_METHOD_NOT_FOUND, err)
+		return nil, sendError(err)
 	}
 
+	if connClose, err = authenticationHook(c.sessionArgs.User, true /* public */); err != nil {
+		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_CREDENTIALS_INVALID, err)
+		return connClose, sendError(err)
+	}
+
+	ac.LogAuthOK(ctx)
 	c.msgBuilder.initMsg(pgwirebase.ServerMsgAuth)
 	c.msgBuilder.putInt32(authOK)
-	return c.msgBuilder.finishMsg(c.conn)
+	return connClose, c.msgBuilder.finishMsg(c.conn)
 }
 
 func (c *conn) findAuthenticationMethod(
@@ -119,6 +145,7 @@ func (c *conn) findAuthenticationMethod(
 		// Insecure connections always use "trust" no matter what, and the
 		// remaining of the configuration is ignored.
 		methodFn = authTrust
+		hbaEntry = &insecureEntry
 		return
 	}
 
@@ -157,9 +184,9 @@ func (c *conn) lookupAuthenticationMethodUsingRules(
 	var ip net.IP
 	if connType != hba.ConnLocal {
 		// Extract the IP address of the client.
-		tcpAddr, ok := c.conn.RemoteAddr().(*net.TCPAddr)
+		tcpAddr, ok := c.sessionArgs.RemoteAddr.(*net.TCPAddr)
 		if !ok {
-			err = errors.AssertionFailedf("client address type %T unsupported", c.conn.RemoteAddr())
+			err = errors.AssertionFailedf("client address type %T unsupported", c.sessionArgs.RemoteAddr)
 			return
 		}
 		ip = tcpAddr.IP
@@ -228,19 +255,35 @@ type AuthConn interface {
 	// AuthOK declares that authentication succeeded and provides a
 	// unqualifiedIntSizer, to be returned by authenticator.authResult(). Future
 	// authenticator.sendPwdData() calls fail.
-	AuthOK(unqualifiedIntSizer)
+	AuthOK(context.Context, unqualifiedIntSizer)
 	// AuthFail declares that authentication has failed and provides an error to
 	// be returned by authenticator.authResult(). Future
 	// authenticator.sendPwdData() calls fail. The error has already been written
 	// to the client connection.
 	AuthFail(err error)
+
+	// SetAuthMethod sets the authentication method for subsequent
+	// logging messages.
+	SetAuthMethod(method string)
+	// LogAuthInfof logs details about the progress of the
+	// authentication.
+	LogAuthInfof(ctx context.Context, format string, args ...interface{})
+	// LogAuthFailed logs details about an authentication failure.
+	LogAuthFailed(ctx context.Context, reason eventpb.AuthFailReason, err error)
+	// LogAuthOK logs when the authentication handshake has completed.
+	LogAuthOK(ctx context.Context)
 }
 
 // authPipe is the implementation for the authenticator and AuthConn interfaces.
 // A single authPipe will serve as both an AuthConn and an authenticator; the
 // two represent the two "ends" of the pipe and we'll pass data between them.
 type authPipe struct {
-	c *conn // Only used for writing, not for reading.
+	c   *conn // Only used for writing, not for reading.
+	log bool
+
+	connDetails eventpb.CommonConnectionDetails
+	authDetails eventpb.CommonSessionDetails
+	authMethod  string
 
 	ch chan []byte
 	// writerDone is a channel closed by noMorePwdData().
@@ -254,9 +297,15 @@ type authRes struct {
 	err      error
 }
 
-func newAuthPipe(c *conn) *authPipe {
+func newAuthPipe(c *conn, logAuthn bool, authOpt authOptions, user security.SQLUsername) *authPipe {
 	ap := &authPipe{
-		c:          c,
+		c:           c,
+		log:         logAuthn,
+		connDetails: authOpt.connDetails,
+		authDetails: eventpb.CommonSessionDetails{
+			Transport: authOpt.connType.String(),
+			User:      user.Normalized(),
+		},
 		ch:         make(chan []byte),
 		writerDone: make(chan struct{}),
 		readerDone: make(chan authRes, 1),
@@ -296,12 +345,58 @@ func (p *authPipe) GetPwdData() ([]byte, error) {
 }
 
 // AuthOK is part of the AuthConn interface.
-func (p *authPipe) AuthOK(intSizer unqualifiedIntSizer) {
+func (p *authPipe) AuthOK(ctx context.Context, intSizer unqualifiedIntSizer) {
 	p.readerDone <- authRes{intSizer: intSizer}
 }
 
 func (p *authPipe) AuthFail(err error) {
 	p.readerDone <- authRes{err: err}
+}
+
+func (p *authPipe) SetAuthMethod(method string) {
+	p.authMethod = method
+}
+
+func (p *authPipe) LogAuthOK(ctx context.Context) {
+	if p.log {
+		ev := &eventpb.ClientAuthenticationOk{
+			CommonConnectionDetails: p.connDetails,
+			CommonSessionDetails:    p.authDetails,
+			Method:                  p.authMethod,
+		}
+		log.StructuredEvent(ctx, ev)
+	}
+}
+
+func (p *authPipe) LogAuthInfof(ctx context.Context, format string, args ...interface{}) {
+	if p.log {
+		ev := &eventpb.ClientAuthenticationInfo{
+			CommonConnectionDetails: p.connDetails,
+			CommonSessionDetails:    p.authDetails,
+			Info:                    fmt.Sprintf(format, args...),
+			Method:                  p.authMethod,
+		}
+		log.StructuredEvent(ctx, ev)
+	}
+}
+
+func (p *authPipe) LogAuthFailed(
+	ctx context.Context, reason eventpb.AuthFailReason, detailedErr error,
+) {
+	if p.log {
+		var errStr string
+		if detailedErr != nil {
+			errStr = detailedErr.Error()
+		}
+		ev := &eventpb.ClientAuthenticationFailed{
+			CommonConnectionDetails: p.connDetails,
+			CommonSessionDetails:    p.authDetails,
+			Reason:                  reason,
+			Detail:                  errStr,
+			Method:                  p.authMethod,
+		}
+		log.StructuredEvent(ctx, ev)
+	}
 }
 
 // authResult is part of the authenticator interface.

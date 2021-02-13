@@ -8,217 +8,279 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-// {{/*
 // +build execgen_template
-//
-// This file is the execgen template for hashjoiner.eg.go. It's formatted in a
-// special way, so it's both valid Go and a valid text/template input. This
-// permits editing this file with editor support.
-//
-// */}}
 
 package colexec
 
-import (
-	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-)
+import "github.com/cockroachdb/cockroach/pkg/col/coldata"
 
-// {{/*
-
-func _COLLECT_PROBE_OUTER(
-	hj *hashJoiner, batchSize int, nResults int, batch coldata.Batch, _USE_SEL bool,
-) int { // */}}
-	// {{define "collectProbeOuter" -}}
+// execgen:template<useSel>
+func collectProbeOuter(
+	hj *hashJoiner, batchSize int, nResults int, batch coldata.Batch, sel []int, useSel bool,
+) int {
 	// Early bounds checks.
-	_ = hj.ht.headID[batchSize-1]
-	// {{if .UseSel}}
-	_ = sel[batchSize-1]
-	// {{end}}
-	for i := hj.probeState.prevBatchResumeIdx; i < batchSize; i++ {
-		currentID := hj.ht.headID[i]
+	// Capture the slices in order for BCE to occur.
+	headIDs := hj.ht.probeScratch.headID
+	startIdx := hj.probeState.prevBatchResumeIdx
+	_ = headIDs[startIdx]
+	_ = headIDs[batchSize-1]
+	if useSel {
+		_ = sel[batchSize-1]
+	}
+	maxResults := len(hj.probeState.buildIdx)
+	buildIdx := hj.probeState.buildIdx
+	probeIdx := hj.probeState.probeIdx
+	_ = buildIdx[nResults]
+	_ = probeIdx[nResults]
+	_ = buildIdx[maxResults-1]
+	_ = probeIdx[maxResults-1]
+	for i := startIdx; i < batchSize; i++ {
+		//gcassert:bce
+		currentID := headIDs[i]
 
-		for {
-			if nResults >= hj.outputBatchSize {
-				hj.probeState.prevBatch = batch
-				hj.probeState.prevBatchResumeIdx = i
-				return nResults
-			}
-
-			hj.probeState.probeRowUnmatched[nResults] = currentID == 0
-			if currentID > 0 {
-				hj.probeState.buildIdx[nResults] = int(currentID - 1)
+		for ; nResults < maxResults; nResults++ {
+			rowUnmatched := currentID == 0
+			// For some reason, BCE doesn't occur for probeRowUnmatched slice.
+			// TODO(yuzefovich): figure it out.
+			hj.probeState.probeRowUnmatched[nResults] = rowUnmatched
+			if rowUnmatched {
+				// The row is unmatched, and we set the corresponding buildIdx
+				// to zero so that (as long as the build hash table has at least
+				// one row) we can copy the values vector without paying
+				// attention to probeRowUnmatched.
+				//gcassert:bce
+				buildIdx[nResults] = 0
 			} else {
-				// If currentID == 0, then probeRowUnmatched will have been set - and
-				// we set the corresponding buildIdx to zero so that (as long as the
-				// build hash table has at least one row) we can copy the values vector
-				// without paying attention to probeRowUnmatched.
-				hj.probeState.buildIdx[nResults] = 0
+				//gcassert:bce
+				buildIdx[nResults] = int(currentID - 1)
 			}
-			// {{if .UseSel}}
-			hj.probeState.probeIdx[nResults] = sel[i]
-			// {{else}}
-			hj.probeState.probeIdx[nResults] = i
-			// {{end}}
+			pIdx := getIdx(i, sel, useSel)
+			//gcassert:bce
+			probeIdx[nResults] = pIdx
 			currentID = hj.ht.same[currentID]
-			hj.ht.headID[i] = currentID
-			nResults++
+			//gcassert:bce
+			headIDs[i] = currentID
 
 			if currentID == 0 {
+				nResults++
 				break
 			}
 		}
-	}
-	// {{end}}
-	// {{/*
-	// Dummy return value that is never used.
-	return 0
-}
 
-func _COLLECT_PROBE_NO_OUTER(
-	hj *hashJoiner, batchSize int, nResults int, batch coldata.Batch, _USE_SEL bool,
-) int { // */}}
-	// {{define "collectProbeNoOuter" -}}
-	// Early bounds checks.
-	_ = hj.ht.headID[batchSize-1]
-	// {{if .UseSel}}
-	_ = sel[batchSize-1]
-	// {{end}}
-	for i := hj.probeState.prevBatchResumeIdx; i < batchSize; i++ {
-		currentID := hj.ht.headID[i]
-		for currentID != 0 {
-			if nResults >= hj.outputBatchSize {
+		if nResults == maxResults {
+			// We have collected the maximum number of results that fit into the
+			// current output batch.
+			if currentID != 0 {
+				// We haven't finished probing the ith tuple of the current
+				// probing batch, so we'll need to resume from the same state.
 				hj.probeState.prevBatch = batch
 				hj.probeState.prevBatchResumeIdx = i
-				return nResults
+			} else {
+				// We're done probing the ith tuple.
+				if i+1 < batchSize {
+					// But we're not done probing the batch yet.
+					hj.probeState.prevBatch = batch
+					hj.probeState.prevBatchResumeIdx = i + 1
+				}
 			}
-
-			hj.probeState.buildIdx[nResults] = int(currentID - 1)
-			// {{if .UseSel}}
-			hj.probeState.probeIdx[nResults] = sel[i]
-			// {{else}}
-			hj.probeState.probeIdx[nResults] = i
-			// {{end}}
-			currentID = hj.ht.same[currentID]
-			hj.ht.headID[i] = currentID
-			nResults++
+			return nResults
 		}
 	}
-	// {{end}}
-	// {{/*
-	// Dummy return value that is never used.
-	return 0
+	return nResults
 }
 
-func _COLLECT_LEFT_ANTI(
-	hj *hashJoiner, batchSize int, nResults int, batch coldata.Batch, _USE_SEL bool,
-) int { // */}}
-	// {{define "collectLeftAnti" -}}
+// execgen:template<useSel>
+func collectProbeNoOuter(
+	hj *hashJoiner, batchSize int, nResults int, batch coldata.Batch, sel []int, useSel bool,
+) int {
 	// Early bounds checks.
-	_ = hj.ht.headID[batchSize-1]
-	// {{if .UseSel}}
-	_ = sel[batchSize-1]
-	// {{end}}
-	for i := int(0); i < batchSize; i++ {
-		currentID := hj.ht.headID[i]
+	// Capture the slices in order for BCE to occur.
+	headIDs := hj.ht.probeScratch.headID
+	startIdx := hj.probeState.prevBatchResumeIdx
+	_ = headIDs[startIdx]
+	_ = headIDs[batchSize-1]
+	if useSel {
+		_ = sel[batchSize-1]
+	}
+	maxResults := len(hj.probeState.buildIdx)
+	probeIdx := hj.probeState.probeIdx
+	_ = probeIdx[nResults]
+	_ = probeIdx[maxResults-1]
+	for i := startIdx; i < batchSize; i++ {
+		//gcassert:bce
+		currentID := headIDs[i]
+		for ; currentID != 0 && nResults < maxResults; nResults++ {
+			// For some reason, BCE doesn't occur for buildIdx slice.
+			// TODO(yuzefovich): figure it out.
+			hj.probeState.buildIdx[nResults] = int(currentID - 1)
+			pIdx := getIdx(i, sel, useSel)
+			//gcassert:bce
+			probeIdx[nResults] = pIdx
+			currentID = hj.ht.same[currentID]
+			//gcassert:bce
+			headIDs[i] = currentID
+		}
+
+		if nResults == maxResults {
+			// We have collected the maximum number of results that fit into the
+			// current output batch.
+			if currentID != 0 {
+				// We haven't finished probing the ith tuple of the current
+				// probing batch, so we'll need to resume from the same state.
+				hj.probeState.prevBatch = batch
+				hj.probeState.prevBatchResumeIdx = i
+			} else {
+				// We're done probing the ith tuple.
+				if i+1 < batchSize {
+					// But we're not done probing the batch yet.
+					hj.probeState.prevBatch = batch
+					hj.probeState.prevBatchResumeIdx = i + 1
+				}
+			}
+			return nResults
+		}
+	}
+	return nResults
+}
+
+// This code snippet collects the "matches" for LEFT ANTI and EXCEPT ALL joins.
+// "Matches" are in quotes because we're actually interested in non-matches
+// from the left side.
+// execgen:template<useSel>
+func collectLeftAnti(
+	hj *hashJoiner, batchSize int, nResults int, batch coldata.Batch, sel []int, useSel bool,
+) int {
+	// Early bounds checks.
+	// Capture the slice in order for BCE to occur.
+	headIDs := hj.ht.probeScratch.headID
+	_ = headIDs[batchSize-1]
+	if useSel {
+		_ = sel[batchSize-1]
+	}
+	for i := 0; i < batchSize; i++ {
+		//gcassert:bce
+		currentID := headIDs[i]
 		if currentID == 0 {
 			// currentID of 0 indicates that ith probing row didn't have a match, so
 			// we include it into the output.
-			// {{if .UseSel}}
-			hj.probeState.probeIdx[nResults] = sel[i]
-			// {{else}}
-			hj.probeState.probeIdx[nResults] = i
-			// {{end}}
+			hj.probeState.probeIdx[nResults] = getIdx(i, sel, useSel)
 			nResults++
 		}
 	}
-	// {{end}}
-	// {{/*
-	// Dummy return value that is never used.
-	return 0
+	return nResults
 }
 
-func _DISTINCT_COLLECT_PROBE_OUTER(hj *hashJoiner, batchSize int, _USE_SEL bool) { // */}}
-	// {{define "distinctCollectProbeOuter" -}}
+// collectRightSemiAnti processes all matches for right semi/anti joins. Note
+// that during the probing phase we do not emit any output for these joins and
+// are simply tracking whether build rows had a match. The output will be
+// populated when in hjEmittingRight state.
+func collectRightSemiAnti(hj *hashJoiner, batchSize int) {
 	// Early bounds checks.
-	_ = hj.ht.groupID[batchSize-1]
-	_ = hj.probeState.probeRowUnmatched[batchSize-1]
-	_ = hj.probeState.buildIdx[batchSize-1]
-	_ = hj.probeState.probeIdx[batchSize-1]
-	// {{if .UseSel}}
-	_ = sel[batchSize-1]
-	// {{end}}
-	for i := int(0); i < batchSize; i++ {
+	// Capture the slice in order for BCE to occur.
+	headIDs := hj.ht.probeScratch.headID
+	_ = headIDs[batchSize-1]
+	for i := 0; i < batchSize; i++ {
+		//gcassert:bce
+		currentID := headIDs[i]
+		for currentID != 0 {
+			hj.probeState.buildRowMatched[currentID-1] = true
+			currentID = hj.ht.same[currentID]
+		}
+	}
+}
+
+// execgen:template<useSel>
+func distinctCollectProbeOuter(hj *hashJoiner, batchSize int, sel []int, useSel bool) {
+	// Early bounds checks.
+	// Capture the slices in order for BCE to occur.
+	groupIDs := hj.ht.probeScratch.groupID
+	probeRowUnmatched := hj.probeState.probeRowUnmatched
+	buildIdx := hj.probeState.buildIdx
+	probeIdx := hj.probeState.probeIdx
+	_ = groupIDs[batchSize-1]
+	_ = probeRowUnmatched[batchSize-1]
+	_ = buildIdx[batchSize-1]
+	_ = probeIdx[batchSize-1]
+	if useSel {
+		_ = sel[batchSize-1]
+	}
+	for i := 0; i < batchSize; i++ {
 		// Index of keys and outputs in the hash table is calculated as ID - 1.
-		id := hj.ht.groupID[i]
+		//gcassert:bce
+		id := groupIDs[i]
 		rowUnmatched := id == 0
-		hj.probeState.probeRowUnmatched[i] = rowUnmatched
-		if !rowUnmatched {
-			hj.probeState.buildIdx[i] = int(id - 1)
+		//gcassert:bce
+		probeRowUnmatched[i] = rowUnmatched
+		if rowUnmatched {
+			// The row is unmatched, and we set the corresponding buildIdx
+			// to zero so that (as long as the build hash table has at least
+			// one row) we can copy the values vector without paying
+			// attention to probeRowUnmatched.
+			//gcassert:bce
+			buildIdx[i] = 0
+		} else {
+			//gcassert:bce
+			buildIdx[i] = int(id - 1)
 		}
-		// {{if .UseSel}}
-		hj.probeState.probeIdx[i] = sel[i]
-		// {{else}}
-		hj.probeState.probeIdx[i] = i
-		// {{end}}
+		pIdx := getIdx(i, sel, useSel)
+		//gcassert:bce
+		probeIdx[i] = pIdx
 	}
-	// {{end}}
-	// {{/*
 }
 
-func _DISTINCT_COLLECT_PROBE_NO_OUTER(hj *hashJoiner, batchSize int, nResults int, _USE_SEL bool) { // */}}
-	// {{define "distinctCollectProbeNoOuter" -}}
+// execgen:template<useSel>
+func distinctCollectProbeNoOuter(
+	hj *hashJoiner, batchSize int, nResults int, sel []int, useSel bool,
+) int {
 	// Early bounds checks.
-	_ = hj.ht.groupID[batchSize-1]
-	_ = hj.probeState.buildIdx[batchSize-1]
-	_ = hj.probeState.probeIdx[batchSize-1]
-	// {{if .UseSel}}
-	_ = sel[batchSize-1]
-	// {{end}}
-	for i := int(0); i < batchSize; i++ {
-		if hj.ht.groupID[i] != 0 {
+	// Capture the slice in order for BCE to occur.
+	groupIDs := hj.ht.probeScratch.groupID
+	_ = groupIDs[batchSize-1]
+	if useSel {
+		_ = sel[batchSize-1]
+	}
+	for i := 0; i < batchSize; i++ {
+		//gcassert:bce
+		id := groupIDs[i]
+		if id != 0 {
 			// Index of keys and outputs in the hash table is calculated as ID - 1.
-			hj.probeState.buildIdx[nResults] = int(hj.ht.groupID[i] - 1)
-			// {{if .UseSel}}
-			hj.probeState.probeIdx[nResults] = sel[i]
-			// {{else}}
-			hj.probeState.probeIdx[nResults] = i
-			// {{end}}
+			hj.probeState.buildIdx[nResults] = int(id - 1)
+			hj.probeState.probeIdx[nResults] = getIdx(i, sel, useSel)
 			nResults++
 		}
 	}
-	// {{end}}
-	// {{/*
+	return nResults
 }
-
-// */}}
 
 // collect prepares the buildIdx and probeIdx arrays where the buildIdx and
 // probeIdx at each index are joined to make an output row. The total number of
 // resulting rows is returned.
 func (hj *hashJoiner) collect(batch coldata.Batch, batchSize int, sel []int) int {
-	nResults := int(0)
+	nResults := 0
 
-	if hj.spec.left.outer {
+	if hj.spec.joinType.IsRightSemiOrRightAnti() {
+		collectRightSemiAnti(hj, batchSize)
+		return 0
+	}
+
+	if hj.spec.joinType.IsLeftOuterOrFullOuter() {
 		if sel != nil {
-			_COLLECT_PROBE_OUTER(hj, batchSize, nResults, batch, true)
+			nResults = collectProbeOuter(hj, batchSize, nResults, batch, sel, true)
 		} else {
-			_COLLECT_PROBE_OUTER(hj, batchSize, nResults, batch, false)
+			nResults = collectProbeOuter(hj, batchSize, nResults, batch, sel, false)
 		}
 	} else {
 		if sel != nil {
-			switch hj.spec.joinType {
-			case sqlbase.JoinType_LEFT_ANTI:
-				_COLLECT_LEFT_ANTI(hj, batchSize, nResults, batch, true)
-			default:
-				_COLLECT_PROBE_NO_OUTER(hj, batchSize, nResults, batch, true)
+			if hj.spec.joinType.IsLeftAntiOrExceptAll() {
+				nResults = collectLeftAnti(hj, batchSize, nResults, batch, sel, true)
+			} else {
+				nResults = collectProbeNoOuter(hj, batchSize, nResults, batch, sel, true)
 			}
 		} else {
-			switch hj.spec.joinType {
-			case sqlbase.JoinType_LEFT_ANTI:
-				_COLLECT_LEFT_ANTI(hj, batchSize, nResults, batch, false)
-			default:
-				_COLLECT_PROBE_NO_OUTER(hj, batchSize, nResults, batch, false)
+			if hj.spec.joinType.IsLeftAntiOrExceptAll() {
+				nResults = collectLeftAnti(hj, batchSize, nResults, batch, sel, false)
+			} else {
+				nResults = collectProbeNoOuter(hj, batchSize, nResults, batch, sel, false)
 			}
 		}
 	}
@@ -230,37 +292,52 @@ func (hj *hashJoiner) collect(batch coldata.Batch, batchSize int, sel []int) int
 // row index for each probe row is given in the groupID slice. This function
 // requires assumes a N-1 hash join.
 func (hj *hashJoiner) distinctCollect(batch coldata.Batch, batchSize int, sel []int) int {
-	nResults := int(0)
+	nResults := 0
 
-	if hj.spec.left.outer {
+	if hj.spec.joinType.IsRightSemiOrRightAnti() {
+		collectRightSemiAnti(hj, batchSize)
+		return 0
+	}
+
+	if hj.spec.joinType.IsLeftOuterOrFullOuter() {
 		nResults = batchSize
 
 		if sel != nil {
-			_DISTINCT_COLLECT_PROBE_OUTER(hj, batchSize, true)
+			distinctCollectProbeOuter(hj, batchSize, sel, true)
 		} else {
-			_DISTINCT_COLLECT_PROBE_OUTER(hj, batchSize, false)
+			distinctCollectProbeOuter(hj, batchSize, sel, false)
 		}
 	} else {
 		if sel != nil {
-			switch hj.spec.joinType {
-			case sqlbase.JoinType_LEFT_ANTI:
-				// {{/* For LEFT ANTI join we don't care whether the build (right) side
-				// was distinct, so we only have single variation of COLLECT method. */}}
-				_COLLECT_LEFT_ANTI(hj, batchSize, nResults, batch, true)
-			default:
-				_DISTINCT_COLLECT_PROBE_NO_OUTER(hj, batchSize, nResults, true)
+			if hj.spec.joinType.IsLeftAntiOrExceptAll() {
+				// For LEFT ANTI and EXCEPT ALL joins we don't care whether the build
+				// (right) side was distinct, so we only have single variation of COLLECT
+				// method.
+				nResults = collectLeftAnti(hj, batchSize, nResults, batch, sel, true)
+			} else {
+				nResults = distinctCollectProbeNoOuter(hj, batchSize, nResults, sel, true)
 			}
 		} else {
-			switch hj.spec.joinType {
-			case sqlbase.JoinType_LEFT_ANTI:
-				// {{/* For LEFT ANTI join we don't care whether the build (right) side
-				// was distinct, so we only have single variation of COLLECT method. */}}
-				_COLLECT_LEFT_ANTI(hj, batchSize, nResults, batch, false)
-			default:
-				_DISTINCT_COLLECT_PROBE_NO_OUTER(hj, batchSize, nResults, false)
+			if hj.spec.joinType.IsLeftAntiOrExceptAll() {
+				// For LEFT ANTI and EXCEPT ALL joins we don't care whether the build
+				// (right) side was distinct, so we only have single variation of COLLECT
+				// method.
+				nResults = collectLeftAnti(hj, batchSize, nResults, batch, sel, false)
+			} else {
+				nResults = distinctCollectProbeNoOuter(hj, batchSize, nResults, sel, false)
 			}
 		}
 	}
 
 	return nResults
+}
+
+// execgen:template<useSel>
+// execgen:inline
+func getIdx(i int, sel []int, useSel bool) int {
+	if useSel {
+		return sel[i]
+	} else {
+		return i
+	}
 }

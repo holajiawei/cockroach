@@ -14,9 +14,10 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 var upsertNodePool = sync.Pool{
@@ -31,7 +32,7 @@ type upsertNode struct {
 	// columns is set if this UPDATE is returning any rows, to be
 	// consumed by a renderNode upstream. This occurs when there is a
 	// RETURNING clause with some scalar expressions.
-	columns sqlbase.ResultColumns
+	columns colinfo.ResultColumns
 
 	run upsertRun
 }
@@ -42,7 +43,7 @@ type upsertRun struct {
 	checkOrds checkSet
 
 	// insertCols are the columns being inserted/upserted into.
-	insertCols []sqlbase.ColumnDescriptor
+	insertCols []descpb.ColumnDescriptor
 
 	// done informs a new call to BatchedNext() that the previous call to
 	// BatchedNext() has completed the work already.
@@ -53,10 +54,6 @@ type upsertRun struct {
 }
 
 func (n *upsertNode) startExec(params runParams) error {
-	if err := params.p.maybeSetSystemConfig(n.run.tw.tableDesc().GetID()); err != nil {
-		return err
-	}
-
 	// cache traceKV during execution, to avoid re-evaluating it for every row.
 	n.run.traceKV = params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 
@@ -73,19 +70,14 @@ func (n *upsertNode) Next(params runParams) (bool, error) { panic("not valid") }
 // in plan_batch.go.
 func (n *upsertNode) Values() tree.Datums { panic("not valid") }
 
-// maxUpsertBatchSize is the max number of entries in the KV batch for
-// the upsert operation (including secondary index updates, FK
-// cascading updates, etc), before the current KV batch is executed
-// and a new batch is started.
-const maxUpsertBatchSize = 10000
-
 // BatchedNext implements the batchedPlanNode interface.
 func (n *upsertNode) BatchedNext(params runParams) (bool, error) {
 	if n.run.done {
 		return false, nil
 	}
 
-	tracing.AnnotateTrace()
+	// Advance one batch. First, clear the last batch.
+	n.run.tw.clearLastBatch(params.ctx)
 
 	// Now consume/accumulate the rows for this batch.
 	lastBatch := false
@@ -110,19 +102,12 @@ func (n *upsertNode) BatchedNext(params runParams) (bool, error) {
 		}
 
 		// Are we done yet with the current batch?
-		if n.run.tw.curBatchSize() >= maxUpsertBatchSize {
+		if n.run.tw.currentBatchSize >= n.run.tw.maxBatchSize {
 			break
 		}
 	}
 
-	// In Upsert, curBatchSize indicates whether "there is still work to do in this batch".
-	batchSize := n.run.tw.curBatchSize()
-
-	if batchSize > 0 {
-		if err := n.run.tw.atBatchEnd(params.ctx, n.run.traceKV); err != nil {
-			return false, err
-		}
-
+	if n.run.tw.currentBatchSize > 0 {
 		if !lastBatch {
 			// We only run/commit the batch if there were some rows processed
 			// in this batch.
@@ -133,7 +118,7 @@ func (n *upsertNode) BatchedNext(params runParams) (bool, error) {
 	}
 
 	if lastBatch {
-		if _, err := n.run.tw.finalize(params.ctx, n.run.traceKV); err != nil {
+		if err := n.run.tw.finalize(params.ctx); err != nil {
 			return false, err
 		}
 		// Remember we're done for the next call to BatchedNext().
@@ -142,11 +127,11 @@ func (n *upsertNode) BatchedNext(params runParams) (bool, error) {
 
 	// Possibly initiate a run of CREATE STATISTICS.
 	params.ExecCfg().StatsRefresher.NotifyMutation(
-		n.run.tw.tableDesc().ID,
-		n.run.tw.batchedCount(),
+		n.run.tw.tableDesc().GetID(),
+		n.run.tw.lastBatchSize,
 	)
 
-	return n.run.tw.batchedCount() > 0, nil
+	return n.run.tw.lastBatchSize > 0, nil
 }
 
 // processSourceRow processes one row from the source for upsertion.
@@ -156,13 +141,36 @@ func (n *upsertNode) processSourceRow(params runParams, rowVals tree.Datums) err
 		return err
 	}
 
-	// Run the CHECK constraints, if any. CheckHelper will either evaluate the
-	// constraints itself, or else inspect boolean columns from the input that
+	// Create a set of partial index IDs to not add or remove entries from.
+	var pm row.PartialIndexUpdateHelper
+	if len(n.run.tw.tableDesc().PartialIndexes()) > 0 {
+		partialIndexValOffset := len(n.run.insertCols) + len(n.run.tw.fetchCols) + len(n.run.tw.updateCols) + n.run.checkOrds.Len()
+		if n.run.tw.canaryOrdinal != -1 {
+			partialIndexValOffset++
+		}
+		partialIndexVals := rowVals[partialIndexValOffset:]
+		partialIndexPutVals := partialIndexVals[:len(partialIndexVals)/2]
+		partialIndexDelVals := partialIndexVals[len(partialIndexVals)/2:]
+
+		err := pm.Init(partialIndexPutVals, partialIndexDelVals, n.run.tw.tableDesc())
+		if err != nil {
+			return err
+		}
+
+		// Truncate rowVals so that it no longer includes partial index predicate
+		// values.
+		rowVals = rowVals[:partialIndexValOffset]
+	}
+
+	// Verify the CHECK constraints by inspecting boolean columns from the input that
 	// contain the results of evaluation.
 	if !n.run.checkOrds.Empty() {
-		ord := len(rowVals) - n.run.checkOrds.Len()
+		ord := len(n.run.insertCols) + len(n.run.tw.fetchCols) + len(n.run.tw.updateCols)
+		if n.run.tw.canaryOrdinal != -1 {
+			ord++
+		}
 		checkVals := rowVals[ord:]
-		if err := checkMutationInput(n.run.tw.tableDesc(), n.run.checkOrds, checkVals); err != nil {
+		if err := checkMutationInput(params.ctx, &params.p.semaCtx, n.run.tw.tableDesc(), n.run.checkOrds, checkVals); err != nil {
 			return err
 		}
 		rowVals = rowVals[:ord]
@@ -170,14 +178,14 @@ func (n *upsertNode) processSourceRow(params runParams, rowVals tree.Datums) err
 
 	// Process the row. This is also where the tableWriter will accumulate
 	// the row for later.
-	return n.run.tw.row(params.ctx, rowVals, n.run.traceKV)
+	return n.run.tw.row(params.ctx, rowVals, pm, n.run.traceKV)
 }
 
 // BatchedCount implements the batchedPlanNode interface.
-func (n *upsertNode) BatchedCount() int { return n.run.tw.batchedCount() }
+func (n *upsertNode) BatchedCount() int { return n.run.tw.lastBatchSize }
 
-// BatchedCount implements the batchedPlanNode interface.
-func (n *upsertNode) BatchedValues(rowIdx int) tree.Datums { return n.run.tw.batchedValues(rowIdx) }
+// BatchedValues implements the batchedPlanNode interface.
+func (n *upsertNode) BatchedValues(rowIdx int) tree.Datums { return n.run.tw.rows.At(rowIdx) }
 
 func (n *upsertNode) Close(ctx context.Context) {
 	n.source.Close(ctx)

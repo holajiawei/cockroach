@@ -12,31 +12,29 @@ package main
 
 import (
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-func genAnyNotNullAgg(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/any_not_null_agg_tmpl.go")
-	if err != nil {
-		return err
-	}
+const anyNotNullAggTmpl = "pkg/sql/colexec/colexecagg/any_not_null_agg_tmpl.go"
 
-	s := string(t)
+func genAnyNotNullAgg(inputFileContents string, wr io.Writer) error {
+	r := strings.NewReplacer(
+		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"_GOTYPESLICE", "{{.GoTypeSliceName}}",
+		"_GOTYPE", "{{.GoType}}",
+		"_TYPE", "{{.VecMethod}}",
+		"TemplateType", "{{.VecMethod}}",
+	)
+	s := r.Replace(inputFileContents)
 
-	s = strings.Replace(s, "_GOTYPESLICE", "{{.LTyp.GoTypeSliceName}}", -1)
-	s = strings.Replace(s, "_GOTYPE", "{{.LTyp.GoTypeName}}", -1)
-	s = strings.Replace(s, "_TYPES_T", "coltypes.{{.LTyp}}", -1)
-	s = strings.Replace(s, "_TYPE", "{{.LTyp}}", -1)
-	s = strings.Replace(s, "_TemplateType", "{{.LTyp}}", -1)
+	findAnyNotNull := makeFunctionRegex("_FIND_ANY_NOT_NULL", 6)
+	s = findAnyNotNull.ReplaceAllString(s, `{{template "findAnyNotNull" buildDict "Global" . "HasNulls" $5 "HasSel" $6}}`)
 
-	findAnyNotNull := makeFunctionRegex("_FIND_ANY_NOT_NULL", 4)
-	s = findAnyNotNull.ReplaceAllString(s, `{{template "findAnyNotNull" buildDict "Global" . "LTyp" .LTyp "HasNulls" $4}}`)
-
-	s = replaceManipulationFuncs(".LTyp", s)
+	s = replaceManipulationFuncs(s)
 
 	tmpl, err := template.New("any_not_null_agg").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
 	if err != nil {
@@ -47,5 +45,5 @@ func genAnyNotNullAgg(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genAnyNotNullAgg, "any_not_null_agg.eg.go")
+	registerAggGenerator(genAnyNotNullAgg, "any_not_null_agg.eg.go", anyNotNullAggTmpl)
 }

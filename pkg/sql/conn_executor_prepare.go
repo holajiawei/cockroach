@@ -12,14 +12,14 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
+	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -32,7 +32,7 @@ func (ex *connExecutor) execPrepare(
 ) (fsm.Event, fsm.EventPayload) {
 
 	retErr := func(err error) (fsm.Event, fsm.EventPayload) {
-		return eventNonRetriableErr{IsCommit: fsm.False}, eventNonRetriableErrPayload{err: err}
+		return ex.makeErrEvent(err, parseCmd.AST)
 	}
 
 	// The anonymous statement can be overwritten.
@@ -49,10 +49,36 @@ func (ex *connExecutor) execPrepare(
 		ex.deletePreparedStmt(ctx, "")
 	}
 
+	// If we were provided any type hints, attempt to resolve any user defined
+	// type OIDs into types.T's.
+	if parseCmd.TypeHints != nil {
+		for i := range parseCmd.TypeHints {
+			if parseCmd.TypeHints[i] == nil {
+				if i >= len(parseCmd.RawTypeHints) {
+					return retErr(
+						pgwirebase.NewProtocolViolationErrorf(
+							"expected %d arguments, got %d",
+							len(parseCmd.TypeHints),
+							len(parseCmd.RawTypeHints),
+						),
+					)
+				}
+				if types.IsOIDUserDefinedType(parseCmd.RawTypeHints[i]) {
+					var err error
+					parseCmd.TypeHints[i], err = ex.planner.ResolveTypeByOID(ctx, parseCmd.RawTypeHints[i])
+					if err != nil {
+						return retErr(err)
+					}
+				}
+			}
+		}
+	}
+
+	stmt := makeStatement(parseCmd.Statement, ex.generateID())
 	ps, err := ex.addPreparedStmt(
 		ctx,
 		parseCmd.Name,
-		Statement{Statement: parseCmd.Statement},
+		stmt,
 		parseCmd.TypeHints,
 		PreparedStatementOriginWire,
 	)
@@ -99,7 +125,7 @@ func (ex *connExecutor) addPreparedStmt(
 	origin PreparedStatementOrigin,
 ) (*PreparedStatement, error) {
 	if _, ok := ex.extraTxnState.prepStmtsNamespace.prepStmts[name]; ok {
-		panic(fmt.Sprintf("prepared statement already exists: %q", name))
+		panic(errors.AssertionFailedf("prepared statement already exists: %q", name))
 	}
 
 	// Prepare the query. This completes the typing of placeholders.
@@ -133,7 +159,7 @@ func (ex *connExecutor) prepare(
 	}
 
 	prepared := &PreparedStatement{
-		PrepareMetadata: sqlbase.PrepareMetadata{
+		PrepareMetadata: querycache.PrepareMetadata{
 			PlaceholderTypesInfo: tree.PlaceholderTypesInfo{
 				TypeHints: placeholderHints,
 			},
@@ -152,32 +178,47 @@ func (ex *connExecutor) prepare(
 		return prepared, nil
 	}
 	prepared.Statement = stmt.Statement
+	prepared.AnonymizedStr = stmt.AnonymizedStr
 
 	// Point to the prepared state, which can be further populated during query
 	// preparation.
 	stmt.Prepared = prepared
 
-	if err := tree.ProcessPlaceholderAnnotations(stmt.AST, placeholderHints); err != nil {
+	if err := tree.ProcessPlaceholderAnnotations(&ex.planner.semaCtx, stmt.AST, placeholderHints); err != nil {
 		return nil, err
 	}
-	// Preparing needs a transaction because it needs to retrieve db/table
-	// descriptors for type checking.
-	// TODO(andrei): Needing a transaction for preparing seems non-sensical, as
-	// the prepared statement outlives the txn. I hope that it's not used for
-	// anything other than getting a timestamp.
-	txn := client.NewTxn(ctx, ex.server.cfg.DB, ex.server.cfg.NodeID.Get())
 
-	ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
-	p := &ex.planner
-	ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */, stmt.NumAnnotations)
-	p.stmt = &stmt
-	flags, err := ex.populatePrepared(ctx, txn, placeholderHints, p)
-	if err != nil {
-		txn.CleanupOnError(ctx, err)
-		return nil, err
+	// Preparing needs a transaction because it needs to retrieve db/table
+	// descriptors for type checking. If we already have an open transaction for
+	// this planner, use it. Using the user's transaction here is critical for
+	// proper deadlock detection. At the time of writing, it is the case that any
+	// data read on behalf of this transaction is not cached for use in other
+	// transactions. It's critical that this fact remain true but nothing really
+	// enforces it. If we create a new transaction (newTxn is true), we'll need to
+	// finish it before we return.
+
+	var flags planFlags
+	prepare := func(ctx context.Context, txn *kv.Txn) (err error) {
+		ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
+		p := &ex.planner
+		ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */)
+		p.stmt = stmt
+		p.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
+		flags, err = ex.populatePrepared(ctx, txn, placeholderHints, p)
+		return err
 	}
-	if err := txn.CommitOrCleanup(ctx); err != nil {
-		return nil, err
+
+	if txn := ex.state.mu.txn; txn != nil && txn.IsOpen() {
+		// Use the existing transaction.
+		if err := prepare(ctx, txn); err != nil {
+			return nil, err
+		}
+	} else {
+		// Use a new transaction. This will handle retriable errors here rather
+		// than bubbling them up to the connExecutor state machine.
+		if err := ex.server.cfg.DB.Txn(ctx, prepare); err != nil {
+			return nil, err
+		}
 	}
 
 	// Account for the memory used by this prepared statement.
@@ -191,15 +232,20 @@ func (ex *connExecutor) prepare(
 // populatePrepared analyzes and type-checks the query and populates
 // stmt.Prepared.
 func (ex *connExecutor) populatePrepared(
-	ctx context.Context, txn *client.Txn, placeholderHints tree.PlaceholderTypes, p *planner,
+	ctx context.Context, txn *kv.Txn, placeholderHints tree.PlaceholderTypes, p *planner,
 ) (planFlags, error) {
-	stmt := p.stmt
+	if before := ex.server.cfg.TestingKnobs.BeforePrepare; before != nil {
+		if err := before(ctx, ex.planner.stmt.String(), txn); err != nil {
+			return 0, err
+		}
+	}
+	stmt := &p.stmt
 	if err := p.semaCtx.Placeholders.Init(stmt.NumPlaceholders, placeholderHints); err != nil {
 		return 0, err
 	}
 	p.extendedEvalCtx.PrepareOnly = true
 
-	protoTS, err := p.isAsOf(stmt.AST)
+	protoTS, err := p.isAsOf(ctx, stmt.AST)
 	if err != nil {
 		return 0, err
 	}
@@ -304,8 +350,6 @@ func (ex *connExecutor) execBind(
 					"expected %d arguments, got %d", numQArgs, len(bindCmd.Args)))
 		}
 
-		ptCtx := tree.NewParseTimeContext(ex.state.sqlTimestamp.In(ex.sessionData.DataConversion.Location))
-
 		for i, arg := range bindCmd.Args {
 			k := tree.PlaceholderIdx(i)
 			t := ps.InferredTypes[i]
@@ -313,7 +357,20 @@ func (ex *connExecutor) execBind(
 				// nil indicates a NULL argument value.
 				qargs[k] = tree.DNull
 			} else {
-				d, err := pgwirebase.DecodeOidDatum(ptCtx, t, qArgFormatCodes[i], arg)
+				typ, ok := types.OidToType[t]
+				if !ok {
+					var err error
+					typ, err = ex.planner.ResolveTypeByOID(ctx, t)
+					if err != nil {
+						return nil, err
+					}
+				}
+				d, err := pgwirebase.DecodeDatum(
+					ex.planner.EvalContext(),
+					typ,
+					qArgFormatCodes[i],
+					arg,
+				)
 				if err != nil {
 					return retErr(pgerror.Wrapf(err, pgcode.ProtocolViolation,
 						"error in argument for %s", k))
@@ -340,9 +397,7 @@ func (ex *connExecutor) execBind(
 	}
 
 	// Create the new PreparedPortal.
-	if err := ex.addPortal(
-		ctx, portalName, bindCmd.PreparedStatementName, ps, qargs, columnFormatCodes,
-	); err != nil {
+	if err := ex.addPortal(ctx, portalName, ps, qargs, columnFormatCodes); err != nil {
 		return retErr(err)
 	}
 
@@ -361,22 +416,32 @@ func (ex *connExecutor) execBind(
 func (ex *connExecutor) addPortal(
 	ctx context.Context,
 	portalName string,
-	psName string,
 	stmt *PreparedStatement,
 	qargs tree.QueryArguments,
 	outFormats []pgwirebase.FormatCode,
 ) error {
 	if _, ok := ex.extraTxnState.prepStmtsNamespace.portals[portalName]; ok {
-		panic(fmt.Sprintf("portal already exists: %q", portalName))
+		panic(errors.AssertionFailedf("portal already exists: %q", portalName))
 	}
 
-	portal, err := ex.newPreparedPortal(ctx, portalName, stmt, qargs, outFormats)
+	portal, err := ex.makePreparedPortal(ctx, portalName, stmt, qargs, outFormats)
 	if err != nil {
 		return err
 	}
 
 	ex.extraTxnState.prepStmtsNamespace.portals[portalName] = portal
 	return nil
+}
+
+// exhaustPortal marks a portal with the provided name as "exhausted" and
+// panics if there is no portal with such name.
+func (ex *connExecutor) exhaustPortal(portalName string) {
+	portal, ok := ex.extraTxnState.prepStmtsNamespace.portals[portalName]
+	if !ok {
+		panic(errors.AssertionFailedf("portal %s doesn't exist", portalName))
+	}
+	portal.exhausted = true
+	ex.extraTxnState.prepStmtsNamespace.portals[portalName] = portal
 }
 
 func (ex *connExecutor) deletePreparedStmt(ctx context.Context, name string) {
@@ -393,7 +458,7 @@ func (ex *connExecutor) deletePortal(ctx context.Context, name string) {
 	if !ok {
 		return
 	}
-	portal.decRef(ctx)
+	portal.decRef(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc, name)
 	delete(ex.extraTxnState.prepStmtsNamespace.portals, name)
 }
 
@@ -418,7 +483,7 @@ func (ex *connExecutor) execDelPrepStmt(
 		}
 		ex.deletePortal(ctx, delCmd.Name)
 	default:
-		panic(fmt.Sprintf("unknown del type: %s", delCmd.Type))
+		panic(errors.AssertionFailedf("unknown del type: %s", delCmd.Type))
 	}
 	return nil, nil
 }

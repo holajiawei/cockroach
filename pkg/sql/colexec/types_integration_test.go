@@ -19,27 +19,27 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
 
-// TestSupportedSQLTypesIntegration tests that all SQL types supported by the
-// vectorized engine are "actually supported." For each type, it creates a bunch
-// of rows consisting of a single datum (possibly null), converts them into
-// column batches, serializes and then deserializes these batches, and finally
-// converts the deserialized batches back to rows which are compared with the
-// original rows.
-func TestSupportedSQLTypesIntegration(t *testing.T) {
+// TestSQLTypesIntegration tests that all SQL types are supported by the
+// vectorized engine. For each type, it creates a bunch of rows consisting of a
+// single datum (possibly null), converts them into column batches, serializes
+// and then deserializes these batches, and finally converts the deserialized
+// batches back to rows which are compared with the original rows.
+func TestSQLTypesIntegration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
@@ -55,15 +55,12 @@ func TestSupportedSQLTypesIntegration(t *testing.T) {
 		},
 	}
 
-	var da sqlbase.DatumAlloc
+	var da rowenc.DatumAlloc
 	rng, _ := randutil.NewPseudoRand()
+	typesToTest := 20
 
-	for _, typ := range allSupportedSQLTypes {
-		if typ.Equal(*types.Interval) {
-			// Serialization of Intervals is currently not supported.
-			// TODO(yuzefovich): remove this once it is supported.
-			continue
-		}
+	for i := 0; i < typesToTest; i++ {
+		typ := rowenc.RandType(rng)
 		for _, numRows := range []int{
 			// A few interesting sizes.
 			1,
@@ -71,24 +68,22 @@ func TestSupportedSQLTypesIntegration(t *testing.T) {
 			coldata.BatchSize(),
 			coldata.BatchSize() + 1,
 		} {
-			rows := make(sqlbase.EncDatumRows, numRows)
+			rows := make(rowenc.EncDatumRows, numRows)
 			for i := 0; i < numRows; i++ {
-				rows[i] = make(sqlbase.EncDatumRow, 1)
-				rows[i][0] = sqlbase.DatumToEncDatum(&typ, sqlbase.RandDatum(rng, &typ, true /* nullOk */))
+				rows[i] = make(rowenc.EncDatumRow, 1)
+				rows[i][0] = rowenc.DatumToEncDatum(typ, rowenc.RandDatum(rng, typ, true /* nullOk */))
 			}
-			typs := []types.T{typ}
+			typs := []*types.T{typ}
 			source := execinfra.NewRepeatableRowSource(typs, rows)
 
-			columnarizer, err := NewColumnarizer(ctx, testAllocator, flowCtx, 0 /* processorID */, source)
+			columnarizer, err := NewBufferingColumnarizer(ctx, testAllocator, flowCtx, 0 /* processorID */, source)
 			require.NoError(t, err)
 
-			coltyps, err := typeconv.FromColumnTypes(typs)
+			c, err := colserde.NewArrowBatchConverter(typs)
 			require.NoError(t, err)
-			c, err := colserde.NewArrowBatchConverter(coltyps)
+			r, err := colserde.NewRecordBatchSerializer(typs)
 			require.NoError(t, err)
-			r, err := colserde.NewRecordBatchSerializer(coltyps)
-			require.NoError(t, err)
-			arrowOp := newArrowTestOperator(columnarizer, c, r)
+			arrowOp := newArrowTestOperator(columnarizer, c, r, typs)
 
 			output := distsqlutils.NewRowBuffer(typs, nil /* rows */, distsqlutils.RowBufferArgs{})
 			materializer, err := NewMaterializer(
@@ -96,10 +91,10 @@ func TestSupportedSQLTypesIntegration(t *testing.T) {
 				1, /* processorID */
 				arrowOp,
 				typs,
-				&execinfrapb.PostProcessSpec{},
 				output,
 				nil, /* metadataSourcesQueue */
-				nil, /* outputStatsToTrace */
+				nil, /* toClose */
+				nil, /* execStatsForTrace */
 				nil, /* cancelFlow */
 			)
 			require.NoError(t, err)
@@ -110,7 +105,7 @@ func TestSupportedSQLTypesIntegration(t *testing.T) {
 			require.Equal(t, len(rows), len(actualRows))
 			for rowIdx, expectedRow := range rows {
 				require.Equal(t, len(expectedRow), len(actualRows[rowIdx]))
-				cmp, err := expectedRow[0].Compare(&typ, &da, &evalCtx, &actualRows[rowIdx][0])
+				cmp, err := expectedRow[0].Compare(typ, &da, &evalCtx, &actualRows[rowIdx][0])
 				require.NoError(t, err)
 				require.Equal(t, 0, cmp)
 			}
@@ -130,17 +125,23 @@ type arrowTestOperator struct {
 
 	c *colserde.ArrowBatchConverter
 	r *colserde.RecordBatchSerializer
+
+	typs []*types.T
 }
 
-var _ Operator = &arrowTestOperator{}
+var _ colexecbase.Operator = &arrowTestOperator{}
 
 func newArrowTestOperator(
-	input Operator, c *colserde.ArrowBatchConverter, r *colserde.RecordBatchSerializer,
-) Operator {
+	input colexecbase.Operator,
+	c *colserde.ArrowBatchConverter,
+	r *colserde.RecordBatchSerializer,
+	typs []*types.T,
+) colexecbase.Operator {
 	return &arrowTestOperator{
 		OneInputNode: NewOneInputNode(input),
 		c:            c,
 		r:            r,
+		typs:         typs,
 	}
 }
 
@@ -154,19 +155,20 @@ func (a *arrowTestOperator) Next(ctx context.Context) coldata.Batch {
 	var buf bytes.Buffer
 	arrowDataIn, err := a.c.BatchToArrow(batchIn)
 	if err != nil {
-		execerror.VectorizedInternalPanic(err)
+		colexecerror.InternalError(err)
 	}
-	_, _, err = a.r.Serialize(&buf, arrowDataIn)
+	_, _, err = a.r.Serialize(&buf, arrowDataIn, batchIn.Length())
 	if err != nil {
-		execerror.VectorizedInternalPanic(err)
+		colexecerror.InternalError(err)
 	}
 	var arrowDataOut []*array.Data
-	if err := a.r.Deserialize(&arrowDataOut, buf.Bytes()); err != nil {
-		execerror.VectorizedInternalPanic(err)
+	batchLength, err := a.r.Deserialize(&arrowDataOut, buf.Bytes())
+	if err != nil {
+		colexecerror.InternalError(err)
 	}
-	batchOut := testAllocator.NewMemBatchWithSize(nil, 0)
-	if err := a.c.ArrowToBatch(arrowDataOut, batchOut); err != nil {
-		execerror.VectorizedInternalPanic(err)
+	batchOut := testAllocator.NewMemBatchWithFixedCapacity(a.typs, batchLength)
+	if err := a.c.ArrowToBatch(arrowDataOut, batchLength, batchOut); err != nil {
+		colexecerror.InternalError(err)
 	}
 	return batchOut
 }

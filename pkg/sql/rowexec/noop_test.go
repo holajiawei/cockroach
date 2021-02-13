@@ -18,8 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -36,14 +36,14 @@ func BenchmarkNoop(b *testing.B) {
 		EvalCtx: &evalCtx,
 	}
 	post := &execinfrapb.PostProcessSpec{}
-	disposer := &execinfra.RowDisposer{}
+	disposer := &rowDisposer{}
 	for _, numCols := range []int{1, 1 << 1, 1 << 2, 1 << 4, 1 << 8} {
 		b.Run(fmt.Sprintf("cols=%d", numCols), func(b *testing.B) {
-			cols := make([]types.T, numCols)
+			cols := make([]*types.T, numCols)
 			for i := range cols {
-				cols[i] = *types.Int
+				cols[i] = types.Int
 			}
-			input := execinfra.NewRepeatableRowSource(cols, sqlbase.MakeIntRows(numRows, numCols))
+			input := execinfra.NewRepeatableRowSource(cols, rowenc.MakeIntRows(numRows, numCols))
 
 			b.SetBytes(int64(8 * numRows * numCols))
 			b.ResetTimer()

@@ -14,12 +14,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"math/rand"
+	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
@@ -33,11 +35,15 @@ var (
 
 	// ColumnFamilyMutator modifies a CREATE TABLE statement without any FAMILY
 	// definitions to have random FAMILY definitions.
-	ColumnFamilyMutator StatementMutator = sqlbase.ColumnFamilyMutator
+	ColumnFamilyMutator StatementMutator = rowenc.ColumnFamilyMutator
 
 	// IndexStoringMutator modifies the STORING clause of CREATE INDEX and
 	// indexes in CREATE TABLE.
-	IndexStoringMutator MultiStatementMutation = sqlbase.IndexStoringMutator
+	IndexStoringMutator MultiStatementMutation = rowenc.IndexStoringMutator
+
+	// PartialIndexMutator adds random partial index predicate expressions to
+	// indexes.
+	PartialIndexMutator MultiStatementMutation = rowenc.PartialIndexMutator
 
 	// PostgresMutator modifies strings such that they execute identically
 	// in both Postgres and Cockroach (however this mutator does not remove
@@ -87,7 +93,7 @@ func (msm MultiStatementMutation) Mutate(
 // changed in place) statements and a boolean indicating whether any changes
 // were made.
 func Apply(
-	rng *rand.Rand, stmts []tree.Statement, mutators ...sqlbase.Mutator,
+	rng *rand.Rand, stmts []tree.Statement, mutators ...rowenc.Mutator,
 ) (mutated []tree.Statement, changed bool) {
 	var mc bool
 	for _, m := range mutators {
@@ -123,7 +129,7 @@ func (sm StatementStringMutator) MutateString(
 // ApplyString executes all mutators on input. A mutator can also be a
 // StringMutator which will operate after all other mutators.
 func ApplyString(
-	rng *rand.Rand, input string, mutators ...sqlbase.Mutator,
+	rng *rand.Rand, input string, mutators ...rowenc.Mutator,
 ) (output string, changed bool) {
 	parsed, err := parser.Parse(input)
 	if err != nil {
@@ -135,7 +141,7 @@ func ApplyString(
 		stmts[i] = p.AST
 	}
 
-	var normalMutators []sqlbase.Mutator
+	var normalMutators []rowenc.Mutator
 	var stringMutators []StringMutator
 	for _, m := range mutators {
 		if sm, ok := m.(StringMutator); ok {
@@ -202,15 +208,16 @@ func statisticsMutator(
 			}
 			n := rng.Intn(10)
 			seen := map[string]bool{}
+			colType := tree.MustBeStaticallyKnownType(col.Type)
 			h := stats.HistogramData{
-				ColumnType: *col.Type,
+				ColumnType: colType,
 			}
 			for i := 0; i < n; i++ {
-				upper := sqlbase.RandDatumWithNullChance(rng, col.Type, 0)
+				upper := rowenc.RandDatumWithNullChance(rng, colType, 0)
 				if upper == tree.DNull {
 					continue
 				}
-				enc, err := sqlbase.EncodeTableKey(nil, upper, encoding.Ascending)
+				enc, err := rowenc.EncodeTableKey(nil, upper, encoding.Ascending)
 				if err != nil {
 					panic(err)
 				}
@@ -271,13 +278,15 @@ func statisticsMutator(
 					DistinctCount: distinctCount,
 					NullCount:     nullCount,
 				}
-				if def.Unique || def.PrimaryKey.IsPrimaryKey {
+				if (def.Unique.IsUnique && !def.Unique.WithoutIndex) || def.PrimaryKey.IsPrimaryKey {
 					makeHistogram(def)
 				}
 			case *tree.IndexTableDef:
 				makeHistogram(cols[def.Columns[0].Column])
 			case *tree.UniqueConstraintTableDef:
-				makeHistogram(cols[def.Columns[0].Column])
+				if !def.WithoutIndex {
+					makeHistogram(cols[def.Columns[0].Column])
+				}
 			}
 		}
 		if len(colStats) > 0 {
@@ -290,8 +299,12 @@ func statisticsMutator(
 				// Should not happen.
 				panic(err)
 			}
+			j, err := tree.ParseDJSON(string(b))
+			if err != nil {
+				panic(err)
+			}
 			alter.Cmds = append(alter.Cmds, &tree.AlterTableInjectStats{
-				Stats: tree.NewDString(string(b)),
+				Stats: j,
 			})
 			stmts = append(stmts, alter)
 			changed = true
@@ -416,7 +429,9 @@ func foreignKeyMutator(
 				fkCol := fkCols[len(usingCols)]
 				found := false
 				for refI, refCol := range availCols {
-					if fkCol.Type.Equivalent(refCol.Type) {
+					fkColType := tree.MustBeStaticallyKnownType(fkCol.Type)
+					refColType := tree.MustBeStaticallyKnownType(refCol.Type)
+					if fkColType.Equivalent(refColType) && colinfo.ColumnTypeIsIndexable(refColType) {
 						usingCols = append(usingCols, refCol)
 						availCols = append(availCols[:refI], availCols[refI+1:]...)
 						found = true
@@ -507,6 +522,8 @@ Loop:
 	}
 }
 
+var postgresMutatorAtIndex = regexp.MustCompile(`@[\[\]\w]+`)
+
 func postgresMutator(rng *rand.Rand, q string) string {
 	q, _ = ApplyString(rng, q, postgresStatementMutator)
 
@@ -521,6 +538,7 @@ func postgresMutator(rng *rand.Rand, q string) string {
 	} {
 		q = strings.Replace(q, from, to, -1)
 	}
+	q = postgresMutatorAtIndex.ReplaceAllString(q, "")
 	return q
 }
 
@@ -529,15 +547,15 @@ func postgresMutator(rng *rand.Rand, q string) string {
 var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts []tree.Statement) (mutated []tree.Statement, changed bool) {
 	for _, stmt := range stmts {
 		switch stmt := stmt.(type) {
-		case *tree.SetClusterSetting:
+		case *tree.SetClusterSetting, *tree.SetVar:
 			continue
 		case *tree.CreateTable:
 			if stmt.Interleave != nil {
 				stmt.Interleave = nil
 				changed = true
 			}
-			if stmt.PartitionBy != nil {
-				stmt.PartitionBy = nil
+			if stmt.PartitionByTable != nil {
+				stmt.PartitionByTable = nil
 				changed = true
 			}
 			for i := 0; i < len(stmt.Defs); i++ {
@@ -553,13 +571,21 @@ var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts
 						def.Family.Create = false
 						changed = true
 					}
+					if def.Unique.WithoutIndex {
+						def.Unique.WithoutIndex = false
+						changed = true
+					}
 				case *tree.UniqueConstraintTableDef:
 					if def.Interleave != nil {
 						def.Interleave = nil
 						changed = true
 					}
-					if def.PartitionBy != nil {
-						def.PartitionBy = nil
+					if def.PartitionByIndex != nil {
+						def.PartitionByIndex = nil
+						changed = true
+					}
+					if def.WithoutIndex {
+						def.WithoutIndex = false
 						changed = true
 					}
 				}

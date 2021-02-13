@@ -17,11 +17,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // DefaultLeaseDuration is the duration a lease will be acquired for if no
@@ -43,7 +43,7 @@ func (e *LeaseNotAvailableError) Error() string {
 // LeaseManager provides functionality for acquiring and managing leases
 // via the kv api.
 type LeaseManager struct {
-	db            *client.DB
+	db            *kv.DB
 	clock         *hlc.Clock
 	clientID      string
 	leaseDuration time.Duration
@@ -55,7 +55,7 @@ type Lease struct {
 	val struct {
 		sem      chan struct{}
 		lease    *LeaseVal
-		leaseRaw roachpb.Value
+		leaseRaw []byte
 	}
 }
 
@@ -67,7 +67,7 @@ type Options struct {
 }
 
 // New allocates a new LeaseManager.
-func New(db *client.DB, clock *hlc.Clock, options Options) *LeaseManager {
+func New(db *kv.DB, clock *hlc.Clock, options Options) *LeaseManager {
 	if options.ClientID == "" {
 		options.ClientID = uuid.MakeV4().String()
 	}
@@ -94,7 +94,7 @@ func (m *LeaseManager) AcquireLease(ctx context.Context, key roachpb.Key) (*Leas
 		key: key,
 	}
 	lease.val.sem = make(chan struct{}, 1)
-	if err := m.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	if err := m.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		var val LeaseVal
 		err := txn.GetProto(ctx, key, &val)
 		if err != nil {
@@ -114,11 +114,7 @@ func (m *LeaseManager) AcquireLease(ctx context.Context, key roachpb.Key) (*Leas
 		if err := txn.Put(ctx, key, &leaseRaw); err != nil {
 			return err
 		}
-		// After using newRaw as an arg to CPut, we're not allowed to modify it.
-		// Passing it back to CPut again (which is the whole point of keeping it
-		// around) will clear and re-init the checksum, so defensively copy it before
-		// we save it.
-		lease.val.leaseRaw = roachpb.Value{RawBytes: append([]byte(nil), leaseRaw.RawBytes...)}
+		lease.val.leaseRaw = leaseRaw.TagAndDataBytes()
 		return nil
 	}); err != nil {
 		return nil, err
@@ -164,8 +160,8 @@ func (m *LeaseManager) ExtendLease(ctx context.Context, l *Lease) error {
 	if err := newRaw.SetProto(newVal); err != nil {
 		return err
 	}
-	if err := m.db.CPut(ctx, l.key, &newRaw, &l.val.leaseRaw); err != nil {
-		if _, ok := err.(*roachpb.ConditionFailedError); ok {
+	if err := m.db.CPut(ctx, l.key, &newRaw, l.val.leaseRaw); err != nil {
+		if errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
 			// Something is wrong - immediately expire the local lease state.
 			l.val.lease.Expiration = hlc.Timestamp{}
 			return errors.Wrapf(err, "local lease state %v out of sync with DB state", l.val.lease)
@@ -173,11 +169,7 @@ func (m *LeaseManager) ExtendLease(ctx context.Context, l *Lease) error {
 		return err
 	}
 	l.val.lease = newVal
-	// After using newRaw as an arg to CPut, we're not allowed to modify it.
-	// Passing it back to CPut again (which is the whole point of keeping it
-	// around) will clear and re-init the checksum, so defensively copy it before
-	// we save it.
-	l.val.leaseRaw = roachpb.Value{RawBytes: append([]byte(nil), newRaw.RawBytes...)}
+	l.val.leaseRaw = newRaw.TagAndDataBytes()
 	return nil
 }
 
@@ -191,5 +183,5 @@ func (m *LeaseManager) ReleaseLease(ctx context.Context, l *Lease) error {
 	}
 	defer func() { <-l.val.sem }()
 
-	return m.db.CPut(ctx, l.key, nil, &l.val.leaseRaw)
+	return m.db.CPut(ctx, l.key, nil /* value - delete the lease */, l.val.leaseRaw)
 }

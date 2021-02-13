@@ -13,22 +13,21 @@ package sql
 import (
 	"context"
 	"math"
-	"math/rand"
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/logtags"
@@ -45,6 +44,8 @@ var _ rowResultWriter = &RowResultWriter{}
 
 // NewRowResultWriter creates a new RowResultWriter.
 func NewRowResultWriter(rowContainer *rowcontainer.RowContainer) *RowResultWriter {
+	// TODO(yuzefovich): consider using disk-backed row container in some cases
+	// (for example, in case of subqueries and apply-joins).
 	return &RowResultWriter{rowContainer: rowContainer}
 }
 
@@ -102,36 +103,6 @@ func (c *callbackResultWriter) Err() error {
 	return c.err
 }
 
-func (dsp *DistSQLPlanner) setupAllNodesPlanning(
-	ctx context.Context, evalCtx *extendedEvalContext, execCfg *ExecutorConfig,
-) (*PlanningCtx, []roachpb.NodeID, error) {
-	planCtx := dsp.NewPlanningCtx(ctx, evalCtx, nil /* txn */)
-
-	resp, err := execCfg.StatusServer.Nodes(ctx, &serverpb.NodesRequest{})
-	if err != nil {
-		return nil, nil, err
-	}
-	// Because we're not going through the normal pathways, we have to set up
-	// the nodeID -> nodeAddress map ourselves.
-	for _, node := range resp.Nodes {
-		if err := dsp.CheckNodeHealthAndVersion(planCtx, &node.Desc); err != nil {
-			continue
-		}
-	}
-	nodes := make([]roachpb.NodeID, 0, len(planCtx.NodeAddresses))
-	for nodeID := range planCtx.NodeAddresses {
-		nodes = append(nodes, nodeID)
-	}
-	// Shuffle node order so that multiple IMPORTs done in parallel will not
-	// identically schedule CSV reading. For example, if there are 3 nodes and 4
-	// files, the first node will get 2 files while the other nodes will each get 1
-	// file. Shuffling will make that first node random instead of always the same.
-	rand.Shuffle(len(nodes), func(i, j int) {
-		nodes[i], nodes[j] = nodes[j], nodes[i]
-	})
-	return planCtx, nodes, nil
-}
-
 func makeImportReaderSpecs(
 	job *jobs.Job,
 	tables map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
@@ -139,6 +110,7 @@ func makeImportReaderSpecs(
 	format roachpb.IOFileFormat,
 	nodes []roachpb.NodeID,
 	walltime int64,
+	user security.SQLUsername,
 ) []*execinfrapb.ReadImportDataSpec {
 
 	// For each input file, assign it to a node.
@@ -159,6 +131,7 @@ func makeImportReaderSpecs(
 				WalltimeNanos: walltime,
 				Uri:           make(map[int32]string),
 				ResumePos:     make(map[int32]int64),
+				UserProto:     user.EncodeProto(),
 			}
 			inputSpecs = append(inputSpecs, spec)
 		}
@@ -184,8 +157,10 @@ func presplitTableBoundaries(
 ) error {
 	expirationTime := cfg.DB.Clock().Now().Add(time.Hour.Nanoseconds(), 0)
 	for _, tbl := range tables {
-		for _, span := range tbl.Desc.AllIndexSpans() {
-			if err := cfg.DB.AdminSplit(ctx, span.Key, span.Key, expirationTime); err != nil {
+		// TODO(ajwerner): Consider passing in the wrapped descriptors.
+		tblDesc := tabledesc.NewImmutable(*tbl.Desc)
+		for _, span := range tblDesc.AllIndexSpans(cfg.Codec) {
+			if err := cfg.DB.AdminSplit(ctx, span.Key, expirationTime); err != nil {
 				return err
 			}
 
@@ -193,7 +168,7 @@ func presplitTableBoundaries(
 			scatterReq := &roachpb.AdminScatterRequest{
 				RequestHeader: roachpb.RequestHeaderFromSpan(span),
 			}
-			if _, pErr := client.SendWrapped(ctx, cfg.DB.NonTransactionalSender(), scatterReq); pErr != nil {
+			if _, pErr := kv.SendWrapped(ctx, cfg.DB.NonTransactionalSender(), scatterReq); pErr != nil {
 				log.Errorf(ctx, "failed to scatter span %s: %s", span.Key, pErr)
 			}
 		}
@@ -207,7 +182,7 @@ func presplitTableBoundaries(
 // returned.
 func DistIngest(
 	ctx context.Context,
-	phs PlanHookState,
+	execCtx JobExecContext,
 	job *jobs.Job,
 	tables map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
 	from []string,
@@ -217,45 +192,48 @@ func DistIngest(
 ) (roachpb.BulkOpSummary, error) {
 	ctx = logtags.AddTag(ctx, "import-distsql-ingest", nil)
 
-	dsp := phs.DistSQLPlanner()
-	evalCtx := phs.ExtendedEvalContext()
+	dsp := execCtx.DistSQLPlanner()
+	evalCtx := execCtx.ExtendedEvalContext()
 
-	planCtx, nodes, err := dsp.setupAllNodesPlanning(ctx, evalCtx, phs.ExecCfg())
+	planCtx, nodes, err := dsp.SetupAllNodesPlanning(ctx, evalCtx, execCtx.ExecCfg())
 	if err != nil {
 		return roachpb.BulkOpSummary{}, err
 	}
 
-	inputSpecs := makeImportReaderSpecs(job, tables, from, format, nodes, walltime)
+	inputSpecs := makeImportReaderSpecs(job, tables, from, format, nodes, walltime, execCtx.User())
 
-	var p PhysicalPlan
+	p := planCtx.NewPhysicalPlan()
 
 	// Setup a one-stage plan with one proc per input spec.
-	stageID := p.NewStageID()
-	p.ResultRouters = make([]physicalplan.ProcessorIdx, len(inputSpecs))
-	for i, rcs := range inputSpecs {
-		proc := physicalplan.Processor{
-			Node: nodes[i],
-			Spec: execinfrapb.ProcessorSpec{
-				Core:    execinfrapb.ProcessorCoreUnion{ReadImport: rcs},
-				Output:  []execinfrapb.OutputRouterSpec{{Type: execinfrapb.OutputRouterSpec_PASS_THROUGH}},
-				StageID: stageID,
-			},
-		}
-		pIdx := p.AddProcessor(proc)
-		p.ResultRouters[i] = pIdx
+	corePlacement := make([]physicalplan.ProcessorCorePlacement, len(inputSpecs))
+	for i := range inputSpecs {
+		corePlacement[i].NodeID = nodes[i]
+		corePlacement[i].Core.ReadImport = inputSpecs[i]
 	}
+	p.AddNoInputStage(
+		corePlacement,
+		execinfrapb.PostProcessSpec{},
+		// The direct-ingest readers will emit a binary encoded BulkOpSummary.
+		[]*types.T{types.Bytes, types.Bytes},
+		execinfrapb.Ordering{},
+	)
 
-	// The direct-ingest readers will emit a binary encoded BulkOpSummary.
 	p.PlanToStreamColMap = []int{0, 1}
-	p.ResultTypes = []types.T{*types.Bytes, *types.Bytes}
 
-	dsp.FinalizePlan(planCtx, &p)
+	dsp.FinalizePlan(planCtx, p)
 
 	if err := job.FractionProgressed(ctx,
 		func(ctx context.Context, details jobspb.ProgressDetails) float32 {
 			prog := details.(*jobspb.Progress_Import).Import
 			prog.ReadProgress = make([]float32, len(from))
 			prog.ResumePos = make([]int64, len(from))
+			if prog.SequenceDetails == nil {
+				prog.SequenceDetails = make([]*jobspb.SequenceDetails, len(from))
+				for i := range prog.SequenceDetails {
+					prog.SequenceDetails[i] = &jobspb.SequenceDetails{}
+				}
+			}
+
 			return 0.0
 		},
 	); err != nil {
@@ -309,19 +287,21 @@ func DistIngest(
 		return nil
 	})
 
-	if err := presplitTableBoundaries(ctx, phs.ExecCfg(), tables); err != nil {
-		return roachpb.BulkOpSummary{}, err
+	if evalCtx.Codec.ForSystemTenant() {
+		if err := presplitTableBoundaries(ctx, execCtx.ExecCfg(), tables); err != nil {
+			return roachpb.BulkOpSummary{}, err
+		}
 	}
 
 	recv := MakeDistSQLReceiver(
 		ctx,
-		&metadataCallbackWriter{rowResultWriter: rowResultWriter, fn: metaFn},
+		&MetadataCallbackWriter{rowResultWriter: rowResultWriter, fn: metaFn},
 		tree.Rows,
 		nil, /* rangeCache */
-		nil, /* leaseCache */
 		nil, /* txn - the flow does not read or write the database */
-		func(ts hlc.Timestamp) {},
+		nil, /* clockUpdater */
 		evalCtx.Tracing,
+		evalCtx.ExecCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 
@@ -349,7 +329,7 @@ func DistIngest(
 		defer close(stopProgress)
 		// Copy the evalCtx, as dsp.Run() might change it.
 		evalCtxCopy := *evalCtx
-		dsp.Run(planCtx, nil, &p, recv, &evalCtxCopy, nil /* finishedSetupFn */)()
+		dsp.Run(planCtx, nil, p, recv, &evalCtxCopy, nil /* finishedSetupFn */)()
 		return rowResultWriter.Err()
 	})
 

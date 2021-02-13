@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -70,7 +71,6 @@ select '''
 			f.Close()
 		}
 		_ = os.Remove(fname)
-		stdin = os.Stdin
 	}()
 
 	for _, test := range tests {
@@ -89,10 +89,7 @@ select '''
 			fmt.Fprintln(stderr, err)
 			return
 		}
-		// Override the standard input for runInteractive().
-		stdin = f
-
-		err := runInteractive(conn)
+		err := runInteractive(conn, f)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 		}
@@ -124,6 +121,7 @@ select '''
 
 func TestIsEndOfStatement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	tests := []struct {
 		in         string
@@ -192,12 +190,16 @@ func TestIsEndOfStatement(t *testing.T) {
 // statements.
 func TestHandleCliCmdSqlAlias(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	initCLIDefaults()
+
 	clientSideCommandTestsTable := []struct {
 		commandString string
 		wantSQLStmt   string
 	}{
 		{`\l`, `SHOW DATABASES`},
 		{`\dt`, `SHOW TABLES`},
+		{`\dT`, `SHOW TYPES`},
 		{`\du`, `SHOW USERS`},
 		{`\d mytable`, `SHOW COLUMNS FROM mytable`},
 		{`\d`, `SHOW TABLES`},
@@ -216,6 +218,8 @@ func TestHandleCliCmdSqlAlias(t *testing.T) {
 
 func TestHandleCliCmdSlashDInvalidSyntax(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	initCLIDefaults()
 
 	clientSideCommandTests := []string{`\d goodarg badarg`, `\dz`}
 

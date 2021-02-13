@@ -21,7 +21,6 @@
 #             step in some important transformations (like eliminating
 #             subqueries).
 
-
 # Scan returns a result set containing every row in a table by scanning one of
 # the table's indexes according to its ordering. The ScanPrivate field
 # identifies the table and index to scan, as well as the subset of columns to
@@ -51,8 +50,13 @@ define ScanPrivate {
     Cols ColSet
 
     # If set, the scan is a constrained scan; the constraint contains the spans
-    # that need to be scanned.
+    # that need to be scanned. If InvertedConstraint is also set, Constraint
+    # contains non-ranging spans that constrain the non-inverted prefix columns.
     Constraint Constraint
+
+    # If set, the scan is a constrained scan of an inverted index; the
+    # InvertedConstraint contains the spans that need to be scanned.
+    InvertedConstraint InvertedSpans
 
     # HardLimit specifies the maximum number of rows that the scan can return
     # (after applying any constraint), as well as the required scan direction.
@@ -79,35 +83,6 @@ define ScanPrivate {
     PartitionConstrainedScan bool
 }
 
-# VirtualScan returns a result set containing every row in a virtual table.
-# Virtual tables are system tables that are populated "on the fly" with rows
-# synthesized from system metadata and other state. An example is the
-# "information_schema.tables" virtual table which returns one row for each
-# accessible system or user table.
-#
-# VirtualScan has many of the same characteristics as the Scan operator.
-# However, virtual tables do not have indexes or keys, and the physical operator
-# used to scan virtual tables does not support limits or constraints. Therefore,
-# nearly all the rules that apply to Scan do not apply to VirtualScan, so it
-# makes sense to have a separate operator.
-[Relational]
-define VirtualScan {
-    _ VirtualScanPrivate
-}
-
-[Private]
-define VirtualScanPrivate {
-    # Table identifies the virtual table to synthesize and scan. It is an id
-    # that can be passed to the Metadata.Table method in order to fetch
-    # cat.Table metadata.
-    Table TableID
-
-    # Cols specifies the set of columns that the VirtualScan operator projects.
-    # This is always every column in the virtual table (i.e. never a subset even
-    # if all columns are not needed).
-    Cols ColSet
-}
-
 # SequenceSelect represents a read from a sequence as a data source. It always returns
 # three columns, last_value, log_cnt, and is_called, with a single row. last_value is
 # the most recent value returned from the sequence and log_cnt and is_called are
@@ -119,11 +94,11 @@ define SequenceSelect {
 
 [Private]
 define SequenceSelectPrivate {
-  # Sequence identifies the sequence to read from.
-  Sequence SequenceID
+    # Sequence identifies the sequence to read from.
+    Sequence SequenceID
 
-  # Cols is the 3 element list of column IDs returned by the operator.
-  Cols ColList
+    # Cols is the 3 element list of column IDs returned by the operator.
+    Cols ColList
 }
 
 # Values returns a manufactured result set containing a constant number of rows.
@@ -138,8 +113,7 @@ define SequenceSelectPrivate {
 [Relational]
 define Values {
     Rows ScalarListExpr
-
-    _    ValuesPrivate
+    _ ValuesPrivate
 }
 
 [Private]
@@ -160,7 +134,7 @@ define ValuesPrivate {
 # matching easier.
 [Relational]
 define Select {
-    Input   RelExpr
+    Input RelExpr
     Filters FiltersExpr
 }
 
@@ -173,9 +147,8 @@ define Select {
 # output columns.
 [Relational]
 define Project {
-    Input       RelExpr
+    Input RelExpr
     Projections ProjectionsExpr
-
     Passthrough ColSet
 
     # notNullCols is the set of columns (input or synthesized) that are known to
@@ -187,62 +160,89 @@ define Project {
     internalFuncDeps FuncDepSet
 }
 
+# InvertedFilter filters rows from its input result set, based on the
+# InvertedExpression predicate (which is defined in InvertedFilterPrivate).
+# Rows which do not match the filter are discarded. The input should be a
+# constrained scan of an inverted index, possibly wrapped in other operators
+# such as Select.
+[Relational]
+define InvertedFilter {
+    Input RelExpr
+    _ InvertedFilterPrivate
+}
+
+[Private]
+define InvertedFilterPrivate {
+    # InvertedExpression represents the set operations (UNION or INTERSECTION)
+    # that should be executed on the inverted spans retrieved from the input.
+    # The input should already be filtered based on SpansToRead from the
+    # SpanExpression, but this InvertedExpression serves to filter the rows
+    # further by applying set operations on the primary key columns.
+    InvertedExpression SpanExpression
+
+    # PreFiltererState represents the optional pre-filtering state.
+    PreFiltererState PreFiltererState
+
+    # The InvertedColumn is the id of the inverted column in the input. It is
+    # used during execution to map rows from the input to their corresponding
+    # spans in the SpanExpression.
+    InvertedColumn ColumnID
+}
+
 # InnerJoin creates a result set that combines columns from its left and right
 # inputs, based upon its "on" join predicate. Rows which do not match the
 # predicate are filtered. While expressions in the predicate can refer to
 # columns projected by either the left or right inputs, the inputs are not
 # allowed to refer to the other's projected columns.
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define InnerJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
+    multiplicity JoinMultiplicity
 }
 
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define LeftJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
-   _ JoinPrivate
+    On FiltersExpr
+    _ JoinPrivate
+    multiplicity JoinMultiplicity
 }
 
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define RightJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define FullJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
+    multiplicity JoinMultiplicity
 }
 
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define SemiJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
+    multiplicity JoinMultiplicity
 }
 
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define AntiJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
@@ -252,6 +252,10 @@ define AntiJoin {
 define JoinPrivate {
     # Flags modify what type of join we choose.
     Flags JoinFlags
+
+    # SkipReorderJoins indicates whether the ReorderJoins rule should match this
+    # join.
+    SkipReorderJoins bool
 }
 
 # IndexJoin represents an inner join between an input expression and a primary
@@ -264,7 +268,6 @@ define JoinPrivate {
 [Relational]
 define IndexJoin {
     Input RelExpr
-
     _ IndexJoinPrivate
 }
 
@@ -281,11 +284,10 @@ define IndexJoinPrivate {
 
 # LookupJoin represents a join between an input expression and an index. The
 # type of join is in the LookupJoinPrivate field.
-[Relational, Telemetry]
+[Relational]
 define LookupJoin {
     Input RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ LookupJoinPrivate
 
     # lookupProps caches relational properties for the "table" side of the lookup
@@ -312,10 +314,16 @@ define LookupJoinPrivate {
     # index columns (or a prefix of them).
     KeyCols ColList
 
-    # Cols is the set of columns produced by the lookup join. This set can
-    # contain columns from the input and columns from the index. Any columns not
-    # in the input are retrieved from the index. Cols may not contain some or
-    # all of the KeyCols, if they are not output columns for the join.
+    # Cols is the union between the set of input columns that are returned by
+    # the lookup join and the set of lookup columns retrieved through lookup.
+    #
+    # For inner/left join, this is the set of columns produced by the LookupJoin
+    # operator.
+    # For semi/anti-join, this contains the semi-join output columns (from the
+    # input) plus the columns that we need to look up for the ON condition.
+    #
+    # Cols may not contain some or all of the KeyCols, if they are not output
+    # columns for the join.
     #
     # TODO(radu): this effectively allows an arbitrary projection; it should be
     # just a LookupCols set indicating which columns we should add from the
@@ -328,11 +336,73 @@ define LookupJoinPrivate {
     # table (and thus each left row matches with at most one table row).
     LookupColsAreTableKey bool
 
+    # IsSecondJoinInPairedJoiner is true if this is the second join of a
+    # paired-joiner used for left joins.
+    IsSecondJoinInPairedJoiner bool
+
     # ConstFilters contains the constant filters that are represented as equality
     # conditions on the KeyCols. These filters are needed by the statistics code to
     # correctly estimate selectivity.
     ConstFilters FiltersExpr
+    _ JoinPrivate
+}
 
+# InvertedJoin represents a join between an input expression and an inverted
+# index. The type of join is in the InvertedJoinPrivate field.
+[Relational]
+define InvertedJoin {
+    Input RelExpr
+
+    # On only contains filters on the input columns and primary key columns of
+    # the inverted index's base table.
+    On FiltersExpr
+    _ InvertedJoinPrivate
+
+    # lookupProps caches relational properties for the "table" side of the lookup
+    # join, treating it as if it were another relational input. This makes the
+    # lookup join appear more like other join operators.
+    lookupProps RelProps
+}
+
+[Private]
+define InvertedJoinPrivate {
+    # JoinType is InnerJoin, LeftJoin, SemiJoin, or AntiJoin.
+    JoinType Operator
+
+    # InvertedExpr is the inverted join condition. It is used to get the keys
+    # to lookup in the inverted index based on the values of the input columns.
+    InvertedExpr ScalarExpr
+
+    # Table identifies the table do to lookups in.
+    Table TableID
+
+    # Index identifies the inverted index to do lookups in. It can be passed to
+    # the cat.Table.Index() method in order to fetch the cat.Index metadata.
+    Index IndexOrdinal
+
+    # IsFirstJoinInPairedJoiner is true if this is the first join of a
+    # paired-joiner used for left joins.
+    IsFirstJoinInPairedJoiner bool
+
+    # ContinuationCol is the column ID of the continuation column when
+    # IsFirstJoinInPairedJoiner is true.
+    ContinuationCol ColumnID
+
+    # PrefixKeyCols are the columns (produced by the input) used to create
+    # lookup keys for the non-inverted prefix columns if the index is a
+    # multi-column inverted index. There must be a key column for each prefix
+    # column.
+    PrefixKeyCols ColList
+
+    # Cols is the set of columns produced by the inverted join. This set can
+    # contain columns from the input and columns from the index. Any columns
+    # not in the input are retrieved from the index.
+    Cols ColSet
+
+    # ConstFilters contains the constant filters that are represented as
+    # equality conditions on the PrefixKeyCols. These filters are needed by the
+    # statistics code to correctly estimate selectivity.
+    ConstFilters FiltersExpr
     _ JoinPrivate
 }
 
@@ -340,12 +410,11 @@ define LookupJoinPrivate {
 # MergeOn is a scalar which contains the ON condition and merge-join ordering
 # information; see the MergeOn scalar operator.
 # It can be any type of join (identified in the MergeJoinPrivate field).
-[Relational, Telemetry]
+[Relational]
 define MergeJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ MergeJoinPrivate
 }
 
@@ -363,16 +432,15 @@ define MergeJoinPrivate {
     # Examples of valid settings for abc JOIN def ON a=d,b=e:
     #   LeftEq: a+,b+   RightEq: d+,e+
     #   LeftEq: b-,a+   RightEq: e-,d+
-    LeftEq  Ordering
+    LeftEq Ordering
     RightEq Ordering
 
     # LeftOrdering and RightOrdering are "simplified" versions of LeftEq/RightEq,
     # taking into account the functional dependencies of each side. We need both
     # versions because we need to configure execution with specific equality
     # columns and orderings.
-    LeftOrdering  OrderingChoice
+    LeftOrdering OrderingChoice
     RightOrdering OrderingChoice
-
     _ JoinPrivate
 }
 
@@ -384,8 +452,7 @@ define MergeJoinPrivate {
 # TODO(itsbilal): Add support for representing multi-way zigzag joins.
 [Relational, Telemetry]
 define ZigzagJoin {
-    On   FiltersExpr
-
+    On FiltersExpr
     _ ZigzagJoinPrivate
 
     # leftProps and rightProps cache relational properties corresponding to an
@@ -438,37 +505,33 @@ define ZigzagJoinPrivate {
 # left input.
 [Relational, Join, JoinApply, Telemetry]
 define InnerJoinApply {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
 [Relational, Join, JoinApply, Telemetry]
 define LeftJoinApply {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
 [Relational, Join, JoinApply, Telemetry]
 define SemiJoinApply {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
 [Relational, Join, JoinApply, Telemetry]
 define AntiJoinApply {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
@@ -499,15 +562,15 @@ define AntiJoinApply {
 # interesting orderings.
 [Relational, Grouping, Telemetry]
 define GroupBy {
-    Input        RelExpr
+    Input RelExpr
     Aggregations AggregationsExpr
-
     _ GroupingPrivate
 }
 
 # GroupingPrivate is shared between the grouping-related operators: GroupBy
-# ScalarGroupBy, DistinctOn, and UpsertDistinctOn. This allows the operators to
-# be treated polymorphically.
+# ScalarGroupBy, DistinctOn, EnsureDistinctOn, UpsertDistinctOn, and
+# EnsureUpsertDistinctOn. This allows the operators to be treated
+# polymorphically.
 [Private]
 define GroupingPrivate {
     # GroupingCols partitions the GroupBy input rows into aggregation groups.
@@ -527,6 +590,17 @@ define GroupingPrivate {
     # columns. Exploration rules can create versions of the operator with
     # orderings that contain grouping columns.
     Ordering OrderingChoice
+
+    # NullsAreDistinct specifies the null behavior of the grouping operator. If
+    # true, the operator considers nulls to be distinct for grouping purposes.
+    # NullsAreDistinct should only be true for UpsertDistinctOn and
+    # EnsureUpsertDistinctOn.
+    NullsAreDistinct bool
+
+    # ErrorOnDup, if non-empty, triggers an error with the given text if any
+    # aggregation group contains more than one row. This can only take on a
+    # value for the EnsureDistinctOn and EnsureUpsertDistinctOn operators.
+    ErrorOnDup string
 }
 
 # ScalarGroupBy computes aggregate functions over the complete set of input
@@ -543,9 +617,8 @@ define GroupingPrivate {
 # empty.
 [Relational, Grouping, Telemetry]
 define ScalarGroupBy {
-    Input        RelExpr
+    Input RelExpr
     Aggregations AggregationsExpr
-
     _ GroupingPrivate
 }
 
@@ -585,32 +658,65 @@ define ScalarGroupBy {
 # ConstAgg.
 [Relational, Grouping, Telemetry]
 define DistinctOn {
-    Input        RelExpr
+    Input RelExpr
     Aggregations AggregationsExpr
+    _ GroupingPrivate
+}
 
+# EnsureDistinctOn is a variation on DistinctOn that is only used to replace a
+# Max1Row operator in a decorrelation attempt. It raises an error if any
+# distinct grouping contains more than one row. Or in other words, it "ensures"
+# that the input is distinct on the grouping columns.
+#
+# EnsureDistinctOn is used when nulls are not considered distinct for grouping
+# purposes and an error should be raised when duplicates are detected.
+#
+# Rules should only "push through" or eliminate an EnsureDistinctOn if they
+# preserve the expected error behavior. For example, it would be invalid to
+# push a Select filter into an EnsureDistinctOn, as it might eliminate rows
+# that would otherwise trigger the EnsureDistinctOn error.
+[Relational, Grouping, Telemetry]
+define EnsureDistinctOn {
+    Input RelExpr
+    Aggregations AggregationsExpr
     _ GroupingPrivate
 }
 
 # UpsertDistinctOn is a variation on DistinctOn that is only used with UPSERT
-# and INSERT..ON CONFLICT statements. It differs from DistinctOn in two ways:
+# and INSERT..ON CONFLICT statements. Unlike DistinctOn, UpsertDistinctOn treats
+# NULL values as not equal to one another for purposes of grouping. Two rows
+# having a NULL-valued grouping column will be placed in different groups. This
+# differs from DistinctOn behavior, where the two rows would be grouped
+# together. This behavior difference reflects SQL semantics, in which a unique
+# index key still allows multiple NULL values.
 #
-#   1. Null behavior: UpsertDistinctOn treats NULL values as not equal to one
-#      another for purposes of grouping. Two rows having a NULL-valued grouping
-#      column will be placed in different groups. This differs from DistinctOn
-#      behavior, where the two rows would be grouped together. This behavior
-#      difference reflects SQL semantics, in which a unique index key still
-#      allows multiple NULL values.
-#
-#   2. Duplicate behavior: UpsertDistinctOn raises an error if any distinct
-#      grouping contains more than one row. It has "input must be distinct"
-#      semantics rather than "make the input distinct" semantics. This is used
-#      to ensure that no row will be updated more than once.
-#
+# UpsertDistinctOn is used when nulls are considered distinct for grouping
+# purposes and duplicates should be filtered out without raising an error.
 [Relational, Grouping, Telemetry]
 define UpsertDistinctOn {
-    Input        RelExpr
+    Input RelExpr
     Aggregations AggregationsExpr
+    _ GroupingPrivate
+}
 
+# EnsureUpsertDistinctOn is a variation on UpsertDistinctOn that is only used
+# with UPSERT and INSERT..ON CONFLICT statements. Like UpsertDistinctOn,
+# EnsureUpsertDistinctOn treats NULL values as not equal to one another for
+# purposes of grouping. Unlike UpsertDistinctOn, it raises an error if any
+# distinct grouping contains more than one row. Or in other words, it "ensures"
+# that the input is distinct on the grouping columns.
+#
+# EnsureUpsertDistinctOn is used when nulls are considered distinct for grouping
+# purposes and an error should be raised when duplicates are detected.
+#
+# Rules should only "push through" or eliminate an EnsureUpsertDistinctOn if
+# they preserve the expected error behavior. For example, it would be invalid to
+# push a Select filter into an EnsureUpsertDistinctOn, as it might eliminate
+# rows that would otherwise trigger the EnsureUpsertDistinctOn error.
+[Relational, Grouping, Telemetry]
+define EnsureUpsertDistinctOn {
+    Input RelExpr
+    Aggregations AggregationsExpr
     _ GroupingPrivate
 }
 
@@ -621,9 +727,8 @@ define UpsertDistinctOn {
 # details.
 [Relational, Set]
 define Union {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -651,9 +756,9 @@ define Union {
 # must have matching types.
 [Private]
 define SetPrivate {
-    LeftCols  ColList
+    LeftCols ColList
     RightCols ColList
-    OutCols   ColList
+    OutCols ColList
 }
 
 # Intersect is an operator used to perform an intersection between the Left
@@ -665,9 +770,8 @@ define SetPrivate {
 # details.
 [Relational, Set]
 define Intersect {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -678,9 +782,8 @@ define Intersect {
 # with the output columns. See the comment above SetPrivate for more details.
 [Relational, Set]
 define Except {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -703,9 +806,8 @@ define Except {
 # details.
 [Relational, Set]
 define UnionAll {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -730,9 +832,8 @@ define UnionAll {
 # details.
 [Relational, Set]
 define IntersectAll {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -756,9 +857,8 @@ define IntersectAll {
 # details.
 [Relational, Set]
 define ExceptAll {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -771,7 +871,6 @@ define ExceptAll {
 define Limit {
     Input RelExpr
     Limit ScalarExpr
-
     Ordering OrderingChoice
 }
 
@@ -779,9 +878,8 @@ define Limit {
 # conjunction with Limit.
 [Relational]
 define Offset {
-    Input  RelExpr
+    Input RelExpr
     Offset ScalarExpr
-
     Ordering OrderingChoice
 }
 
@@ -793,7 +891,6 @@ define Offset {
 [Relational]
 define Max1Row {
     Input RelExpr
-
     ErrorText string
 }
 
@@ -802,7 +899,6 @@ define Max1Row {
 [Relational]
 define Ordinality {
     Input RelExpr
-
     _ OrdinalityPrivate
 }
 
@@ -833,7 +929,7 @@ define OrdinalityPrivate {
 [Relational, Telemetry]
 define ProjectSet {
     Input RelExpr
-    Zip   ZipExpr
+    Zip ZipExpr
 }
 
 # Window represents a window function. Window functions are operators which
@@ -849,11 +945,10 @@ define ProjectSet {
 # cumulative sum, or something else.
 [Relational]
 define Window {
-    Input    RelExpr
+    Input RelExpr
 
     # Windows is the set of window functions to be computed for this operator.
     Windows WindowsExpr
-
     _ WindowPrivate
 }
 
@@ -871,11 +966,10 @@ define WindowPrivate {
 # With executes Binding, making its results available to Main. Within Main, the
 # results of Binding may be referenced by a WithScan expression containing the
 # ID of this With.
-[Relational]
+[Relational, WithBinding]
 define With {
     Binding RelExpr
-    Main    RelExpr
-
+    Main RelExpr
     _ WithPrivate
 }
 
@@ -887,12 +981,18 @@ define WithPrivate {
     # it in the EXPLAIN plan).
     OriginalExpr Statement
 
+    # Mtr is used to specify whether or not to override the optimizer's
+    # default decision for materializing or not materializing tables.
+    Mtr MaterializeClause
+
     # Name is used to identify the with for debugging purposes.
     Name string
 }
 
 # WithScan returns the results present in the With expression referenced
 # by ID.
+# Note that in order to contruct a WithScan, the WithID must have a bound
+# expression in the metadata.
 [Relational]
 define WithScan {
     _ WithScanPrivate
@@ -902,9 +1002,6 @@ define WithScan {
 define WithScanPrivate {
     # With identifies the CTE to scan.
     With WithID
-
-    # BindingProps stores the relational properties of the referenced expression.
-    BindingProps RelPropsPtr
 
     # Name is used to identify the with being referenced for debugging purposes.
     Name string
@@ -935,11 +1032,21 @@ define WithScanPrivate {
 #    - the Recursive query (which refers to the working table using a specific
 #      WithID) is evaluated; the results are emitted and also saved into a new
 #      "working table" for the next iteration.
-[Relational]
+[Relational, WithBinding]
 define RecursiveCTE {
-    Initial RelExpr
-    Recursive RelExpr
+    # Binding is a dummy relational expression that is associated with the
+    # WithID; its logical properties are used by WithScan.
+    # TODO(radu): this is a little hacky; investigate other ways to fill out the
+    # WithScan properties in this case.
+    Binding RelExpr
 
+    # Initial is the expression that is executed once and returns the initial
+    # set of rows for the "working table".
+    Initial RelExpr
+
+    # Recursive is the expression that is executed repeatedly; it reads the
+    # "working table" using WithScan.
+    Recursive RelExpr
     _ RecursiveCTEPrivate
 }
 
@@ -969,9 +1076,10 @@ define RecursiveCTEPrivate {
     OutCols ColList
 }
 
-# FakeRel is a mock relational operator used for testing; its logical properties
-# are pre-determined and stored in the private. It can be used as the child of
-# an operator for which we are calculating properties or statistics.
+# FakeRel is a mock relational operator used for testing and as a dummy binding
+# relation for building cascades; its logical properties are pre-determined and
+# stored in the private. It can be used as the child of an operator for which we
+# are calculating properties or statistics.
 [Relational]
 define FakeRel {
     _ FakeRelPrivate

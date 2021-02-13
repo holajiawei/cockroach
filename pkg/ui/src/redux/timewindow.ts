@@ -59,12 +59,17 @@ export interface TimeScaleCollection {
  * availableTimeScales is a preconfigured set of time scales that can be
  * selected by the user.
  */
-export let availableTimeScales: TimeScaleCollection = _.mapValues(
+export const availableTimeScales: TimeScaleCollection = _.mapValues(
   {
     "Past 10 Minutes": {
       windowSize: moment.duration(10, "minutes"),
       windowValid: moment.duration(10, "seconds"),
       sampleSize: moment.duration(10, "seconds"),
+    },
+    "Past 30 Minutes": {
+      windowSize: moment.duration(30, "minutes"),
+      windowValid: moment.duration(30, "seconds"),
+      sampleSize: moment.duration(30, "seconds"),
     },
     "Past 1 Hour": {
       windowSize: moment.duration(1, "hour"),
@@ -122,6 +127,21 @@ export let availableTimeScales: TimeScaleCollection = _.mapValues(
   },
 );
 
+export const findClosestTimeScale = (seconds: number) => {
+  const data: TimeScale[] = [];
+  Object.keys(availableTimeScales).forEach((val) =>
+    data.push(availableTimeScales[val]),
+  );
+  data.sort(
+    (a, b) =>
+      Math.abs(seconds - a.windowSize.asSeconds()) -
+      Math.abs(seconds - b.windowSize.asSeconds()),
+  );
+  return data[0].windowSize.asSeconds() === seconds
+    ? data[0]
+    : { ...data[0], key: "Custom" };
+};
+
 export class TimeWindowState {
   // Currently selected scale.
   scale: TimeScale;
@@ -129,40 +149,46 @@ export class TimeWindowState {
   currentWindow: TimeWindow;
   // True if scale has changed since currentWindow was generated.
   scaleChanged: boolean;
-  useTimeRage: boolean;
+  useTimeRange: boolean;
   constructor() {
     this.scale = availableTimeScales["Past 10 Minutes"];
-    this.useTimeRage = false;
+    this.useTimeRange = false;
     this.scaleChanged = false;
   }
 }
 
-export function timeWindowReducer(state = new TimeWindowState(), action: Action): TimeWindowState {
+export function timeWindowReducer(
+  state = new TimeWindowState(),
+  action: Action,
+): TimeWindowState {
   switch (action.type) {
-    case SET_WINDOW:
+    case SET_WINDOW: {
       const { payload: tw } = action as PayloadAction<TimeWindow>;
       state = _.clone(state);
       state.currentWindow = tw;
       state.scaleChanged = false;
       return state;
-    case SET_RANGE:
+    }
+    case SET_RANGE: {
       const { payload: data } = action as PayloadAction<TimeWindow>;
       state = _.clone(state);
       state.currentWindow = data;
-      state.useTimeRage = true;
+      state.useTimeRange = true;
       state.scaleChanged = false;
       return state;
-    case SET_SCALE:
+    }
+    case SET_SCALE: {
       const { payload: scale } = action as PayloadAction<TimeScale>;
       state = _.clone(state);
       if (scale.key === "Custom") {
-        state.useTimeRage = true;
-      } else if (state.scale.key !== scale.key) {
-        state.useTimeRage = false;
+        state.useTimeRange = true;
+      } else {
+        state.useTimeRange = false;
       }
       state.scale = scale;
       state.scaleChanged = true;
       return state;
+    }
     default:
       return state;
   }

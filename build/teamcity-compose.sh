@@ -7,7 +7,8 @@ source "$(dirname "${0}")/teamcity-support.sh"
 tc_prepare
 
 tc_start_block "Prepare environment for compose tests"
-type=$(go env GOOS)
+# Disable global -json flag.
+type=$(GOFLAGS=; go env GOOS)
 tc_end_block "Prepare environment for compose tests"
 
 tc_start_block "Compile CockroachDB"
@@ -17,13 +18,12 @@ rm artifacts/compose-compile.log
 tc_end_block "Compile CockroachDB"
 
 tc_start_block "Compile compose tests"
-run build/builder.sh mkrelease "$type" -Otarget testbuild PKG=./pkg/compose
+run build/builder.sh mkrelease "$type" -Otarget testbuild PKG=./pkg/compose TAGS=compose
 tc_end_block "Compile compose tests"
 
 tc_start_block "Run compose tests"
-run cd pkg/compose
-# run_text_test needs ./artifacts to be the artifacts folder.
-ln -s ../../artifacts artifacts
-run_text_test github.com/cockroachdb/cockroach/pkg/compose ./compose.test -test.v -test.timeout 30m
-run cd ../..
+# NB: apply the same trick as teamcity-acceptance.sh
+run_json_test stdbuf -eL -oL go test \
+  -mod=vendor -json -v -timeout 30m -tags compose \
+  -exec "../../build/teamcity-go-test-precompiled.sh ./pkg/compose/compose.test -artifacts \"$TMPDIR\"" ./pkg/compose
 tc_end_block "Run compose tests"

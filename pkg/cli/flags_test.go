@@ -28,23 +28,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/spf13/cobra"
 )
 
 func TestStdFlagToPflag(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	cf := cockroachCmd.PersistentFlags()
 	flag.VisitAll(func(f *flag.Flag) {
 		if strings.HasPrefix(f.Name, "test.") {
-			return
-		}
-		switch f.Name {
-		case logflags.LogDirName,
-			logflags.LogFileMaxSizeName,
-			logflags.LogFilesCombinedMaxSizeName,
-			logflags.LogFileVerbosityThresholdName:
 			return
 		}
 		if pf := cf.Lookup(f.Name); pf == nil {
@@ -55,6 +51,8 @@ func TestStdFlagToPflag(t *testing.T) {
 
 func TestNoLinkForbidden(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	// Verify that the cockroach binary doesn't depend on certain packages.
 	buildutil.VerifyNoImports(t,
 		"github.com/cockroachdb/cockroach/pkg/cmd/cockroach", true,
@@ -66,16 +64,17 @@ func TestNoLinkForbidden(t *testing.T) {
 		[]string{
 			"github.com/cockroachdb/cockroach/pkg/testutils", // meant for testing code only
 		},
-		// Raven (Sentry) and the errors library use go/build to determine
+		// Sentry and the errors library use go/build to determine
 		// the list of source directories (used to strip the source prefix
 		// in stack trace reports).
-		"github.com/cockroachdb/cockroach/vendor/github.com/getsentry/raven-go",
+		"github.com/cockroachdb/cockroach/vendor/github.com/cockroachdb/sentry-go",
 		"github.com/cockroachdb/cockroach/vendor/github.com/cockroachdb/errors/withstack",
 	)
 }
 
 func TestCacheFlagValue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the test ends.
 	defer initCLIDefaults()
@@ -94,6 +93,7 @@ func TestCacheFlagValue(t *testing.T) {
 
 func TestClusterNameFlag(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the test ends.
 	defer initCLIDefaults()
@@ -135,6 +135,7 @@ func TestClusterNameFlag(t *testing.T) {
 
 func TestSQLMemoryPoolFlagValue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the test ends.
 	defer initCLIDefaults()
@@ -155,8 +156,8 @@ func TestSQLMemoryPoolFlagValue(t *testing.T) {
 		if err := f.Parse(args); err != nil {
 			t.Fatal(err)
 		}
-		if c.expected != serverCfg.SQLMemoryPoolSize {
-			t.Errorf("expected %d, but got %d", c.expected, serverCfg.SQLMemoryPoolSize)
+		if c.expected != serverCfg.MemoryPoolSize {
+			t.Errorf("expected %d, but got %d", c.expected, serverCfg.MemoryPoolSize)
 		}
 	}
 
@@ -167,21 +168,22 @@ func TestSQLMemoryPoolFlagValue(t *testing.T) {
 		}
 
 		// Check fractional values.
-		maxMem, err := status.GetTotalMemory(context.TODO())
+		maxMem, err := status.GetTotalMemory(context.Background())
 		if err != nil {
 			t.Logf("total memory unknown: %v", err)
 			return
 		}
 		expectedLow := (maxMem * 28) / 100
 		expectedHigh := (maxMem * 32) / 100
-		if serverCfg.SQLMemoryPoolSize < expectedLow || serverCfg.SQLMemoryPoolSize > expectedHigh {
-			t.Errorf("expected %d-%d, but got %d", expectedLow, expectedHigh, serverCfg.SQLMemoryPoolSize)
+		if serverCfg.MemoryPoolSize < expectedLow || serverCfg.MemoryPoolSize > expectedHigh {
+			t.Errorf("expected %d-%d, but got %d", expectedLow, expectedHigh, serverCfg.MemoryPoolSize)
 		}
 	}
 }
 
 func TestClockOffsetFlagValue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
@@ -209,6 +211,7 @@ func TestClockOffsetFlagValue(t *testing.T) {
 
 func TestClientURLFlagEquivalence(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
@@ -233,9 +236,9 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 
 	anyCmd := []string{"sql", "quit"}
 	anyNonSQL := []string{"quit", "init"}
-	anySQL := []string{"sql", "dump"}
+	anySQL := []string{"sql"}
 	sqlShell := []string{"sql"}
-	anyNonSQLShell := []string{"dump", "quit"}
+	anyNonSQLShell := []string{"quit"}
 
 	testData := []struct {
 		cmds       []string
@@ -265,8 +268,12 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 		{anyNonSQL, []string{"--url=postgresql://b:12345"}, []string{"--host=b", "--port=12345"}, "", ""},
 		{anyNonSQL, []string{"--url=postgresql://b:c"}, nil, `invalid port ":c" after host`, ""},
 
-		{anyCmd, []string{"--url=postgresql://foo?application_name=abc"}, []string{"--host=foo", "--insecure"}, "", ""},
-		{anyCmd, []string{"--url=postgresql://foo?sslmode=disable"}, []string{"--host=foo", "--insecure"}, "", ""},
+		{anyNonSQL, []string{"--url=postgresql://foo?application_name=abc"}, []string{"--host=foo", "--insecure"}, "", ""},
+		{anySQL, []string{"--url=postgresql://foo?application_name=abc"}, []string{"--host=foo"}, "", ""},
+
+		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=disable"}, []string{"--host=foo", "--insecure"}, "", ""},
+		{anySQL, []string{"--url=postgresql://foo?sslmode=disable"}, []string{"--host=foo"}, "", ""},
+
 		{anySQL, []string{"--url=postgresql://foo?sslmode=require"}, []string{"--host=foo", "--insecure=false"}, "", ""},
 		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=require"}, nil, "command .* only supports sslmode=disable or sslmode=verify-full", ""},
 		{anyCmd, []string{"--url=postgresql://foo?sslmode=verify-full"}, []string{"--host=foo", "--insecure=false"}, "", ""},
@@ -278,8 +285,10 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 		{anyCmd, []string{"--port=baz", "--url=postgresql://foo"}, []string{"--host=foo", "--port=baz"}, "", `invalid port ":baz" after host`},
 		{sqlShell, []string{"--database=baz", "--url=postgresql://foo"}, []string{"--host=foo", "--database=baz"}, "", ""},
 		{anySQL, []string{"--user=baz", "--url=postgresql://foo"}, []string{"--host=foo", "--user=baz"}, "", ""},
+
 		{anyCmd, []string{"--insecure=false", "--url=postgresql://foo"}, []string{"--host=foo", "--insecure=false"}, "", ""},
-		{anyCmd, []string{"--insecure", "--url=postgresql://foo"}, []string{"--host=foo", "--insecure"}, "", ""},
+		// Only non-SQL lets --insecure bleed into a URL that does not specify sslmode.
+		{anyNonSQL, []string{"--insecure", "--url=postgresql://foo"}, []string{"--host=foo", "--insecure"}, "", ""},
 
 		// URL overrides previous flags if component specified.
 		{anyCmd, []string{"--host=baz", "--url=postgresql://bar"}, []string{"--host=bar"}, "", ""},
@@ -287,8 +296,11 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 		{anyCmd, []string{"--port=baz", "--url=postgresql://foo:bar"}, nil, `invalid port ":bar" after host`, ""},
 		{sqlShell, []string{"--database=baz", "--url=postgresql://foo/bar"}, []string{"--host=foo", "--database=bar"}, "", ""},
 		{anySQL, []string{"--user=baz", "--url=postgresql://bar@foo"}, []string{"--host=foo", "--user=bar"}, "", ""},
-		{anyCmd, []string{"--insecure=false", "--url=postgresql://foo?sslmode=disable"}, []string{"--host=foo", "--insecure"}, "", ""},
+
+		{anyNonSQL, []string{"--insecure=false", "--url=postgresql://foo?sslmode=disable"}, []string{"--host=foo", "--insecure"}, "", ""},
 		{anyCmd, []string{"--insecure", "--url=postgresql://foo?sslmode=verify-full"}, []string{"--host=foo", "--insecure=false"}, "", ""},
+		// SQL is special case: specifying sslmode= does not imply insecure mode. So the insecure bit does not get reset.
+		{anySQL, []string{"--insecure=false", "--url=postgresql://foo?sslmode=disable"}, []string{"--host=foo"}, "", ""},
 
 		// Discrete flag overrides URL if specified afterwards.
 		{anyCmd, []string{"--url=postgresql://bar", "--host=baz"}, []string{"--host=baz"}, "", ""},
@@ -297,8 +309,9 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 		{anyCmd, []string{"--url=postgresql://foo:bar", "--port=baz"}, nil, `invalid port ":bar" after host`, ""},
 		{sqlShell, []string{"--url=postgresql://foo/bar", "--database=baz"}, []string{"--host=foo", "--database=baz"}, "", ""},
 		{anySQL, []string{"--url=postgresql://bar@foo", "--user=baz"}, []string{"--host=foo", "--user=baz"}, "", ""},
-		{anyCmd, []string{"--url=postgresql://foo?sslmode=disable", "--insecure=false"}, []string{"--host=foo", "--insecure=false"}, "", ""},
-		{anyCmd, []string{"--url=postgresql://foo?sslmode=verify-full", "--insecure"}, []string{"--host=foo", "--insecure"}, "", ""},
+
+		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=disable", "--insecure=false"}, []string{"--host=foo", "--insecure=false"}, "", ""},
+		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full", "--insecure"}, []string{"--host=foo", "--insecure"}, "", ""},
 
 		// Check that the certs dir is extracted properly.
 		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslrootcert=" + testCertsDirPath + "/ca.crt"}, []string{"--host=foo", "--certs-dir=" + testCertsDirPath}, "", ""},
@@ -337,9 +350,9 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 		}
 	}
 
-	for _, test := range testData {
+	for testNum, test := range testData {
 		for _, cmdName := range test.cmds {
-			t.Run(fmt.Sprintf("%s/%s", cmdName, strings.Join(test.flags, " ")), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%d/%s/%s", testNum+1, cmdName, strings.Join(test.flags, " ")), func(t *testing.T) {
 				cmd, _, _ := cockroachCmd.Find([]string{cmdName})
 
 				// Parse using the URL.
@@ -377,6 +390,15 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 				// Verify that parsing the URL produces the same parameters as parsing the discrete flags.
 				if urlParams != discreteParams {
 					t.Fatalf("mismatch: URL %q parses\n%+v,\ndiscrete parses\n%+v", resultURL, urlParams, discreteParams)
+				}
+
+				// For SQL commands only, test that reconstructing the URL
+				// from discrete flags yield equivalent connection parameters.
+				// (RPC commands never reconstruct a URL.)
+				for _, s := range anyNonSQL {
+					if cmdName == s {
+						return
+					}
 				}
 
 				// Re-parse using the derived URL.
@@ -417,6 +439,7 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 
 func TestServerConnSettings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
@@ -428,44 +451,56 @@ func TestServerConnSettings(t *testing.T) {
 		expectedAdvertiseAddr string
 		expSQLAddr            string
 		expSQLAdvAddr         string
+		expTenantAddr         string
+		expTenantAdvAddr      string
 	}{
 		{[]string{"start"},
+			":" + base.DefaultPort, ":" + base.DefaultPort,
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1"},
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
+			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "192.168.0.111"},
+			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", ":"},
 			":", ":",
 			":", ":",
+			":", ":",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1:"},
+			"127.0.0.1:", "127.0.0.1:",
 			"127.0.0.1:", "127.0.0.1:",
 			"127.0.0.1:", "127.0.0.1:",
 		},
 		{[]string{"start", "--listen-addr", ":12345"},
 			":12345", ":12345",
 			":12345", ":12345",
+			":12345", ":12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1:12345"},
+			"127.0.0.1:12345", "127.0.0.1:12345",
 			"127.0.0.1:12345", "127.0.0.1:12345",
 			"127.0.0.1:12345", "127.0.0.1:12345",
 		},
 		{[]string{"start", "--listen-addr", "[::1]"},
 			"[::1]:" + base.DefaultPort, "[::1]:" + base.DefaultPort,
 			"[::1]:" + base.DefaultPort, "[::1]:" + base.DefaultPort,
+			"[::1]:" + base.DefaultPort, "[::1]:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "[::1]:12345"},
 			"[::1]:12345", "[::1]:12345",
 			"[::1]:12345", "[::1]:12345",
+			"[::1]:12345", "[::1]:12345",
 		},
 		{[]string{"start", "--listen-addr", "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]"},
+			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort,
 			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort,
 			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort,
 		},
@@ -473,8 +508,10 @@ func TestServerConnSettings(t *testing.T) {
 		{[]string{"start", "--listen-addr", "my.host.name"},
 			"my.host.name:" + base.DefaultPort, "my.host.name:" + base.DefaultPort,
 			"my.host.name:" + base.DefaultPort, "my.host.name:" + base.DefaultPort,
+			"my.host.name:" + base.DefaultPort, "my.host.name:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "myhostname"},
+			"myhostname:" + base.DefaultPort, "myhostname:" + base.DefaultPort,
 			"myhostname:" + base.DefaultPort, "myhostname:" + base.DefaultPort,
 			"myhostname:" + base.DefaultPort, "myhostname:" + base.DefaultPort,
 		},
@@ -483,71 +520,89 @@ func TestServerConnSettings(t *testing.T) {
 		{[]string{"start", "--sql-addr", "127.0.0.1"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
+			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--sql-addr", ":1234"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			":1234", ":1234",
+			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--sql-addr", "127.0.0.1:1234"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			"127.0.0.1:1234", "127.0.0.1:1234",
+			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--sql-addr", "[::2]"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			"[::2]:" + base.DefaultPort, "[::2]:" + base.DefaultPort,
+			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--sql-addr", "[::2]:1234"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			"[::2]:1234", "[::2]:1234",
+			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 
 		// Configuring the components of the SQL address separately.
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--sql-addr", "127.0.0.2"},
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 			"127.0.0.2:" + base.DefaultPort, "127.0.0.2:" + base.DefaultPort,
+			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--sql-addr", ":1234"},
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 			"127.0.0.1:1234", "127.0.0.1:1234",
+			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--sql-addr", "127.0.0.2:1234"},
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 			"127.0.0.2:1234", "127.0.0.2:1234",
+			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "[::2]", "--sql-addr", ":1234"},
 			"[::2]:" + base.DefaultPort, "[::2]:" + base.DefaultPort,
-			"[::2]:1234", "[::2]:1234"},
+			"[::2]:1234", "[::2]:1234",
+			"[::2]:" + base.DefaultPort, "[::2]:" + base.DefaultPort,
+		},
 
 		// --advertise-addr overrides.
 		{[]string{"start", "--advertise-addr", "192.168.0.111"},
+			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111:12345"},
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			":" + base.DefaultPort, "192.168.0.111:12345",
+			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111"},
+			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1:12345", "--advertise-addr", "192.168.0.111"},
 			"127.0.0.1:12345", "192.168.0.111:12345",
 			"127.0.0.1:12345", "192.168.0.111:12345",
+			"127.0.0.1:12345", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111:12345"},
+			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1:54321", "--advertise-addr", "192.168.0.111:12345"},
 			"127.0.0.1:54321", "192.168.0.111:12345",
 			"127.0.0.1:54321", "192.168.0.111:12345",
+			"127.0.0.1:54321", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--listen-addr", ":12345"},
 			":12345", "192.168.0.111:12345",
 			":12345", "192.168.0.111:12345",
+			":12345", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--listen-addr", ":54321"},
+			":54321", "192.168.0.111:12345",
 			":54321", "192.168.0.111:12345",
 			":54321", "192.168.0.111:12345",
 		},
@@ -557,6 +612,7 @@ func TestServerConnSettings(t *testing.T) {
 		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--sql-addr", ":54321"},
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			":54321", "192.168.0.111:54321",
+			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 
 		// Show that if the SQL address is overridden, its advertised form picks the
@@ -564,66 +620,82 @@ func TestServerConnSettings(t *testing.T) {
 		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--sql-addr", "127.0.0.1:54321"},
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			"127.0.0.1:54321", "192.168.0.111:54321",
+			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--sql-addr", "127.0.0.1"},
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--sql-addr", "127.0.0.1:12345"},
 			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"127.0.0.1:12345", "192.168.0.111:12345",
+			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 
 		// Backward-compatibility flag combinations.
 		{[]string{"start", "--host", "192.168.0.111"},
 			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 		{[]string{"start", "--port", "12345"},
+			":12345", ":12345",
 			":12345", ":12345",
 			":12345", ":12345",
 		},
 		{[]string{"start", "--advertise-host", "192.168.0.111"},
 			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"},
+			":" + base.DefaultPort, "192.168.0.111:12345",
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--port", "12345"},
 			"127.0.0.1:12345", "127.0.0.1:12345",
 			"127.0.0.1:12345", "127.0.0.1:12345",
+			"127.0.0.1:12345", "127.0.0.1:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1:12345", "--port", "55555"},
 			"127.0.0.1:55555", "127.0.0.1:55555",
 			"127.0.0.1:55555", "127.0.0.1:55555",
+			"127.0.0.1:55555", "127.0.0.1:55555",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "12345"},
 			"127.0.0.1:12345", "192.168.0.111:12345",
 			"127.0.0.1:12345", "192.168.0.111:12345",
+			"127.0.0.1:12345", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "12345"},
+			"127.0.0.1:12345", "192.168.0.111:12345",
 			"127.0.0.1:12345", "192.168.0.111:12345",
 			"127.0.0.1:12345", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"},
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
+			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "54321", "--advertise-port", "12345"},
+			"127.0.0.1:54321", "192.168.0.111:12345",
 			"127.0.0.1:54321", "192.168.0.111:12345",
 			"127.0.0.1:54321", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--port", "12345"},
 			":12345", "192.168.0.111:12345",
 			":12345", "192.168.0.111:12345",
+			":12345", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"},
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			":" + base.DefaultPort, "192.168.0.111:12345",
+			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--port", "54321", "--advertise-port", "12345"},
+			":54321", "192.168.0.111:12345",
 			":54321", "192.168.0.111:12345",
 			":54321", "192.168.0.111:12345",
 		},
@@ -650,9 +722,9 @@ func TestServerConnSettings(t *testing.T) {
 
 			wantSQLSplit := false
 			for _, r := range td.args {
-				if r == "--sql-addr" {
+				switch r {
+				case "--sql-addr":
 					wantSQLSplit = true
-					break
 				}
 			}
 			if wantSQLSplit != serverCfg.SplitListenSQL {
@@ -671,8 +743,50 @@ func TestServerConnSettings(t *testing.T) {
 	}
 }
 
+func TestServerSocketSettings(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Avoid leaking configuration changes after the tests end.
+	defer initCLIDefaults()
+
+	f := startCmd.Flags()
+	testData := []struct {
+		args           []string
+		expectedSocket string
+	}{
+		{[]string{"start"}, ""},
+		// No socket unless requested.
+		{[]string{"start", "--listen-addr=:12345"}, ""},
+		// File name is auto-generated.
+		{[]string{"start", "--socket-dir=/blah"}, "/blah/.s.PGSQL." + base.DefaultPort},
+		{[]string{"start", "--socket-dir=/blah", "--listen-addr=:12345"}, "/blah/.s.PGSQL.12345"},
+		// Empty socket dir disables the socket.
+		{[]string{"start", "--socket-dir="}, ""},
+		{[]string{"start", "--socket-dir=", "--listen-addr=:12345"}, ""},
+	}
+
+	for i, td := range testData {
+		t.Run(strings.Join(td.args, " "), func(t *testing.T) {
+			initCLIDefaults()
+			if err := f.Parse(td.args); err != nil {
+				t.Fatalf("Parse(%#v) got unexpected error: %v", td.args, err)
+			}
+
+			if err := extraServerFlagInit(startCmd); err != nil {
+				t.Fatal(err)
+			}
+			if td.expectedSocket != serverCfg.SocketFile {
+				t.Errorf("%d. serverCfg.SocketFile expected '%s', but got '%s'. td.args was '%#v'.",
+					i, td.expectedSocket, serverCfg.SocketFile, td.args)
+			}
+		})
+	}
+}
+
 func TestLocalityAdvAddrFlag(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
@@ -727,6 +841,7 @@ func TestLocalityAdvAddrFlag(t *testing.T) {
 
 func TestServerJoinSettings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
@@ -756,7 +871,9 @@ func TestServerJoinSettings(t *testing.T) {
 			t.Fatalf("Parse(%#v) got unexpected error: %v", td.args, err)
 		}
 
-		extraClientFlagInit()
+		if err := extraClientFlagInit(); err != nil {
+			t.Fatal(err)
+		}
 
 		var actual []string
 		myHostname, _ := os.Hostname()
@@ -779,12 +896,11 @@ func TestServerJoinSettings(t *testing.T) {
 
 func TestClientConnSettings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// For some reason, when run under stress all these test cases fail due to the
 	// `--host` flag being unknown to quitCmd. Just skip this under stress.
-	if testutils.NightlyStress() {
-		t.Skip()
-	}
+	skip.UnderStress(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
@@ -818,7 +934,9 @@ func TestClientConnSettings(t *testing.T) {
 			t.Fatalf("Parse(%#v) got unexpected error: %v", td.args, err)
 		}
 
-		extraClientFlagInit()
+		if err := extraClientFlagInit(); err != nil {
+			t.Fatal(err)
+		}
 		if td.expectedAddr != serverCfg.Addr {
 			t.Errorf("%d. serverCfg.Addr expected '%s', but got '%s'. td.args was '%#v'.",
 				i, td.expectedAddr, serverCfg.Addr, td.args)
@@ -828,29 +946,47 @@ func TestClientConnSettings(t *testing.T) {
 
 func TestHttpHostFlagValue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
 
 	f := startCmd.Flags()
 	testData := []struct {
-		args     []string
-		expected string
+		args       []string
+		expected   string
+		tlsEnabled bool
 	}{
-		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "127.0.0.1"}, "127.0.0.1:" + base.DefaultHTTPPort},
-		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "192.168.0.111"}, "192.168.0.111:" + base.DefaultHTTPPort},
+		{[]string{"start", "--http-addr", "127.0.0.1"}, "127.0.0.1:" + base.DefaultHTTPPort, true},
+		{[]string{"start", "--http-addr", "192.168.0.111"}, "192.168.0.111:" + base.DefaultHTTPPort, true},
 		// confirm --http-host still works
-		{[]string{"start", "--" + cliflags.ListenHTTPAddrAlias.Name, "127.0.0.1"}, "127.0.0.1:" + base.DefaultHTTPPort},
-		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, ":12345", "--" + cliflags.ListenHTTPAddrAlias.Name, "192.168.0.111"}, "192.168.0.111:12345"},
+		{[]string{"start", "--http-host", "127.0.0.1"}, "127.0.0.1:" + base.DefaultHTTPPort, true},
+		{[]string{"start", "--http-addr", ":12345", "--http-host", "192.168.0.111"}, "192.168.0.111:12345", true},
 		// confirm --http-port still works
-		{[]string{"start", "--" + cliflags.ListenHTTPPort.Name, "12345"}, ":12345"},
-		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "192.168.0.111", "--" + cliflags.ListenHTTPPort.Name, "12345"}, "192.168.0.111:12345"},
+		{[]string{"start", "--http-port", "12345"}, ":12345", true},
+		{[]string{"start", "--http-addr", "192.168.0.111", "--" + cliflags.ListenHTTPPort.Name, "12345"}, "192.168.0.111:12345", true},
 		// confirm hostnames will work
-		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "my.host.name"}, "my.host.name:" + base.DefaultHTTPPort},
-		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "myhostname"}, "myhostname:" + base.DefaultHTTPPort},
+		{[]string{"start", "--http-addr", "my.host.name"}, "my.host.name:" + base.DefaultHTTPPort, true},
+		{[]string{"start", "--http-addr", "myhostname"}, "myhostname:" + base.DefaultHTTPPort, true},
 		// confirm IPv6 works too
-		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "[::1]"}, "[::1]:" + base.DefaultHTTPPort},
-		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]"}, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultHTTPPort},
+		{[]string{"start", "--http-addr", "[::1]"}, "[::1]:" + base.DefaultHTTPPort, true},
+		{[]string{"start", "--http-addr", "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]"},
+			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultHTTPPort, true},
+		// Confirm that the host part is derived from --listen-addr if not specified.
+		{[]string{"start", "--listen-addr=blah:1111"}, "blah:" + base.DefaultHTTPPort, true},
+		{[]string{"start", "--listen-addr=blah:1111", "--http-addr=:1234"}, "blah:1234", true},
+		{[]string{"start", "--listen-addr=blah", "--http-addr=:1234"}, "blah:1234", true},
+		// Confirm that --insecure implies no TLS.
+		{[]string{"start", "--http-addr=127.0.0.1", "--insecure"}, "127.0.0.1:" + base.DefaultHTTPPort, false},
+		// Confirm that --unencrypted-localhost-http overrides the hostname part (and disables TLS).
+		{[]string{"start", "--http-addr=:1234", "--unencrypted-localhost-http"}, "localhost:1234", false},
+		{[]string{"start", "--listen-addr=localhost:1111", "--unencrypted-localhost-http"}, "localhost:" + base.DefaultHTTPPort, false},
+		{[]string{"start", "--http-addr=127.0.0.1", "--unencrypted-localhost-http"},
+			"ERROR: --unencrypted-localhost-http is incompatible with --http-addr=127.0.0.1:8080", false},
+		{[]string{"start", "--http-addr=incompatible", "--unencrypted-localhost-http"},
+			"ERROR: --unencrypted-localhost-http is incompatible with --http-addr=incompatible:8080", false},
+		{[]string{"start", "--http-addr=incompatible:1111", "--unencrypted-localhost-http"},
+			"ERROR: --unencrypted-localhost-http is incompatible with --http-addr=incompatible:1111", false},
 	}
 
 	for i, td := range testData {
@@ -860,11 +996,67 @@ func TestHttpHostFlagValue(t *testing.T) {
 			t.Fatalf("Parse(%#v) got unexpected error: %v", td.args, err)
 		}
 
-		if err := extraServerFlagInit(startCmd); err != nil {
-			t.Fatal(err)
+		err := extraServerFlagInit(startCmd)
+
+		expectErr := strings.HasPrefix(td.expected, "ERROR:")
+		expectedErr := strings.TrimPrefix(td.expected, "ERROR: ")
+		if err != nil {
+			if !expectErr {
+				t.Fatalf("%d. error: %v", i, err)
+			}
+			if !testutils.IsError(err, expectedErr) {
+				t.Fatalf("%d. expected error %q, got: %v", i, expectedErr, err)
+			}
+			continue
+		}
+		if err == nil && expectErr {
+			t.Fatalf("%d expected error %q, got none", i, expectedErr)
+		}
+		exp := "http"
+		if td.tlsEnabled {
+			exp = "https"
 		}
 		if td.expected != serverCfg.HTTPAddr {
 			t.Errorf("%d. serverCfg.HTTPAddr expected '%s', but got '%s'. td.args was '%#v'.", i, td.expected, serverCfg.HTTPAddr, td.args)
+		}
+		if exp != serverCfg.HTTPRequestScheme() {
+			t.Errorf("%d. TLS config expected %s, got %s. td.args was '%#v'.", i, exp, serverCfg.HTTPRequestScheme(), td.args)
+		}
+	}
+}
+
+func TestMaxDiskTempStorageFlagValue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Avoid leaking configuration changes after the tests end.
+	defer initCLIDefaults()
+
+	f := startCmd.Flags()
+	testData := []struct {
+		args     []string
+		expected string
+	}{
+		{nil, "<nil>"},
+		{[]string{"--max-disk-temp-storage", "1GiB"}, "1.0 GiB"},
+		{[]string{"--max-disk-temp-storage", "1GB"}, "954 MiB"},
+	}
+
+	for i, td := range testData {
+		initCLIDefaults()
+
+		if err := f.Parse(td.args); err != nil {
+			t.Fatal(err)
+		}
+		tempStorageFlag := f.Lookup("max-disk-temp-storage")
+		if tempStorageFlag == nil {
+			t.Fatalf("%d. max-disk-temp-storage flag was nil", i)
+		}
+		if tempStorageFlag.DefValue != "<nil>" {
+			t.Errorf("%d. tempStorageFlag.DefValue expected <nil>, got %s", i, tempStorageFlag.DefValue)
+		}
+		if td.expected != tempStorageFlag.Value.String() {
+			t.Errorf("%d. tempStorageFlag.Value expected %v, but got %v", i, td.expected, tempStorageFlag.Value)
 		}
 	}
 }

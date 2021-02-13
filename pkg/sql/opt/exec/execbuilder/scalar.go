@@ -87,33 +87,21 @@ func init() {
 // buildScalar converts a scalar expression to a TypedExpr. Variables are mapped
 // according to ctx.
 func (b *Builder) buildScalar(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {
-	if fn := scalarBuildFuncMap[scalar.Op()]; fn != nil {
-		texpr, err := fn(b, ctx, scalar)
-		if err != nil {
-			return nil, err
-		}
-		if b.evalCtx != nil && b.isConst(texpr) {
-			value, err := texpr.Eval(b.evalCtx)
-			if err != nil {
-				if errors.IsAssertionFailure(err) {
-					return nil, err
-				}
-				// Ignore any errors here (e.g. division by zero), so they can happen
-				// during execution where they are correctly handled. Note that in some
-				// cases we might not even get an error (if this particular expression
-				// does not get evaluated when the query runs, e.g. it's inside a CASE).
-				return texpr, nil
-			}
-			if value == tree.DNull {
-				// We don't want to return an expression that has a different type; cast
-				// the NULL if necessary.
-				return tree.ReType(tree.DNull, texpr.ResolvedType()), nil
-			}
-			return value, nil
-		}
-		return texpr, nil
+	fn := scalarBuildFuncMap[scalar.Op()]
+	if fn == nil {
+		return nil, errors.AssertionFailedf("unsupported op %s", log.Safe(scalar.Op()))
 	}
-	return nil, errors.Errorf("unsupported op %s", scalar.Op())
+	return fn(b, ctx, scalar)
+}
+
+func (b *Builder) buildScalarWithMap(
+	colMap opt.ColMap, scalar opt.ScalarExpr,
+) (tree.TypedExpr, error) {
+	ctx := buildScalarCtx{
+		ivh:     tree.MakeIndexedVarHelper(nil /* container */, numOutputColsInMap(colMap)),
+		ivarMap: colMap,
+	}
+	return b.buildScalar(&ctx, scalar)
 }
 
 func (b *Builder) buildTypedExpr(
@@ -123,6 +111,10 @@ func (b *Builder) buildTypedExpr(
 }
 
 func (b *Builder) buildNull(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {
+	if scalar.DataType().Family() == types.TupleFamily {
+		// See comment in buildCast.
+		return tree.DNull, nil
+	}
 	return tree.ReType(tree.DNull, scalar.DataType()), nil
 }
 
@@ -137,9 +129,6 @@ func (b *Builder) indexedVar(
 ) tree.TypedExpr {
 	idx, ok := ctx.ivarMap.Get(int(colID))
 	if !ok {
-		if b.nullifyMissingVarExprs > 0 {
-			return tree.ReType(tree.DNull, md.ColumnMeta(colID).Type)
-		}
 		panic(errors.AssertionFailedf("cannot map variable %d to an indexed var", log.Safe(colID)))
 	}
 	return ctx.ivh.IndexedVarWithType(idx, md.ColumnMeta(colID).Type)
@@ -208,6 +197,20 @@ func (b *Builder) buildBoolean(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree
 	case opt.RangeOp:
 		return b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
 
+	case opt.IsTupleNullOp:
+		expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
+		if err != nil {
+			return nil, err
+		}
+		return tree.NewTypedIsNullExpr(expr), nil
+
+	case opt.IsTupleNotNullOp:
+		expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
+		if err != nil {
+			return nil, err
+		}
+		return tree.NewTypedIsNotNullExpr(expr), nil
+
 	default:
 		panic(errors.AssertionFailedf("invalid op %s", log.Safe(scalar.Op())))
 	}
@@ -224,6 +227,19 @@ func (b *Builder) buildComparison(
 	if err != nil {
 		return nil, err
 	}
+
+	// When the operator is an IsOp, the right is NULL, and the left is not a
+	// tuple, return the unary tree.IsNullExpr.
+	if scalar.Op() == opt.IsOp && right == tree.DNull && left.ResolvedType().Family() != types.TupleFamily {
+		return tree.NewTypedIsNullExpr(left), nil
+	}
+
+	// When the operator is an IsNotOp, the right is NULL, and the left is not a
+	// tuple, return the unary tree.IsNotNullExpr.
+	if scalar.Op() == opt.IsNotOp && right == tree.DNull && left.ResolvedType().Family() != types.TupleFamily {
+		return tree.NewTypedIsNotNullExpr(left), nil
+	}
+
 	operator := opt.ComparisonOpReverseMap[scalar.Op()]
 	return tree.NewTypedComparisonExpr(operator, left, right), nil
 }
@@ -320,7 +336,14 @@ func (b *Builder) buildCast(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Ty
 	if err != nil {
 		return nil, err
 	}
-	return tree.NewTypedCastExpr(input, cast.Typ)
+	if cast.Typ.Family() == types.TupleFamily {
+		// TODO(radu): casts to Tuple are not supported (they can't be serialized
+		// for distsql). This should only happen when the input is always NULL so
+		// the expression should still be valid without the cast (though there could
+		// be cornercases where the type does matter).
+		return input, nil
+	}
+	return tree.NewTypedCastExpr(input, cast.Typ), nil
 }
 
 func (b *Builder) buildCoalesce(
@@ -487,9 +510,9 @@ func (b *Builder) buildAny(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Typ
 	}
 
 	// Construct tuple type of columns in the row.
-	contents := make([]types.T, plan.numOutputCols())
+	contents := make([]*types.T, plan.numOutputCols())
 	plan.outputCols.ForEach(func(key, val int) {
-		contents[val] = *b.mem.Metadata().ColumnMeta(opt.ColumnID(key)).Type
+		contents[val] = b.mem.Metadata().ColumnMeta(opt.ColumnID(key)).Type
 	})
 	typs := types.MakeTuple(contents)
 	subqueryExpr := b.addSubquery(exec.SubqueryAnyRows, typs, plan.root, any.OriginalExpr)
@@ -573,85 +596,4 @@ func (b *Builder) addSubquery(
 	// by index (1-based).
 	exprNode.Idx = len(b.subqueries)
 	return exprNode
-}
-
-func (b *Builder) isConst(expr tree.Expr) bool {
-	return b.fastIsConstVisitor.run(expr)
-}
-
-// fastIsConstVisitor determines if an expression is constant by visiting
-// at most two levels of the tree (with one exception, see below).
-// In essence, it determines whether an expression is constant by checking
-// whether its children are const Datums.
-//
-// This can be used by the execbuilder since constants are evaluated
-// bottom-up. If a child is *not* a const Datum, that means it was already
-// determined to be non-constant, and therefore was not evaluated.
-type fastIsConstVisitor struct {
-	isConst bool
-
-	// visited indicates whether we have already visited one level of the tree.
-	// fastIsConstVisitor only visits at most two levels of the tree, with one
-	// exception: If the second level has a Cast expression, fastIsConstVisitor
-	// may visit three levels.
-	visited bool
-}
-
-var _ tree.Visitor = &fastIsConstVisitor{}
-
-func (v *fastIsConstVisitor) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
-	if v.visited {
-		if _, ok := expr.(*tree.CastExpr); ok {
-			// We recurse one more time for cast expressions, since the
-			// execbuilder may have wrapped a NULL.
-			return true, expr
-		}
-		if _, ok := expr.(tree.Datum); !ok || isVar(expr) {
-			// If the child expression is not a const Datum, the parent expression is
-			// not constant. Note that all constant literals have already been
-			// normalized to Datum in TypeCheck.
-			v.isConst = false
-		}
-		return false, expr
-	}
-	v.visited = true
-
-	// If the parent expression is a variable or impure function, we know that it
-	// is not constant.
-
-	if isVar(expr) {
-		v.isConst = false
-		return false, expr
-	}
-
-	switch t := expr.(type) {
-	case *tree.FuncExpr:
-		if t.IsImpure() {
-			v.isConst = false
-			return false, expr
-		}
-	}
-
-	return true, expr
-}
-
-func (*fastIsConstVisitor) VisitPost(expr tree.Expr) tree.Expr { return expr }
-
-func (v *fastIsConstVisitor) run(expr tree.Expr) bool {
-	v.isConst = true
-	v.visited = false
-	tree.WalkExprConst(v, expr)
-	return v.isConst
-}
-
-// isVar returns true if the expression's value can vary during plan
-// execution.
-func isVar(expr tree.Expr) bool {
-	switch expr.(type) {
-	case tree.VariableExpr:
-		return true
-	case *tree.Placeholder:
-		panic(errors.AssertionFailedf("placeholder should have been replaced"))
-	}
-	return false
 }

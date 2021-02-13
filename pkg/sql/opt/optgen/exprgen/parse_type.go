@@ -35,25 +35,16 @@ func ParseType(typeStr string) (*types.T, error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "cannot parse %s as a type", typeStr)
 		}
-		colTypes := parsed.AST.(*tree.Prepare).Types
-		contents := make([]types.T, len(colTypes))
-		for i := range colTypes {
-			contents[i] = *colTypes[i]
+		colTypesRefs := parsed.AST.(*tree.Prepare).Types
+		colTypes := make([]*types.T, len(colTypesRefs))
+		for i := range colTypesRefs {
+			colTypes[i] = tree.MustBeStaticallyKnownType(colTypesRefs[i])
 		}
-		return types.MakeTuple(contents), nil
+		return types.MakeTuple(colTypes), nil
 	}
-	return parser.ParseType(typeStr)
-}
-
-// ParseTypes parses a list of types.
-func ParseTypes(colStrs []string) ([]*types.T, error) {
-	res := make([]*types.T, len(colStrs))
-	for i, s := range colStrs {
-		var err error
-		res[i], err = ParseType(s)
-		if err != nil {
-			return nil, err
-		}
+	typ, err := parser.GetTypeFromValidSQLSyntax(typeStr)
+	if err != nil {
+		return nil, err
 	}
-	return res, nil
+	return tree.MustBeStaticallyKnownType(typ), nil
 }

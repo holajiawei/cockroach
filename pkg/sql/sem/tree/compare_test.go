@@ -17,10 +17,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestEvalComparisonExprCaching(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testExprs := []struct {
 		op          ComparisonOperator
 		left, right string
@@ -53,14 +55,14 @@ func TestEvalComparisonExprCaching(t *testing.T) {
 		ctx := NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer ctx.Mon.Stop(context.Background())
 		ctx.ReCache = NewRegexpCache(8)
-		typedExpr, err := TypeCheck(expr, nil, types.Any)
+		typedExpr, err := TypeCheck(context.Background(), expr, nil, types.Any)
 		if err != nil {
 			t.Fatalf("%v: %v", d, err)
 		}
 		if _, err := typedExpr.Eval(ctx); err != nil {
 			t.Fatalf("%v: %v", d, err)
 		}
-		if typedExpr.(*ComparisonExpr).fn.Fn == nil {
+		if typedExpr.(*ComparisonExpr).Fn.Fn == nil {
 			t.Errorf("%s: expected the comparison function to be looked up and memoized, but it wasn't", expr)
 		}
 		if count := ctx.ReCache.Len(); count != d.cacheCount {

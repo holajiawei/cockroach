@@ -14,14 +14,14 @@ import (
 	"bytes"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // CheckEndTxnTrigger verifies that an EndTxnRequest that includes intents for
 // the SystemDB keys sets the proper trigger.
-func CheckEndTxnTrigger(args storagebase.FilterArgs) *roachpb.Error {
+func CheckEndTxnTrigger(args kvserverbase.FilterArgs) *roachpb.Error {
 	req, ok := args.Req.(*roachpb.EndTxnRequest)
 	if !ok {
 		return nil
@@ -36,7 +36,7 @@ func CheckEndTxnTrigger(args storagebase.FilterArgs) *roachpb.Error {
 	modifiedSystemConfigSpan := modifiedSpanTrigger != nil && modifiedSpanTrigger.SystemConfigSpan
 
 	var hasSystemKey bool
-	for _, span := range req.IntentSpans {
+	for _, span := range req.LockSpans {
 		if bytes.Compare(span.Key, keys.SystemConfigSpan.Key) >= 0 &&
 			bytes.Compare(span.Key, keys.SystemConfigSpan.EndKey) < 0 {
 			hasSystemKey = true

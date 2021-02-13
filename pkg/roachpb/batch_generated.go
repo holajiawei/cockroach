@@ -40,8 +40,6 @@ func (ru ErrorDetail) GetInner() error {
 		return t.LeaseRejected
 	case *ErrorDetail_NodeUnavailable:
 		return t.NodeUnavailable
-	case *ErrorDetail_Send:
-		return t.Send
 	case *ErrorDetail_RaftGroupDeleted:
 		return t.RaftGroupDeleted
 	case *ErrorDetail_ReplicaCorruption:
@@ -70,6 +68,8 @@ func (ru ErrorDetail) GetInner() error {
 		return t.RangefeedRetry
 	case *ErrorDetail_IndeterminateCommit:
 		return t.IndeterminateCommit
+	case *ErrorDetail_InvalidLeaseError:
+		return t.InvalidLeaseError
 	default:
 		return nil
 	}
@@ -166,6 +166,8 @@ func (ru RequestUnion) GetInner() Request {
 		return t.RangeStats
 	case *RequestUnion_AdminVerifyProtectedTimestamp:
 		return t.AdminVerifyProtectedTimestamp
+	case *RequestUnion_Migrate:
+		return t.Migrate
 	default:
 		return nil
 	}
@@ -260,13 +262,16 @@ func (ru ResponseUnion) GetInner() Response {
 		return t.RangeStats
 	case *ResponseUnion_AdminVerifyProtectedTimestamp:
 		return t.AdminVerifyProtectedTimestamp
+	case *ResponseUnion_Migrate:
+		return t.Migrate
 	default:
 		return nil
 	}
 }
 
-// SetInner sets the error in the union.
-func (ru *ErrorDetail) SetInner(r error) bool {
+// MustSetInner sets the error in the union.
+func (ru *ErrorDetail) MustSetInner(r error) {
+	ru.Reset()
 	var union isErrorDetail_Value
 	switch t := r.(type) {
 	case *NotLeaseHolderError:
@@ -297,8 +302,6 @@ func (ru *ErrorDetail) SetInner(r error) bool {
 		union = &ErrorDetail_LeaseRejected{t}
 	case *NodeUnavailableError:
 		union = &ErrorDetail_NodeUnavailable{t}
-	case *SendError:
-		union = &ErrorDetail_Send{t}
 	case *RaftGroupDeletedError:
 		union = &ErrorDetail_RaftGroupDeleted{t}
 	case *ReplicaCorruptionError:
@@ -327,15 +330,17 @@ func (ru *ErrorDetail) SetInner(r error) bool {
 		union = &ErrorDetail_RangefeedRetry{t}
 	case *IndeterminateCommitError:
 		union = &ErrorDetail_IndeterminateCommit{t}
+	case *InvalidLeaseError:
+		union = &ErrorDetail_InvalidLeaseError{t}
 	default:
-		return false
+		panic(fmt.Sprintf("unsupported type %T for %T", r, ru))
 	}
 	ru.Value = union
-	return true
 }
 
-// SetInner sets the Request in the union.
-func (ru *RequestUnion) SetInner(r Request) bool {
+// MustSetInner sets the Request in the union.
+func (ru *RequestUnion) MustSetInner(r Request) {
+	ru.Reset()
 	var union isRequestUnion_Value
 	switch t := r.(type) {
 	case *GetRequest:
@@ -426,15 +431,17 @@ func (ru *RequestUnion) SetInner(r Request) bool {
 		union = &RequestUnion_RangeStats{t}
 	case *AdminVerifyProtectedTimestampRequest:
 		union = &RequestUnion_AdminVerifyProtectedTimestamp{t}
+	case *MigrateRequest:
+		union = &RequestUnion_Migrate{t}
 	default:
-		return false
+		panic(fmt.Sprintf("unsupported type %T for %T", r, ru))
 	}
 	ru.Value = union
-	return true
 }
 
-// SetInner sets the Response in the union.
-func (ru *ResponseUnion) SetInner(r Response) bool {
+// MustSetInner sets the Response in the union.
+func (ru *ResponseUnion) MustSetInner(r Response) {
+	ru.Reset()
 	var union isResponseUnion_Value
 	switch t := r.(type) {
 	case *GetResponse:
@@ -523,14 +530,15 @@ func (ru *ResponseUnion) SetInner(r Response) bool {
 		union = &ResponseUnion_RangeStats{t}
 	case *AdminVerifyProtectedTimestampResponse:
 		union = &ResponseUnion_AdminVerifyProtectedTimestamp{t}
+	case *MigrateResponse:
+		union = &ResponseUnion_Migrate{t}
 	default:
-		return false
+		panic(fmt.Sprintf("unsupported type %T for %T", r, ru))
 	}
 	ru.Value = union
-	return true
 }
 
-type reqCounts [44]int32
+type reqCounts [45]int32
 
 // getReqCounts returns the number of times each
 // request type appears in the batch.
@@ -626,6 +634,8 @@ func (ba *BatchRequest) getReqCounts() reqCounts {
 			counts[42]++
 		case *RequestUnion_AdminVerifyProtectedTimestamp:
 			counts[43]++
+		case *RequestUnion_Migrate:
+			counts[44]++
 		default:
 			panic(fmt.Sprintf("unsupported request: %+v", ru))
 		}
@@ -678,6 +688,7 @@ var requestNames = []string{
 	"Subsume",
 	"RngStats",
 	"AdmVerifyProtectedTimestamp",
+	"Migrate",
 }
 
 // Summary prints a short summary of the requests in a batch.
@@ -885,6 +896,10 @@ type adminVerifyProtectedTimestampResponseAlloc struct {
 	union ResponseUnion_AdminVerifyProtectedTimestamp
 	resp  AdminVerifyProtectedTimestampResponse
 }
+type migrateResponseAlloc struct {
+	union ResponseUnion_Migrate
+	resp  MigrateResponse
+}
 
 // CreateReply creates replies for each of the contained requests, wrapped in a
 // BatchResponse. The response objects are batch allocated to minimize
@@ -939,6 +954,7 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 	var buf41 []subsumeResponseAlloc
 	var buf42 []rangeStatsResponseAlloc
 	var buf43 []adminVerifyProtectedTimestampResponseAlloc
+	var buf44 []migrateResponseAlloc
 
 	for i, r := range ba.Requests {
 		switch r.GetValue().(type) {
@@ -1250,9 +1266,114 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 			buf43[0].union.AdminVerifyProtectedTimestamp = &buf43[0].resp
 			br.Responses[i].Value = &buf43[0].union
 			buf43 = buf43[1:]
+		case *RequestUnion_Migrate:
+			if buf44 == nil {
+				buf44 = make([]migrateResponseAlloc, counts[44])
+			}
+			buf44[0].union.Migrate = &buf44[0].resp
+			br.Responses[i].Value = &buf44[0].union
+			buf44 = buf44[1:]
 		default:
 			panic(fmt.Sprintf("unsupported request: %+v", r))
 		}
 	}
 	return br
+}
+
+// CreateRequest creates an empty Request for each of the Method types.
+func CreateRequest(method Method) Request {
+	switch method {
+	case Get:
+		return &GetRequest{}
+	case Put:
+		return &PutRequest{}
+	case ConditionalPut:
+		return &ConditionalPutRequest{}
+	case Increment:
+		return &IncrementRequest{}
+	case Delete:
+		return &DeleteRequest{}
+	case DeleteRange:
+		return &DeleteRangeRequest{}
+	case ClearRange:
+		return &ClearRangeRequest{}
+	case RevertRange:
+		return &RevertRangeRequest{}
+	case Scan:
+		return &ScanRequest{}
+	case EndTxn:
+		return &EndTxnRequest{}
+	case AdminSplit:
+		return &AdminSplitRequest{}
+	case AdminUnsplit:
+		return &AdminUnsplitRequest{}
+	case AdminMerge:
+		return &AdminMergeRequest{}
+	case AdminTransferLease:
+		return &AdminTransferLeaseRequest{}
+	case AdminChangeReplicas:
+		return &AdminChangeReplicasRequest{}
+	case AdminRelocateRange:
+		return &AdminRelocateRangeRequest{}
+	case HeartbeatTxn:
+		return &HeartbeatTxnRequest{}
+	case GC:
+		return &GCRequest{}
+	case PushTxn:
+		return &PushTxnRequest{}
+	case RecoverTxn:
+		return &RecoverTxnRequest{}
+	case ResolveIntent:
+		return &ResolveIntentRequest{}
+	case ResolveIntentRange:
+		return &ResolveIntentRangeRequest{}
+	case Merge:
+		return &MergeRequest{}
+	case TruncateLog:
+		return &TruncateLogRequest{}
+	case RequestLease:
+		return &RequestLeaseRequest{}
+	case ReverseScan:
+		return &ReverseScanRequest{}
+	case ComputeChecksum:
+		return &ComputeChecksumRequest{}
+	case CheckConsistency:
+		return &CheckConsistencyRequest{}
+	case InitPut:
+		return &InitPutRequest{}
+	case TransferLease:
+		return &TransferLeaseRequest{}
+	case LeaseInfo:
+		return &LeaseInfoRequest{}
+	case WriteBatch:
+		return &WriteBatchRequest{}
+	case Export:
+		return &ExportRequest{}
+	case Import:
+		return &ImportRequest{}
+	case QueryTxn:
+		return &QueryTxnRequest{}
+	case QueryIntent:
+		return &QueryIntentRequest{}
+	case AdminScatter:
+		return &AdminScatterRequest{}
+	case AddSSTable:
+		return &AddSSTableRequest{}
+	case RecomputeStats:
+		return &RecomputeStatsRequest{}
+	case Refresh:
+		return &RefreshRequest{}
+	case RefreshRange:
+		return &RefreshRangeRequest{}
+	case Subsume:
+		return &SubsumeRequest{}
+	case RangeStats:
+		return &RangeStatsRequest{}
+	case AdminVerifyProtectedTimestamp:
+		return &AdminVerifyProtectedTimestampRequest{}
+	case Migrate:
+		return &MigrateRequest{}
+	default:
+		panic(fmt.Sprintf("unsupported method: %+v", method))
+	}
 }

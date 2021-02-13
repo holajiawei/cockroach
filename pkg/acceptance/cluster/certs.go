@@ -24,7 +24,7 @@ import (
 const certsDir = ".localcluster.certs"
 
 // keyLen is the length (in bits) of the generated CA and node certs.
-const keyLen = 1024
+const keyLen = 2048
 
 // GenerateCerts generates CA and client certificates and private keys to be
 // used with a cluster. It returns a function that will clean up the generated
@@ -39,17 +39,17 @@ func GenerateCerts(ctx context.Context) func() {
 	// Root user.
 	maybePanic(security.CreateClientPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		1024, 48*time.Hour, false, security.RootUser, true /* generate pk8 key */))
+		1024, 48*time.Hour, false, security.RootUserName(), true /* generate pk8 key */))
 
 	// Test user.
 	maybePanic(security.CreateClientPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		1024, 48*time.Hour, false, "testuser", true /* generate pk8 key */))
+		1024, 48*time.Hour, false, security.TestUserName(), true /* generate pk8 key */))
 
 	// Certs for starting a cockroach server. Key size is from cli/cert.go:defaultKeySize.
 	maybePanic(security.CreateNodePair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		2048, 48*time.Hour, false, []string{"localhost", "cockroach"}))
+		keyLen, 48*time.Hour, false, []string{"localhost", "cockroach"}))
 
 	// Store a copy of the client certificate and private key in a PKCS#12
 	// bundle, which is the only format understood by Npgsql (.NET).

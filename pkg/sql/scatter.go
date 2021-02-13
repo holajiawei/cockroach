@@ -13,13 +13,14 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/errors"
 )
 
 type scatterNode struct {
@@ -32,6 +33,10 @@ type scatterNode struct {
 // (`ALTER TABLE/INDEX ... SCATTER ...` statement)
 // Privileges: INSERT on table.
 func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error) {
+	if !p.ExecCfg().Codec.ForSystemTenant() {
+		return nil, errorutil.UnsupportedWithMultiTenancy(54255)
+	}
+
 	tableDesc, index, err := p.getTableAndIndex(ctx, &n.TableOrIndex, privilege.INSERT)
 	if err != nil {
 		return nil, err
@@ -40,7 +45,7 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 	var span roachpb.Span
 	if n.From == nil {
 		// No FROM/TO specified; the span is the entire table/index.
-		span = tableDesc.IndexSpan(index.ID)
+		span = tableDesc.IndexSpan(p.ExecCfg().Codec, index.ID)
 	} else {
 		switch {
 		case len(n.From) == 0:
@@ -58,11 +63,11 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 		//  (the relevant prefix is used).
 		desiredTypes := make([]*types.T, len(index.ColumnIDs))
 		for i, colID := range index.ColumnIDs {
-			c, err := tableDesc.FindColumnByID(colID)
+			c, err := tableDesc.FindColumnWithID(colID)
 			if err != nil {
 				return nil, err
 			}
-			desiredTypes[i] = &c.Type
+			desiredTypes[i] = c.GetType()
 		}
 		fromVals := make([]tree.Datum, len(n.From))
 		for i, expr := range n.From {
@@ -91,11 +96,11 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 			}
 		}
 
-		span.Key, err = getRowKey(tableDesc.TableDesc(), index, fromVals)
+		span.Key, err = getRowKey(p.ExecCfg().Codec, tableDesc, index, fromVals)
 		if err != nil {
 			return nil, err
 		}
-		span.EndKey, err = getRowKey(tableDesc.TableDesc(), index, toVals)
+		span.EndKey, err = getRowKey(p.ExecCfg().Codec, tableDesc, index, toVals)
 		if err != nil {
 			return nil, err
 		}
@@ -122,7 +127,7 @@ type scatterRun struct {
 	span roachpb.Span
 
 	rangeIdx int
-	ranges   []roachpb.AdminScatterResponse_Range
+	ranges   []roachpb.Span
 }
 
 func (n *scatterNode) startExec(params runParams) error {
@@ -131,12 +136,26 @@ func (n *scatterNode) startExec(params runParams) error {
 		RequestHeader:   roachpb.RequestHeader{Key: n.run.span.Key, EndKey: n.run.span.EndKey},
 		RandomizeLeases: true,
 	}
-	res, pErr := client.SendWrapped(params.ctx, db.NonTransactionalSender(), req)
+	res, pErr := kv.SendWrapped(params.ctx, db.NonTransactionalSender(), req)
 	if pErr != nil {
 		return pErr.GoError()
 	}
+	scatterRes := res.(*roachpb.AdminScatterResponse)
 	n.run.rangeIdx = -1
-	n.run.ranges = res.(*roachpb.AdminScatterResponse).Ranges
+	n.run.ranges = make([]roachpb.Span, len(scatterRes.RangeInfos))
+	if len(scatterRes.RangeInfos) != 0 {
+		for i, rangeInfo := range scatterRes.RangeInfos {
+			n.run.ranges[i] = roachpb.Span{
+				Key:    rangeInfo.Desc.StartKey.AsRawKey(),
+				EndKey: rangeInfo.Desc.EndKey.AsRawKey(),
+			}
+		}
+	} else {
+		// TODO(pbardea): This is a non-combined response from 20.1. Remove in 21.1.
+		for i, r := range scatterRes.DeprecatedRanges {
+			n.run.ranges[i] = r.Span
+		}
+	}
 	return nil
 }
 
@@ -149,8 +168,8 @@ func (n *scatterNode) Next(params runParams) (bool, error) {
 func (n *scatterNode) Values() tree.Datums {
 	r := n.run.ranges[n.run.rangeIdx]
 	return tree.Datums{
-		tree.NewDBytes(tree.DBytes(r.Span.Key)),
-		tree.NewDString(keys.PrettyPrint(nil /* valDirs */, r.Span.Key)),
+		tree.NewDBytes(tree.DBytes(r.Key)),
+		tree.NewDString(keys.PrettyPrint(nil /* valDirs */, r.Key)),
 	}
 }
 

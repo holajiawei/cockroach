@@ -16,9 +16,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -31,14 +32,14 @@ import (
 //    that refers to a primary index key that cannot be found.
 type indexCheckOperation struct {
 	tableName *tree.TableName
-	tableDesc *sqlbase.ImmutableTableDescriptor
-	indexDesc *sqlbase.IndexDescriptor
+	tableDesc catalog.TableDescriptor
+	indexDesc *descpb.IndexDescriptor
 	asOf      hlc.Timestamp
 
 	// columns is a list of the columns returned by one side of the
 	// queries join. The actual resulting rows from the RowContainer is
 	// twice this.
-	columns []*sqlbase.ColumnDescriptor
+	columns []*descpb.ColumnDescriptor
 	// primaryColIdxs maps PrimaryIndex.Columns to the row
 	// indexes in the query result tree.Datums.
 	primaryColIdxs []int
@@ -56,8 +57,8 @@ type indexCheckRun struct {
 
 func newIndexCheckOperation(
 	tableName *tree.TableName,
-	tableDesc *sqlbase.ImmutableTableDescriptor,
-	indexDesc *sqlbase.IndexDescriptor,
+	tableDesc catalog.TableDescriptor,
+	indexDesc *descpb.IndexDescriptor,
 	asOf hlc.Timestamp,
 ) *indexCheckOperation {
 	return &indexCheckOperation{
@@ -73,28 +74,28 @@ func newIndexCheckOperation(
 func (o *indexCheckOperation) Start(params runParams) error {
 	ctx := params.ctx
 
-	colToIdx := make(map[sqlbase.ColumnID]int)
-	for i := range o.tableDesc.Columns {
-		id := o.tableDesc.Columns[i].ID
-		colToIdx[id] = i
+	var colToIdx catalog.TableColMap
+	for _, c := range o.tableDesc.PublicColumns() {
+		colToIdx.Set(c.GetID(), c.Ordinal())
 	}
 
-	var pkColumns, otherColumns []*sqlbase.ColumnDescriptor
+	var pkColumns, otherColumns []*descpb.ColumnDescriptor
 
-	for _, colID := range o.tableDesc.PrimaryIndex.ColumnIDs {
-		col := &o.tableDesc.Columns[colToIdx[colID]]
-		pkColumns = append(pkColumns, col)
-		colToIdx[colID] = -1
+	for i := 0; i < o.tableDesc.GetPrimaryIndex().NumColumns(); i++ {
+		colID := o.tableDesc.GetPrimaryIndex().GetColumnID(i)
+		col := o.tableDesc.PublicColumns()[colToIdx.GetDefault(colID)]
+		pkColumns = append(pkColumns, col.ColumnDesc())
+		colToIdx.Set(colID, -1)
 	}
 
-	maybeAddOtherCol := func(colID sqlbase.ColumnID) {
-		pos := colToIdx[colID]
+	maybeAddOtherCol := func(colID descpb.ColumnID) {
+		pos := colToIdx.GetDefault(colID)
 		if pos == -1 {
 			// Skip PK column.
 			return
 		}
-		col := &o.tableDesc.Columns[pos]
-		otherColumns = append(otherColumns, col)
+		col := o.tableDesc.PublicColumns()[pos]
+		otherColumns = append(otherColumns, col.ColumnDesc())
 	}
 
 	// Collect all of the columns we are fetching from the index. This
@@ -110,7 +111,7 @@ func (o *indexCheckOperation) Start(params runParams) error {
 		maybeAddOtherCol(colID)
 	}
 
-	colNames := func(cols []*sqlbase.ColumnDescriptor) []string {
+	colNames := func(cols []*descpb.ColumnDescriptor) []string {
 		res := make([]string, len(cols))
 		for i := range cols {
 			res[i] = cols[i].Name
@@ -119,7 +120,7 @@ func (o *indexCheckOperation) Start(params runParams) error {
 	}
 
 	checkQuery := createIndexCheckQuery(
-		colNames(pkColumns), colNames(otherColumns), o.tableDesc.ID, o.indexDesc.ID,
+		colNames(pkColumns), colNames(otherColumns), o.tableDesc.GetID(), o.indexDesc.ID,
 	)
 
 	rows, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Query(
@@ -171,8 +172,11 @@ func (o *indexCheckOperation) Next(params runParams) (tree.Datums, error) {
 		}
 	}
 	primaryKey := tree.NewDString(primaryKeyDatums.String())
-	timestamp := tree.MakeDTimestamp(
+	timestamp, err := tree.MakeDTimestamp(
 		params.extendedEvalCtx.GetStmtTimestamp(), time.Nanosecond)
+	if err != nil {
+		return nil, err
+	}
 
 	details := make(map[string]interface{})
 	rowDetails := make(map[string]interface{})
@@ -281,7 +285,7 @@ func (o *indexCheckOperation) Close(ctx context.Context) {
 //         side row from the primary key had no match in the secondary index.
 //
 func createIndexCheckQuery(
-	pkColumns []string, otherColumns []string, tableID sqlbase.ID, indexID sqlbase.IndexID,
+	pkColumns []string, otherColumns []string, tableID descpb.ID, indexID descpb.IndexID,
 ) string {
 	allColumns := append(pkColumns, otherColumns...)
 	// We need to make sure we can handle the non-public column `rowid`

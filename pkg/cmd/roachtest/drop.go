@@ -29,7 +29,7 @@ func registerDrop(r *testRegistry) {
 	// by a truncation for the `stock` table (which contains warehouses*100k
 	// rows). Next, it issues a `DROP` for the whole database, and sets the GC TTL
 	// to one second.
-	runDrop := func(ctx context.Context, t *test, c *cluster, warehouses, nodes int, initDiskSpace int) {
+	runDrop := func(ctx context.Context, t *test, c *cluster, warehouses, nodes int) {
 		c.Put(ctx, cockroach, "./cockroach", c.Range(1, nodes))
 		c.Put(ctx, workload, "./workload", c.Range(1, nodes))
 		c.Start(ctx, t, c.Range(1, nodes), startArgs("-e", "COCKROACH_MEMPROF_INTERVAL=15s"))
@@ -37,8 +37,7 @@ func registerDrop(r *testRegistry) {
 		m := newMonitor(ctx, c, c.Range(1, nodes))
 		m.Go(func(ctx context.Context) error {
 			t.WorkerStatus("importing TPCC fixture")
-			c.Run(ctx, c.Node(1), fmt.Sprintf(
-				"./workload fixtures load tpcc --warehouses=%d --db tpcc {pgurl:1}", warehouses))
+			c.Run(ctx, c.Node(1), tpccImportCmd(warehouses))
 
 			// Don't open the DB connection until after the data has been imported.
 			// Otherwise the ALTER TABLE query below might fail to find the
@@ -87,12 +86,6 @@ func registerDrop(r *testRegistry) {
 				}
 
 				t.l.Printf("Node %d space used: %s\n", j, humanizeutil.IBytes(int64(size)))
-
-				// Return if the size of the directory is less than 100mb
-				if size < initDiskSpace {
-					t.Fatalf("Node %d space used: %s less than %s", j, humanizeutil.IBytes(int64(size)),
-						humanizeutil.IBytes(int64(initDiskSpace)))
-				}
 			}
 
 			for i := minWarehouse; i <= maxWarehouse; i++ {
@@ -161,9 +154,6 @@ func registerDrop(r *testRegistry) {
 	warehouses := 100
 	numNodes := 9
 
-	// 1GB
-	initDiskSpace := int(1e9)
-
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("drop/tpcc/w=%d,nodes=%d", warehouses, numNodes),
 		Owner:      OwnerKV,
@@ -175,12 +165,9 @@ func registerDrop(r *testRegistry) {
 			if local {
 				numNodes = 4
 				warehouses = 1
-
-				// 100 MB
-				initDiskSpace = 1e8
 				fmt.Printf("running with w=%d,nodes=%d in local mode\n", warehouses, numNodes)
 			}
-			runDrop(ctx, t, c, warehouses, numNodes, initDiskSpace)
+			runDrop(ctx, t, c, warehouses, numNodes)
 		},
 	})
 }

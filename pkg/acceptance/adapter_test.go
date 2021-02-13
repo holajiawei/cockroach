@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -38,6 +39,7 @@ func TestDockerC(t *testing.T) {
 }
 
 func TestDockerCSharp(t *testing.T) {
+	skip.WithIssue(t, 58218, "flaky test")
 	s := log.Scope(t)
 	defer s.Close(t)
 
@@ -56,6 +58,8 @@ func TestDockerJava(t *testing.T) {
 }
 
 func TestDockerElixir(t *testing.T) {
+	skip.IgnoreLint(t, "Elixir requires network to run, which can flake. When attempting to update this (#52341), the new Elixir version does not work with CRDB/TLS.")
+
 	s := log.Scope(t)
 	defer s.Close(t)
 

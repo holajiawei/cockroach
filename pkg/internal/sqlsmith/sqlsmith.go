@@ -57,13 +57,17 @@ const retryCount = 20
 
 // Smither is a sqlsmith generator.
 type Smither struct {
-	rnd        *rand.Rand
-	db         *gosql.DB
-	lock       syncutil.RWMutex
-	tables     []*tableRef
-	columns    map[tree.TableName]map[tree.Name]*tree.ColumnTableDef
-	indexes    map[tree.TableName]map[tree.Name]*tree.CreateIndex
-	nameCounts map[string]int
+	rnd              *rand.Rand
+	db               *gosql.DB
+	lock             syncutil.RWMutex
+	dbName           string
+	schemas          []*schemaRef
+	tables           []*tableRef
+	columns          map[tree.TableName]map[tree.Name]*tree.ColumnTableDef
+	indexes          map[tree.TableName]map[tree.Name]*tree.CreateIndex
+	nameCounts       map[string]int
+	activeSavepoints []string
+	types            *typeInfo
 
 	stmtWeights, alterWeights          []statementWeight
 	stmtSampler, alterSampler          *statementSampler
@@ -126,6 +130,10 @@ func NewSmither(db *gosql.DB, rnd *rand.Rand, opts ...SmitherOption) (*Smither, 
 	s.scalarExprSampler = newWeightedScalarExprSampler(s.scalarExprWeights, rnd.Int63())
 	s.boolExprSampler = newWeightedScalarExprSampler(s.boolExprWeights, rnd.Int63())
 	s.enableBulkIO()
+	row := s.db.QueryRow("SELECT current_database()")
+	if err := row.Scan(&s.dbName); err != nil {
+		return nil, err
+	}
 	return s, s.ReloadSchemas()
 }
 
@@ -240,6 +248,13 @@ var DisableDDLs = simpleOption("disable DDLs", func(s *Smither) {
 		{5, makeInsert},
 		{5, makeUpdate},
 		{1, makeDelete},
+		// If we don't have any DDL's, allow for use of savepoints and transactions.
+		{2, makeBegin},
+		{2, makeSavepoint},
+		{2, makeReleaseSavepoint},
+		{2, makeRollbackToSavepoint},
+		{2, makeCommit},
+		{2, makeRollback},
 	}
 })
 

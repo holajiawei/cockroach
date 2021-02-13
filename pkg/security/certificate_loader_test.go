@@ -17,7 +17,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"errors"
 	"io/ioutil"
 	"math/big"
 	"os"
@@ -31,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 func TestCertNomenclature(t *testing.T) {
@@ -108,7 +108,7 @@ func TestLoadEmbeddedCerts(t *testing.T) {
 
 	// Check that all non-CA pairs include a key.
 	for _, c := range certs {
-		if c.FileUsage == security.CAPem {
+		if c.FileUsage == security.CAPem || c.FileUsage == security.TenantClientCAPem {
 			if len(c.KeyFilename) != 0 {
 				t.Errorf("CA key was loaded for CertInfo %+v", c)
 			}
@@ -284,7 +284,7 @@ func TestNamingScheme(t *testing.T) {
 			},
 			certs: []security.CertInfo{
 				{FileUsage: security.ClientPem, Filename: "client.root.crt", Name: "root",
-					Error: errors.New("client certificate has Subject \"CN=notroot\", expected \"CN=root")},
+					Error: errors.New(`client certificate has principals \["notroot"\], expected "root"`)},
 				{FileUsage: security.NodePem, Filename: "node.crt", KeyFilename: "node.key",
 					FileContents: badUserNodeCert, KeyFileContents: []byte("node.key")},
 			},

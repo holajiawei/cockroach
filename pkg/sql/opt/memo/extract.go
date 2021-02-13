@@ -163,7 +163,7 @@ func ExtractJoinEqualityColumns(
 ) (leftEq opt.ColList, rightEq opt.ColList) {
 	for i := range on {
 		condition := on[i].Condition
-		ok, left, right := isJoinEquality(leftCols, rightCols, condition)
+		ok, left, right := ExtractJoinEquality(leftCols, rightCols, condition)
 		if !ok {
 			continue
 		}
@@ -193,7 +193,7 @@ func ExtractJoinEqualityFilters(leftCols, rightCols opt.ColSet, on FiltersExpr) 
 	var newFilters FiltersExpr
 	for i := range on {
 		condition := on[i].Condition
-		ok, _, _ := isJoinEquality(leftCols, rightCols, condition)
+		ok, _, _ := ExtractJoinEquality(leftCols, rightCols, condition)
 		if ok {
 			if newFilters != nil {
 				newFilters = append(newFilters, on[i])
@@ -222,7 +222,11 @@ func isVarEquality(condition opt.ScalarExpr) (leftVar, rightVar *VariableExpr, o
 	return nil, nil, false
 }
 
-func isJoinEquality(
+// ExtractJoinEquality returns true if the given condition is a simple equality
+// condition with two variables (e.g. a=b), where one of the variables (returned
+// as "left") is in the set of leftCols and the other (returned as "right") is
+// in the set of rightCols.
+func ExtractJoinEquality(
 	leftCols, rightCols opt.ColSet, condition opt.ScalarExpr,
 ) (ok bool, left, right opt.ColumnID) {
 	lvar, rvar, ok := isVarEquality(condition)
@@ -248,8 +252,14 @@ func isJoinEquality(
 // ExtractRemainingJoinFilters calculates the remaining ON condition after
 // removing equalities that are handled separately. The given function
 // determines if an equality is redundant. The result is empty if there are no
-// remaining conditions.
+// remaining conditions. Panics if leftEq and rightEq are not the same length.
 func ExtractRemainingJoinFilters(on FiltersExpr, leftEq, rightEq opt.ColList) FiltersExpr {
+	if len(leftEq) != len(rightEq) {
+		panic(errors.AssertionFailedf("leftEq and rightEq have different lengths"))
+	}
+	if len(leftEq) == 0 {
+		return on
+	}
 	var newFilters FiltersExpr
 	for i := range on {
 		leftVar, rightVar, ok := isVarEquality(on[i].Condition)
@@ -278,9 +288,7 @@ func ExtractRemainingJoinFilters(on FiltersExpr, leftEq, rightEq opt.ColList) Fi
 
 // ExtractConstColumns returns columns in the filters expression that have been
 // constrained to fixed values.
-func ExtractConstColumns(
-	on FiltersExpr, mem *Memo, evalCtx *tree.EvalContext,
-) (fixedCols opt.ColSet) {
+func ExtractConstColumns(on FiltersExpr, evalCtx *tree.EvalContext) (fixedCols opt.ColSet) {
 	for i := range on {
 		scalar := on[i]
 		scalarProps := scalar.ScalarProps()
@@ -291,49 +299,19 @@ func ExtractConstColumns(
 	return fixedCols
 }
 
-// ExtractValuesFromFilter returns a map of constant columns, to the values
-// they're constrained to.
-func ExtractValuesFromFilter(on FiltersExpr, cols opt.ColSet) map[opt.ColumnID]tree.Datum {
-	vals := make(map[opt.ColumnID]tree.Datum)
+// ExtractValueForConstColumn returns the constant value of a column returned by
+// ExtractConstColumns.
+func ExtractValueForConstColumn(
+	on FiltersExpr, evalCtx *tree.EvalContext, col opt.ColumnID,
+) tree.Datum {
 	for i := range on {
-		ok, col, val := extractConstEquality(on[i].Condition)
-		if !ok || !cols.Contains(col) {
-			continue
-		}
-		vals[col] = val
-	}
-	return vals
-}
-
-// ExtractConstantFilter returns a map of columns to the filters that constrain
-// value to a constant.
-func ExtractConstantFilter(on FiltersExpr, cols opt.ColSet) map[opt.ColumnID]FiltersItem {
-	vals := make(map[opt.ColumnID]FiltersItem)
-	for i := range on {
-		ok, col, _ := extractConstEquality(on[i].Condition)
-		if !ok || !cols.Contains(col) {
-			continue
-		}
-		vals[col] = on[i]
-	}
-	return vals
-}
-
-// extractConstEquality extracts a column that's being equated to a constant
-// value if possible.
-func extractConstEquality(condition opt.ScalarExpr) (bool, opt.ColumnID, tree.Datum) {
-	// TODO(justin): this is error-prone because this logic is different from the
-	// constraint logic. Extract these values directly from the constraints.
-	switch condition.(type) {
-	case *EqExpr, *IsExpr:
-		// Only check the left side - the variable is always on the left side
-		// due to the CommuteVar norm rule.
-		if leftVar, ok := condition.Child(0).(*VariableExpr); ok {
-			if CanExtractConstDatum(condition.Child(1)) {
-				return true, leftVar.Col, ExtractConstDatum(condition.Child(1))
+		scalar := on[i]
+		scalarProps := scalar.ScalarProps()
+		if scalarProps.Constraints != nil {
+			if val := scalarProps.Constraints.ExtractValueForConstCol(evalCtx, col); val != nil {
+				return val
 			}
 		}
 	}
-
-	return false, 0, nil
+	return nil
 }

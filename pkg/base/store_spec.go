@@ -15,19 +15,21 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
+	"github.com/cockroachdb/pebble"
 	humanize "github.com/dustin/go-humanize"
-	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -176,6 +178,10 @@ type StoreSpec struct {
 	// RocksDBOptions contains RocksDB specific options using a semicolon
 	// separated key-value syntax ("key1=value1; key2=value2").
 	RocksDBOptions string
+	// PebbleOptions contains Pebble-specific options in the same format as a
+	// Pebble OPTIONS file but treating any whitespace as a newline:
+	// (Eg, "[Options] delete_range_flush_delay=2s flush_split_bytes=4096")
+	PebbleOptions string
 	// ExtraOptions is a serialized protobuf set by Go CCL code and passed through
 	// to C CCL code.
 	ExtraOptions []byte
@@ -205,6 +211,12 @@ func (ss StoreSpec) String() string {
 			buffer.WriteString(attr)
 		}
 		fmt.Fprintf(&buffer, ",")
+	}
+	if len(ss.PebbleOptions) > 0 {
+		optsStr := strings.Replace(ss.PebbleOptions, "\n", " ", -1)
+		fmt.Fprint(&buffer, "pebble=")
+		fmt.Fprint(&buffer, optsStr)
+		fmt.Fprint(&buffer, ",")
 	}
 	// Trim the extra comma from the end if it exists.
 	if l := buffer.Len(); l > 0 {
@@ -318,6 +330,42 @@ func NewStoreSpec(value string) (StoreSpec, error) {
 			}
 		case "rocksdb":
 			ss.RocksDBOptions = value
+		case "pebble":
+			// Pebble options are supplied in the Pebble OPTIONS ini-like
+			// format, but allowing any whitespace to delimit lines. Convert
+			// the options to a newline-delimited format. This isn't a trivial
+			// character replacement because whitespace may appear within a
+			// stanza, eg ["Level 0"].
+			value = strings.TrimSpace(value)
+			var buf bytes.Buffer
+			for len(value) > 0 {
+				i := strings.IndexFunc(value, func(r rune) bool {
+					return r == '[' || unicode.IsSpace(r)
+				})
+				switch {
+				case i == -1:
+					buf.WriteString(value)
+					value = value[len(value):]
+				case value[i] == '[':
+					// If there's whitespace within [ ], we write it verbatim.
+					j := i + strings.IndexRune(value[i:], ']')
+					buf.WriteString(value[:j+1])
+					value = value[j+1:]
+				case unicode.IsSpace(rune(value[i])):
+					// NB: This doesn't handle multibyte whitespace.
+					buf.WriteString(value[:i])
+					buf.WriteRune('\n')
+					value = strings.TrimSpace(value[i+1:])
+				}
+			}
+
+			// Parse the options just to fail early if invalid. We'll parse
+			// them again later when constructing the store engine.
+			var opts pebble.Options
+			if err := opts.Parse(buf.String(), nil); err != nil {
+				return StoreSpec{}, err
+			}
+			ss.PebbleOptions = buf.String()
 		default:
 			return StoreSpec{}, fmt.Errorf("%s is not a valid store field", field)
 		}
@@ -369,12 +417,23 @@ func PreventedStartupFile(dir string) string {
 	return filepath.Join(dir, "_CRITICAL_ALERT.txt")
 }
 
-// GetPreventedStartupMessage attempts to read the PreventedStartupFile for each
-// store directory and returns their concatenated contents. These files
-// typically request operator intervention after a corruption event by
-// preventing the affected node(s) from starting back up.
-func (ssl StoreSpecList) GetPreventedStartupMessage() (string, error) {
-	var buf strings.Builder
+// PriorCriticalAlertError attempts to read the
+// PreventedStartupFile for each store directory and returns their
+// contents as a structured error.
+//
+// These files typically request operator intervention after a
+// corruption event by preventing the affected node(s) from starting
+// back up.
+func (ssl StoreSpecList) PriorCriticalAlertError() (err error) {
+	addError := func(newErr error) {
+		if err == nil {
+			err = errors.New("startup forbidden by prior critical alert")
+		}
+		// We use WithDetailf here instead of errors.CombineErrors
+		// because we want the details to be printed to the screen
+		// (combined errors only show up via %+v).
+		err = errors.WithDetailf(err, "%v", newErr)
+	}
 	for _, ss := range ssl.Specs {
 		path := ss.PreventedStartupFile()
 		if path == "" {
@@ -382,16 +441,14 @@ func (ssl StoreSpecList) GetPreventedStartupMessage() (string, error) {
 		}
 		b, err := ioutil.ReadFile(path)
 		if err != nil {
-			if !os.IsNotExist(err) {
-				return "", err
+			if !oserror.IsNotExist(err) {
+				addError(errors.Wrapf(err, "%s", path))
 			}
 			continue
 		}
-		fmt.Fprintf(&buf, "From %s:\n\n", path)
-		_, _ = buf.Write(b)
-		fmt.Fprintln(&buf)
+		addError(errors.Newf("From %s:\n\n%s\n", path, b))
 	}
-	return buf.String(), nil
+	return err
 }
 
 // PreventedStartupFile returns the path to a file which, if it exists, should

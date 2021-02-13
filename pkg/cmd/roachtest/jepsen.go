@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -172,8 +173,22 @@ func runJepsen(ctx context.Context, t *test, c *cluster, testName, nemesis strin
 	// monorepos so steps like this are necessary for one package to
 	// depend on an unreleased package in the same repo.
 	// Also remove the invoke.log from a previous test, if any.
-	run(c, ctx, controller, "bash", "-e", "-c",
-		`"cd /mnt/data1/jepsen/jepsen && ~/lein install && rm -f /mnt/data1/jepsen/cockroachdb/invoke.log"`)
+	{
+		err := runE(c, ctx, controller, "bash", "-e", "-c",
+			`"cd /mnt/data1/jepsen/jepsen && ~/lein install && rm -f /mnt/data1/jepsen/cockroachdb/invoke.log"`)
+		if err != nil {
+			// Ignore an error like the following.
+			// Could not transfer artifact org.clojure:clojure:jar:1.9.0 from/to central (https://repo1.maven.org/maven2/): GET request of: org/clojure/clojure/1.9.0/clojure-1.9.0.jar from central failed
+			r := regexp.MustCompile("Could not transfer artifact|Failed to read artifact descriptor for")
+			match := r.FindStringSubmatch(GetStderr(err))
+			if match != nil {
+				t.logger().PrintfCtx(ctx, "failure installing deps (\"%s\")\nfull err: %+v",
+					match, err)
+				t.Skipf("failure installing deps (\"%s\"); in the past it's been transient", match)
+			}
+			t.Fatalf("error installing Jepsen deps: %+v", err)
+		}
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -235,13 +250,18 @@ cd /mnt/data1/jepsen/cockroachdb && set -eo pipefail && \
 		// once the respective issues are fixed.
 		ignoreErr := false
 		if err := runE(c, ctx, controller,
-			`grep -E "(Oh jeez, I'm sorry, Jepsen broke. Here's why|Caused by)" /mnt/data1/jepsen/cockroachdb/invoke.log -A1 `+
-				`| grep -e BrokenBarrierException -e InterruptedException -e com.jcraft.jsch.JSchException `+
+			`grep -E "(Oh jeez, I'm sorry, Jepsen broke. Here's why|Caused by)" /mnt/data1/jepsen/cockroachdb/invoke.log -A1 | grep `+
+				`-e BrokenBarrierException `+
+				`-e InterruptedException `+
+				`-e com.jcraft.jsch.JSchException `+
+				`-e ArrayIndexOutOfBoundsException `+
+				`-e NullPointerException `+
 				// And one more ssh failure we've seen, apparently encountered when
 				// downloading logs.
 				`-e "clojure.lang.ExceptionInfo: clj-ssh scp failure" `+
 				// And sometimes the analysis succeeds and yet we still get an error code for some reason.
-				`-e "Everything looks good"`,
+				`-e "Everything looks good" `+
+				`-e "RuntimeException: Connection to"`, // timeout
 		); err == nil {
 			t.l.Printf("Recognized BrokenBarrier or other known exceptions (see grep output above). " +
 				"Ignoring it and considering the test successful. " +
@@ -311,8 +331,10 @@ func registerJepsen(r *testRegistry) {
 		for _, nemesis := range jepsenNemeses {
 			nemesis := nemesis // copy for closure
 			spec := testSpec{
-				Name:  fmt.Sprintf("jepsen/%s/%s", testName, nemesis.name),
-				Owner: OwnerKV,
+				Name: fmt.Sprintf("jepsen/%s/%s", testName, nemesis.name),
+				// We don't run jepsen on older releases due to the high rate of flakes.
+				MinVersion: "v20.1.0",
+				Owner:      OwnerKV,
 				// The Jepsen tests do funky things to machines, like muck with the
 				// system clock; therefore, their clusters cannot be reused other tests
 				// except the Jepsen ones themselves which reset all this state when

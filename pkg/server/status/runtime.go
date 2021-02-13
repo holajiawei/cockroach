@@ -11,17 +11,22 @@
 package status
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"runtime"
 	"runtime/debug"
+	"text/template"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/util/cgroups"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/redact"
 	"github.com/dustin/go-humanize"
 	"github.com/elastic/gosigar"
 	"github.com/shirou/gopsutil/net"
@@ -305,7 +310,7 @@ func NewRuntimeStatSampler(ctx context.Context, clock *hlc.Clock) *RuntimeStatSa
 	timestamp, err := info.Timestamp()
 	if err != nil {
 		// We can't panic here, tests don't have a build timestamp.
-		log.Warningf(ctx, "Could not parse build timestamp: %v", err)
+		log.Warningf(ctx, "could not parse build timestamp: %v", err)
 	}
 
 	// Build information.
@@ -323,11 +328,11 @@ func NewRuntimeStatSampler(ctx context.Context, clock *hlc.Clock) *RuntimeStatSa
 
 	diskCounters, err := getSummedDiskCounters(ctx)
 	if err != nil {
-		log.Errorf(ctx, "could not get initial disk IO counters: %v", err)
+		log.Ops.Errorf(ctx, "could not get initial disk IO counters: %v", err)
 	}
 	netCounters, err := getSummedNetStats(ctx)
 	if err != nil {
-		log.Errorf(ctx, "could not get initial disk IO counters: %v", err)
+		log.Ops.Errorf(ctx, "could not get initial disk IO counters: %v", err)
 	}
 
 	rsr := &RuntimeStatSampler{
@@ -381,6 +386,42 @@ type GoMemStats struct {
 	Collected time.Time
 }
 
+// CGoMemStats reports what has been allocated outside of Go.
+type CGoMemStats struct {
+	// CGoAllocated represents allocated bytes.
+	CGoAllocatedBytes uint64
+	// CGoTotal represents total bytes (allocated + metadata etc).
+	CGoTotalBytes uint64
+}
+
+// GetCGoMemStats collects non-Go memory statistics.
+func GetCGoMemStats(ctx context.Context) *CGoMemStats {
+	var cgoAllocated, cgoTotal uint
+	if getCgoMemStats != nil {
+		var err error
+		cgoAllocated, cgoTotal, err = getCgoMemStats(ctx)
+		if err != nil {
+			log.Warningf(ctx, "problem fetching CGO memory stats: %s; CGO stats will be empty.", err)
+		}
+	}
+	return &CGoMemStats{
+		CGoAllocatedBytes: uint64(cgoAllocated),
+		CGoTotalBytes:     uint64(cgoTotal),
+	}
+}
+
+var statsTemplate = template.Must(template.New("runtime stats").Funcs(template.FuncMap{
+	"iBytes":            func(i uint64) string { return humanize.IBytes(i) },
+	"oneDecimal":        func(f float64) string { return fmt.Sprintf("%.1f", f) },
+	"oneDecimalPercent": func(f float64) string { return fmt.Sprintf("%.1f", f*100) },
+	"sub":               func(a, b uint64) string { return humanize.IBytes(a - b) },
+}).Parse(`runtime stats: {{iBytes .Mem.Resident}} RSS, {{.NumGoroutines}} goroutines (stacks: {{iBytes .MS.StackSys}}), ` +
+	`{{iBytes .MS.HeapAlloc}}/{{iBytes .GoTotal}} Go alloc/total{{.StaleMsg}} ` +
+	`(heap fragmentation: {{sub .MS.HeapInuse .MS.HeapAlloc}}, heap reserved: {{sub .MS.HeapIdle .MS.HeapReleased}}, heap released: {{iBytes .MS.HeapReleased}}), ` +
+	`{{iBytes .CS.CGoAllocatedBytes}}/{{iBytes .CS.CGoTotalBytes}} CGO alloc/total ({{oneDecimal .CGORate}} CGO/sec), ` +
+	`{{oneDecimalPercent .URate}}/{{oneDecimalPercent .SRate}} %%(u/s)time, {{oneDecimalPercent .GCPauseRatio}} %%gc ({{.GCCount}}x), ` +
+	`{{iBytes .DeltaNet.BytesRecv}}/{{iBytes .DeltaNet.BytesSent}} (r/w)net`))
+
 // SampleEnvironment queries the runtime system for various interesting metrics,
 // storing the resulting values in the set of metric gauges maintained by
 // RuntimeStatSampler. This makes runtime statistics more convenient for
@@ -391,7 +432,10 @@ type GoMemStats struct {
 //
 // SampleEnvironment takes GoMemStats as input because that is collected
 // separately, on a different schedule.
-func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, ms GoMemStats) {
+// The CGoMemStats should be provided via GetCGoMemStats().
+func (rsr *RuntimeStatSampler) SampleEnvironment(
+	ctx context.Context, ms *GoMemStats, cs *CGoMemStats,
+) {
 	// Note that debug.ReadGCStats() does not suffer the same problem as
 	// runtime.ReadMemStats(). The only way you can know that is by reading the
 	// source.
@@ -405,29 +449,31 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, ms GoMemSt
 	pid := os.Getpid()
 	mem := gosigar.ProcMem{}
 	if err := mem.Get(pid); err != nil {
-		log.Errorf(ctx, "unable to get mem usage: %v", err)
+		log.Ops.Errorf(ctx, "unable to get mem usage: %v", err)
 	}
 	cpuTime := gosigar.ProcTime{}
 	if err := cpuTime.Get(pid); err != nil {
-		log.Errorf(ctx, "unable to get cpu usage: %v", err)
+		log.Ops.Errorf(ctx, "unable to get cpu usage: %v", err)
 	}
+	cgroupCPU, _ := cgroups.GetCgroupCPU()
+	cpuShare := cgroupCPU.CPUShares()
 
 	fds := gosigar.ProcFDUsage{}
 	if err := fds.Get(pid); err != nil {
-		if _, ok := err.(gosigar.ErrNotImplemented); ok {
+		if gosigar.IsNotImplemented(err) {
 			if !rsr.fdUsageNotImplemented {
 				rsr.fdUsageNotImplemented = true
-				log.Warningf(ctx, "unable to get file descriptor usage (will not try again): %s", err)
+				log.Ops.Warningf(ctx, "unable to get file descriptor usage (will not try again): %s", err)
 			}
 		} else {
-			log.Errorf(ctx, "unable to get file descriptor usage: %s", err)
+			log.Ops.Errorf(ctx, "unable to get file descriptor usage: %s", err)
 		}
 	}
 
 	var deltaDisk diskStats
 	diskCounters, err := getSummedDiskCounters(ctx)
 	if err != nil {
-		log.Warningf(ctx, "problem fetching disk stats: %s; disk stats will be empty.", err)
+		log.Ops.Warningf(ctx, "problem fetching disk stats: %s; disk stats will be empty.", err)
 	} else {
 		deltaDisk = diskCounters
 		subtractDiskCounters(&deltaDisk, rsr.last.disk)
@@ -448,7 +494,7 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, ms GoMemSt
 	var deltaNet net.IOCountersStat
 	netCounters, err := getSummedNetStats(ctx)
 	if err != nil {
-		log.Warningf(ctx, "problem fetching net stats: %s; net stats will be empty.", err)
+		log.Ops.Warningf(ctx, "problem fetching net stats: %s; net stats will be empty.", err)
 	} else {
 		deltaNet = netCounters
 		subtractNetworkCounters(&deltaNet, rsr.last.net)
@@ -469,23 +515,14 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, ms GoMemSt
 	// cpuTime.{User,Sys} are in milliseconds, convert to nanoseconds.
 	utime := int64(cpuTime.User) * 1e6
 	stime := int64(cpuTime.Sys) * 1e6
-	uPerc := float64(utime-rsr.last.utime) / dur
-	sPerc := float64(stime-rsr.last.stime) / dur
-	combinedNormalizedPerc := (sPerc + uPerc) / float64(runtime.NumCPU())
-	gcPausePercent := float64(uint64(gc.PauseTotal)-rsr.last.gcPauseTime) / dur
+	urate := float64(utime-rsr.last.utime) / dur
+	srate := float64(stime-rsr.last.stime) / dur
+	combinedNormalizedPerc := (srate + urate) / cpuShare
+	gcPauseRatio := float64(uint64(gc.PauseTotal)-rsr.last.gcPauseTime) / dur
 	rsr.last.now = now
 	rsr.last.utime = utime
 	rsr.last.stime = stime
 	rsr.last.gcPauseTime = uint64(gc.PauseTotal)
-
-	var cgoAllocated, cgoTotal uint
-	if getCgoMemStats != nil {
-		var err error
-		cgoAllocated, cgoTotal, err = getCgoMemStats(ctx)
-		if err != nil {
-			log.Warningf(ctx, "problem fetching CGO memory stats: %s; CGO stats will be empty.", err)
-		}
-	}
 
 	// Log summary of statistics to console.
 	cgoRate := float64((numCgoCall-rsr.last.cgoCall)*int64(time.Second)) / dur
@@ -495,16 +532,26 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, ms GoMemSt
 		staleMsg = "(stale)"
 	}
 	goTotal := ms.Sys - ms.HeapReleased
-	log.Infof(ctx, "runtime stats: %s RSS, %d goroutines, %s/%s/%s GO alloc/idle/total%s, "+
-		"%s/%s CGO alloc/total, %.1f CGO/sec, %.1f/%.1f %%(u/s)time, %.1f %%gc (%dx), "+
-		"%s/%s (r/w)net",
-		humanize.IBytes(mem.Resident), numGoroutine,
-		humanize.IBytes(ms.HeapAlloc), humanize.IBytes(ms.HeapIdle), humanize.IBytes(goTotal),
-		staleMsg,
-		humanize.IBytes(uint64(cgoAllocated)), humanize.IBytes(uint64(cgoTotal)),
-		cgoRate, 100*uPerc, 100*sPerc, 100*gcPausePercent, gc.NumGC-rsr.last.gcCount,
-		humanize.IBytes(deltaNet.BytesRecv), humanize.IBytes(deltaNet.BytesSent),
-	)
+
+	var buf bytes.Buffer
+	if err := statsTemplate.Execute(&buf,
+		struct {
+			MS                                  *GoMemStats
+			Mem                                 gosigar.ProcMem
+			DeltaNet                            net.IOCountersStat
+			CS                                  *CGoMemStats
+			GoTotal                             uint64
+			NumGoroutines, GCCount              int
+			CGORate, URate, SRate, GCPauseRatio float64
+			StaleMsg                            string
+		}{
+			MS: ms, Mem: mem, DeltaNet: deltaNet, CS: cs, GoTotal: goTotal, NumGoroutines: numGoroutine,
+			CGORate: cgoRate, URate: urate, SRate: srate, GCPauseRatio: gcPauseRatio, StaleMsg: staleMsg,
+		}); err != nil {
+		log.Warningf(ctx, "failed to render runtime stats: %s", err)
+	}
+	log.Health.Infof(ctx, "%s", redact.Safe(buf.String()))
+
 	rsr.last.cgoCall = numCgoCall
 	rsr.last.gcCount = gc.NumGC
 
@@ -512,15 +559,15 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, ms GoMemSt
 	rsr.GoTotalBytes.Update(int64(goTotal))
 	rsr.CgoCalls.Update(numCgoCall)
 	rsr.Goroutines.Update(int64(numGoroutine))
-	rsr.CgoAllocBytes.Update(int64(cgoAllocated))
-	rsr.CgoTotalBytes.Update(int64(cgoTotal))
+	rsr.CgoAllocBytes.Update(int64(cs.CGoAllocatedBytes))
+	rsr.CgoTotalBytes.Update(int64(cs.CGoTotalBytes))
 	rsr.GcCount.Update(gc.NumGC)
 	rsr.GcPauseNS.Update(int64(gc.PauseTotal))
-	rsr.GcPausePercent.Update(gcPausePercent)
+	rsr.GcPausePercent.Update(gcPauseRatio)
 	rsr.CPUUserNS.Update(utime)
-	rsr.CPUUserPercent.Update(uPerc)
+	rsr.CPUUserPercent.Update(urate)
 	rsr.CPUSysNS.Update(stime)
-	rsr.CPUSysPercent.Update(sPerc)
+	rsr.CPUSysPercent.Update(srate)
 	rsr.CPUCombinedPercentNorm.Update(combinedNormalizedPerc)
 	rsr.FDOpen.Update(int64(fds.Open))
 	rsr.FDSoftLimit.Update(int64(fds.SoftLimit))

@@ -59,6 +59,23 @@ var retiredSettings = map[string]struct{}{
 	"changefeed.push.enabled":                              {},
 	"sql.defaults.optimizer":                               {},
 	"kv.bulk_io_write.addsstable_max_rate":                 {},
+	// removed as of 20.1.
+	"schemachanger.lease.duration":       {},
+	"schemachanger.lease.renew_fraction": {},
+	// removed as of 20.2.
+	"rocksdb.ingest_backpressure.pending_compaction_threshold":         {},
+	"sql.distsql.temp_storage.joins":                                   {},
+	"sql.distsql.temp_storage.sorts":                                   {},
+	"sql.distsql.distribute_index_joins":                               {},
+	"sql.distsql.merge_joins.enabled":                                  {},
+	"sql.defaults.optimizer_foreign_keys.enabled":                      {},
+	"sql.defaults.experimental_optimizer_foreign_key_cascades.enabled": {},
+	"sql.parallel_scans.enabled":                                       {},
+	// removed as of 21.1.
+	"sql.distsql.interleaved_joins.enabled": {},
+	"sql.testing.vectorize.batch_size":      {},
+	"sql.testing.mutations.max_batch_size":  {},
+	"sql.testing.mock_contention.enabled":   {},
 }
 
 // register adds a setting to the registry.
@@ -130,7 +147,8 @@ var ReadableTypes = map[string]string{
 	"z": "byte size",
 	"d": "duration",
 	"e": "enumeration",
-	"m": "custom validation",
+	// This is named "m" (instead of "v") for backwards compatibility reasons.
+	"m": "version",
 }
 
 // RedactedValue returns a string representation of the value for settings

@@ -19,12 +19,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -32,20 +34,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // TestCreateStatsControlJob tests that PAUSE JOB, RESUME JOB, and CANCEL JOB
 // work as intended on create statistics jobs.
 func TestCreateStatsControlJob(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	defer func(oldInterval time.Duration) {
-		jobs.DefaultAdoptInterval = oldInterval
-	}(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 100 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	// Test with 3 nodes and rowexec.SamplerProgressInterval=100 to ensure
 	// that progress metadata is sent correctly after every 100 input rows.
@@ -61,7 +62,7 @@ func TestCreateStatsControlJob(t *testing.T) {
 
 	var serverArgs base.TestServerArgs
 	params := base.TestClusterArgs{ServerArgs: serverArgs}
-	params.ServerArgs.Knobs.Store = &storage.StoreTestingKnobs{
+	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingRequestFilter: createStatsRequestFilter(&allowRequest),
 	}
 
@@ -75,7 +76,7 @@ func TestCreateStatsControlJob(t *testing.T) {
 
 	t.Run("cancel", func(t *testing.T) {
 		// Test that CREATE STATISTICS can be canceled.
-		query := fmt.Sprintf(`CREATE STATISTICS s1 FROM d.t`)
+		query := `CREATE STATISTICS s1 FROM d.t`
 
 		if _, err := jobutils.RunJob(
 			t, sqlDB, &allowRequest, []string{"cancel"}, query,
@@ -91,7 +92,7 @@ func TestCreateStatsControlJob(t *testing.T) {
 
 	t.Run("pause", func(t *testing.T) {
 		// Test that CREATE STATISTICS can be paused and resumed.
-		query := fmt.Sprintf(`CREATE STATISTICS s2 FROM d.t`)
+		query := `CREATE STATISTICS s2 FROM d.t`
 
 		jobID, err := jobutils.RunJob(
 			t, sqlDB, &allowRequest, []string{"PAUSE"}, query,
@@ -132,17 +133,17 @@ func TestCreateStatsControlJob(t *testing.T) {
 // becomes non-live (from the perspective of the jobs registry).
 func TestCreateStatsLivenessWithRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	defer func(oldAdoptInterval, oldCancelInterval time.Duration) {
-		jobs.DefaultAdoptInterval = oldAdoptInterval
-		jobs.DefaultCancelInterval = oldCancelInterval
-	}(jobs.DefaultAdoptInterval, jobs.DefaultCancelInterval)
-	jobs.DefaultAdoptInterval = 100 * time.Millisecond
-	jobs.DefaultCancelInterval = 100 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	const nodes = 1
 	nl := jobs.NewFakeNodeLiveness(nodes)
 	serverArgs := base.TestServerArgs{
+		Settings: cluster.MakeTestingClusterSettingsWithVersions(
+			roachpb.Version{Major: 20, Minor: 1},
+			roachpb.Version{Major: 20, Minor: 1},
+			true),
 		Knobs: base.TestingKnobs{
 			RegistryLiveness: nl,
 		},
@@ -150,7 +151,7 @@ func TestCreateStatsLivenessWithRestart(t *testing.T) {
 
 	var allowRequest chan struct{}
 	params := base.TestClusterArgs{ServerArgs: serverArgs}
-	params.ServerArgs.Knobs.Store = &storage.StoreTestingKnobs{
+	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingRequestFilter: createStatsRequestFilter(&allowRequest),
 	}
 
@@ -241,17 +242,17 @@ func TestCreateStatsLivenessWithRestart(t *testing.T) {
 // owning node to continue processing.
 func TestCreateStatsLivenessWithLeniency(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	defer func(oldAdoptInterval, oldCancelInterval time.Duration) {
-		jobs.DefaultAdoptInterval = oldAdoptInterval
-		jobs.DefaultCancelInterval = oldCancelInterval
-	}(jobs.DefaultAdoptInterval, jobs.DefaultCancelInterval)
-	jobs.DefaultAdoptInterval = 100 * time.Millisecond
-	jobs.DefaultCancelInterval = 100 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	const nodes = 1
 	nl := jobs.NewFakeNodeLiveness(nodes)
 	serverArgs := base.TestServerArgs{
+		Settings: cluster.MakeTestingClusterSettingsWithVersions(
+			roachpb.Version{Major: 20, Minor: 1},
+			roachpb.Version{Major: 20, Minor: 1},
+			true),
 		Knobs: base.TestingKnobs{
 			RegistryLiveness: nl,
 		},
@@ -259,7 +260,7 @@ func TestCreateStatsLivenessWithLeniency(t *testing.T) {
 
 	var allowRequest chan struct{}
 	params := base.TestClusterArgs{ServerArgs: serverArgs}
-	params.ServerArgs.Knobs.Store = &storage.StoreTestingKnobs{
+	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingRequestFilter: createStatsRequestFilter(&allowRequest),
 	}
 
@@ -329,17 +330,15 @@ func TestCreateStatsLivenessWithLeniency(t *testing.T) {
 
 func TestAtMostOneRunningCreateStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	defer func(oldAdoptInterval time.Duration) {
-		jobs.DefaultAdoptInterval = oldAdoptInterval
-	}(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 100 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	var allowRequest chan struct{}
 
 	var serverArgs base.TestServerArgs
 	params := base.TestClusterArgs{ServerArgs: serverArgs}
-	params.ServerArgs.Knobs.Store = &storage.StoreTestingKnobs{
+	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingRequestFilter: createStatsRequestFilter(&allowRequest),
 	}
 
@@ -442,11 +441,9 @@ func TestAtMostOneRunningCreateStats(t *testing.T) {
 
 func TestDeleteFailedJob(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	defer func(oldAdoptInterval time.Duration) {
-		jobs.DefaultAdoptInterval = oldAdoptInterval
-	}(jobs.DefaultAdoptInterval)
-	jobs.DefaultAdoptInterval = 100 * time.Millisecond
+	defer jobs.TestingSetAdoptAndCancelIntervals(100*time.Millisecond, 100*time.Millisecond)()
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
@@ -496,6 +493,7 @@ func TestDeleteFailedJob(t *testing.T) {
 // for the CREATE STATISTICS job.
 func TestCreateStatsProgress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	defer func(oldProgressInterval time.Duration) {
 		rowexec.SampleAggregatorProgressInterval = oldProgressInterval
@@ -513,7 +511,7 @@ func TestCreateStatsProgress(t *testing.T) {
 	var allowRequest chan struct{}
 	var serverArgs base.TestServerArgs
 	params := base.TestClusterArgs{ServerArgs: serverArgs}
-	params.ServerArgs.Knobs.Store = &storage.StoreTestingKnobs{
+	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingRequestFilter: createStatsRequestFilter(&allowRequest),
 	}
 
@@ -589,6 +587,13 @@ func TestCreateStatsProgress(t *testing.T) {
 		)
 	}
 
+	// Invalidate the stats cache so that we can be sure to get the latest stats.
+	var tableID descpb.ID
+	sqlDB.QueryRow(t, `SELECT id FROM system.namespace WHERE name = 't'`).Scan(&tableID)
+	tc.Servers[0].ExecutorConfig().(sql.ExecutorConfig).TableStatsCache.InvalidateTableStats(
+		ctx, tableID,
+	)
+
 	// Start another CREATE STATISTICS run and wait until it has scanned part of
 	// the table.
 	allowRequest = make(chan struct{})
@@ -637,6 +642,7 @@ func TestCreateStatsProgress(t *testing.T) {
 
 func TestCreateStatsAsOfTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
@@ -666,13 +672,13 @@ func TestCreateStatsAsOfTime(t *testing.T) {
 // Create a blocking request filter for the actions related
 // to CREATE STATISTICS, i.e. Scanning a user table. See discussion
 // on jobutils.RunJob for where this might be useful.
-func createStatsRequestFilter(allowProgressIota *chan struct{}) storagebase.ReplicaRequestFilter {
+func createStatsRequestFilter(allowProgressIota *chan struct{}) kvserverbase.ReplicaRequestFilter {
 	return func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		if req, ok := ba.GetArg(roachpb.Scan); ok {
 			_, tableID, _ := encoding.DecodeUvarintAscending(req.(*roachpb.ScanRequest).Key)
 			// Ensure that the tableID is within the expected range for a table,
 			// but is not a system table.
-			if tableID > 0 && tableID < 100 && !sqlbase.IsReservedID(sqlbase.ID(tableID)) {
+			if tableID > 0 && tableID < 100 && !descpb.IsReservedID(descpb.ID(tableID)) {
 				// Read from the channel twice to allow jobutils.RunJob to complete
 				// even though there is only one ScanRequest.
 				<-*allowProgressIota

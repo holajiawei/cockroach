@@ -21,28 +21,37 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestShowCreateTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
+	params.Locality.Tiers = []roachpb.Tier{
+		{Key: "region", Value: "us-west1"},
+	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
+    SET CLUSTER SETTING sql.cross_db_fks.enabled = TRUE;
+		SET experimental_enable_hash_sharded_indexes = TRUE;
 		CREATE DATABASE d;
-		SET DATABASE = d;
+		CREATE DATABASE mrdb PRIMARY REGION = "us-west1";
+		USE d;
 		CREATE TABLE items (
 			a int8,
 			b int8,
@@ -56,8 +65,9 @@ func TestShowCreateTable(t *testing.T) {
 	}
 
 	tests := []struct {
-		stmt   string
-		expect string // empty means identical to stmt
+		stmt     string
+		expect   string // empty means identical to stmt
+		database string // empty means to use database "d"
 	}{
 		{
 			stmt: `CREATE TABLE %s (
@@ -69,14 +79,16 @@ func TestShowCreateTable(t *testing.T) {
 	FAMILY "primary" (i, v, t, rowid),
 	FAMILY fam_1_s (s)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	s STRING NULL,
 	v FLOAT8 NOT NULL,
 	t TIMESTAMP NULL DEFAULT now():::TIMESTAMP,
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
 	FAMILY "primary" (i, v, t, rowid),
 	FAMILY fam_1_s (s),
-	CONSTRAINT check_i CHECK (i > 0)
+	CONSTRAINT check_i CHECK (i > 0:::INT8)
 )`,
 		},
 		{
@@ -88,14 +100,16 @@ func TestShowCreateTable(t *testing.T) {
 	FAMILY "primary" (i, v, t, rowid),
 	FAMILY fam_1_s (s)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	s STRING NULL,
 	v FLOAT8 NOT NULL,
 	t TIMESTAMP NULL DEFAULT now():::TIMESTAMP,
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
 	FAMILY "primary" (i, v, t, rowid),
 	FAMILY fam_1_s (s),
-	CONSTRAINT check_i CHECK (i > 0)
+	CONSTRAINT check_i CHECK (i > 0:::INT8)
 )`,
 		},
 		{
@@ -106,19 +120,21 @@ func TestShowCreateTable(t *testing.T) {
 	FAMILY "primary" (i, rowid),
 	FAMILY fam_1_s (s)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	s STRING NULL,
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
 	FAMILY "primary" (i, rowid),
 	FAMILY fam_1_s (s),
-	CONSTRAINT ck CHECK (i > 0)
+	CONSTRAINT ck CHECK (i > 0:::INT8)
 )`,
 		},
 		{
 			stmt: `CREATE TABLE %s (
 	i INT8 PRIMARY KEY
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (i ASC),
 	FAMILY "primary" (i)
@@ -132,11 +148,13 @@ func TestShowCreateTable(t *testing.T) {
 				CREATE INDEX idx_if on %[1]s (f, i) STORING (s, d);
 				CREATE UNIQUE INDEX on %[1]s (d);
 			`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	f FLOAT8 NULL,
 	s STRING NULL,
 	d DATE NULL,
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
 	INDEX idx_if (f ASC, i ASC) STORING (s, d),
 	UNIQUE INDEX %[1]s_d_key (d ASC),
 	FAMILY "primary" (i, f, d, rowid),
@@ -149,6 +167,11 @@ func TestShowCreateTable(t *testing.T) {
 	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC),
 	FAMILY "primary" ("te""st")
 )`,
+			expect: `CREATE TABLE public.%s (
+	"te""st" INT8 NOT NULL,
+	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC),
+	FAMILY "primary" ("te""st")
+)`,
 		},
 		{
 			stmt: `CREATE TABLE %s (
@@ -156,9 +179,11 @@ func TestShowCreateTable(t *testing.T) {
 	b int8,
 	index c(a asc, b desc)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	a INT8 NULL,
 	b INT8 NULL,
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
 	INDEX c (a ASC, b DESC),
 	FAMILY "primary" (a, b, rowid)
 )`,
@@ -172,14 +197,14 @@ func TestShowCreateTable(t *testing.T) {
 	FOREIGN KEY (i, j) REFERENCES items (a, b),
 	k int REFERENCES items (c)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	j INT8 NULL,
 	k INT8 NULL,
-	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items(a, b),
-	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES items(c),
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC),
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES public.items(a, b),
+	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES public.items(c),
 	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
@@ -192,14 +217,14 @@ func TestShowCreateTable(t *testing.T) {
 	k int REFERENCES items (c) MATCH FULL,
 	FOREIGN KEY (i, j) REFERENCES items (a, b) MATCH FULL
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL,
 	j INT8 NULL,
 	k INT8 NULL,
-	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items(a, b) MATCH FULL,
-	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES items(c) MATCH FULL,
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC),
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES public.items(a, b) MATCH FULL,
+	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES public.items(c) MATCH FULL,
 	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
@@ -210,10 +235,11 @@ func TestShowCreateTable(t *testing.T) {
 	x INT8,
 	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.foo (x)
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	x INT8 NULL,
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
 	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.public.foo(x),
-	INDEX %[1]s_auto_index_fk_ref (x ASC),
 	FAMILY "primary" (x, rowid)
 )`,
 		},
@@ -226,14 +252,14 @@ func TestShowCreateTable(t *testing.T) {
 	FOREIGN KEY (i, j) REFERENCES items (a, b) ON DELETE SET DEFAULT,
 	k int8 REFERENCES items (c) ON DELETE SET NULL
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL DEFAULT 123:::INT8,
 	j INT8 NULL DEFAULT 123:::INT8,
 	k INT8 NULL,
-	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items(a, b) ON DELETE SET DEFAULT,
-	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES items(c) ON DELETE SET NULL,
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC),
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES public.items(a, b) ON DELETE SET DEFAULT,
+	CONSTRAINT fk_k_ref_items FOREIGN KEY (k) REFERENCES public.items(c) ON DELETE SET NULL,
 	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
@@ -245,12 +271,12 @@ func TestShowCreateTable(t *testing.T) {
 	b INT8,
 	PRIMARY KEY (a, b)
 ) INTERLEAVE IN PARENT items (a, b)`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	a INT8 NOT NULL,
 	b INT8 NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (a ASC, b ASC),
 	FAMILY "primary" (a, b)
-) INTERLEAVE IN PARENT items (a, b)`,
+) INTERLEAVE IN PARENT public.items (a, b)`,
 		},
 		// Check that INTERLEAVE dependencies outside of the current
 		// database are prefixed by their db name.
@@ -258,7 +284,7 @@ func TestShowCreateTable(t *testing.T) {
 			stmt: `CREATE TABLE %s (
 	x INT8 PRIMARY KEY
 ) INTERLEAVE IN PARENT o.foo (x)`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	x INT8 NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (x ASC),
 	FAMILY "primary" (x)
@@ -275,17 +301,70 @@ func TestShowCreateTable(t *testing.T) {
 	FOREIGN KEY (i, j) REFERENCES items (a, b) MATCH SIMPLE ON DELETE SET DEFAULT,
 	FOREIGN KEY (k, l) REFERENCES items (a, b) MATCH FULL ON UPDATE CASCADE
 )`,
-			expect: `CREATE TABLE %s (
+			expect: `CREATE TABLE public.%s (
 	i INT8 NULL DEFAULT 1:::INT8,
 	j INT8 NULL DEFAULT 2:::INT8,
 	k INT8 NULL DEFAULT 3:::INT8,
 	l INT8 NULL DEFAULT 4:::INT8,
-	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES items(a, b) ON DELETE SET DEFAULT,
-	CONSTRAINT fk_k_ref_items FOREIGN KEY (k, l) REFERENCES items(a, b) MATCH FULL ON UPDATE CASCADE,
-	INDEX %[1]s_auto_index_fk_i_ref_items (i ASC, j ASC),
-	INDEX %[1]s_auto_index_fk_k_ref_items (k ASC, l ASC),
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+	CONSTRAINT fk_i_ref_items FOREIGN KEY (i, j) REFERENCES public.items(a, b) ON DELETE SET DEFAULT,
+	CONSTRAINT fk_k_ref_items FOREIGN KEY (k, l) REFERENCES public.items(a, b) MATCH FULL ON UPDATE CASCADE,
 	FAMILY "primary" (i, j, k, l, rowid)
 )`,
+		},
+		// Check hash sharded indexes are round trippable.
+		{
+			stmt: `CREATE TABLE %s (
+				a INT,
+				INDEX (a) USING HASH WITH BUCKET_COUNT = 8
+			)`,
+			expect: `CREATE TABLE public.%s (
+	a INT8 NULL,
+	crdb_internal_a_shard_8 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(a AS STRING), '':::STRING)), 8:::INT8)) STORED,
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+	INDEX t14_a_idx (a ASC) USING HASH WITH BUCKET_COUNT = 8,
+	FAMILY "primary" (a, crdb_internal_a_shard_8, rowid)
+)`,
+		},
+		// Check GLOBAL tables are round trippable.
+		{
+			stmt: `CREATE TABLE %s (
+				a INT
+			) LOCALITY GLOBAL`,
+			expect: `CREATE TABLE public.%s (
+	a INT8 NULL,
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+	FAMILY "primary" (a, rowid)
+) LOCALITY GLOBAL`,
+			database: "mrdb",
+		},
+		// Check REGIONAL BY TABLE tables are round trippable.
+		{
+			stmt: `CREATE TABLE %s (
+				a INT
+			) LOCALITY REGIONAL BY TABLE`,
+			expect: `CREATE TABLE public.%s (
+	a INT8 NULL,
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+	FAMILY "primary" (a, rowid)
+) LOCALITY REGIONAL BY TABLE IN PRIMARY REGION`,
+			database: "mrdb",
+		},
+		{
+			stmt: `CREATE TABLE %s (
+				a INT
+			) LOCALITY REGIONAL BY TABLE IN "us-west1"`,
+			expect: `CREATE TABLE public.%s (
+	a INT8 NULL,
+	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+	FAMILY "primary" (a, rowid)
+) LOCALITY REGIONAL BY TABLE IN "us-west1"`,
+			database: "mrdb",
 		},
 	}
 	for i, test := range tests {
@@ -294,6 +373,12 @@ func TestShowCreateTable(t *testing.T) {
 			if test.expect == "" {
 				test.expect = test.stmt
 			}
+			db := test.database
+			if db == "" {
+				db = "d"
+			}
+			_, err := sqlDB.Exec("USE $1", db)
+			require.NoError(t, err)
 			stmt := fmt.Sprintf(test.stmt, name)
 			expect := fmt.Sprintf(test.expect, name)
 			if _, err := sqlDB.Exec(stmt); err != nil {
@@ -335,10 +420,11 @@ func TestShowCreateTable(t *testing.T) {
 
 func TestShowCreateView(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
 		CREATE DATABASE d;
@@ -354,35 +440,35 @@ func TestShowCreateView(t *testing.T) {
 	}{
 		{
 			`CREATE VIEW %s AS SELECT i, s, v, t FROM t`,
-			`CREATE VIEW %s (i, s, v, t) AS SELECT i, s, v, t FROM d.public.t`,
+			`CREATE VIEW public.%s (i, s, v, t) AS SELECT i, s, v, t FROM d.public.t`,
 		},
 		{
 			`CREATE VIEW %s AS SELECT i, s, t FROM t`,
-			`CREATE VIEW %s (i, s, t) AS SELECT i, s, t FROM d.public.t`,
+			`CREATE VIEW public.%s (i, s, t) AS SELECT i, s, t FROM d.public.t`,
 		},
 		{
 			`CREATE VIEW %s AS SELECT t.i, t.s, t.t FROM t`,
-			`CREATE VIEW %s (i, s, t) AS SELECT t.i, t.s, t.t FROM d.public.t`,
+			`CREATE VIEW public.%s (i, s, t) AS SELECT t.i, t.s, t.t FROM d.public.t`,
 		},
 		{
 			`CREATE VIEW %s AS SELECT foo.i, foo.s, foo.t FROM t AS foo WHERE foo.i > 3`,
-			`CREATE VIEW %s (i, s, t) AS SELECT foo.i, foo.s, foo.t FROM d.public.t AS foo WHERE foo.i > 3`,
+			`CREATE VIEW public.%s (i, s, t) AS SELECT foo.i, foo.s, foo.t FROM d.public.t AS foo WHERE foo.i > 3`,
 		},
 		{
 			`CREATE VIEW %s AS SELECT count(*) FROM t`,
-			`CREATE VIEW %s (count) AS SELECT count(*) FROM d.public.t`,
+			`CREATE VIEW public.%s (count) AS SELECT count(*) FROM d.public.t`,
 		},
 		{
 			`CREATE VIEW %s AS SELECT s, count(*) FROM t GROUP BY s HAVING count(*) > 3:::INT8`,
-			`CREATE VIEW %s (s, count) AS SELECT s, count(*) FROM d.public.t GROUP BY s HAVING count(*) > 3:::INT8`,
+			`CREATE VIEW public.%s (s, count) AS SELECT s, count(*) FROM d.public.t GROUP BY s HAVING count(*) > 3:::INT8`,
 		},
 		{
 			`CREATE VIEW %s (a, b, c, d) AS SELECT i, s, v, t FROM t`,
-			`CREATE VIEW %s (a, b, c, d) AS SELECT i, s, v, t FROM d.public.t`,
+			`CREATE VIEW public.%s (a, b, c, d) AS SELECT i, s, v, t FROM d.public.t`,
 		},
 		{
 			`CREATE VIEW %s (a, b) AS SELECT i, v FROM t`,
-			`CREATE VIEW %s (a, b) AS SELECT i, v FROM d.public.t`,
+			`CREATE VIEW public.%s (a, b) AS SELECT i, v FROM d.public.t`,
 		},
 	}
 	for i, test := range tests {
@@ -429,10 +515,11 @@ func TestShowCreateView(t *testing.T) {
 
 func TestShowCreateSequence(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
 		CREATE DATABASE d;
@@ -447,19 +534,19 @@ func TestShowCreateSequence(t *testing.T) {
 	}{
 		{
 			`CREATE SEQUENCE %s`,
-			`CREATE SEQUENCE %s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1`,
+			`CREATE SEQUENCE public.%s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1`,
 		},
 		{
 			`CREATE SEQUENCE %s INCREMENT BY 5`,
-			`CREATE SEQUENCE %s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 5 START 1`,
+			`CREATE SEQUENCE public.%s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 5 START 1`,
 		},
 		{
 			`CREATE SEQUENCE %s START WITH 5`,
-			`CREATE SEQUENCE %s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 5`,
+			`CREATE SEQUENCE public.%s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 5`,
 		},
 		{
 			`CREATE SEQUENCE %s INCREMENT 5 MAXVALUE 10000 START 10 MINVALUE 0`,
-			`CREATE SEQUENCE %s MINVALUE 0 MAXVALUE 10000 INCREMENT 5 START 10`,
+			`CREATE SEQUENCE public.%s MINVALUE 0 MAXVALUE 10000 INCREMENT 5 START 10`,
 		},
 	}
 	for i, test := range tests {
@@ -506,6 +593,7 @@ func TestShowCreateSequence(t *testing.T) {
 
 func TestShowQueries(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	const multiByte = "💩"
 	const selectBase = "SELECT * FROM "
@@ -591,7 +679,7 @@ func TestShowQueries(t *testing.T) {
 		}
 	}
 
-	tc := serverutils.StartTestCluster(t, 2, /* numNodes */
+	tc := serverutils.StartNewTestCluster(t, 2, /* numNodes */
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
@@ -601,7 +689,7 @@ func TestShowQueries(t *testing.T) {
 				},
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	conn1 = tc.ServerConn(0)
 	conn2 = tc.ServerConn(1)
@@ -654,11 +742,12 @@ func TestShowQueries(t *testing.T) {
 
 func TestShowSessions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	var conn *gosql.DB
 
-	tc := serverutils.StartTestCluster(t, 2 /* numNodes */, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(context.TODO())
+	tc := serverutils.StartNewTestCluster(t, 2 /* numNodes */, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(context.Background())
 
 	conn = tc.ServerConn(0)
 	sqlutils.CreateTable(t, conn, "t", "num INT", 0, nil)
@@ -667,7 +756,7 @@ func TestShowSessions(t *testing.T) {
 	var showSessions = fmt.Sprintf(`
 	select node_id, (now() - session_start)::float from
 		[show cluster sessions] where application_name not like '%s%%'
-	`, sqlbase.InternalAppNamePrefix)
+	`, catconstants.InternalAppNamePrefix)
 
 	rows, err := conn.Query(showSessions)
 	if err != nil {
@@ -765,86 +854,89 @@ func TestShowSessions(t *testing.T) {
 
 func TestShowSessionPrivileges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	params.Insecure = true
 	s, rawSQLDBroot, _ := serverutils.StartServer(t, params)
 	sqlDBroot := sqlutils.MakeSQLRunner(rawSQLDBroot)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
-	// Prepare a non-root session.
-	_ = sqlDBroot.Exec(t, `CREATE USER nonroot`)
-	pgURL := url.URL{
-		Scheme:   "postgres",
-		User:     url.User("nonroot"),
-		Host:     s.ServingSQLAddr(),
-		RawQuery: "sslmode=disable",
+	// Create three users: one with no special permissions, one with the
+	// VIEWACTIVITY role option, and one admin. We'll check that the VIEWACTIVITY
+	// users and the admin can see all sessions and the unpermissioned user can
+	// only see their own session.
+	_ = sqlDBroot.Exec(t, `CREATE USER noperms`)
+	_ = sqlDBroot.Exec(t, `CREATE USER viewactivity VIEWACTIVITY`)
+	_ = sqlDBroot.Exec(t, `CREATE USER adminuser`)
+	_ = sqlDBroot.Exec(t, `GRANT admin TO adminuser`)
+
+	type user struct {
+		username             string
+		canViewOtherSessions bool
+		sqlRunner            *sqlutils.SQLRunner
 	}
-	rawSQLDBnonroot, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		t.Fatal(err)
+
+	users := []user{
+		{"noperms", false, nil},
+		{"viewactivity", true, nil},
+		{"adminuser", true, nil},
 	}
-	defer rawSQLDBnonroot.Close()
-	sqlDBnonroot := sqlutils.MakeSQLRunner(rawSQLDBnonroot)
-
-	// Ensure the non-root session is open.
-	sqlDBnonroot.Exec(t, `SELECT version()`)
-
-	t.Run("root", func(t *testing.T) {
-		// Verify that the root session can use SHOW SESSIONS properly and
-		// can observe other sessions than its own.
-		rows := sqlDBroot.Query(t, `SELECT user_name FROM [SHOW CLUSTER SESSIONS]`)
-		defer rows.Close()
-		counts := map[string]int{}
-		for rows.Next() {
-			var userName string
-			if err := rows.Scan(&userName); err != nil {
-				t.Fatal(err)
-			}
-			counts[userName]++
+	for i, tc := range users {
+		pgURL := url.URL{
+			Scheme:   "postgres",
+			User:     url.User(tc.username),
+			Host:     s.ServingSQLAddr(),
+			RawQuery: "sslmode=disable",
 		}
-		if err := rows.Err(); err != nil {
+		db, err := gosql.Open("postgres", pgURL.String())
+		if err != nil {
 			t.Fatal(err)
 		}
-		if counts[security.RootUser] == 0 {
-			t.Fatalf("root session is unable to see its own session: %+v", counts)
-		}
-		if counts["nonroot"] == 0 {
-			t.Fatal("root session is unable to see non-root session")
-		}
-	})
+		defer db.Close()
+		users[i].sqlRunner = sqlutils.MakeSQLRunner(db)
 
-	t.Run("non-root", func(t *testing.T) {
-		// Verify that the non-root session can use SHOW SESSIONS properly
-		// and cannot observe other sessions than its own.
-		rows := sqlDBnonroot.Query(t, `SELECT user_name FROM [SHOW CLUSTER SESSIONS]`)
-		defer rows.Close()
-		counts := map[string]int{}
-		for rows.Next() {
-			var userName string
-			if err := rows.Scan(&userName); err != nil {
+		// Ensure the session is open.
+		users[i].sqlRunner.Exec(t, `SELECT version()`)
+	}
+
+	for _, u := range users {
+		t.Run(u.username, func(t *testing.T) {
+			rows := u.sqlRunner.Query(t, `SELECT user_name FROM [SHOW CLUSTER SESSIONS]`)
+			defer rows.Close()
+			counts := map[string]int{}
+			for rows.Next() {
+				var userName string
+				if err := rows.Scan(&userName); err != nil {
+					t.Fatal(err)
+				}
+				counts[userName]++
+			}
+			if err := rows.Err(); err != nil {
 				t.Fatal(err)
 			}
-			counts[userName]++
-		}
-		if err := rows.Err(); err != nil {
-			t.Fatal(err)
-		}
-		if counts["nonroot"] == 0 {
-			t.Fatal("non-root session is unable to see its own session")
-		}
-		if len(counts) > 1 {
-			t.Fatalf("non-root session is able to see other sessions: %+v", counts)
-		}
-	})
+			for _, u2 := range users {
+				if u.canViewOtherSessions || u.username == u2.username {
+					if counts[u2.username] == 0 {
+						t.Fatalf(
+							"%s session is unable to see %s session: %+v", u.username, u2.username, counts)
+					}
+				} else if counts[u2.username] > 0 {
+					t.Fatalf(
+						"%s session should not be able to see %s session: %+v", u.username, u2.username, counts)
+				}
+			}
+		})
+	}
 }
 
 func TestLintClusterSettingNames(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	rows, err := sqlDB.Query(`SELECT variable, setting_type, description FROM [SHOW ALL CLUSTER SETTINGS]`)
 	if err != nil {
@@ -921,8 +1013,6 @@ func TestLintClusterSettingNames(t *testing.T) {
 				"server.clock.forward_jump_check_enabled":            `server.clock.forward_jump_check_enabled: use ".enabled" instead of "_enabled"`,
 				"sql.defaults.experimental_optimizer_mutations":      `sql.defaults.experimental_optimizer_mutations: use .enabled for booleans`,
 				"sql.distsql.distribute_index_joins":                 `sql.distsql.distribute_index_joins: use .enabled for booleans`,
-				"sql.distsql.temp_storage.joins":                     `sql.distsql.temp_storage.joins: use .enabled for booleans`,
-				"sql.distsql.temp_storage.sorts":                     `sql.distsql.temp_storage.sorts: use .enabled for booleans`,
 				"sql.metrics.statement_details.dump_to_logs":         `sql.metrics.statement_details.dump_to_logs: use .enabled for booleans`,
 				"sql.metrics.statement_details.sample_logical_plans": `sql.metrics.statement_details.sample_logical_plans: use .enabled for booleans`,
 				"sql.trace.log_statement_execute":                    `sql.trace.log_statement_execute: use .enabled for booleans`,
@@ -933,6 +1023,11 @@ func TestLintClusterSettingNames(t *testing.T) {
 				// TODO(knz): remove these cases when these settings are retired.
 				"timeseries.storage.10s_resolution_ttl": `timeseries.storage.10s_resolution_ttl: part "10s_resolution_ttl" has invalid structure`,
 				"timeseries.storage.30m_resolution_ttl": `timeseries.storage.30m_resolution_ttl: part "30m_resolution_ttl" has invalid structure`,
+
+				// sql.defaults.idle_in_session_timeout uses the _timeout suffix stay
+				// consistent with the corresponding session variable
+				// idle_in_session_timeout.
+				"sql.defaults.idle_in_session_timeout": `sql.defaults.idle_in_session_timeout: use ".timeout" instead of "_timeout"`,
 			}
 			expectedErr, found := grandFathered[varName]
 			if !found || expectedErr != nameErr.Error() {
@@ -952,10 +1047,37 @@ func TestLintClusterSettingNames(t *testing.T) {
 			if strings.ToLower(desc[0:1]) != desc[0:1] {
 				t.Errorf("%s: description %q must not start with capital", varName, desc)
 			}
-			if strings.Contains(desc, ". ") != (desc[len(desc)-1] == '.') {
+			if sType != "e" && strings.Contains(desc, ". ") != (desc[len(desc)-1] == '.') {
+				// TODO(knz): this check doesn't work with the way enum values are added to their descriptions.
 				t.Errorf("%s: description %q must end with period if and only if it contains a secondary sentence", varName, desc)
 			}
 		}
 	}
 
+}
+
+// TestCancelQueriesRace can be stressed to try and reproduce a race
+// between SHOW QUERIES and currently executing statements. For
+// more details, see #28033.
+func TestCancelQueriesRace(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+
+	waiter := make(chan struct{})
+	go func() {
+		_, _ = sqlDB.ExecContext(ctx, `SELECT pg_sleep(10)`)
+		close(waiter)
+	}()
+	_, _ = sqlDB.ExecContext(ctx, `CANCEL QUERIES (
+		SELECT query_id FROM [SHOW QUERIES] WHERE query LIKE 'SELECT pg_sleep%'
+	)`)
+	_, _ = sqlDB.ExecContext(ctx, `CANCEL QUERIES (
+		SELECT query_id FROM [SHOW QUERIES] WHERE query LIKE 'SELECT pg_sleep%'
+	)`)
+
+	cancel()
+	<-waiter
 }

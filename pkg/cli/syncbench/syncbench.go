@@ -22,14 +22,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/codahale/hdrhistogram"
-	"github.com/pkg/errors"
 )
 
 var numOps uint64
@@ -51,7 +51,7 @@ func clampLatency(d, min, max time.Duration) time.Duration {
 }
 
 type worker struct {
-	db      engine.Engine
+	db      storage.Engine
 	latency struct {
 		syncutil.Mutex
 		*hdrhistogram.WindowedHistogram
@@ -59,7 +59,7 @@ type worker struct {
 	logOnly bool
 }
 
-func newWorker(db engine.Engine) *worker {
+func newWorker(db storage.Engine) *worker {
 	w := &worker{db: db}
 	w.latency.WindowedHistogram = hdrhistogram.NewWindowed(1,
 		minLatency.Nanoseconds(), maxLatency.Nanoseconds(), 1)
@@ -87,28 +87,28 @@ func (w *worker) run(wg *sync.WaitGroup) {
 		if w.logOnly {
 			block := randBlock(300, 400)
 			if err := b.LogData(block); err != nil {
-				log.Fatal(ctx, err)
+				log.Fatalf(ctx, "%v", err)
 			}
 		} else {
 			for j := 0; j < 5; j++ {
 				block := randBlock(60, 80)
 				key := encoding.EncodeUint32Ascending(buf, rand.Uint32())
-				if err := b.Put(engine.MakeMVCCMetadataKey(key), block); err != nil {
-					log.Fatal(ctx, err)
+				if err := b.PutUnversioned(key, block); err != nil {
+					log.Fatalf(ctx, "%v", err)
 				}
 				buf = key[:0]
 			}
 		}
 		bytes := uint64(b.Len())
 		if err := b.Commit(true); err != nil {
-			log.Fatal(ctx, err)
+			log.Fatalf(ctx, "%v", err)
 		}
 		atomic.AddUint64(&numOps, 1)
 		atomic.AddUint64(&numBytes, bytes)
 		elapsed := clampLatency(timeutil.Since(start), minLatency, maxLatency)
 		w.latency.Lock()
 		if err := w.latency.Current.RecordValue(elapsed.Nanoseconds()); err != nil {
-			log.Fatal(ctx, err)
+			log.Fatalf(ctx, "%v", err)
 		}
 		w.latency.Unlock()
 	}
@@ -139,7 +139,7 @@ func Run(opts Options) error {
 
 	fmt.Printf("writing to %s\n", opts.Dir)
 
-	db, err := engine.NewDefaultEngine(
+	db, err := storage.NewDefaultEngine(
 		0,
 		base.StorageConfig{
 			Settings: cluster.MakeTestingClusterSettings(),

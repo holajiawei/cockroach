@@ -24,171 +24,110 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	semtypes "github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var _ coldataext.Datum
 
 // {{/*
 
-type _ALLTYPES interface{}
-type _FROMTYPE interface{}
-type _TOTYPE interface{}
-type _GOTYPE interface{}
+type _R_GO_TYPE interface{}
 
 var _ apd.Decimal
 var _ = math.MaxInt8
 var _ tree.Datum
 
-func _ASSIGN_CAST(to, from interface{}) {
-	execerror.VectorizedInternalPanic("")
-}
+// _LEFT_CANONICAL_TYPE_FAMILY is the template variable.
+const _LEFT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
 
-// This will be replaced with execgen.UNSAFEGET
-func _FROM_TYPE_UNSAFEGET(to, from interface{}) interface{} {
-	execerror.VectorizedInternalPanic("")
+// _LEFT_TYPE_WIDTH is the template variable.
+const _LEFT_TYPE_WIDTH = 0
+
+// _RIGHT_CANONICAL_TYPE_FAMILY is the template variable.
+const _RIGHT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _RIGHT_TYPE_WIDTH is the template variable.
+const _RIGHT_TYPE_WIDTH = 0
+
+func _CAST(to, from, fromCol, toType interface{}) {
+	colexecerror.InternalError(errors.AssertionFailedf(""))
 }
 
 // This will be replaced with execgen.SET.
-func _TO_TYPE_SET(to, from interface{}) {
-	execerror.VectorizedInternalPanic("")
-}
-
-// This will be replaced with execgen.SLICE.
-func _FROM_TYPE_SLICE(col, i, j interface{}) interface{} {
-	execerror.VectorizedInternalPanic("")
+func _R_SET(to, from interface{}) {
+	colexecerror.InternalError(errors.AssertionFailedf(""))
 }
 
 // */}}
 
-func cast(fromType, toType coltypes.T, inputVec, outputVec coldata.Vec, n int, sel []int) {
-	switch fromType {
-	// {{ range $typ, $overloads := . }}
-	case coltypes._ALLTYPES:
-		switch toType {
-		// {{ range $overloads }}
-		// {{ if isCastFuncSet . }}
-		case coltypes._TOTYPE:
-			inputCol := inputVec._FROMTYPE()
-			outputCol := outputVec._TOTYPE()
-			if inputVec.MaybeHasNulls() {
-				inputNulls := inputVec.Nulls()
-				outputNulls := outputVec.Nulls()
-				if sel != nil {
-					sel = sel[:n]
-					for _, i := range sel {
-						if inputNulls.NullAt(i) {
-							outputNulls.SetNull(i)
-						} else {
-							v := _FROM_TYPE_UNSAFEGET(inputCol, i)
-							var r _GOTYPE
-							_ASSIGN_CAST(r, v)
-							_TO_TYPE_SET(outputCol, i, r)
-						}
-					}
-				} else {
-					inputCol = _FROM_TYPE_SLICE(inputCol, 0, n)
-					for execgen.RANGE(i, inputCol, 0, n) {
-						if inputNulls.NullAt(i) {
-							outputNulls.SetNull(i)
-						} else {
-							v := _FROM_TYPE_UNSAFEGET(inputCol, i)
-							var r _GOTYPE
-							_ASSIGN_CAST(r, v)
-							_TO_TYPE_SET(outputCol, i, r)
-						}
-					}
-				}
-			} else {
-				if sel != nil {
-					sel = sel[:n]
-					for _, i := range sel {
-						v := _FROM_TYPE_UNSAFEGET(inputCol, i)
-						var r _GOTYPE
-						_ASSIGN_CAST(r, v)
-						_TO_TYPE_SET(outputCol, i, r)
-					}
-				} else {
-					inputCol = _FROM_TYPE_SLICE(inputCol, 0, n)
-					for execgen.RANGE(i, inputCol, 0, n) {
-						v := _FROM_TYPE_UNSAFEGET(inputCol, i)
-						var r _GOTYPE
-						_ASSIGN_CAST(r, v)
-						_TO_TYPE_SET(outputCol, i, r)
-					}
-				}
-			}
-			// {{end}}
-			// {{end}}
-		default:
-			execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled cast FROM -> TO type: %s -> %s", fromType, toType))
-		}
-		// {{end}}
-	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled FROM type: %s", fromType))
-	}
-}
-
 func GetCastOperator(
-	allocator *Allocator,
-	input Operator,
+	allocator *colmem.Allocator,
+	input colexecbase.Operator,
 	colIdx int,
 	resultIdx int,
-	fromType *semtypes.T,
-	toType *semtypes.T,
-) (Operator, error) {
-	if fromType.Family() == semtypes.UnknownFamily {
+	fromType *types.T,
+	toType *types.T,
+) (colexecbase.Operator, error) {
+	input = newVectorTypeEnforcer(allocator, input, toType, resultIdx)
+	if fromType.Family() == types.UnknownFamily {
 		return &castOpNullAny{
-			OneInputNode: NewOneInputNode(input),
-			allocator:    allocator,
-			colIdx:       colIdx,
-			outputIdx:    resultIdx,
-			toType:       typeconv.FromColumnType(toType),
+			oneInputCloserHelper: makeOneInputCloserHelper(input),
+			allocator:            allocator,
+			colIdx:               colIdx,
+			outputIdx:            resultIdx,
 		}, nil
 	}
-	switch from := typeconv.FromColumnType(fromType); from {
-	// {{ range $typ, $overloads := . }}
-	case coltypes._ALLTYPES:
-		switch to := typeconv.FromColumnType(toType); to {
-		// {{ range $overloads }}
-		// {{ if isCastFuncSet . }}
-		case coltypes._TOTYPE:
-			return &castOp{
-				OneInputNode: NewOneInputNode(input),
-				allocator:    allocator,
-				colIdx:       colIdx,
-				outputIdx:    resultIdx,
-				fromType:     from,
-				toType:       to,
-			}, nil
+	leftType, rightType := fromType, toType
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
+	// {{range .LeftFamilies}}
+	case _LEFT_CANONICAL_TYPE_FAMILY:
+		switch leftType.Width() {
+		// {{range .LeftWidths}}
+		case _LEFT_TYPE_WIDTH:
+			switch typeconv.TypeFamilyToCanonicalTypeFamily(rightType.Family()) {
+			// {{range .RightFamilies}}
+			case _RIGHT_CANONICAL_TYPE_FAMILY:
+				switch rightType.Width() {
+				// {{range .RightWidths}}
+				case _RIGHT_TYPE_WIDTH:
+					return &cast_NAMEOp{
+						oneInputCloserHelper: makeOneInputCloserHelper(input),
+						allocator:            allocator,
+						colIdx:               colIdx,
+						outputIdx:            resultIdx,
+						toType:               toType,
+					}, nil
+					// {{end}}
+				}
+				// {{end}}
+			}
 			// {{end}}
-			// {{end}}
-		default:
-			return nil, errors.Errorf("unhandled cast FROM -> TO type: %s -> %s", from, to)
 		}
 		// {{end}}
-	default:
-		return nil, errors.Errorf("unhandled FROM type: %s", from)
 	}
+	return nil, errors.Errorf("unhandled cast %s -> %s", fromType, toType)
 }
 
 type castOpNullAny struct {
-	OneInputNode
-	allocator *Allocator
+	oneInputCloserHelper
+
+	allocator *colmem.Allocator
 	colIdx    int
 	outputIdx int
-	toType    coltypes.T
 }
 
-var _ Operator = &castOpNullAny{}
+var _ closableOperator = &castOpNullAny{}
 
 func (c *castOpNullAny) Init() {
 	c.input.Init()
@@ -200,18 +139,22 @@ func (c *castOpNullAny) Next(ctx context.Context) coldata.Batch {
 	if n == 0 {
 		return coldata.ZeroBatch
 	}
-	c.allocator.MaybeAddColumn(batch, c.toType, c.outputIdx)
 	vec := batch.ColVec(c.colIdx)
 	projVec := batch.ColVec(c.outputIdx)
 	vecNulls := vec.Nulls()
 	projNulls := projVec.Nulls()
+	if projVec.MaybeHasNulls() {
+		// We need to make sure that there are no left over nulls values in the
+		// output vector.
+		projNulls.UnsetNulls()
+	}
 	if sel := batch.Selection(); sel != nil {
 		sel = sel[:n]
 		for _, i := range sel {
 			if vecNulls.NullAt(i) {
 				projNulls.SetNull(i)
 			} else {
-				execerror.VectorizedInternalPanic(errors.Errorf("unexpected non-null at index %d", i))
+				colexecerror.InternalError(errors.Errorf("unexpected non-null at index %d", i))
 			}
 		}
 	} else {
@@ -219,39 +162,135 @@ func (c *castOpNullAny) Next(ctx context.Context) coldata.Batch {
 			if vecNulls.NullAt(i) {
 				projNulls.SetNull(i)
 			} else {
-				execerror.VectorizedInternalPanic(fmt.Errorf("unexpected non-null at index %d", i))
+				colexecerror.InternalError(fmt.Errorf("unexpected non-null at index %d", i))
 			}
 		}
 	}
 	return batch
 }
 
-type castOp struct {
-	OneInputNode
-	allocator *Allocator
+// TODO(yuzefovich): refactor castOp so that it is type-specific (meaning not
+// canonical type family specific, but actual type specific). This will
+// probably require changing the way we handle cast overloads as well.
+
+// {{range .LeftFamilies}}
+// {{range .LeftWidths}}
+// {{range .RightFamilies}}
+// {{range .RightWidths}}
+
+type cast_NAMEOp struct {
+	oneInputCloserHelper
+
+	allocator *colmem.Allocator
 	colIdx    int
 	outputIdx int
-	fromType  coltypes.T
-	toType    coltypes.T
+	toType    *types.T
 }
 
-var _ Operator = &castOp{}
+var _ ResettableOperator = &cast_NAMEOp{}
+var _ closableOperator = &cast_NAMEOp{}
 
-func (c *castOp) Init() {
+func (c *cast_NAMEOp) Init() {
 	c.input.Init()
 }
 
-func (c *castOp) Next(ctx context.Context) coldata.Batch {
+func (c *cast_NAMEOp) reset(ctx context.Context) {
+	if r, ok := c.input.(resetter); ok {
+		r.reset(ctx)
+	}
+}
+
+func (c *cast_NAMEOp) Next(ctx context.Context) coldata.Batch {
 	batch := c.input.Next(ctx)
 	n := batch.Length()
 	if n == 0 {
 		return coldata.ZeroBatch
 	}
-	c.allocator.MaybeAddColumn(batch, c.toType, c.outputIdx)
-	vec := batch.ColVec(c.colIdx)
-	projVec := batch.ColVec(c.outputIdx)
+	sel := batch.Selection()
+	inputVec := batch.ColVec(c.colIdx)
+	outputVec := batch.ColVec(c.outputIdx)
 	c.allocator.PerformOperation(
-		[]coldata.Vec{projVec}, func() { cast(c.fromType, c.toType, vec, projVec, n, batch.Selection()) },
+		[]coldata.Vec{outputVec}, func() {
+			inputCol := inputVec._L_TYP()
+			outputCol := outputVec._R_TYP()
+			outputNulls := outputVec.Nulls()
+			if inputVec.MaybeHasNulls() {
+				inputNulls := inputVec.Nulls()
+				outputNulls.Copy(inputNulls)
+				if sel != nil {
+					_CAST_TUPLES(true, true)
+				} else {
+					_CAST_TUPLES(true, false)
+				}
+			} else {
+				// We need to make sure that there are no left over null values
+				// in the output vector.
+				outputNulls.UnsetNulls()
+				if sel != nil {
+					_CAST_TUPLES(false, true)
+				} else {
+					_CAST_TUPLES(false, false)
+				}
+			}
+		},
 	)
 	return batch
 }
+
+// {{end}}
+// {{end}}
+// {{end}}
+// {{end}}
+
+// {{/*
+// This code snippet casts all non-null tuples from the vector named 'inputCol'
+// to the vector named 'outputCol'.
+func _CAST_TUPLES(_HAS_NULLS, _HAS_SEL bool) { // */}}
+	// {{define "castTuples" -}}
+	// {{$hasNulls := .HasNulls}}
+	// {{$hasSel := .HasSel}}
+	// {{with .Global}}
+	// {{if $hasSel}}
+	sel = sel[:n]
+	// {{else}}
+	// Remove bounds checks for inputCol[i] and outputCol[i].
+	_ = inputCol.Get(n - 1)
+	_ = outputCol.Get(n - 1)
+	// {{end}}
+	var tupleIdx int
+	for i := 0; i < n; i++ {
+		// {{if $hasSel}}
+		tupleIdx = sel[i]
+		// {{else}}
+		tupleIdx = i
+		// {{end}}
+		// {{if $hasNulls}}
+		if inputNulls.NullAt(tupleIdx) {
+			continue
+		}
+		// {{end}}
+		// {{if not $hasSel}}
+		//gcassert:bce
+		// {{end}}
+		v := inputCol.Get(tupleIdx)
+		var r _R_GO_TYPE
+		_CAST(r, v, inputCol, c.toType)
+		// {{if and (.Right.Sliceable) (not $hasSel)}}
+		//gcassert:bce
+		// {{end}}
+		_R_SET(outputCol, tupleIdx, r)
+		// {{if eq .Right.VecMethod "Datum"}}
+		// Casting to datum-backed vector might produce a null value on
+		// non-null tuple, so we need to check that case after the cast was
+		// performed.
+		if r == tree.DNull {
+			outputNulls.SetNull(tupleIdx)
+		}
+		// {{end}}
+	}
+	// {{end}}
+	// {{end}}
+	// {{/*
+}
+
+// */}}

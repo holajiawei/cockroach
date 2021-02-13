@@ -24,15 +24,15 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -42,8 +42,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/shuffle"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -82,14 +82,13 @@ func checkCorrectTxn(value string, magicVals *filterVals, txn *roachpb.Transacti
 	if !found {
 		return nil
 	}
-	switch failureRec.err.(type) {
-	case *roachpb.TransactionAbortedError:
+	if errors.HasType(failureRec.err, (*roachpb.TransactionAbortedError)(nil)) {
 		// The previous txn should have been aborted, so check that we're running
 		// in a new one.
 		if failureRec.txn.ID == txn.ID {
 			return errors.Errorf(`new transaction for value "%s" is the same as the old one`, value)
 		}
-	default:
+	} else {
 		// The previous txn should have been restarted, so we should be running in
 		// the same one.
 		if failureRec.txn.ID != txn.ID {
@@ -206,12 +205,13 @@ func checkRestarts(t *testing.T, magicVals *filterVals) {
 //
 //	func TestTxnAutoRetry(t *testing.T) {
 //		defer leaktest.AfterTest(t)()
+//		defer log.Scope(t).Close(t)
 //		aborter := NewTxnAborter()
 //		defer aborter.Close(t)
 //		params, cmdFilters := tests.CreateTestServerParams()
 //		params.Knobs.SQLExecutor = aborter.executorKnobs()
 //		s, sqlDB, _ := serverutils.StartServer(t, params)
-//		defer s.Stopper().Stop(context.TODO())
+//		defer s.Stopper().Stop(context.Background())
 //		{
 //			pgURL, cleanup := sqlutils.PGUrl(t, s.ServingRPCAddr(), "TestTxnAutoRetry", url.User(security.RootUser)
 //			defer cleanup()
@@ -359,7 +359,7 @@ func (ta *TxnAborter) statementFilter(ctx context.Context, stmt string, err erro
 	ta.mu.Unlock()
 	if shouldAbort {
 		if err := ta.abortTxn(ri.key); err != nil {
-			panic(fmt.Sprintf("TxnAborter failed to abort: %s", err))
+			panic(errors.AssertionFailedf("TxnAborter failed to abort: %s", err))
 		}
 	}
 }
@@ -443,13 +443,14 @@ func (ri *restartInfo) Verify() error {
 // retriable errors.
 func TestTxnAutoRetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	aborter := NewTxnAborter()
 	defer aborter.Close(t)
 	params, cmdFilters := tests.CreateTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestTxnAutoRetry", url.User(security.RootUser))
 		defer cleanup()
@@ -489,7 +490,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT, t DECIMAL);
 		"boulanger": 2,
 	}
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			if err := injectErrors(args.Req, args.Hdr, magicVals, true /* verifyTxn */); err != nil {
 				return roachpb.NewErrorWithTxn(err, args.Hdr.Txn)
 			}
@@ -589,7 +590,7 @@ INSERT INTO t.public.test(k, v, t) VALUES (6, 'laureal', cluster_logical_timesta
 		"hooly": 2,
 	}
 	cleanupFilter = cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			if err := injectErrors(args.Req, args.Hdr, magicVals, true /* verifyTxn */); err != nil {
 				return roachpb.NewErrorWithTxn(err, args.Hdr.Txn)
 			}
@@ -613,20 +614,21 @@ BEGIN;
 
 	// Continue the txn in a new request, which is not retriable.
 	_, err = sqlDB.Exec("INSERT INTO t.public.test(k, v, t) VALUES (4, 'hooly', cluster_logical_timestamp())")
-	require.Error(t, err, "RETRY_REASON_UNKNOWN - injected err")
+	require.Regexp(t, "RETRY_REASON_UNKNOWN - injected err", err)
 }
 
 // Test that aborted txn are only retried once.
 // Prevents regressions of #8456.
 func TestAbortedTxnOnlyRetriedOnce(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	aborter := NewTxnAborter()
 	defer aborter.Close(t)
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestAbortedTxnOnlyRetriedOnce", url.User(security.RootUser))
 		defer cleanup()
@@ -709,8 +711,8 @@ func retryExec(t *testing.T, sqlDB *gosql.DB, rs rollbackStrategy, fn func(*gosq
 
 // isRetryableErr returns whether the given error is a PG retryable error.
 func isRetryableErr(err error) bool {
-	pqErr, ok := err.(*pq.Error)
-	return ok && pqErr.Code == "40001"
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "40001"
 }
 
 // Returns true on retriable errors.
@@ -753,6 +755,7 @@ func runTestTxn(
 // and checks that we still manage to run a txn despite them.
 func TestTxnUserRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Set up error injection that causes retries.
 	testCases := []struct {
@@ -781,7 +784,7 @@ func TestTxnUserRestart(t *testing.T) {
 				params, cmdFilters := tests.CreateTestServerParams()
 				params.Knobs.SQLExecutor = aborter.executorKnobs()
 				s, sqlDB, _ := serverutils.StartServer(t, params)
-				defer s.Stopper().Stop(context.TODO())
+				defer s.Stopper().Stop(context.Background())
 				{
 					pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestTxnUserRestart", url.User(security.RootUser))
 					defer cleanup()
@@ -797,7 +800,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 					t.Fatal(err)
 				}
 				cleanupFilter := cmdFilters.AppendFilter(
-					func(args storagebase.FilterArgs) *roachpb.Error {
+					func(args kvserverbase.FilterArgs) *roachpb.Error {
 						if err := injectErrors(args.Req, args.Hdr, tc.magicVals, true /* verifyTxn */); err != nil {
 							return roachpb.NewErrorWithTxn(err, args.Hdr.Txn)
 						}
@@ -856,10 +859,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 // Test that rando commands while in COMMIT_WAIT return a particular error.
 func TestCommitWaitState(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t; CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 `); err != nil {
@@ -889,13 +893,14 @@ CREATE DATABASE t; CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 // txn, where we retry the txn (not tested here).
 func TestErrorOnCommitFinalizesTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	aborter := NewTxnAborter()
 	defer aborter.Close(t)
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestErrorOnCommitFinalizesTxn", url.User(security.RootUser))
 		defer cleanup()
@@ -975,13 +980,14 @@ CREATE DATABASE t; CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 // RetryWait state works.
 func TestRollbackInRestartWait(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	aborter := NewTxnAborter()
 	defer aborter.Close(t)
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestRollbackInRestartWait", url.User(security.RootUser))
 		defer cleanup()
@@ -1037,10 +1043,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 // #15412, whereby the server would crash in this situation.
 func TestUnexpectedStatementInRestartWait(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	tx, err := sqlDB.Begin()
 	if err != nil {
@@ -1065,13 +1072,12 @@ func TestUnexpectedStatementInRestartWait(t *testing.T) {
 	if err := tx.QueryRow("SHOW TRANSACTION STATUS").Scan(&state); err != nil {
 		t.Fatal(err)
 	}
-	if state != "RestartWait" {
-		t.Fatalf("expected state %s, got: %s", "RestartWait", state)
+	if state != "Aborted" {
+		t.Fatalf("expected state %s, got: %s", "Aborted", state)
 	}
 
 	if _, err := tx.Exec("SELECT 1"); !testutils.IsError(err,
-		`pq: Expected "ROLLBACK TO SAVEPOINT cockroach_restart": `+
-			"current transaction is aborted, commands ignored until end of transaction block") {
+		`pq: current transaction is aborted, commands ignored until end of transaction block`) {
 		t.Fatal(err)
 	}
 	if err := tx.QueryRow("SHOW TRANSACTION STATUS").Scan(&state); err != nil {
@@ -1088,17 +1094,18 @@ func TestUnexpectedStatementInRestartWait(t *testing.T) {
 // TestNonRetryableError verifies that a non-retryable error is propagated to the client.
 func TestNonRetryableError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, cmdFilters := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	testKey := []byte("test_key")
 	hitError := false
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			if req, ok := args.Req.(*roachpb.ScanRequest); ok {
-				if bytes.Contains(req.Key, testKey) && !client.TestingIsRangeLookupRequest(req) {
+				if bytes.Contains(req.Key, testKey) && !kv.TestingIsRangeLookupRequest(req) {
 					hitError = true
 					return roachpb.NewErrorWithTxn(fmt.Errorf("testError"), args.Hdr.Txn)
 				}
@@ -1131,41 +1138,23 @@ SELECT * from t.test WHERE k = 'test_key';
 // timestamp exceeds the deadline of the EndTxnRequest.
 func TestReacquireLeaseOnRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	advancement := 2 * base.DefaultTableDescriptorLeaseDuration
+	advancement := 2 * base.DefaultDescriptorLeaseDuration
 
 	var cmdFilters tests.CommandFilters
 	cmdFilters.AppendFilter(tests.CheckEndTxnTrigger, true)
 
-	var clockUpdate int32
 	testKey := []byte("test_key")
-	storeTestingKnobs := &storage.StoreTestingKnobs{
-		EvalKnobs: storagebase.BatchEvalTestingKnobs{
+	storeTestingKnobs := &kvserver.StoreTestingKnobs{
+		EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 			TestingEvalFilter: cmdFilters.RunFilters,
 		},
 		DisableMaxOffsetCheck: true,
-		ClockBeforeSend: func(c *hlc.Clock, ba roachpb.BatchRequest) {
-			if atomic.LoadInt32(&clockUpdate) > 0 {
-				return
-			}
-
-			// Hack to advance the transaction timestamp on a transaction restart.
-			for _, union := range ba.Requests {
-				if req, ok := union.GetInner().(*roachpb.ScanRequest); ok {
-					if bytes.Contains(req.Key, testKey) && !client.TestingIsRangeLookupRequest(req) {
-						atomic.AddInt32(&clockUpdate, 1)
-						now := c.Now()
-						now.WallTime += advancement.Nanoseconds()
-						c.Update(now)
-						break
-					}
-				}
-			}
-		},
 	}
 
 	const refreshAttempts = 3
-	clientTestingKnobs := &kv.ClientTestingKnobs{
+	clientTestingKnobs := &kvcoord.ClientTestingKnobs{
 		MaxTxnRefreshAttempts: refreshAttempts,
 	}
 
@@ -1173,26 +1162,34 @@ func TestReacquireLeaseOnRestart(t *testing.T) {
 	params.Knobs.Store = storeTestingKnobs
 	params.Knobs.KVClient = clientTestingKnobs
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
-	var restartDone int32
+	var clockUpdate, restartDone int32
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
-			// Allow a set number of restarts so that the auto retry on the
-			// first few uncertainty interval errors also fails.
-			if atomic.LoadInt32(&restartDone) > refreshAttempts {
-				return nil
-			}
-
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			if req, ok := args.Req.(*roachpb.ScanRequest); ok {
-				if bytes.Contains(req.Key, testKey) && !client.TestingIsRangeLookupRequest(req) {
-					atomic.AddInt32(&restartDone, 1)
-					// Return ReadWithinUncertaintyIntervalError to update the transaction timestamp on retry.
-					txn := args.Hdr.Txn
-					txn.ResetObservedTimestamps()
-					now := s.Clock().Now()
-					txn.UpdateObservedTimestamp(s.(*server.TestServer).Gossip().NodeID.Get(), now)
-					return roachpb.NewErrorWithTxn(roachpb.NewReadWithinUncertaintyIntervalError(now, now, txn), txn)
+				if bytes.Contains(req.Key, testKey) && !kv.TestingIsRangeLookupRequest(req) {
+					if atomic.LoadInt32(&clockUpdate) == 0 {
+						atomic.AddInt32(&clockUpdate, 1)
+						// Hack to advance the transaction timestamp on a
+						// transaction restart.
+						now := s.Clock().NowAsClockTimestamp()
+						now.WallTime += advancement.Nanoseconds()
+						s.Clock().Update(now)
+					}
+
+					// Allow a set number of restarts so that the auto retry on
+					// the first few uncertainty interval errors also fails.
+					if atomic.LoadInt32(&restartDone) <= refreshAttempts {
+						atomic.AddInt32(&restartDone, 1)
+						// Return ReadWithinUncertaintyIntervalError to update
+						// the transaction timestamp on retry.
+						txn := args.Hdr.Txn
+						txn.ResetObservedTimestamps()
+						now := s.Clock().NowAsClockTimestamp()
+						txn.UpdateObservedTimestamp(s.(*server.TestServer).Gossip().NodeID.Get(), now)
+						return roachpb.NewErrorWithTxn(roachpb.NewReadWithinUncertaintyIntervalError(now.ToTimestamp(), now.ToTimestamp(), now.ToTimestamp(), txn), txn)
+					}
 				}
 			}
 			return nil
@@ -1232,12 +1229,13 @@ SELECT * from t.test WHERE k = 'test_key';
 // ReadWithinUncertaintyIntervalError on the first transaction attempt.
 func TestFlushUncommitedDescriptorCacheOnRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	var cmdFilters tests.CommandFilters
 	cmdFilters.AppendFilter(tests.CheckEndTxnTrigger, true)
 	testKey := []byte("test_key")
-	testingKnobs := &storage.StoreTestingKnobs{
-		EvalKnobs: storagebase.BatchEvalTestingKnobs{
+	testingKnobs := &kvserver.StoreTestingKnobs{
+		EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 			TestingEvalFilter: cmdFilters.RunFilters,
 		},
 	}
@@ -1245,24 +1243,24 @@ func TestFlushUncommitedDescriptorCacheOnRestart(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.Store = testingKnobs
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	var restartDone int32
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args storagebase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *roachpb.Error {
 			if atomic.LoadInt32(&restartDone) > 0 {
 				return nil
 			}
 
 			if req, ok := args.Req.(*roachpb.ScanRequest); ok {
-				if bytes.Contains(req.Key, testKey) && !client.TestingIsRangeLookupRequest(req) {
+				if bytes.Contains(req.Key, testKey) && !kv.TestingIsRangeLookupRequest(req) {
 					atomic.AddInt32(&restartDone, 1)
 					// Return ReadWithinUncertaintyIntervalError.
 					txn := args.Hdr.Txn
 					txn.ResetObservedTimestamps()
-					now := s.Clock().Now()
+					now := s.Clock().NowAsClockTimestamp()
 					txn.UpdateObservedTimestamp(s.(*server.TestServer).Gossip().NodeID.Get(), now)
-					return roachpb.NewErrorWithTxn(roachpb.NewReadWithinUncertaintyIntervalError(now, now, txn), txn)
+					return roachpb.NewErrorWithTxn(roachpb.NewReadWithinUncertaintyIntervalError(now.ToTimestamp(), now.ToTimestamp(), now.ToTimestamp(), txn), txn)
 				}
 			}
 			return nil
@@ -1298,30 +1296,32 @@ COMMIT;
 // Test that retryable errors are handled properly through DistSQL.
 func TestDistSQLRetryableError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// One of the rows in the table.
 	targetKey := roachpb.Key("\275\211\212")
 
 	restarted := true
 
-	tc := serverutils.StartTestCluster(t, 3, /* numNodes */
+	tc := serverutils.StartNewTestCluster(t, 3, /* numNodes */
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
 				UseDatabase: "test",
 				Knobs: base.TestingKnobs{
-					Store: &storage.StoreTestingKnobs{
-						EvalKnobs: storagebase.BatchEvalTestingKnobs{
-							TestingEvalFilter: func(fArgs storagebase.FilterArgs) *roachpb.Error {
+					Store: &kvserver.StoreTestingKnobs{
+						EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
+							TestingEvalFilter: func(fArgs kvserverbase.FilterArgs) *roachpb.Error {
 								_, ok := fArgs.Req.(*roachpb.ScanRequest)
 								if ok && fArgs.Req.Header().Key.Equal(targetKey) && fArgs.Hdr.Txn.Epoch == 0 {
 									restarted = true
 									err := roachpb.NewReadWithinUncertaintyIntervalError(
 										fArgs.Hdr.Timestamp, /* readTS */
 										hlc.Timestamp{},
+										hlc.Timestamp{},
 										nil)
 									errTxn := fArgs.Hdr.Txn.Clone()
-									errTxn.UpdateObservedTimestamp(roachpb.NodeID(2), hlc.Timestamp{})
+									errTxn.UpdateObservedTimestamp(roachpb.NodeID(2), hlc.ClockTimestamp{})
 									pErr := roachpb.NewErrorWithTxn(err, errTxn)
 									pErr.OriginNode = 2
 									return pErr
@@ -1334,7 +1334,7 @@ func TestDistSQLRetryableError(t *testing.T) {
 				},
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	db := tc.ServerConn(0)
 	sqlutils.CreateTable(t, db, "t",
@@ -1382,12 +1382,12 @@ func TestDistSQLRetryableError(t *testing.T) {
 	}
 
 	// Let's make sure that DISTSQL will actually be used.
-	row := txn.QueryRow(`SELECT automatic FROM [EXPLAIN (DISTSQL) SELECT count(1) FROM t]`)
-	var automatic bool
+	row := txn.QueryRow(`SELECT info FROM [EXPLAIN SELECT count(1) FROM t] WHERE info LIKE 'distribution%'`)
+	var automatic string
 	if err := row.Scan(&automatic); err != nil {
 		t.Fatal(err)
 	}
-	if !automatic {
+	if automatic != "distribution: full" {
 		t.Fatal("DISTSQL not used for test's query")
 	}
 
@@ -1431,10 +1431,11 @@ func TestDistSQLRetryableError(t *testing.T) {
 // opens has the same attributes as the existing one.
 func TestRollbackToSavepointFromUnusualStates(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	checkState := func(tx *gosql.Tx, ts time.Time) {
 		t.Helper()
@@ -1447,12 +1448,6 @@ func TestRollbackToSavepointFromUnusualStates(t *testing.T) {
 				t.Errorf("Expected high, got: %s", pri)
 			}
 		}
-	}
-
-	// ROLLBACK TO SAVEPOINT with a wrong name
-	_, err := sqlDB.Exec("ROLLBACK TO SAVEPOINT foo")
-	if !testutils.IsError(err, "SAVEPOINT not supported except for cockroach_restart") {
-		t.Fatalf("unexpected error: %v", err)
 	}
 
 	tx, err := sqlDB.Begin()
@@ -1499,10 +1494,11 @@ func TestRollbackToSavepointFromUnusualStates(t *testing.T) {
 // auto-restart.
 func TestTxnAutoRetriesDisabledAfterResultsHaveBeenSentToClient(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	tests := []struct {
 		name                              string
@@ -1513,12 +1509,12 @@ func TestTxnAutoRetriesDisabledAfterResultsHaveBeenSentToClient(t *testing.T) {
 		{
 			name:                              "client_directed_retries",
 			clientDirectedRetry:               true,
-			expectedTxnStateAfterRetriableErr: "RestartWait",
+			expectedTxnStateAfterRetriableErr: "Aborted",
 		},
 		{
 			name:                              "no_client_directed_retries",
 			clientDirectedRetry:               false,
-			expectedTxnStateAfterRetriableErr: "RestartWait",
+			expectedTxnStateAfterRetriableErr: "Aborted",
 		},
 		{
 			name:                              "autocommit",

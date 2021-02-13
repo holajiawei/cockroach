@@ -11,12 +11,13 @@
 package colcontainerutils
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/fs"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 )
 
@@ -34,9 +35,9 @@ func NewTestingDiskQueueCfg(t testing.TB, inMem bool) (colcontainer.DiskQueueCfg
 	)
 
 	if inMem {
-		ngn := engine.NewDefaultInMem()
+		ngn := storage.NewDefaultInMemForTesting()
 		testingFS = ngn.(fs.FS)
-		if err := testingFS.CreateDir(inMemDirName); err != nil {
+		if err := testingFS.MkdirAll(inMemDirName); err != nil {
 			t.Fatal(err)
 		}
 		path = inMemDirName
@@ -44,7 +45,7 @@ func NewTestingDiskQueueCfg(t testing.TB, inMem bool) (colcontainer.DiskQueueCfg
 	} else {
 		tempPath, dirCleanup := testutils.TempDir(t)
 		path = tempPath
-		ngn, err := engine.NewDefaultEngine(0 /* cacheSize */, base.StorageConfig{Dir: tempPath})
+		ngn, err := storage.NewDefaultEngine(0 /* cacheSize */, base.StorageConfig{Dir: tempPath})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -55,8 +56,7 @@ func NewTestingDiskQueueCfg(t testing.TB, inMem bool) (colcontainer.DiskQueueCfg
 		}
 	}
 	cfg.FS = testingFS
-	cfg.Path = path
-
+	cfg.GetPather = colcontainer.GetPatherFunc(func(context.Context) string { return path })
 	if err := cfg.EnsureDefaults(); err != nil {
 		t.Fatal(err)
 	}

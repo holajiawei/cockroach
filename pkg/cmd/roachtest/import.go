@@ -17,11 +17,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func registerImportTPCC(r *testRegistry) {
 	runImportTPCC := func(ctx context.Context, t *test, c *cluster, warehouses int) {
+		// Randomize starting with encryption-at-rest enabled.
+		c.encryptAtRandom = true
 		c.Put(ctx, cockroach, "./cockroach")
 		c.Put(ctx, workload, "./workload")
 		t.Status("starting csv servers")
@@ -35,12 +37,11 @@ func registerImportTPCC(r *testRegistry) {
 		hc := NewHealthChecker(c, c.All())
 		m.Go(hc.Runner)
 
+		workloadStr := `./cockroach workload fixtures import tpcc --warehouses=%d --csv-server='http://localhost:8081'`
 		m.Go(func(ctx context.Context) error {
 			defer dul.Done()
 			defer hc.Done()
-			cmd := fmt.Sprintf(
-				`./workload fixtures import tpcc --warehouses=%d --csv-server='http://localhost:8081'`,
-				warehouses)
+			cmd := fmt.Sprintf(workloadStr, warehouses)
 			c.Run(ctx, c.Node(1), cmd)
 			return nil
 		})
@@ -62,12 +63,12 @@ func registerImportTPCC(r *testRegistry) {
 	const geoWarehouses = 4000
 	const geoZones = "europe-west2-b,europe-west4-b,asia-northeast1-b,us-west1-b"
 	r.Add(testSpec{
+		Skip:    "#37349 - OOMing",
 		Name:    fmt.Sprintf("import/tpcc/warehouses=%d/geo", geoWarehouses),
 		Owner:   OwnerBulkIO,
 		Cluster: makeClusterSpec(8, cpu(16), geo(), zones(geoZones)),
 		Timeout: 5 * time.Hour,
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			t.Skip("#37349 - OOMing", "" /* details */)
 			runImportTPCC(ctx, t, c, geoWarehouses)
 		},
 	})
@@ -96,6 +97,8 @@ func registerImportTPCH(r *testRegistry) {
 			Cluster: makeClusterSpec(item.nodes),
 			Timeout: item.timeout,
 			Run: func(ctx context.Context, t *test, c *cluster) {
+				// Randomize starting with encryption-at-rest enabled.
+				c.encryptAtRandom = true
 				c.Put(ctx, cockroach, "./cockroach")
 				c.Start(ctx, t)
 				conn := c.Conn(ctx, 1)
@@ -168,4 +171,89 @@ func registerImportTPCH(r *testRegistry) {
 			},
 		})
 	}
+}
+
+func successfulImportStep(warehouses, nodeID int) versionStep {
+	return func(ctx context.Context, t *test, u *versionUpgradeTest) {
+		u.c.Run(ctx, u.c.Node(nodeID), tpccImportCmd(warehouses))
+	}
+}
+
+func runImportMixedVersion(
+	ctx context.Context, t *test, c *cluster, warehouses int, predecessorVersion string,
+) {
+	// An empty string means that the cockroach binary specified by flag
+	// `cockroach` will be used.
+	const mainVersion = ""
+	roachNodes := c.All()
+
+	t.Status("starting csv servers")
+
+	u := newVersionUpgradeTest(c,
+		uploadAndStartFromCheckpointFixture(roachNodes, predecessorVersion),
+		waitForUpgradeStep(roachNodes),
+		preventAutoUpgradeStep(1),
+
+		// Upgrade some of the nodes.
+		binaryUpgradeStep(c.Node(1), mainVersion),
+		binaryUpgradeStep(c.Node(2), mainVersion),
+
+		successfulImportStep(warehouses, 1 /* nodeID */),
+	)
+	u.run(ctx, t)
+}
+
+func registerImportMixedVersion(r *testRegistry) {
+	r.Add(testSpec{
+		Name:  "import/mixed-versions",
+		Owner: OwnerBulkIO,
+		// Mixed-version support was added in 21.1.
+		MinVersion: "v21.1.0",
+		Cluster:    makeClusterSpec(4),
+		Run: func(ctx context.Context, t *test, c *cluster) {
+			predV, err := PredecessorVersion(r.buildVersion)
+			if err != nil {
+				t.Fatal(err)
+			}
+			warehouses := 100
+			if local {
+				warehouses = 10
+			}
+			runImportMixedVersion(ctx, t, c, warehouses, predV)
+		},
+	})
+}
+
+func registerImportDecommissioned(r *testRegistry) {
+	runImportDecommissioned := func(ctx context.Context, t *test, c *cluster) {
+		warehouses := 100
+		if local {
+			warehouses = 10
+		}
+
+		c.Put(ctx, cockroach, "./cockroach")
+		c.Put(ctx, workload, "./workload")
+		t.Status("starting csv servers")
+		c.Start(ctx, t)
+		c.Run(ctx, c.All(), `./workload csv-server --port=8081 &> logs/workload-csv-server.log < /dev/null &`)
+
+		// Decommission a node.
+		nodeToDecommission := 2
+		t.Status(fmt.Sprintf("decommissioning node %d", nodeToDecommission))
+		c.Run(ctx, c.Node(nodeToDecommission), `./cockroach node decommission --insecure --self --wait=all`)
+
+		// Wait for a bit for node liveness leases to expire.
+		time.Sleep(10 * time.Second)
+
+		t.Status("running workload")
+		c.Run(ctx, c.Node(1), tpccImportCmd(warehouses))
+	}
+
+	r.Add(testSpec{
+		Name:       "import/decommissioned",
+		Owner:      OwnerBulkIO,
+		MinVersion: "v21.1.0",
+		Cluster:    makeClusterSpec(4),
+		Run:        runImportDecommissioned,
+	})
 }

@@ -22,10 +22,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestClassifyTablePattern(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testCases := []struct {
 		in, out  string
 		expanded string
@@ -111,6 +113,7 @@ func TestClassifyTablePattern(t *testing.T) {
 
 func TestClassifyColumnName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testCases := []struct {
 		in, out string
 		err     string
@@ -228,7 +231,7 @@ func (f *fakeSource) FindSourceMatchingName(
 	var columns colsRes
 	for i := range f.knownTables {
 		t := &f.knownTables[i]
-		if t.srcName.TableName != tn.TableName {
+		if t.srcName.ObjectName != tn.ObjectName {
 			continue
 		}
 		if tn.ExplicitSchema {
@@ -373,12 +376,14 @@ func (f *fakeSource) ResolveColumnItemTestResults(res tree.ColumnResolutionResul
 
 func TestResolveQualifiedStar(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	f := &fakeSource{t: t}
 	sqlutils.RunResolveQualifiedStarTest(t, f)
 }
 
 func TestResolveColumnItem(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	f := &fakeSource{t: t}
 	sqlutils.RunResolveColumnItemTest(t, f)
 }
@@ -524,12 +529,14 @@ func newFakeMetadata() *fakeMetadata {
 				{"public", []tree.Name{"foo", "bar"}},
 				{"pg_temp_123", []tree.Name{"foo", "baz"}},
 			}},
+			{"system", []knownSchema{{"public", []tree.Name{"users"}}}},
 		},
 	}
 }
 
 func TestResolveTablePatternOrName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	type spath = sessiondata.SearchPath
 
 	var mpath = func(args ...string) spath {
@@ -618,6 +625,9 @@ func TestResolveTablePatternOrName(t *testing.T) {
 		{`kv`, ``, mpath("public", "pg_catalog"), true, ``, ``, ``, `prefix or object not found`},
 		{`pg_tables`, ``, mpath("public", "pg_catalog"), true, `pg_tables`, `"".pg_catalog.pg_tables`, `.pg_catalog[0]`, ``},
 		{`pg_tables`, ``, mpath(), true, `pg_tables`, `"".pg_catalog.pg_tables`, `.pg_catalog[0]`, ``},
+		{`system.users`, ``, mpath(), true, `system.public.users`, `system.public.users`, `system.public[0]`, ``},
+		{`"".system.users`, ``, mpath(), true, ``, ``, ``, `prefix or object not found`},
+		{`"".system.users`, ``, mpath(), false, ``, ``, ``, `prefix or object not found`},
 
 		{`blix`, ``, mpath("public"), false, ``, ``, ``, `prefix or object not found`},
 		{`blix`, ``, mpath("public", "pg_catalog"), false, `blix`, `"".pg_catalog.blix`, `.pg_catalog`, ``},
@@ -719,7 +729,7 @@ func TestResolveTablePatternOrName(t *testing.T) {
 		// Names of length 2
 
 		{`public.foo`, `db3`, tpath("pg_temp_123", "public"), true, `public.foo`, `db3.public.foo`, `db3.public[0]`, ``},
-		{`pg_temp.foo`, `db3`, tpath("pg_temp_123", "public"), true, `pg_temp.foo`, `db3.pg_temp.foo`, `db3.pg_temp[0]`, ``},
+		{`pg_temp.foo`, `db3`, tpath("pg_temp_123", "public"), true, `pg_temp_123.foo`, `db3.pg_temp_123.foo`, `db3.pg_temp_123[0]`, ``},
 		{`pg_temp_123.foo`, `db3`, tpath("pg_temp_123", "public"), true, `pg_temp_123.foo`, `db3.pg_temp_123.foo`, `db3.pg_temp_123[0]`, ``},
 
 		// Wrongly qualifying a TT/PT as a PT/TT results in an error.
@@ -732,7 +742,7 @@ func TestResolveTablePatternOrName(t *testing.T) {
 
 		// Case where the temporary table being created has the same name as an
 		// existing persistent table.
-		{`pg_temp.bar`, `db3`, tpath("pg_temp_123", "public"), false, `pg_temp.bar`, `db3.pg_temp.bar`, `db3.pg_temp_123`, ``},
+		{`pg_temp.bar`, `db3`, tpath("pg_temp_123", "public"), false, `pg_temp_123.bar`, `db3.pg_temp_123.bar`, `db3.pg_temp_123`, ``},
 
 		// Case where the persistent table being created has the same name as an
 		// existing temporary table.
@@ -744,7 +754,7 @@ func TestResolveTablePatternOrName(t *testing.T) {
 		// Names of length 3
 
 		{`db3.public.foo`, `db3`, tpath("pg_temp_123", "public"), true, `db3.public.foo`, `db3.public.foo`, `db3.public[0]`, ``},
-		{`db3.pg_temp.foo`, `db3`, tpath("pg_temp_123", "public"), true, `db3.pg_temp.foo`, `db3.pg_temp.foo`, `db3.pg_temp[0]`, ``},
+		{`db3.pg_temp.foo`, `db3`, tpath("pg_temp_123", "public"), true, `db3.pg_temp_123.foo`, `db3.pg_temp_123.foo`, `db3.pg_temp_123[0]`, ``},
 		{`db3.pg_temp_123.foo`, `db3`, tpath("pg_temp_123", "public"), true, `db3.pg_temp_123.foo`, `db3.pg_temp_123.foo`, `db3.pg_temp_123[0]`, ``},
 
 		// Wrongly qualifying a TT/PT as a PT/TT results in an error.
@@ -757,7 +767,7 @@ func TestResolveTablePatternOrName(t *testing.T) {
 
 		// Case where the temporary table being created has the same name as an
 		// existing persistent table.
-		{`db3.pg_temp.bar`, `db3`, tpath("pg_temp_123", "public"), false, `db3.pg_temp.bar`, `db3.pg_temp.bar`, `db3.pg_temp_123`, ``},
+		{`db3.pg_temp.bar`, `db3`, tpath("pg_temp_123", "public"), false, `db3.pg_temp_123.bar`, `db3.pg_temp_123.bar`, `db3.pg_temp_123`, ``},
 
 		// Case where the persistent table being created has the same name as an
 		// existing temporary table.
@@ -788,16 +798,24 @@ func TestResolveTablePatternOrName(t *testing.T) {
 				ctx := context.Background()
 				switch tpv := tp.(type) {
 				case *tree.AllTablesSelector:
-					found, scMeta, err = tpv.TableNamePrefix.Resolve(ctx, fakeResolver, tc.curDb, tc.searchPath)
+					found, scMeta, err = tpv.ObjectNamePrefix.Resolve(ctx, fakeResolver, tc.curDb, tc.searchPath)
 					scPrefix = tpv.Schema()
 					ctPrefix = tpv.Catalog()
 				case *tree.TableName:
+					var prefix tree.ObjectNamePrefix
 					if tc.expected {
 						flags := tree.ObjectLookupFlags{}
-						found, obMeta, err = tpv.ResolveExisting(ctx, fakeResolver, flags, tc.curDb, tc.searchPath)
+						// TODO: As part of work for #34240, we should be operating on
+						//  UnresolvedObjectNames here, rather than TableNames.
+						un := tpv.ToUnresolvedObjectName()
+						found, prefix, obMeta, err = tree.ResolveExisting(ctx, un, fakeResolver, flags, tc.curDb, tc.searchPath)
 					} else {
-						found, scMeta, err = tpv.ResolveTarget(ctx, fakeResolver, tc.curDb, tc.searchPath)
+						// TODO: As part of work for #34240, we should be operating on
+						//  UnresolvedObjectNames here, rather than TableNames.
+						un := tpv.ToUnresolvedObjectName()
+						found, prefix, scMeta, err = tree.ResolveTarget(ctx, un, fakeResolver, tc.curDb, tc.searchPath)
 					}
+					tpv.ObjectNamePrefix = prefix
 					scPrefix = tpv.Schema()
 					ctPrefix = tpv.Catalog()
 				default:
@@ -840,11 +858,11 @@ func TestResolveTablePatternOrName(t *testing.T) {
 			}
 			switch tpv := tp.(type) {
 			case *tree.AllTablesSelector:
-				tpv.TableNamePrefix.ExplicitCatalog = true
-				tpv.TableNamePrefix.ExplicitSchema = true
+				tpv.ObjectNamePrefix.ExplicitCatalog = true
+				tpv.ObjectNamePrefix.ExplicitSchema = true
 			case *tree.TableName:
-				tpv.TableNamePrefix.ExplicitCatalog = true
-				tpv.TableNamePrefix.ExplicitSchema = true
+				tpv.ObjectNamePrefix.ExplicitCatalog = true
+				tpv.ObjectNamePrefix.ExplicitSchema = true
 			}
 			if out := tp.String(); tc.expanded != out {
 				t.Errorf("%s: expected full %s, but found %s", t.Name(), tc.expanded, out)

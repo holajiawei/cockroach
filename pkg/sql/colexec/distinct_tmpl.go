@@ -20,29 +20,36 @@
 package colexec
 
 import (
-	"bytes"
 	"context"
-	"math"
-	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ apd.Context
+	_ coldataext.Datum
+	_ duration.Duration
+	_ tree.AggType
 )
 
 // OrderedDistinctColsToOperators is a utility function that given an input and
 // a slice of columns, creates a chain of distinct operators and returns the
 // last distinct operator in that chain as well as its output column.
 func OrderedDistinctColsToOperators(
-	input Operator, distinctCols []uint32, typs []coltypes.T,
-) (Operator, []bool, error) {
+	input colexecbase.Operator, distinctCols []uint32, typs []*types.T,
+) (ResettableOperator, []bool, error) {
 	distinctCol := make([]bool, coldata.BatchSize())
 	// zero the boolean column on every iteration.
 	input = fnOp{
@@ -51,35 +58,35 @@ func OrderedDistinctColsToOperators(
 	}
 	var (
 		err error
-		r   resettableOperator
+		r   ResettableOperator
 		ok  bool
 	)
 	for i := range distinctCols {
-		input, err = newSingleOrderedDistinct(input, int(distinctCols[i]), distinctCol, typs[distinctCols[i]])
+		input, err = newSingleDistinct(input, int(distinctCols[i]), distinctCol, typs[distinctCols[i]])
 		if err != nil {
 			return nil, nil, err
 		}
 	}
-	if r, ok = input.(resettableOperator); !ok {
-		execerror.VectorizedInternalPanic("unexpectedly an ordered distinct is not a resetter")
+	if r, ok = input.(ResettableOperator); !ok {
+		colexecerror.InternalError(errors.AssertionFailedf("unexpectedly an ordered distinct is not a resetter"))
 	}
 	distinctChain := &distinctChainOps{
-		resettableOperator: r,
+		ResettableOperator: r,
 	}
 	return distinctChain, distinctCol, nil
 }
 
 type distinctChainOps struct {
-	resettableOperator
+	ResettableOperator
 }
 
-var _ resettableOperator = &distinctChainOps{}
+var _ ResettableOperator = &distinctChainOps{}
 
 // NewOrderedDistinct creates a new ordered distinct operator on the given
-// input columns with the given coltypes.
+// input columns with the given types.
 func NewOrderedDistinct(
-	input Operator, distinctCols []uint32, typs []coltypes.T,
-) (Operator, error) {
+	input colexecbase.Operator, distinctCols []uint32, typs []*types.T,
+) (ResettableOperator, error) {
 	op, outputCol, err := OrderedDistinctColsToOperators(input, distinctCols, typs)
 	if err != nil {
 		return nil, err
@@ -94,61 +101,45 @@ func NewOrderedDistinct(
 
 // Declarations to make the template compile properly.
 
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
-
-// _GOTYPE is the template Go type variable for this operator. It will be
-// replaced by the Go type equivalent for each type in coltypes.T, for example
-// int64 for coltypes.Int64.
+// _GOTYPE is the template variable.
 type _GOTYPE interface{}
 
-// _GOTYPESLICE is the template Go type slice variable for this operator. It
-// will be replaced by the Go slice representation for each type in coltypes.T, for
-// example []int64 for coltypes.Int64.
+// _GOTYPESLICE is the template variable.
 type _GOTYPESLICE interface{}
-
-// _TYPES_T is the template type variable for coltypes.T. It will be replaced by
-// coltypes.Foo for each type Foo in the coltypes.T type.
-const _TYPES_T = coltypes.Unhandled
 
 // _ASSIGN_NE is the template equality function for assigning the first input
 // to the result of the second input != the third input.
-func _ASSIGN_NE(_ bool, _, _ _GOTYPE) bool {
-	execerror.VectorizedInternalPanic("")
+func _ASSIGN_NE(_ bool, _, _, _, _, _ _GOTYPE) bool {
+	colexecerror.InternalError(errors.AssertionFailedf(""))
 }
+
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
 
 // */}}
 
-func newSingleOrderedDistinct(
-	input Operator, distinctColIdx int, outputCol []bool, t coltypes.T,
-) (Operator, error) {
-	switch t {
+func newSingleDistinct(
+	input colexecbase.Operator, distinctColIdx int, outputCol []bool, t *types.T,
+) (colexecbase.Operator, error) {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
-	case _TYPES_T:
-		return &sortedDistinct_TYPEOp{
-			OneInputNode:      NewOneInputNode(input),
-			sortedDistinctCol: distinctColIdx,
-			outputCol:         outputCol,
-		}, nil
-	// {{end}}
-	default:
-		return nil, errors.Errorf("unsupported distinct type %s", t)
+	case _CANONICAL_TYPE_FAMILY:
+		switch t.Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			return &distinct_TYPEOp{
+				OneInputNode:   NewOneInputNode(input),
+				distinctColIdx: distinctColIdx,
+				outputCol:      outputCol,
+			}, nil
+			// {{end}}
+		}
+		// {{end}}
 	}
+	return nil, errors.Errorf("unsupported distinct type %s", t)
 }
 
 // partitioner is a simple implementation of sorted distinct that's useful for
@@ -169,70 +160,74 @@ type partitioner interface {
 }
 
 // newPartitioner returns a new partitioner on type t.
-func newPartitioner(t coltypes.T) (partitioner, error) {
-	switch t {
+func newPartitioner(t *types.T) (partitioner, error) {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
-	case _TYPES_T:
-		return partitioner_TYPE{}, nil
-	// {{end}}
-	default:
-		return nil, errors.Errorf("unsupported partition type %s", t)
+	case _CANONICAL_TYPE_FAMILY:
+		switch t.Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			return partitioner_TYPE{}, nil
+			// {{end}}
+		}
+		// {{end}}
 	}
+	return nil, errors.Errorf("unsupported partition type %s", t)
 }
 
 // {{range .}}
+// {{range .WidthOverloads}}
 
-// sortedDistinct_TYPEOp runs a distinct on the column in sortedDistinctCol,
-// writing true to the resultant bool column for every value that differs from
-// the previous one.
-// TODO(solon): Update this name to remove "sorted". The input values are not
-// necessarily in sorted order.
-type sortedDistinct_TYPEOp struct {
-	OneInputNode
-
-	// sortedDistinctCol is the index of the column to distinct upon.
-	sortedDistinctCol int
-
+// distinct_TYPEOp runs a distinct on the column in distinctColIdx, writing
+// true to the resultant bool column for every value that differs from the
+// previous one.
+type distinct_TYPEOp struct {
 	// outputCol is the boolean output column. It is shared by all of the
 	// other distinct operators in a distinct operator set.
 	outputCol []bool
+
+	// lastVal is the last value seen by the operator, so that the distincting
+	// still works across batch boundaries.
+	lastVal _GOTYPE
+
+	OneInputNode
+
+	// distinctColIdx is the index of the column to distinct upon.
+	distinctColIdx int
 
 	// Set to true at runtime when we've seen the first row. Distinct always
 	// outputs the first row that it sees.
 	foundFirstRow bool
 
-	// lastVal is the last value seen by the operator, so that the distincting
-	// still works across batch boundaries.
-	lastVal     _GOTYPE
 	lastValNull bool
 }
 
-var _ resettableOperator = &sortedDistinct_TYPEOp{}
+var _ ResettableOperator = &distinct_TYPEOp{}
 
-func (p *sortedDistinct_TYPEOp) Init() {
+func (p *distinct_TYPEOp) Init() {
 	p.input.Init()
 }
 
-func (p *sortedDistinct_TYPEOp) reset() {
+func (p *distinct_TYPEOp) reset(ctx context.Context) {
 	p.foundFirstRow = false
 	p.lastValNull = false
 	if resetter, ok := p.input.(resetter); ok {
-		resetter.reset()
+		resetter.reset(ctx)
 	}
 }
 
-func (p *sortedDistinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
+func (p *distinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
 	batch := p.input.Next(ctx)
 	if batch.Length() == 0 {
 		return batch
 	}
 	outputCol := p.outputCol
-	vec := batch.ColVec(p.sortedDistinctCol)
+	vec := batch.ColVec(p.distinctColIdx)
 	var nulls *coldata.Nulls
 	if vec.MaybeHasNulls() {
 		nulls = vec.Nulls()
 	}
-	col := vec._TemplateType()
+	col := vec.TemplateType()
 
 	// We always output the first row.
 	lastVal := p.lastVal
@@ -254,33 +249,29 @@ func (p *sortedDistinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
 
 	n := batch.Length()
 	if sel != nil {
-		// Bounds check elimination.
 		sel = sel[:n]
 		if nulls != nil {
-			for _, checkIdx := range sel {
-				outputIdx := checkIdx
-				_CHECK_DISTINCT_WITH_NULLS(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
+			for _, idx := range sel {
+				lastVal, lastValNull = checkDistinctWithNulls(idx, idx, lastVal, nulls, lastValNull, col, outputCol)
 			}
 		} else {
-			for _, checkIdx := range sel {
-				outputIdx := checkIdx
-				_CHECK_DISTINCT(checkIdx, outputIdx, lastVal, col, outputCol)
+			for _, idx := range sel {
+				lastVal = checkDistinct(idx, idx, lastVal, col, outputCol)
 			}
 		}
 	} else {
-		// Bounds check elimination.
-		col = execgen.SLICE(col, 0, n)
-		outputCol = outputCol[:n]
+		// Eliminate bounds checks for outputCol[idx].
 		_ = outputCol[n-1]
+		// Eliminate bounds checks for col[idx].
+		_ = col.Get(n - 1)
+		// TODO(yuzefovich): add BCE assertions for these.
 		if nulls != nil {
-			for execgen.RANGE(checkIdx, col, 0, n) {
-				outputIdx := checkIdx
-				_CHECK_DISTINCT_WITH_NULLS(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
+			for idx := 0; idx < n; idx++ {
+				lastVal, lastValNull = checkDistinctWithNulls(idx, idx, lastVal, nulls, lastValNull, col, outputCol)
 			}
 		} else {
-			for execgen.RANGE(checkIdx, col, 0, n) {
-				outputIdx := checkIdx
-				_CHECK_DISTINCT(checkIdx, outputIdx, lastVal, col, outputCol)
+			for idx := 0; idx < n; idx++ {
+				lastVal = checkDistinct(idx, idx, lastVal, col, outputCol)
 			}
 		}
 	}
@@ -307,17 +298,21 @@ func (p partitioner_TYPE) partitionWithOrder(
 		nulls = colVec.Nulls()
 	}
 
-	col := colVec._TemplateType()
-	col = execgen.SLICE(col, 0, n)
-	outputCol = outputCol[:n]
+	col := colVec.TemplateType()
+	// Eliminate bounds checks.
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for outputIdx, checkIdx := range order {
-			_CHECK_DISTINCT_WITH_NULLS(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
+			lastVal, lastValNull = checkDistinctWithNulls(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
 		}
 	} else {
-		for outputIdx, checkIdx := range order {
-			_CHECK_DISTINCT(checkIdx, outputIdx, lastVal, col, outputCol)
+		for outputIdx := 0; outputIdx < n; outputIdx++ {
+			checkIdx := order[outputIdx]
+			lastVal = checkDistinct(checkIdx, outputIdx, lastVal, col, outputCol)
 		}
 	}
 }
@@ -332,50 +327,46 @@ func (p partitioner_TYPE) partition(colVec coldata.Vec, outputCol []bool, n int)
 		nulls = colVec.Nulls()
 	}
 
-	col := colVec._TemplateType()
-	col = execgen.SLICE(col, 0, n)
-	outputCol = outputCol[:n]
+	col := colVec.TemplateType()
+	_ = col.Get(n - 1)
+	_ = outputCol[n-1]
+	// TODO(yuzefovich): add BCE assertions for these.
 	outputCol[0] = true
 	if nulls != nil {
-		for execgen.RANGE(checkIdx, col, 0, n) {
-			outputIdx := checkIdx
-			_CHECK_DISTINCT_WITH_NULLS(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
+		for idx := 0; idx < n; idx++ {
+			lastVal, lastValNull = checkDistinctWithNulls(idx, idx, lastVal, nulls, lastValNull, col, outputCol)
 		}
 	} else {
-		for execgen.RANGE(checkIdx, col, 0, n) {
-			outputIdx := checkIdx
-			_CHECK_DISTINCT(checkIdx, outputIdx, lastVal, col, outputCol)
+		for idx := 0; idx < n; idx++ {
+			lastVal = checkDistinct(idx, idx, lastVal, col, outputCol)
 		}
 	}
 }
 
 // {{end}}
+// {{end}}
 
-// {{/*
-// _CHECK_DISTINCT retrieves the value at the ith index of col, compares it
+// checkDistinct retrieves the value at the ith index of col, compares it
 // to the passed in lastVal, and sets the ith value of outputCol to true if the
 // compared values were distinct. It presumes that the current batch has no null
 // values.
-func _CHECK_DISTINCT(
+// execgen:inline
+func checkDistinct(
 	checkIdx int, outputIdx int, lastVal _GOTYPE, col []_GOTYPE, outputCol []bool,
-) { // */}}
-
-	// {{define "checkDistinct" -}}
-	v := execgen.UNSAFEGET(col, checkIdx)
+) _GOTYPE {
+	v := col.Get(checkIdx)
 	var unique bool
-	_ASSIGN_NE(unique, v, lastVal)
+	_ASSIGN_NE(unique, v, lastVal, _, col, _)
 	outputCol[outputIdx] = outputCol[outputIdx] || unique
 	execgen.COPYVAL(lastVal, v)
-	// {{end}}
+	return lastVal
+}
 
-	// {{/*
-} // */}}
-
-// {{/*
-// _CHECK_DISTINCT_WITH_NULLS behaves the same as _CHECK_DISTINCT, but it also
+// checkDistinctWithNulls behaves the same as checkDistinct, but it also
 // considers whether the previous and current values are null. It assumes that
 // `nulls` is non-nil.
-func _CHECK_DISTINCT_WITH_NULLS(
+// execgen:inline
+func checkDistinctWithNulls(
 	checkIdx int,
 	outputIdx int,
 	lastVal _GOTYPE,
@@ -383,9 +374,7 @@ func _CHECK_DISTINCT_WITH_NULLS(
 	lastValNull bool,
 	col []_GOTYPE,
 	outputCol []bool,
-) { // */}}
-
-	// {{define "checkDistinctWithNulls" -}}
+) (lastVal _GOTYPE, lastValNull bool) {
 	null := nulls.NullAt(checkIdx)
 	if null {
 		if !lastValNull {
@@ -393,20 +382,17 @@ func _CHECK_DISTINCT_WITH_NULLS(
 			outputCol[outputIdx] = true
 		}
 	} else {
-		v := execgen.UNSAFEGET(col, checkIdx)
+		v := col.Get(checkIdx)
 		if lastValNull {
 			// The previous value was null while the current is not.
 			outputCol[outputIdx] = true
 		} else {
 			// Neither value is null, so we must compare.
 			var unique bool
-			_ASSIGN_NE(unique, v, lastVal)
+			_ASSIGN_NE(unique, v, lastVal, _, col, _)
 			outputCol[outputIdx] = outputCol[outputIdx] || unique
 		}
 		execgen.COPYVAL(lastVal, v)
 	}
-	lastValNull = null
-	// {{end}}
-
-	// {{/*
-} // */}}
+	return lastVal, null
+}

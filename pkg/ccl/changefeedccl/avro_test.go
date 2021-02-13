@@ -18,24 +18,29 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
-func parseTableDesc(createTableStmt string) (*sqlbase.TableDescriptor, error) {
+func parseTableDesc(createTableStmt string) (catalog.TableDescriptor, error) {
 	ctx := context.Background()
 	stmt, err := parser.ParseOne(createTableStmt)
 	if err != nil {
@@ -46,18 +51,20 @@ func parseTableDesc(createTableStmt string) (*sqlbase.TableDescriptor, error) {
 		return nil, errors.Errorf("expected *tree.CreateTable got %T", stmt)
 	}
 	st := cluster.MakeTestingClusterSettings()
-	const parentID = sqlbase.ID(keys.MaxReservedDescID + 1)
-	const tableID = sqlbase.ID(keys.MaxReservedDescID + 2)
+	const parentID = descpb.ID(keys.MaxReservedDescID + 1)
+	const tableID = descpb.ID(keys.MaxReservedDescID + 2)
+	semaCtx := tree.MakeSemaContext()
 	mutDesc, err := importccl.MakeSimpleTableDescriptor(
-		ctx, st, createTable, parentID, tableID, importccl.NoFKs, hlc.UnixNano())
+		ctx, &semaCtx, st, createTable, parentID, keys.PublicSchemaID, tableID, importccl.NoFKs, hlc.UnixNano())
 	if err != nil {
 		return nil, err
 	}
-	return mutDesc.TableDesc(), mutDesc.TableDesc().ValidateTable()
+	return mutDesc, mutDesc.ValidateTable(ctx)
 }
 
-func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.EncDatumRow, error) {
-	semaCtx := &tree.SemaContext{}
+func parseValues(tableDesc catalog.TableDescriptor, values string) ([]rowenc.EncDatumRow, error) {
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
 	evalCtx := &tree.EvalContext{}
 
 	valuesStmt, err := parser.ParseOne(values)
@@ -73,21 +80,21 @@ func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.E
 		return nil, errors.Errorf("expected *tree.ValuesClause got %T", selectStmt.Select)
 	}
 
-	var rows []sqlbase.EncDatumRow
+	var rows []rowenc.EncDatumRow
 	for _, rowTuple := range valuesClause.Rows {
-		var row sqlbase.EncDatumRow
+		var row rowenc.EncDatumRow
 		for colIdx, expr := range rowTuple {
-			col := &tableDesc.Columns[colIdx]
-			typedExpr, err := sqlbase.SanitizeVarFreeExpr(
-				expr, &col.Type, "avro", semaCtx, false /* allowImpure */)
+			col := tableDesc.PublicColumns()[colIdx]
+			typedExpr, err := schemaexpr.SanitizeVarFreeExpr(
+				ctx, expr, col.GetType(), "avro", &semaCtx, tree.VolatilityStable)
 			if err != nil {
 				return nil, err
 			}
 			datum, err := typedExpr.Eval(evalCtx)
 			if err != nil {
-				return nil, errors.Wrap(err, typedExpr.String())
+				return nil, errors.Wrapf(err, "evaluating %s", typedExpr)
 			}
-			row = append(row, sqlbase.DatumToEncDatum(&col.Type, datum))
+			row = append(row, rowenc.DatumToEncDatum(col.GetType(), datum))
 		}
 		rows = append(rows, row)
 	}
@@ -102,7 +109,7 @@ func parseAvroSchema(j string) (*avroDataRecord, error) {
 	// This avroDataRecord doesn't have any of the derived fields we need for
 	// serde. Instead of duplicating the logic, fake out a TableDescriptor, so
 	// we can reuse tableToAvroSchema and get them for free.
-	tableDesc := &sqlbase.TableDescriptor{
+	tableDesc := descpb.TableDescriptor{
 		Name: AvroNameToSQLName(s.Name),
 	}
 	for _, f := range s.Fields {
@@ -116,16 +123,18 @@ func parseAvroSchema(j string) (*avroDataRecord, error) {
 		}
 		tableDesc.Columns = append(tableDesc.Columns, *colDesc)
 	}
-	return tableToAvroSchema(tableDesc, avroSchemaNoSuffix)
+	return tableToAvroSchema(tabledesc.NewImmutable(tableDesc), avroSchemaNoSuffix)
 }
 
-func avroFieldMetadataToColDesc(metadata string) (*sqlbase.ColumnDescriptor, error) {
+func avroFieldMetadataToColDesc(metadata string) (*descpb.ColumnDescriptor, error) {
 	parsed, err := parser.ParseOne(`ALTER TABLE FOO ADD COLUMN ` + metadata)
 	if err != nil {
 		return nil, err
 	}
 	def := parsed.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
-	col, _, _, err := sqlbase.MakeColumnDefDescs(def, &tree.SemaContext{})
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
+	col, _, _, err := tabledesc.MakeColumnDefDescs(ctx, def, &semaCtx, &tree.EvalContext{})
 	return col, err
 }
 
@@ -137,6 +146,7 @@ func randTime(rng *rand.Rand) time.Time {
 
 func TestAvroSchema(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	rng, _ := randutil.NewPseudoRand()
 
 	type test struct {
@@ -172,7 +182,7 @@ func TestAvroSchema(t *testing.T) {
 			// Implement these as customer demand dictates.
 			continue
 		}
-		datum := sqlbase.RandDatum(rng, typ, false /* nullOk */)
+		datum := rowenc.RandDatum(rng, typ, false /* nullOk */)
 		if datum == tree.DNull {
 			// DNull is returned by RandDatum for types.UNKNOWN or if the
 			// column type is unimplemented in RandDatum. In either case, the
@@ -190,11 +200,11 @@ func TestAvroSchema(t *testing.T) {
 			// whose nanosecond representation overflows an
 			// int64, so restrict input to fit.
 			t := randTime(rng).Truncate(time.Millisecond)
-			datum = tree.MakeDTimestamp(t, time.Microsecond)
+			datum = tree.MustMakeDTimestamp(t, time.Microsecond)
 		case types.TimestampTZFamily:
 			// See comments above for TimestampFamily.
 			t := randTime(rng).Truncate(time.Millisecond)
-			datum = tree.MakeDTimestampTZ(t, time.Microsecond)
+			datum = tree.MustMakeDTimestampTZ(t, time.Microsecond)
 		case types.DecimalFamily:
 			// TODO(dan): Make RandDatum respect Precision and Width instead.
 			// TODO(dan): The precision is really meant to be in [1,10], but it
@@ -275,7 +285,7 @@ func TestAvroSchema(t *testing.T) {
 				`{"type":["null","long"],"name":"_u0001f366_","default":null,`+
 				`"__crdb__":"🍦 INT8 NOT NULL"}]}`,
 			tableSchema.codec.Schema())
-		indexSchema, err := indexToAvroSchema(tableDesc, &tableDesc.PrimaryIndex)
+		indexSchema, err := indexToAvroSchema(tableDesc, tableDesc.GetPrimaryIndex().IndexDesc(), tableDesc.GetName())
 		require.NoError(t, err)
 		require.Equal(t,
 			`{"type":"record","name":"_u2603_","fields":[`+
@@ -289,9 +299,12 @@ func TestAvroSchema(t *testing.T) {
 	t.Run("type_goldens", func(t *testing.T) {
 		goldens := map[string]string{
 			`BOOL`:         `["null","boolean"]`,
+			`BOX2D`:        `["null","string"]`,
 			`BYTES`:        `["null","bytes"]`,
 			`DATE`:         `["null",{"type":"int","logicalType":"date"}]`,
 			`FLOAT8`:       `["null","double"]`,
+			`GEOGRAPHY`:    `["null","bytes"]`,
+			`GEOMETRY`:     `["null","bytes"]`,
 			`INET`:         `["null","string"]`,
 			`INT8`:         `["null","long"]`,
 			`JSONB`:        `["null","string"]`,
@@ -315,7 +328,7 @@ func TestAvroSchema(t *testing.T) {
 			colType := typ.SQLString()
 			tableDesc, err := parseTableDesc(`CREATE TABLE foo (pk INT PRIMARY KEY, a ` + colType + `)`)
 			require.NoError(t, err)
-			field, err := columnDescToAvroSchema(&tableDesc.Columns[1])
+			field, err := columnDescToAvroSchema(tableDesc.PublicColumns()[1].ColumnDesc())
 			require.NoError(t, err)
 			schema, err := json.Marshal(field.SchemaType)
 			require.NoError(t, err)
@@ -352,6 +365,17 @@ func TestAvroSchema(t *testing.T) {
 			{sqlType: `FLOAT`,
 				sql:  `1.2`,
 				avro: `{"double":1.2}`},
+
+			{sqlType: `BOX2D`, sql: `NULL`, avro: `null`},
+			{sqlType: `BOX2D`, sql: `'BOX(1 2,3 4)'`, avro: `{"string":"BOX(1 2,3 4)"}`},
+			{sqlType: `GEOGRAPHY`, sql: `NULL`, avro: `null`},
+			{sqlType: `GEOGRAPHY`,
+				sql:  "'POINT(1.0 1.0)'",
+				avro: `{"bytes":"\u0001\u0001\u0000\u0000 \u00E6\u0010\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?"}`},
+			{sqlType: `GEOMETRY`, sql: `NULL`, avro: `null`},
+			{sqlType: `GEOMETRY`,
+				sql:  "'POINT(1.0 1.0)'",
+				avro: `{"bytes":"\u0001\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?"}`},
 
 			{sqlType: `STRING`, sql: `NULL`, avro: `null`},
 			{sqlType: `STRING`,
@@ -442,6 +466,56 @@ func TestAvroSchema(t *testing.T) {
 			require.Equal(t, test.avro, value)
 		}
 	})
+
+	// These are values stored with less precision than the column definition allows,
+	// which is still roundtrippable
+	t.Run("lossless_truncations", func(t *testing.T) {
+		truncs := []struct {
+			sqlType string
+			sql     string
+			avro    string
+		}{
+
+			{sqlType: `DECIMAL(4,2)`,
+				sql:  `1.2`,
+				avro: `{"bytes.decimal":"x"}`},
+
+			{sqlType: `DECIMAL(12,2)`,
+				sql:  `1e2`,
+				avro: `{"bytes.decimal":"'\u0010"}`},
+
+			{sqlType: `DECIMAL(4,2)`,
+				sql:  `12e-1`,
+				avro: `{"bytes.decimal":"x"}`},
+
+			{sqlType: `DECIMAL(4,2)`,
+				sql:  `12e-2`,
+				avro: `{"bytes.decimal":"\f"}`},
+		}
+
+		for _, test := range truncs {
+			tableDesc, err := parseTableDesc(
+				`CREATE TABLE foo (pk INT PRIMARY KEY, a ` + test.sqlType + `)`)
+			require.NoError(t, err)
+			rows, err := parseValues(tableDesc, `VALUES (1, `+test.sql+`)`)
+			require.NoError(t, err)
+
+			schema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix)
+			require.NoError(t, err)
+			textual, err := schema.textualFromRow(rows[0])
+			require.NoError(t, err)
+			// Trim the outermost {}.
+			value := string(textual[1 : len(textual)-1])
+			// Strip out the pk field.
+			value = strings.Replace(value, `"pk":{"long":1}`, ``, -1)
+			// Trim the `,`, which could be on either side because of the avro library
+			// doesn't deterministically order the fields.
+			value = strings.Trim(value, `,`)
+			// Strip out the field name.
+			value = strings.Replace(value, `"a":`, ``, -1)
+			require.Equal(t, test.avro, value)
+		}
+	})
 }
 
 func (f *avroSchemaField) defaultValueNative() (interface{}, bool) {
@@ -466,7 +540,7 @@ func (f *avroSchemaField) defaultValueNative() (interface{}, bool) {
 // popular golang once seem to have it implemented.
 func rowFromBinaryEvolved(
 	buf []byte, writerSchema, readerSchema *avroDataRecord,
-) (sqlbase.EncDatumRow, error) {
+) (rowenc.EncDatumRow, error) {
 	native, newBuf, err := writerSchema.codec.NativeFromBinary(buf)
 	if err != nil {
 		return nil, err
@@ -506,6 +580,7 @@ func adjustNative(native map[string]interface{}, writerSchema, readerSchema *avr
 
 func TestAvroMigration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	type test struct {
 		name           string
@@ -555,6 +630,7 @@ func TestAvroMigration(t *testing.T) {
 
 func TestDecimalRatRoundtrip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	t.Run(`table`, func(t *testing.T) {
 		tests := []struct {

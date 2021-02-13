@@ -17,14 +17,22 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 func TestTelemetrySQLStatsIndependence(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -37,7 +45,7 @@ CREATE TABLE t.test (x INT PRIMARY KEY);
 		t.Fatal(err)
 	}
 
-	sqlServer := s.(*TestServer).Server.pgServer.SQLServer
+	sqlServer := s.(*TestServer).Server.sqlServer.pgServer.SQLServer
 
 	// Flush stats at the beginning of the test.
 	sqlServer.ResetSQLStats(ctx)
@@ -45,15 +53,14 @@ CREATE TABLE t.test (x INT PRIMARY KEY);
 
 	// Run some queries mixed with diagnostics, and ensure that the statistics
 	// are unnaffected by the calls to report diagnostics.
-	before := timeutil.Now()
 	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES ($1)`, 1); err != nil {
 		t.Fatal(err)
 	}
-	s.(*TestServer).maybeReportDiagnostics(ctx, timeutil.Now(), before, time.Second)
+	s.DiagnosticsReporter().(*diagnostics.Reporter).ReportDiagnostics(ctx)
 	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES ($1)`, 2); err != nil {
 		t.Fatal(err)
 	}
-	s.(*TestServer).maybeReportDiagnostics(ctx, timeutil.Now(), before, time.Second)
+	s.DiagnosticsReporter().(*diagnostics.Reporter).ReportDiagnostics(ctx)
 
 	// Ensure that our SQL statement data was not affected by the telemetry report.
 	stats := sqlServer.GetUnscrubbedStmtStats()
@@ -71,14 +78,72 @@ CREATE TABLE t.test (x INT PRIMARY KEY);
 	}
 }
 
+func TestEnsureSQLStatsAreFlushedForTelemetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	params.Settings = cluster.MakeClusterSettings()
+	// Set the SQL stat refresh rate very low so that SQL stats are continuously
+	// flushed into the telemetry reporting stats pool.
+	sql.SQLStatReset.Override(&params.Settings.SV, 10*time.Millisecond)
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	// Run some queries against the database.
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (x INT PRIMARY KEY);
+INSERT INTO t.test VALUES (1);
+INSERT INTO t.test VALUES (2);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	statusServer := s.(*TestServer).status
+	sqlServer := s.(*TestServer).Server.sqlServer.pgServer.SQLServer
+	testutils.SucceedsSoon(t, func() error {
+		// Get the diagnostic info.
+		res, err := statusServer.Diagnostics(ctx, &serverpb.DiagnosticsRequest{NodeId: "local"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		found := false
+		for _, stat := range res.SqlStats {
+			// These stats are scrubbed, so look for our scrubbed statement.
+			if strings.HasPrefix(stat.Key.Query, "INSERT INTO _ VALUES (_)") {
+				found = true
+			}
+		}
+
+		if !found {
+			return errors.New("expected to find query stats, but didn't")
+		}
+
+		// We should also not find the stat in the SQL stats pool, since the SQL
+		// stats are getting flushed.
+		stats := sqlServer.GetScrubbedStmtStats()
+		for _, stat := range stats {
+			// These stats are scrubbed, so look for our scrubbed statement.
+			if strings.HasPrefix(stat.Key.Query, "INSERT INTO _ VALUES (_)") {
+				t.Error("expected to not find stat, but did")
+			}
+		}
+		return nil
+	})
+}
+
 func TestSQLStatCollection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	sqlServer := s.(*TestServer).Server.pgServer.SQLServer
+	sqlServer := s.(*TestServer).Server.sqlServer.pgServer.SQLServer
 
 	// Flush stats at the beginning of the test.
 	sqlServer.ResetSQLStats(ctx)

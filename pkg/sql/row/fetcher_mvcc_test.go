@@ -17,22 +17,25 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
-func slurpUserDataKVs(t testing.TB, e engine.Engine) []roachpb.KeyValue {
+func slurpUserDataKVs(t testing.TB, e storage.Engine) []roachpb.KeyValue {
 	t.Helper()
 
 	// Scan meta keys directly from engine. We put this in a retry loop
@@ -41,9 +44,9 @@ func slurpUserDataKVs(t testing.TB, e engine.Engine) []roachpb.KeyValue {
 	var kvs []roachpb.KeyValue
 	testutils.SucceedsSoon(t, func() error {
 		kvs = nil
-		it := e.NewIterator(engine.IterOptions{UpperBound: roachpb.KeyMax})
+		it := e.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
 		defer it.Close()
-		for it.SeekGE(engine.MVCCKey{Key: keys.UserTableDataMin}); ; it.NextKey() {
+		for it.SeekGE(storage.MVCCKey{Key: keys.UserTableDataMin}); ; it.NextKey() {
 			ok, err := it.Valid()
 			if err != nil {
 				t.Fatal(err)
@@ -70,7 +73,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 	ctx := context.Background()
 	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
-	store, _ := s.GetStores().(*storage.Stores).GetStore(s.GetFirstStoreID())
+	store, _ := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	sqlDB.Exec(t, `CREATE DATABASE d`)
@@ -83,34 +86,38 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		e STRING, f STRING, PRIMARY KEY (e, f)
 	) INTERLEAVE IN PARENT parent (e)`)
 
-	parentDesc := sqlbase.GetImmutableTableDescriptor(kvDB, `d`, `parent`)
-	childDesc := sqlbase.GetImmutableTableDescriptor(kvDB, `d`, `child`)
+	parentDesc := catalogkv.TestingGetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `parent`)
+	childDesc := catalogkv.TestingGetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `child`)
 	var args []row.FetcherTableArgs
-	for _, desc := range []*sqlbase.ImmutableTableDescriptor{parentDesc, childDesc} {
-		colIdxMap := make(map[sqlbase.ColumnID]int)
+	for _, desc := range []catalog.TableDescriptor{parentDesc, childDesc} {
+		var colIdxMap catalog.TableColMap
 		var valNeededForCol util.FastIntSet
-		for colIdx := range desc.Columns {
-			id := desc.Columns[colIdx].ID
-			colIdxMap[id] = colIdx
-			valNeededForCol.Add(colIdx)
+		colDescs := make([]descpb.ColumnDescriptor, len(desc.PublicColumns()))
+		for i, col := range desc.PublicColumns() {
+			colIdxMap.Set(col.GetID(), i)
+			valNeededForCol.Add(i)
+			colDescs[i] = *col.ColumnDesc()
 		}
 		args = append(args, row.FetcherTableArgs{
-			Spans:            desc.AllIndexSpans(),
+			Spans:            desc.AllIndexSpans(keys.SystemSQLCodec),
 			Desc:             desc,
-			Index:            &desc.PrimaryIndex,
+			Index:            desc.GetPrimaryIndex().IndexDesc(),
 			ColIdxMap:        colIdxMap,
 			IsSecondaryIndex: false,
-			Cols:             desc.Columns,
+			Cols:             colDescs,
 			ValNeededForCol:  valNeededForCol,
 		})
 	}
 	var rf row.Fetcher
 	if err := rf.Init(
+		ctx,
+		keys.SystemSQLCodec,
 		false, /* reverse */
-		sqlbase.ScanLockingStrength_FOR_NONE,
-		false, /* returnRangeInfo */
-		true,  /* isCheck */
-		&sqlbase.DatumAlloc{},
+		descpb.ScanLockingStrength_FOR_NONE,
+		descpb.ScanLockingWaitPolicy_BLOCK,
+		true, /* isCheck */
+		&rowenc.DatumAlloc{},
+		nil, /* memMonitor */
 		args...,
 	); err != nil {
 		t.Fatal(err)
@@ -123,7 +130,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 	kvsToRows := func(kvs []roachpb.KeyValue) []rowWithMVCCMetadata {
 		t.Helper()
 		for _, kv := range kvs {
-			log.Info(ctx, kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
+			log.Infof(ctx, "%v %v %v", kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
 		}
 
 		if err := rf.StartScanFrom(ctx, &row.SpanKVFetcher{KVs: kvs}); err != nil {
@@ -140,7 +147,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 			}
 			row := rowWithMVCCMetadata{
 				RowIsDeleted:    rf.RowIsDeleted(),
-				RowLastModified: tree.TimestampToDecimal(rf.RowLastModified()).String(),
+				RowLastModified: tree.TimestampToDecimalDatum(rf.RowLastModified()).String(),
 			}
 			for _, datum := range datums {
 				if datum == tree.DNull {

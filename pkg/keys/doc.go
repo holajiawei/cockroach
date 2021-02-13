@@ -21,26 +21,37 @@
 //
 // This is the ten-thousand foot view of the keyspace:
 //
-//    +----------+
-//    | (empty)  | /Min
-//    | \x01...  | /Local    ----+
-//    |          |               |
-//    | ...      |               |	local keys
-//    |          |               |
-//    |          |           ----+
-//    | \x02...  | /Meta1    ----+
-//    | \x03...  | /Meta2        |
-//    | \x04...  | /System       |
-//    |          |               |
-//    | ...      |               |
-//    |          |               | global keys
-//    | \x89...  | /Table/1      |
-//    | \x8a...  | /Table/2      |
-//    |          |               |
-//    | ...      |               |
-//    |          |               |
-//    | \xff\xff | /Max      ----+
-//    +----------+
+//    +------------------+
+//    | (empty)          | /Min
+//    | \x01...          | /Local            ---------------------+
+//    |                  |                                        |
+//    | ...              |                                        | local keys
+//    |                  |                                        |
+//    |                  |                   ---------------------+
+//    |                  |                   ---------------------+
+//    | \x02...          | /Meta1            ----+                |
+//    | \x03...          | /Meta2                |                |
+//    | \x04...          | /System               |                |
+//    |                  |                       | system keys    |
+//    | ...              |                       |                |
+//    |                  |                   ----+                |
+//    | \x89...          | /Table/1          ----+                |
+//    | \x8a...          | /Table/2              |                |
+//    |                  |                       | system tenant  |
+//    | ...              |                       |                | global keys
+//    |                  |                   ----+                |
+//    | \xfe\x8a\x89...  | /Tenant/2/Table/1 ----+                |
+//    | \xfe\x8a\x8a...  | /Tenant/2/Table/2     |                |
+//    |                  |                       | tenant 2       |
+//    | ...              |                       |                |
+//    |                  |                   ----+                |
+//    | \xfe...          | /Tenant/...       ----+                |
+//    | \xfe...          |                       |                |
+//    |                  |                       | tenant ...     |
+//    | ...              |                       |                |
+//    |                  |                   ----+                |
+//    | \xff\xff         | /Max              ---------------------+
+//    +------------------+
 //
 // When keys are pretty printed, the logical name to the right of the table is
 // shown instead of the raw byte sequence.
@@ -114,7 +125,8 @@
 // be the target of KV operations, unaddressable keys can only be written as a
 // side-effect of other KV operations. This can often makes the choice between
 // the two clear (range descriptor keys needing to be addressable, and therefore
-// being a range local key is one example of this).
+// being a range local key is one example of this). Not being addressable also
+// implies not having multiple versions, and therefore never having intents.
 //
 // The "behavioral" difference between range local keys and range-id local keys
 // is that range local keys split and merge along range boundaries while
@@ -125,7 +137,9 @@
 // be range local keys. If not, they're meant to be range-ID local keys. Any key
 // we need to re-write during splits/merges will needs to go through Raft. We
 // have limits set on the size of Raft proposals so we generally don’t want to
-// be re-writing lots of data.
+// be re-writing lots of data. Range lock keys (see below) are separate from
+// range local keys, but behave similarly in that they split and merge along
+// range boundaries.
 //
 // This naturally leads to range-id local keys being used to store metadata
 // about a specific Range and range local keys being used to store metadata
@@ -144,8 +158,10 @@ package keys
 var _ = [...]interface{}{
 	MinKey,
 
-	// There are four types of local key data enumerated below: replicated
-	// range-ID, unreplicated range-ID, range local, and store-local keys.
+	// There are five types of local key data enumerated below: replicated
+	// range-ID, unreplicated range-ID, range local, store-local, and range lock
+	// keys. Range lock keys are required to be last category of keys in the
+	// lock key space.
 	// Local keys are constructed using a prefix, an optional infix, and a
 	// suffix. The prefix and infix are used to disambiguate between the four
 	// types of local keys listed above, and determines inter-group ordering.
@@ -157,11 +173,13 @@ var _ = [...]interface{}{
 	// 		`localRangeIDUnreplicatedInfix`.
 	// 	  - Range local keys all share `LocalRangePrefix`.
 	//	  - Store keys all share `localStorePrefix`.
+	// 	  - Range lock (which are also local keys) all share
+	//	  `LocalRangeLockTablePrefix`.
 	//
-	// `LocalRangeIDPrefix`, `localRangePrefix` and `localStorePrefix` all in
-	// turn share `localPrefix`. `localPrefix` was chosen arbitrarily. Local
-	// keys would work just as well with a different prefix, like 0xff, or even
-	// with a suffix.
+	// `LocalRangeIDPrefix`, `localRangePrefix`, `localStorePrefix`, and
+	// `LocalRangeLockTablePrefix` all in turn share `LocalPrefix`.
+	// `LocalPrefix` was chosen arbitrarily. Local keys would work just as well
+	// with a different prefix, like 0xff, or even with a suffix.
 
 	//   1. Replicated range-ID local keys: These store metadata pertaining to a
 	//   range as a whole. Though they are replicated, they are unaddressable.
@@ -174,6 +192,7 @@ var _ = [...]interface{}{
 	RaftTruncatedStateLegacyKey, // "rftt"
 	RangeLeaseKey,               // "rll-"
 	LeaseAppliedIndexLegacyKey,  // "rlla"
+	RangeVersionKey,             // "rver"
 	RangeStatsLegacyKey,         // "stat"
 
 	//   2. Unreplicated range-ID local keys: These contain metadata that
@@ -190,22 +209,33 @@ var _ = [...]interface{}{
 	//   as a whole. They are replicated and addressable. Typical examples are
 	//   the range descriptor and transaction records. They all share
 	//   `LocalRangePrefix`.
-	QueueLastProcessedKey,   // "qlpt"
-	RangeDescriptorJointKey, // "rdjt"
-	RangeDescriptorKey,      // "rdsc"
-	TransactionKey,          // "txn-"
+	QueueLastProcessedKey, // "qlpt"
+	RangeDescriptorKey,    // "rdsc"
+	TransactionKey,        // "txn-"
 
 	//   4. Store local keys: These contain metadata about an individual store.
 	//   They are unreplicated and unaddressable. The typical example is the
 	//   store 'ident' record. They all share `localStorePrefix`.
-	StoreSuggestedCompactionKey, // "comp"
-	StoreClusterVersionKey,      // "cver"
-	StoreGossipKey,              // "goss"
-	StoreHLCUpperBoundKey,       // "hlcu"
-	StoreIdentKey,               // "iden"
-	StoreLastUpKey,              // "uptm"
+	StoreClusterVersionKey, // "cver"
+	StoreGossipKey,         // "goss"
+	StoreHLCUpperBoundKey,  // "hlcu"
+	StoreIdentKey,          // "iden"
+	StoreNodeTombstoneKey,  // "ntmb"
+	StoreLastUpKey,         // "uptm"
+	StoreCachedSettingsKey, // "stng"
 
-	// The global keyspace includes the meta{1,2}, system, and SQL keys.
+	//   5. Range lock keys for all replicated locks. All range locks share
+	//   LocalRangeLockTablePrefix. Locks can be acquired on global keys and on
+	//   range local keys. Currently, locks are only on single keys, i.e., not
+	//   on a range of keys. Only exclusive locks are currently supported, and
+	//   these additionally function as pointers to the provisional MVCC values.
+	//   Single key locks use a byte, LockTableSingleKeyInfix, that follows
+	//   the LocalRangeLockTablePrefix. This is to keep the single-key locks
+	//   separate from (future) range locks.
+	LockTableSingleKey,
+
+	// The global keyspace includes the meta{1,2}, system, system tenant SQL
+	// keys, and non-system tenant SQL keys.
 	//
 	// 	1. Meta keys: This is where we store all key addressing data.
 	MetaMin,
@@ -218,7 +248,7 @@ var _ = [...]interface{}{
 	SystemPrefix,
 	NodeLivenessPrefix,  // "\x00liveness-"
 	BootstrapVersionKey, // "bootstrap-version"
-	DescIDGenerator,     // "desc-idgen"
+	descIDGenerator,     // "desc-idgen"
 	NodeIDGenerator,     // "node-idgen"
 	RangeIDGenerator,    // "range-idgen"
 	StatusPrefix,        // "status-"
@@ -229,11 +259,17 @@ var _ = [...]interface{}{
 	TimeseriesPrefix,    // "tsd"
 	SystemMax,
 
-	// 	3. SQL keys: This is where we store all table data.
+	// 	3. System tenant SQL keys: This is where we store all system-tenant
+	// 	table data.
 	TableDataMin,
 	NamespaceTableMin,
 	UserTableDataMin,
 	TableDataMax,
+
+	//  4. Non-system tenant SQL keys: This is where we store all non-system
+	//  tenant table data.
+	TenantTableDataMin,
+	TenantTableDataMax,
 
 	MaxKey,
 }

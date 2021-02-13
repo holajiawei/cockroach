@@ -80,7 +80,7 @@ func (l *lexer) Lex(lval *sqlSymType) int {
 	*lval = l.tokens[l.lastPos]
 
 	switch lval.id {
-	case NOT, WITH, AS:
+	case NOT, WITH, AS, GENERATED, NULLS:
 		nextID := int32(0)
 		if l.lastPos+1 < len(l.tokens) {
 			nextID = l.tokens[l.lastPos+1].id
@@ -98,11 +98,21 @@ func (l *lexer) Lex(lval *sqlSymType) int {
 			case BETWEEN, IN, LIKE, ILIKE, SIMILAR:
 				lval.id = NOT_LA
 			}
+		case GENERATED:
+			switch nextID {
+			case ALWAYS:
+				lval.id = GENERATED_ALWAYS
+			}
 
 		case WITH:
 			switch nextID {
 			case TIME, ORDINALITY:
 				lval.id = WITH_LA
+			}
+		case NULLS:
+			switch nextID {
+			case FIRST, LAST:
+				lval.id = NULLS_LA
 			}
 		}
 	}
@@ -161,6 +171,20 @@ func (l *lexer) UnimplementedWithIssueDetail(issue int, detail string) {
 	l.populateErrorDetails()
 }
 
+// PurposelyUnimplemented wraps Error, setting lastUnimplementedError.
+func (l *lexer) PurposelyUnimplemented(feature string, reason string) {
+	// We purposely do not use unimp here, as it appends hints to suggest that
+	// the error may be actively tracked as a bug.
+	l.lastError = errors.WithHint(
+		errors.WithTelemetry(
+			pgerror.Newf(pgcode.Syntax, "unimplemented: this syntax"),
+			fmt.Sprintf("sql.purposely_unimplemented.%s", feature),
+		),
+		reason,
+	)
+	l.populateErrorDetails()
+}
+
 // setErr is called from parsing action rules to register an error observed
 // while running the action. That error becomes the actual "cause" of the
 // syntax error.
@@ -172,7 +196,7 @@ func (l *lexer) setErr(err error) {
 
 func (l *lexer) Error(e string) {
 	e = strings.TrimPrefix(e, "syntax error: ") // we'll add it again below.
-	l.lastError = pgerror.WithCandidateCode(errors.New(e), pgcode.Syntax)
+	l.lastError = pgerror.WithCandidateCode(errors.Newf("%s", e), pgcode.Syntax)
 	l.populateErrorDetails()
 }
 

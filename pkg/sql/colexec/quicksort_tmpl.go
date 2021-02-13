@@ -20,7 +20,7 @@ package colexec
 
 import "context"
 
-// This file is copied from the the Go standard library's sort
+// This file is copied from the Go standard library's sort
 // implementation, found in https://golang.org/src/sort/sort.go. The only
 // modifications are to template each function into each sort_* struct, so
 // that the sort methods can be called without incurring any interface overhead
@@ -36,9 +36,12 @@ func maxDepth(n int) int {
 	return depth * 2
 }
 
-// {{range .}} {{/* for each type */}}
-// {{range .}} {{/* for null vs non null */}}
-// {{range .Overloads}} {{/* for each direction */}}
+// {{range .}}
+// {{$nulls := .Nulls}}
+// {{range .DirOverloads}}
+// {{$dir := .DirString}}
+// {{range .FamilyOverloads}}
+// {{range .WidthOverloads}}
 
 // Insertion sort
 func (p *sort_TYPE_DIR_HANDLES_NULLSOp) insertionSort(a, b int) {
@@ -231,6 +234,7 @@ func (p *sort_TYPE_DIR_HANDLES_NULLSOp) quickSort(ctx context.Context, a, b, max
 	}
 }
 
+// {{end}}
 // {{end}}
 // {{end}}
 // {{end}}

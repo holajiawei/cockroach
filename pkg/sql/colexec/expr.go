@@ -11,10 +11,49 @@
 package colexec
 
 import (
+	"sync"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
+
+var exprHelperPool = sync.Pool{
+	New: func() interface{} {
+		return &ExprHelper{}
+	},
+}
+
+// NewExprHelper returns a new ExprHelper.
+func NewExprHelper() *ExprHelper {
+	return exprHelperPool.Get().(*ExprHelper)
+}
+
+// ExprHelper is a utility struct that helps with expression handling in the
+// vectorized engine.
+type ExprHelper struct {
+	helper execinfrapb.ExprHelper
+}
+
+// ProcessExpr processes the given expression and returns a well-typed
+// expression.
+func (h *ExprHelper) ProcessExpr(
+	expr execinfrapb.Expression,
+	semaCtx *tree.SemaContext,
+	evalCtx *tree.EvalContext,
+	typs []*types.T,
+) (tree.TypedExpr, error) {
+	if expr.LocalExpr != nil {
+		return expr.LocalExpr, nil
+	}
+	h.helper.Types = typs
+	tempVars := tree.MakeIndexedVarHelper(&h.helper, len(typs))
+	return execinfrapb.DeserializeExpr(expr.Expr, semaCtx, evalCtx, &tempVars)
+}
+
+// Remove unused warning.
+var _ = findIVarsInRange
 
 // findIVarsInRange searches Expr for presence of tree.IndexedVars with indices
 // in range [start, end). It returns a slice containing all such indices.

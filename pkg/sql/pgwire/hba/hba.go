@@ -21,8 +21,10 @@ package hba
 import (
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 	"github.com/olekukonko/tablewriter"
@@ -50,6 +52,12 @@ type Entry struct {
 	MethodFn     interface{}
 	Options      [][2]string
 	OptionQuotes []bool
+	// Input is the original configuration line in the HBA configuration string.
+	// This is used for auditing purposes.
+	Input string
+	// Generated is true if the entry was expanded from another. All the
+	// generated entries share the same value for Input.
+	Generated bool
 }
 
 // ConnType represents the type of connection matched by a rule.
@@ -71,7 +79,7 @@ const (
 	ConnAny = ConnHostAny | ConnLocal
 )
 
-// String implements the fmt.Formatter interface.
+// String implements the fmt.Stringer interface.
 func (t ConnType) String() string {
 	switch t {
 	case ConnLocal:
@@ -83,16 +91,25 @@ func (t ConnType) String() string {
 	case ConnHostAny:
 		return "host"
 	default:
-		panic("unimplemented")
+		panic(errors.Newf("unimplemented conn type: %v", int(t)))
 	}
 }
 
-// String implements the fmt.Formatter interface.
+// String implements the fmt.Stringer interface.
 func (c Conf) String() string {
 	if len(c.Entries) == 0 {
 		return "# (empty configuration)\n"
 	}
 	var sb strings.Builder
+	sb.WriteString("# Original configuration:\n")
+	for _, e := range c.Entries {
+		if e.Generated {
+			continue
+		}
+		fmt.Fprintf(&sb, "# %s\n", e.Input)
+	}
+	sb.WriteString("#\n# Interpreted configuration:\n")
+
 	table := tablewriter.NewWriter(&sb)
 	table.SetAutoWrapText(false)
 	table.SetReflowDuringAutoWrap(false)
@@ -121,7 +138,7 @@ func (c Conf) String() string {
 // the "Address" field.
 type AnyAddr struct{}
 
-// String implements the fmt.Formatter interface.
+// String implements the fmt.Stringer interface.
 func (AnyAddr) String() string { return "all" }
 
 // GetOption returns the value of option name if there is exactly one
@@ -138,6 +155,14 @@ func (h Entry) GetOption(name string) string {
 		}
 	}
 	return val
+}
+
+// Equivalent returns true iff the entry is equivalent to another,
+// excluding the original syntax.
+func (h Entry) Equivalent(other Entry) bool {
+	h.Input = ""
+	other.Input = ""
+	return reflect.DeepEqual(h, other)
 }
 
 // GetOptions returns all values of option name.
@@ -187,12 +212,12 @@ func (h Entry) ConnMatches(clientConn ConnType, ip net.IP) (bool, error) {
 // The provided username must be normalized already.
 // The function assumes the entry was normalized to contain only
 // one user and its username normalized. See ParseAndNormalize().
-func (h Entry) UserMatches(userName string) bool {
+func (h Entry) UserMatches(userName security.SQLUsername) bool {
 	if h.User == nil {
 		return true
 	}
 	for _, u := range h.User {
-		if u.Value == userName {
+		if u.Value == userName.Normalized() {
 			return true
 		}
 	}
@@ -265,7 +290,7 @@ func (h Entry) OptionsString() string {
 	return sb.String()
 }
 
-// String implements the fmt.Formatter interface.
+// String implements the fmt.Stringer interface.
 func (h Entry) String() string {
 	return Conf{Entries: []Entry{h}}.String()
 }
@@ -276,7 +301,7 @@ type String struct {
 	Quoted bool
 }
 
-// String implements the fmt.Formatter interface.
+// String implements the fmt.Stringer interface.
 func (s String) String() string {
 	if s.Quoted {
 		return `"` + s.Value + `"`
@@ -343,6 +368,9 @@ outer:
 		for userIdx, iu := range allUsers {
 			entry.User = allUsers[userIdx : userIdx+1]
 			entry.User[0].Value = tree.Name(iu.Value).Normalize()
+			if userIdx > 0 {
+				entry.Generated = true
+			}
 			entries = append(entries, entry)
 		}
 	}

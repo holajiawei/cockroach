@@ -81,7 +81,7 @@ output row: ['a' 'b']
 output row: ['c' 'd']
 output row: ['e' 'f']
 
-statement error pgcode 23505 duplicate key value \(v\)=\('f'\) violates unique constraint "a"
+statement error pgcode 23505 duplicate key value violates unique constraint "a"\nDETAIL: Key \(v\)=\('f'\) already exists\.
 INSERT INTO kv VALUES ('h', 'f')
 
 statement ok
@@ -208,7 +208,7 @@ output row: ['c' 'd']
 output row: ['e' 'f']
 output row: ['f' 'g']
 
-statement error duplicate key value \(v\)=\('g'\) violates unique constraint "a"
+statement error duplicate key value violates unique constraint "a"\nDETAIL: Key \(v\)=\('g'\) already exists\.
 INSERT INTO kv VALUES ('h', 'g')
 
 statement ok
@@ -302,151 +302,199 @@ statement ok
 CREATE TABLE select_t (x INT, v INT)
 
 # Check that INSERT supports ORDER BY (MySQL extension)
-query TTT
-SELECT tree, field, description FROM [
+query T
 EXPLAIN (VERBOSE) INSERT INTO insert_t TABLE select_t ORDER BY v DESC LIMIT 10
-]
 ----
-·                              distributed  false
-·                              vectorized   false
-count                          ·            ·
- └── insert                    ·            ·
-      │                        into         insert_t(x, v, rowid)
-      │                        strategy     inserter
-      │                        auto commit  ·
-      └── render               ·            ·
-           │                   render 0     x
-           │                   render 1     v
-           │                   render 2     unique_rowid()
-           └── limit           ·            ·
-                │              count        10
-                └── sort       ·            ·
-                     │         order        -v
-                     └── scan  ·            ·
-·                              table        select_t@primary
-·                              spans        ALL
+distribution: local
+vectorized: true
+·
+• insert
+│ columns: ()
+│ estimated row count: 0 (missing stats)
+│ into: insert_t(x, v, rowid)
+│ auto commit
+│
+└── • render
+    │ columns: (x, v, column11)
+    │ estimated row count: 10 (missing stats)
+    │ render column11: unique_rowid()
+    │ render x: x
+    │ render v: v
+    │
+    └── • limit
+        │ columns: (x, v)
+        │ estimated row count: 10 (missing stats)
+        │ count: 10
+        │
+        └── • sort
+            │ columns: (x, v)
+            │ ordering: -v
+            │ estimated row count: 1,000 (missing stats)
+            │ order: -v
+            │
+            └── • scan
+                  columns: (x, v)
+                  estimated row count: 1,000 (missing stats)
+                  table: select_t@primary
+                  spans: FULL SCAN
 
 # Check that INSERT supports LIMIT (MySQL extension)
-query TTT
-SELECT tree, field, description FROM [
+query T
 EXPLAIN (VERBOSE) INSERT INTO insert_t SELECT * FROM select_t LIMIT 1
-]
 ----
-·                    distributed  false
-·                    vectorized   false
-count                ·            ·
- └── insert          ·            ·
-      │              into         insert_t(x, v, rowid)
-      │              strategy     inserter
-      │              auto commit  ·
-      └── render     ·            ·
-           │         render 0     x
-           │         render 1     v
-           │         render 2     unique_rowid()
-           └── scan  ·            ·
-·                    table        select_t@primary
-·                    spans        ALL
-·                    limit        1
+distribution: local
+vectorized: true
+·
+• insert
+│ columns: ()
+│ estimated row count: 0 (missing stats)
+│ into: insert_t(x, v, rowid)
+│ auto commit
+│
+└── • render
+    │ columns: (x, v, column11)
+    │ estimated row count: 1 (missing stats)
+    │ render column11: unique_rowid()
+    │ render x: x
+    │ render v: v
+    │
+    └── • scan
+          columns: (x, v)
+          estimated row count: 1 (missing stats)
+          table: select_t@primary
+          spans: LIMITED SCAN
+          limit: 1
 
 # Check the grouping of LIMIT and ORDER BY
-query TTT
+query T
 EXPLAIN (PLAN) INSERT INTO insert_t VALUES (1,1), (2,2) LIMIT 1
 ----
-·                           distributed  false
-·                           vectorized   false
-count                       ·            ·
- └── insert                 ·            ·
-      │                     into         insert_t(x, v, rowid)
-      │                     strategy     inserter
-      │                     auto commit  ·
-      └── render            ·            ·
-           └── limit        ·            ·
-                │           count        1
-                └── values  ·            ·
-·                           size         2 columns, 2 rows
+distribution: local
+vectorized: true
+·
+• insert
+│ into: insert_t(x, v, rowid)
+│ auto commit
+│
+└── • render
+    │
+    └── • limit
+        │ count: 1
+        │
+        └── • values
+              size: 2 columns, 2 rows
 
-query TTT
+query T
 EXPLAIN (PLAN) INSERT INTO insert_t VALUES (1,1), (2,2) ORDER BY 2 LIMIT 1
 ----
-·                                distributed  false
-·                                vectorized   false
-count                            ·            ·
- └── insert                      ·            ·
-      │                          into         insert_t(x, v, rowid)
-      │                          strategy     inserter
-      │                          auto commit  ·
-      └── render                 ·            ·
-           └── limit             ·            ·
-                │                count        1
-                └── sort         ·            ·
-                     │           order        +column2
-                     └── values  ·            ·
-·                                size         2 columns, 2 rows
+distribution: local
+vectorized: true
+·
+• insert
+│ into: insert_t(x, v, rowid)
+│ auto commit
+│
+└── • render
+    │
+    └── • limit
+        │ count: 1
+        │
+        └── • sort
+            │ order: +column2
+            │
+            └── • values
+                  size: 2 columns, 2 rows
 
-query TTT
+query T
 EXPLAIN (PLAN) INSERT INTO insert_t (VALUES (1,1), (2,2) ORDER BY 2) LIMIT 1
 ----
-·                                distributed  false
-·                                vectorized   false
-count                            ·            ·
- └── insert                      ·            ·
-      │                          into         insert_t(x, v, rowid)
-      │                          strategy     inserter
-      │                          auto commit  ·
-      └── render                 ·            ·
-           └── limit             ·            ·
-                │                count        1
-                └── sort         ·            ·
-                     │           order        +column2
-                     └── values  ·            ·
-·                                size         2 columns, 2 rows
+distribution: local
+vectorized: true
+·
+• insert
+│ into: insert_t(x, v, rowid)
+│ auto commit
+│
+└── • render
+    │
+    └── • limit
+        │ count: 1
+        │
+        └── • sort
+            │ order: +column2
+            │
+            └── • values
+                  size: 2 columns, 2 rows
 
-query TTT
+query T
 EXPLAIN (PLAN) INSERT INTO insert_t (VALUES (1,1), (2,2) ORDER BY 2 LIMIT 1)
 ----
-·                                distributed  false
-·                                vectorized   false
-count                            ·            ·
- └── insert                      ·            ·
-      │                          into         insert_t(x, v, rowid)
-      │                          strategy     inserter
-      │                          auto commit  ·
-      └── render                 ·            ·
-           └── limit             ·            ·
-                │                count        1
-                └── sort         ·            ·
-                     │           order        +column2
-                     └── values  ·            ·
-·                                size         2 columns, 2 rows
+distribution: local
+vectorized: true
+·
+• insert
+│ into: insert_t(x, v, rowid)
+│ auto commit
+│
+└── • render
+    │
+    └── • limit
+        │ count: 1
+        │
+        └── • sort
+            │ order: +column2
+            │
+            └── • values
+                  size: 2 columns, 2 rows
 
 # ORDER BY expression that's not inserted into table.
-query TTTTT
+query T
 EXPLAIN (VERBOSE)
 INSERT INTO insert_t (SELECT length(k), 2 FROM kv ORDER BY k || v LIMIT 10) RETURNING x+v
 ----
-·                                        distributed  false                  ·                              ·
-·                                        vectorized   false                  ·                              ·
-render                                   ·            ·                      ("?column?")                   ·
- │                                       render 0     x + v                  ·                              ·
- └── run                                 ·            ·                      (x, v, rowid[hidden])          ·
-      └── insert                         ·            ·                      (x, v, rowid[hidden])          ·
-           │                             into         insert_t(x, v, rowid)  ·                              ·
-           │                             strategy     inserter               ·                              ·
-           └── render                    ·            ·                      (length, "?column?", column9)  ·
-                │                        render 0     length                 ·                              ·
-                │                        render 1     "?column?"             ·                              ·
-                │                        render 2     unique_rowid()         ·                              ·
-                └── limit                ·            ·                      (length, "?column?", column8)  +column8
-                     │                   count        10                     ·                              ·
-                     └── sort            ·            ·                      (length, "?column?", column8)  +column8
-                          │              order        +column8               ·                              ·
-                          └── render     ·            ·                      (length, "?column?", column8)  ·
-                               │         render 0     length(k)              ·                              ·
-                               │         render 1     2                      ·                              ·
-                               │         render 2     k || v                 ·                              ·
-                               └── scan  ·            ·                      (k, v)                         ·
-·                                        table        kv@primary             ·                              ·
-·                                        spans        ALL                    ·                              ·
+distribution: local
+vectorized: true
+·
+• render
+│ columns: ("?column?")
+│ estimated row count: 10 (missing stats)
+│ render ?column?: x + v
+│
+└── • insert
+    │ columns: (x, v, rowid)
+    │ estimated row count: 10 (missing stats)
+    │ into: insert_t(x, v, rowid)
+    │
+    └── • render
+        │ columns: (length, "?column?", column13)
+        │ estimated row count: 10 (missing stats)
+        │ render column13: unique_rowid()
+        │ render length: length
+        │ render ?column?: "?column?"
+        │
+        └── • limit
+            │ columns: (length, "?column?", column12)
+            │ estimated row count: 10 (missing stats)
+            │ count: 10
+            │
+            └── • sort
+                │ columns: (length, "?column?", column12)
+                │ ordering: +column12
+                │ estimated row count: 1,000 (missing stats)
+                │ order: +column12
+                │
+                └── • render
+                    │ columns: (length, "?column?", column12)
+                    │ estimated row count: 1,000 (missing stats)
+                    │ render length: length(k)
+                    │ render ?column?: 2
+                    │ render column12: k::STRING || v::STRING
+                    │
+                    └── • scan
+                          columns: (k, v)
+                          estimated row count: 1,000 (missing stats)
+                          table: kv@primary
+                          spans: FULL SCAN
 
 # ------------------------------------------------------------------------------
 # Insert rows into table during schema changes.
@@ -459,21 +507,24 @@ statement ok
 BEGIN; ALTER TABLE mutation DROP COLUMN y
 
 # Ensure that default value is still inserted into y, since y is write-only.
-query TTTTT
+query T
 EXPLAIN (VERBOSE) INSERT INTO mutation(x) VALUES (2) RETURNING *
 ----
-·                           distributed    false                  ·                   ·
-·                           vectorized     false                  ·                   ·
-render                      ·              ·                      (x)                 ·
- │                          render 0       x                      ·                   ·
- └── run                    ·              ·                      (x, rowid[hidden])  ·
-      └── insert-fast-path  ·              ·                      (x, rowid[hidden])  ·
-·                           into           mutation(x, rowid, y)  ·                   ·
-·                           strategy       inserter               ·                   ·
-·                           size           3 columns, 1 row       ·                   ·
-·                           row 0, expr 0  2                      ·                   ·
-·                           row 0, expr 1  unique_rowid()         ·                   ·
-·                           row 0, expr 2  10                     ·                   ·
+distribution: local
+vectorized: true
+·
+• project
+│ columns: (x)
+│ estimated row count: 1
+│
+└── • insert fast path
+      columns: (x, rowid)
+      estimated row count: 1
+      into: mutation(x, rowid, y)
+      size: 3 columns, 1 row
+      row 0, expr 0: 2
+      row 0, expr 1: unique_rowid()
+      row 0, expr 2: 10
 
 statement ok
 ROLLBACK
@@ -482,19 +533,20 @@ statement ok
 BEGIN; ALTER TABLE mutation ADD COLUMN z INT AS (x + y) STORED
 
 # Ensure that value is *not* inserted into z, since z is delete-only.
-query TTTTT
+query T
 EXPLAIN (VERBOSE) INSERT INTO mutation(x, y) VALUES (2, 2)
 ----
-·                      distributed    false                  ·   ·
-·                      vectorized     false                  ·   ·
-count                  ·              ·                      ()  ·
- └── insert-fast-path  ·              ·                      ()  ·
-·                      into           mutation(x, y, rowid)  ·   ·
-·                      strategy       inserter               ·   ·
-·                      size           3 columns, 1 row       ·   ·
-·                      row 0, expr 0  2                      ·   ·
-·                      row 0, expr 1  2                      ·   ·
-·                      row 0, expr 2  unique_rowid()         ·   ·
+distribution: local
+vectorized: true
+·
+• insert fast path
+  columns: ()
+  estimated row count: 0 (missing stats)
+  into: mutation(x, y, rowid)
+  size: 3 columns, 1 row
+  row 0, expr 0: 2
+  row 0, expr 1: 2
+  row 0, expr 2: unique_rowid()
 
 statement ok
 ROLLBACK
@@ -508,37 +560,57 @@ CREATE TABLE abc (a INT, b INT, c INT, INDEX(c) STORING(a,b))
 statement ok
 CREATE TABLE xyz (x INT, y INT, z INT)
 
-query TTTTT
+query T
 EXPLAIN (VERBOSE) SELECT * FROM [INSERT INTO xyz SELECT a, b, c FROM abc RETURNING z] ORDER BY z
 ----
-·                                             distributed   false                                                ·                   ·
-·                                             vectorized    false                                                ·                   ·
-root                                          ·             ·                                                    (z)                 +z
- ├── sort                                     ·             ·                                                    (z)                 +z
- │    │                                       order         +z                                                   ·                   ·
- │    └── scan buffer node                    ·             ·                                                    (z)                 ·
- │                                            label         buffer 1                                             ·                   ·
- └── subquery                                 ·             ·                                                    (z)                 +z
-      │                                       id            @S1                                                  ·                   ·
-      │                                       original sql  INSERT INTO xyz SELECT a, b, c FROM abc RETURNING z  ·                   ·
-      │                                       exec mode     all rows                                             ·                   ·
-      └── buffer node                         ·             ·                                                    (z)                 ·
-           │                                  label         buffer 1                                             ·                   ·
-           └── spool                          ·             ·                                                    (z)                 ·
-                └── render                    ·             ·                                                    (z)                 ·
-                     │                        render 0      z                                                    ·                   ·
-                     └── run                  ·             ·                                                    (z, rowid[hidden])  ·
-                          └── insert          ·             ·                                                    (z, rowid[hidden])  ·
-                               │              into          xyz(x, y, z, rowid)                                  ·                   ·
-                               │              strategy      inserter                                             ·                   ·
-                               └── render     ·             ·                                                    (a, b, c, column9)  ·
-                                    │         render 0      a                                                    ·                   ·
-                                    │         render 1      b                                                    ·                   ·
-                                    │         render 2      c                                                    ·                   ·
-                                    │         render 3      unique_rowid()                                       ·                   ·
-                                    └── scan  ·             ·                                                    (a, b, c)           ·
-·                                             table         abc@primary                                          ·                   ·
-·                                             spans         ALL                                                  ·                   ·
+distribution: local
+vectorized: true
+·
+• root
+│ columns: (z)
+│
+├── • sort
+│   │ columns: (z)
+│   │ ordering: +z
+│   │ estimated row count: 1,000 (missing stats)
+│   │ order: +z
+│   │
+│   └── • scan buffer
+│         columns: (z)
+│         estimated row count: 1,000 (missing stats)
+│         label: buffer 1
+│
+└── • subquery
+    │ id: @S1
+    │ original sql: INSERT INTO xyz SELECT a, b, c FROM abc RETURNING z
+    │ exec mode: all rows
+    │
+    └── • buffer
+        │ columns: (z)
+        │ label: buffer 1
+        │
+        └── • project
+            │ columns: (z)
+            │ estimated row count: 1,000 (missing stats)
+            │
+            └── • insert
+                │ columns: (z, rowid)
+                │ estimated row count: 1,000 (missing stats)
+                │ into: xyz(x, y, z, rowid)
+                │
+                └── • render
+                    │ columns: (a, b, c, column13)
+                    │ estimated row count: 1,000 (missing stats)
+                    │ render column13: unique_rowid()
+                    │ render a: a
+                    │ render b: b
+                    │ render c: c
+                    │
+                    └── • scan
+                          columns: (a, b, c)
+                          estimated row count: 1,000 (missing stats)
+                          table: abc@primary
+                          spans: FULL SCAN
 
 # ------------------------------------------------------------------------------
 # Regression for #35364. This tests behavior that is different between the CBO

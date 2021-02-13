@@ -25,10 +25,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -73,7 +74,7 @@ type Flagser interface {
 // to have been created and initialized before running these.
 type Opser interface {
 	Generator
-	Ops(urls []string, reg *histogram.Registry) (QueryLoad, error)
+	Ops(ctx context.Context, urls []string, reg *histogram.Registry) (QueryLoad, error)
 }
 
 // Hookser returns any hooks associated with the generator.
@@ -87,6 +88,9 @@ type Hooks struct {
 	// Validate is called after workload flags are parsed. It should return an
 	// error if the workload configuration is invalid.
 	Validate func() error
+	// PreCreate is called before workload tables are created.
+	// Implementations should be idempotent.
+	PreCreate func(*gosql.DB) error
 	// PreLoad is called after workload tables are created and before workload
 	// data is loaded. It is not called when storing or loading a fixture.
 	// Implementations should be idempotent.
@@ -175,9 +179,9 @@ type BatchedTuples struct {
 
 // Tuples is like TypedTuples except that it tries to guess the type of each
 // datum. However, if the function ever returns nil for one of the datums, you
-// need to use TypedTuples instead and specify the coltypes.
+// need to use TypedTuples instead and specify the types.
 func Tuples(count int, fn func(int) []interface{}) BatchedTuples {
-	return TypedTuples(count, nil /* colTypes */, fn)
+	return TypedTuples(count, nil /* typs */, fn)
 }
 
 const (
@@ -187,12 +191,12 @@ const (
 
 // TypedTuples returns a BatchedTuples where each batch has size 1. It's
 // intended to be easier to use than directly specifying a BatchedTuples, but
-// the tradeoff is some bit of performance. If colTypes is nil, an attempt is
+// the tradeoff is some bit of performance. If typs is nil, an attempt is
 // made to infer them.
-func TypedTuples(count int, colTypes []coltypes.T, fn func(int) []interface{}) BatchedTuples {
+func TypedTuples(count int, typs []*types.T, fn func(int) []interface{}) BatchedTuples {
 	// The FillBatch we create has to be concurrency safe, so we can't let it do
-	// the one-time initialization of colTypes without this protection.
-	var colTypesOnce sync.Once
+	// the one-time initialization of typs without this protection.
+	var typesOnce sync.Once
 
 	t := BatchedTuples{
 		NumBatches: count,
@@ -201,9 +205,9 @@ func TypedTuples(count int, colTypes []coltypes.T, fn func(int) []interface{}) B
 		t.FillBatch = func(batchIdx int, cb coldata.Batch, _ *bufalloc.ByteAllocator) {
 			row := fn(batchIdx)
 
-			colTypesOnce.Do(func() {
-				if colTypes == nil {
-					colTypes = make([]coltypes.T, len(row))
+			typesOnce.Do(func() {
+				if typs == nil {
+					typs = make([]*types.T, len(row))
 					for i, datum := range row {
 						if datum == nil {
 							panic(fmt.Sprintf(
@@ -211,16 +215,16 @@ func TypedTuples(count int, colTypes []coltypes.T, fn func(int) []interface{}) B
 						} else {
 							switch datum.(type) {
 							case time.Time:
-								colTypes[i] = coltypes.Bytes
+								typs[i] = types.Bytes
 							default:
-								colTypes[i] = coltypes.FromGoType(datum)
+								typs[i] = typeconv.UnsafeFromGoType(datum)
 							}
 						}
 					}
 				}
 			})
 
-			cb.Reset(colTypes, 1)
+			cb.Reset(typs, 1, coldata.StandardColumnFactory)
 			for colIdx, col := range cb.ColVecs() {
 				switch d := row[colIdx].(type) {
 				case nil:
@@ -238,7 +242,7 @@ func TypedTuples(count int, colTypes []coltypes.T, fn func(int) []interface{}) B
 				case time.Time:
 					col.Bytes().Set(0, []byte(d.Round(time.Microsecond).UTC().Format(timestampOutputFormat)))
 				default:
-					panic(fmt.Sprintf(`unhandled datum type %T`, d))
+					panic(errors.AssertionFailedf(`unhandled datum type %T`, d))
 				}
 			}
 		}
@@ -251,7 +255,7 @@ func TypedTuples(count int, colTypes []coltypes.T, fn func(int) []interface{}) B
 // heavy. In performance-critical code, FillBatch should be used directly,
 // instead.
 func (b BatchedTuples) BatchRows(batchIdx int) [][]interface{} {
-	cb := coldata.NewMemBatchWithSize(nil, 0)
+	cb := coldata.NewMemBatchWithCapacity(nil, 0, coldata.StandardColumnFactory)
 	var a bufalloc.ByteAllocator
 	b.FillBatch(batchIdx, cb, &a)
 	return ColBatchToRows(cb)
@@ -264,34 +268,39 @@ func ColBatchToRows(cb coldata.Batch) [][]interface{} {
 	datums := make([]interface{}, numRows*numCols)
 	for colIdx, col := range cb.ColVecs() {
 		nulls := col.Nulls()
-		switch col.Type() {
-		case coltypes.Bool:
+		switch col.CanonicalTypeFamily() {
+		case types.BoolFamily:
 			for rowIdx, datum := range col.Bool()[:numRows] {
 				if !nulls.NullAt(rowIdx) {
 					datums[rowIdx*numCols+colIdx] = datum
 				}
 			}
-		case coltypes.Int64:
-			for rowIdx, datum := range col.Int64()[:numRows] {
-				if !nulls.NullAt(rowIdx) {
-					datums[rowIdx*numCols+colIdx] = datum
+		case types.IntFamily:
+			switch col.Type().Width() {
+			case 0, 64:
+				for rowIdx, datum := range col.Int64()[:numRows] {
+					if !nulls.NullAt(rowIdx) {
+						datums[rowIdx*numCols+colIdx] = datum
+					}
 				}
-			}
-		case coltypes.Int16:
-			for rowIdx, datum := range col.Int16()[:numRows] {
-				if !nulls.NullAt(rowIdx) {
-					datums[rowIdx*numCols+colIdx] = datum
+			case 16:
+				for rowIdx, datum := range col.Int16()[:numRows] {
+					if !nulls.NullAt(rowIdx) {
+						datums[rowIdx*numCols+colIdx] = datum
+					}
 				}
+			default:
+				panic(fmt.Sprintf(`unhandled type %s`, col.Type()))
 			}
-		case coltypes.Float64:
+		case types.FloatFamily:
 			for rowIdx, datum := range col.Float64()[:numRows] {
 				if !nulls.NullAt(rowIdx) {
 					datums[rowIdx*numCols+colIdx] = datum
 				}
 			}
-		case coltypes.Bytes:
+		case types.BytesFamily:
 			// HACK: workload's Table schemas are SQL schemas, but the initial data is
-			// returned as a coldata.Batch, which has a more limited set of coltypes.
+			// returned as a coldata.Batch, which has a more limited set of types.
 			// (Or, in the case of simple workloads that return a []interface{}, it's
 			// roundtripped through coldata.Batch by the `Tuples` helper.)
 			//
@@ -310,7 +319,7 @@ func ColBatchToRows(cb coldata.Batch) [][]interface{} {
 				}
 			}
 		default:
-			panic(fmt.Sprintf(`unhandled type %s`, col.Type().GoTypeName()))
+			panic(fmt.Sprintf(`unhandled type %s`, col.Type()))
 		}
 	}
 	rows := make([][]interface{}, numRows)
@@ -405,7 +414,8 @@ func FromFlags(meta Meta, flags ...string) Generator {
 		if !ok {
 			panic(fmt.Sprintf(`generator %s does not accept flags: %v`, meta.Name, flags))
 		}
-		if err := f.Flags().Parse(flags); err != nil {
+		flagsStruct := f.Flags()
+		if err := flagsStruct.Parse(flags); err != nil {
 			panic(fmt.Sprintf(`generator %s parsing flags %v: %v`, meta.Name, flags, err))
 		}
 	}
@@ -451,6 +461,6 @@ func ApproxDatumSize(x interface{}) int64 {
 	case time.Time:
 		return 12
 	default:
-		panic(fmt.Sprintf("unsupported type %T: %v", x, x))
+		panic(errors.AssertionFailedf("unsupported type %T: %v", x, x))
 	}
 }

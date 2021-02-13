@@ -14,13 +14,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/covering"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -36,8 +37,8 @@ type kvScanner interface {
 
 type scanRequestScanner struct {
 	settings *cluster.Settings
-	gossip   *gossip.Gossip
-	db       *client.DB
+	gossip   gossip.OptionalGossip
+	db       *kv.DB
 }
 
 var _ kvScanner = (*scanRequestScanner)(nil)
@@ -50,7 +51,9 @@ func (p *scanRequestScanner) Scan(
 			cfg.Spans, cfg.Timestamp, cfg.WithDiff)
 	}
 
-	spans, err := getSpansToProcess(ctx, p.db, cfg.Spans)
+	sender := p.db.NonTransactionalSender()
+	distSender := sender.(*kv.CrossRangeTxnWrapperSender).Wrapped().(*kvcoord.DistSender)
+	spans, err := getSpansToProcess(ctx, distSender, cfg.Spans)
 	if err != nil {
 		return err
 	}
@@ -58,8 +61,13 @@ func (p *scanRequestScanner) Scan(
 	// Export requests for the various watched spans are executed in parallel,
 	// with a semaphore-enforced limit based on a cluster setting.
 	// The spans here generally correspond with range boundaries.
-	maxConcurrentExports := clusterNodeCount(p.gossip) *
-		int(storage.ExportRequestsLimit.Get(&p.settings.SV))
+	approxNodeCount, err := clusterNodeCount(p.gossip)
+	if err != nil {
+		// can't count nodes in tenants
+		approxNodeCount = 1
+	}
+	maxConcurrentExports := approxNodeCount *
+		int(kvserver.ExportRequestsLimit.Get(&p.settings.SV))
 	exportsSem := make(chan struct{}, maxConcurrentExports)
 	g := ctxgroup.WithContext(ctx)
 
@@ -107,7 +115,7 @@ func (p *scanRequestScanner) exportSpan(
 	for remaining := span; ; {
 		start := timeutil.Now()
 		b := txn.NewBatch()
-		r := roachpb.NewScan(remaining.Key, remaining.EndKey).(*roachpb.ScanRequest)
+		r := roachpb.NewScan(remaining.Key, remaining.EndKey, false /* forUpdate */).(*roachpb.ScanRequest)
 		r.ScanFormat = roachpb.BATCH_RESPONSE
 		b.Header.TargetBytes = targetBytesPerScan
 		// NB: We use a raw request rather than the Scan() method because we want
@@ -132,7 +140,7 @@ func (p *scanRequestScanner) exportSpan(
 		}
 	}
 	// p.metrics.PollRequestNanosHist.RecordValue(scanDuration.Nanoseconds())
-	if err := sink.AddResolved(ctx, span, ts); err != nil {
+	if err := sink.AddResolved(ctx, span, ts, false); err != nil {
 		return err
 	}
 	if log.V(2) {
@@ -143,15 +151,11 @@ func (p *scanRequestScanner) exportSpan(
 }
 
 func getSpansToProcess(
-	ctx context.Context, db *client.DB, targetSpans []roachpb.Span,
+	ctx context.Context, ds *kvcoord.DistSender, targetSpans []roachpb.Span,
 ) ([]roachpb.Span, error) {
-	var ranges []roachpb.RangeDescriptor
-	if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		var err error
-		ranges, err = allRangeDescriptors(ctx, txn)
-		return err
-	}); err != nil {
-		return nil, errors.Wrapf(err, "fetching range descriptors")
+	ranges, err := allRangeSpans(ctx, ds, targetSpans)
+	if err != nil {
+		return nil, err
 	}
 
 	type spanMarker struct{}
@@ -167,10 +171,10 @@ func getSpansToProcess(
 	}
 
 	var rangeCovering covering.Covering
-	for _, rangeDesc := range ranges {
+	for _, r := range ranges {
 		rangeCovering = append(rangeCovering, covering.Range{
-			Start:   []byte(rangeDesc.StartKey),
-			End:     []byte(rangeDesc.EndKey),
+			Start:   []byte(r.Key),
+			End:     []byte(r.EndKey),
 			Payload: rangeMarker{},
 		})
 	}
@@ -223,28 +227,45 @@ func slurpScanResponse(
 	return nil
 }
 
-func allRangeDescriptors(ctx context.Context, txn *client.Txn) ([]roachpb.RangeDescriptor, error) {
-	rows, err := txn.Scan(ctx, keys.Meta2Prefix, keys.MetaMax, 0)
-	if err != nil {
-		return nil, err
-	}
+func allRangeSpans(
+	ctx context.Context, ds *kvcoord.DistSender, spans []roachpb.Span,
+) ([]roachpb.Span, error) {
 
-	rangeDescs := make([]roachpb.RangeDescriptor, len(rows))
-	for i, row := range rows {
-		if err := row.ValueProto(&rangeDescs[i]); err != nil {
-			return nil, errors.NewAssertionErrorWithWrappedErrf(err,
-				"%s: unable to unmarshal range descriptor", row.Key)
+	ranges := make([]roachpb.Span, 0, len(spans))
+
+	it := kvcoord.NewRangeIterator(ds)
+
+	for i := range spans {
+		rSpan, err := keys.SpanAddr(spans[i])
+		if err != nil {
+			return nil, err
+		}
+		for it.Seek(ctx, rSpan.Key, kvcoord.Ascending); ; it.Next(ctx) {
+			if !it.Valid() {
+				return nil, it.Error()
+			}
+			ranges = append(ranges, roachpb.Span{
+				Key: it.Desc().StartKey.AsRawKey(), EndKey: it.Desc().EndKey.AsRawKey(),
+			})
+			if !it.NeedAnother(rSpan) {
+				break
+			}
 		}
 	}
-	return rangeDescs, nil
+
+	return ranges, nil
 }
 
 // clusterNodeCount returns the approximate number of nodes in the cluster.
-func clusterNodeCount(g *gossip.Gossip) int {
+func clusterNodeCount(gw gossip.OptionalGossip) (int, error) {
+	g, err := gw.OptionalErr(47971)
+	if err != nil {
+		return 0, err
+	}
 	var nodes int
 	_ = g.IterateInfos(gossip.KeyNodeIDPrefix, func(_ string, _ gossip.Info) error {
 		nodes++
 		return nil
 	})
-	return nodes
+	return nodes, nil
 }

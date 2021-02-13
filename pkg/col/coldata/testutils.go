@@ -12,8 +12,10 @@ package coldata
 
 import (
 	"bytes"
+	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,14 +55,24 @@ func AssertEquivalentBatches(t testingT, expected, actual Batch) {
 		// fail.
 		expectedVec := expected.ColVec(colIdx)
 		actualVec := actual.ColVec(colIdx)
-		typ := expectedVec.Type()
-		require.Equal(t, typ, actualVec.Type())
-		require.Equal(
-			t,
-			expectedVec.Nulls().Slice(0, expected.Length()),
-			actualVec.Nulls().Slice(0, actual.Length()),
-		)
-		if typ == coltypes.Bytes {
+		require.Equal(t, expectedVec.Type(), actualVec.Type())
+		// Check whether the nulls bitmaps are the same. Note that we don't
+		// track precisely the fact whether nulls are present or not in
+		// 'maybeHasNulls' field, so we override it manually to be 'true' for
+		// both nulls vectors if it is 'true' for at least one of them. This is
+		// acceptable since we still check the bitmaps precisely.
+		expectedNulls := expectedVec.Nulls()
+		actualNulls := actualVec.Nulls()
+		oldExpMaybeHasNulls, oldActMaybeHasNulls := expectedNulls.maybeHasNulls, actualNulls.maybeHasNulls
+		defer func() {
+			expectedNulls.maybeHasNulls, actualNulls.maybeHasNulls = oldExpMaybeHasNulls, oldActMaybeHasNulls
+		}()
+		expectedNulls.maybeHasNulls = expectedNulls.maybeHasNulls || actualNulls.maybeHasNulls
+		actualNulls.maybeHasNulls = expectedNulls.maybeHasNulls || actualNulls.maybeHasNulls
+		require.Equal(t, expectedNulls.Slice(0, expected.Length()), actualNulls.Slice(0, actual.Length()))
+
+		canonicalTypeFamily := expectedVec.CanonicalTypeFamily()
+		if canonicalTypeFamily == types.BytesFamily {
 			// Cannot use require.Equal for this type.
 			// TODO(asubiotto): Again, why not?
 			expectedBytes := expectedVec.Bytes().Window(0, expected.Length())
@@ -71,7 +83,7 @@ func AssertEquivalentBatches(t testingT, expected, actual Batch) {
 					t.Fatalf("bytes mismatch at index %d:\nexpected:\n%sactual:\n%s", i, expectedBytes, resultBytes)
 				}
 			}
-		} else if typ == coltypes.Timestamp {
+		} else if canonicalTypeFamily == types.TimestampTZFamily {
 			// Cannot use require.Equal for this type.
 			// TODO(yuzefovich): Again, why not?
 			expectedTimestamp := expectedVec.Timestamp()[0:expected.Length()]
@@ -82,7 +94,7 @@ func AssertEquivalentBatches(t testingT, expected, actual Batch) {
 					t.Fatalf("Timestamp mismatch at index %d:\nexpected:\n%sactual:\n%s", i, expectedTimestamp[i], resultTimestamp[i])
 				}
 			}
-		} else if typ == coltypes.Interval {
+		} else if canonicalTypeFamily == types.IntervalFamily {
 			// Cannot use require.Equal for this type.
 			// TODO(yuzefovich): Again, why not?
 			expectedInterval := expectedVec.Interval()[0:expected.Length()]
@@ -93,11 +105,23 @@ func AssertEquivalentBatches(t testingT, expected, actual Batch) {
 					t.Fatalf("Interval mismatch at index %d:\nexpected:\n%sactual:\n%s", i, expectedInterval[i], resultInterval[i])
 				}
 			}
+		} else if canonicalTypeFamily == typeconv.DatumVecCanonicalTypeFamily {
+			// Cannot use require.Equal for this type.
+			expectedDatum := expectedVec.Datum().Slice(0 /* start */, expected.Length())
+			resultDatum := actualVec.Datum().Slice(0 /* start */, actual.Length())
+			require.Equal(t, expectedDatum.Len(), resultDatum.Len())
+			for i := 0; i < expectedDatum.Len(); i++ {
+				expected := expectedDatum.Get(i).(fmt.Stringer).String()
+				actual := resultDatum.Get(i).(fmt.Stringer).String()
+				if expected != actual {
+					t.Fatalf("Datum mismatch at index %d:\nexpected:\n%sactual:\n%s", i, expectedDatum.Get(i), resultDatum.Get(i))
+				}
+			}
 		} else {
 			require.Equal(
 				t,
-				expectedVec.Window(expectedVec.Type(), 0, expected.Length()),
-				actualVec.Window(actualVec.Type(), 0, actual.Length()),
+				expectedVec.Window(0, expected.Length()),
+				actualVec.Window(0, actual.Length()),
 			)
 		}
 	}

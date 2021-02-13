@@ -16,12 +16,27 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 //go:generate go run -tags gen-batch gen_batch.go
+
+// WriteTimestamp returns the timestamps at which this request is writing. For
+// non-transactional requests, this is the same as the read timestamp. For
+// transactional requests, the write timestamp can be higher until commit time.
+//
+// This should only be called after SetActiveTimestamp().
+func (h Header) WriteTimestamp() hlc.Timestamp {
+	ts := h.Timestamp
+	if h.Txn != nil {
+		ts.Forward(h.Txn.WriteTimestamp)
+	}
+	return ts
+}
 
 // SetActiveTimestamp sets the correct timestamp at which the request is to be
 // carried out. For transactional requests, ba.Timestamp must be zero initially
@@ -30,7 +45,7 @@ import (
 // timestamp is specified, nowFn is used to create and set one.
 func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
 	if txn := ba.Txn; txn != nil {
-		if ba.Timestamp != (hlc.Timestamp{}) {
+		if !ba.Timestamp.IsEmpty() {
 			return errors.New("transactional request must not set batch timestamp")
 		}
 
@@ -45,11 +60,31 @@ func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
 		ba.Timestamp = txn.ReadTimestamp
 	} else {
 		// When not transactional, allow empty timestamp and use nowFn instead
-		if ba.Timestamp == (hlc.Timestamp{}) {
+		if ba.Timestamp.IsEmpty() {
 			ba.Timestamp = nowFn()
 		}
 	}
 	return nil
+}
+
+// EarliestActiveTimestamp returns the earliest timestamp at which the batch
+// would operate, which is nominally ba.Timestamp but could be earlier if a
+// request in the batch operates on a time span such as ExportRequest or
+// RevertRangeRequest, which both specify the start of that span in their
+// arguments while using ba.Timestamp to indicate the upper bound of that span.
+func (ba BatchRequest) EarliestActiveTimestamp() hlc.Timestamp {
+	ts := ba.Timestamp
+	for _, ru := range ba.Requests {
+		switch t := ru.GetInner().(type) {
+		case *ExportRequest:
+			if !t.StartTime.IsEmpty() {
+				ts.Backward(t.StartTime)
+			}
+		case *RevertRangeRequest:
+			ts.Backward(t.TargetTime)
+		}
+	}
+	return ts
 }
 
 // UpdateTxn updates the batch transaction from the supplied one in
@@ -99,7 +134,7 @@ func (ba *BatchRequest) IsReadOnly() bool {
 // RequiresLeaseHolder returns true if the request can only be served by the
 // leaseholders of the ranges it addresses.
 func (ba *BatchRequest) RequiresLeaseHolder() bool {
-	return !ba.IsReadOnly() || ba.Header.ReadConsistency.RequiresReadLease()
+	return ba.IsLocking() || ba.Header.ReadConsistency.RequiresReadLease()
 }
 
 // IsReverse returns true iff the BatchRequest contains a reverse request.
@@ -119,14 +154,27 @@ func (ba *BatchRequest) IsAllTransactional() bool {
 	return ba.hasFlagForAll(isTxn)
 }
 
-// IsTransactionWrite returns true iff the BatchRequest contains a txn write.
-func (ba *BatchRequest) IsTransactionWrite() bool {
-	return ba.hasFlag(isTxnWrite)
+// IsLocking returns true iff the BatchRequest intends to acquire locks.
+func (ba *BatchRequest) IsLocking() bool {
+	return ba.hasFlag(isLocking)
+}
+
+// IsIntentWrite returns true iff the BatchRequest contains an intent write.
+func (ba *BatchRequest) IsIntentWrite() bool {
+	return ba.hasFlag(isIntentWrite)
 }
 
 // IsUnsplittable returns true iff the BatchRequest an un-splittable request.
 func (ba *BatchRequest) IsUnsplittable() bool {
 	return ba.hasFlag(isUnsplittable)
+}
+
+// ConsultsTimestampCache returns whether the request must consult
+// the timestamp cache to determine whether a mutation is safe at
+// a proposed timestamp or needs to move to a higher timestamp to
+// avoid re-writing history.
+func (ba *BatchRequest) ConsultsTimestampCache() bool {
+	return ba.hasFlag(consultsTSCache)
 }
 
 // IsSingleRequest returns true iff the BatchRequest contains a single request.
@@ -254,7 +302,7 @@ func (ba *BatchRequest) IsCompleteTransaction() bool {
 			return false
 		}
 		if seq == nextSeq {
-			if !IsTransactionWrite(req) {
+			if !IsIntentWrite(req) {
 				return false
 			}
 			nextSeq++
@@ -337,15 +385,15 @@ func (br *BatchResponse) String() string {
 	return strings.Join(str, ", ")
 }
 
-// IntentSpanIterate calls the passed method with the key ranges of the
-// transactional writes contained in the batch. Usually the key spans
+// LockSpanIterate calls the passed method with the key ranges of the
+// transactional locks contained in the batch. Usually the key spans
 // contained in the requests are used, but when a response contains a
-// ResumeSpan the ResumeSpan is subtracted from the request span to provide a
-// more minimal span of keys affected by the request.
-func (ba *BatchRequest) IntentSpanIterate(br *BatchResponse, fn func(Span)) {
+// ResumeSpan the ResumeSpan is subtracted from the request span to
+// provide a more minimal span of keys affected by the request.
+func (ba *BatchRequest) LockSpanIterate(br *BatchResponse, fn func(Span, lock.Durability)) {
 	for i, arg := range ba.Requests {
 		req := arg.GetInner()
-		if !IsTransactionWrite(req) {
+		if !IsLocking(req) {
 			continue
 		}
 		var resp Response
@@ -353,7 +401,7 @@ func (ba *BatchRequest) IntentSpanIterate(br *BatchResponse, fn func(Span)) {
 			resp = br.Responses[i].GetInner()
 		}
 		if span, ok := ActualSpan(req, resp); ok {
-			fn(span)
+			fn(span, LockingDurability(req))
 		}
 	}
 }
@@ -424,15 +472,8 @@ func (br *BatchResponse) Combine(otherBatch *BatchResponse, positions []int) err
 		}
 		valLeft := br.Responses[pos].GetInner()
 		valRight := otherBatch.Responses[i].GetInner()
-		cValLeft, lOK := valLeft.(combinable)
-		cValRight, rOK := valRight.(combinable)
-		if lOK && rOK {
-			if err := cValLeft.combine(cValRight); err != nil {
-				return err
-			}
-			continue
-		} else if lOK != rOK {
-			return errors.Errorf("can not combine %T and %T", valLeft, valRight)
+		if err := CombineResponses(valLeft, valRight); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -552,41 +593,53 @@ func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 	return parts
 }
 
-// String gives a brief summary of the contained requests and keys in the batch.
-// TODO(tschottdorf): the key range is useful information, but requires `keys`.
-// See #2198.
-func (ba BatchRequest) String() string {
-	var str []string
-	if ba.Txn != nil {
-		str = append(str, fmt.Sprintf("[txn: %s]", ba.Txn.Short()))
-	}
+// SafeFormat implements redact.SafeFormatter.
+// It gives a brief summary of the contained requests and keys in the batch.
+func (ba BatchRequest) SafeFormat(s redact.SafePrinter, _ rune) {
 	for count, arg := range ba.Requests {
 		// Limit the strings to provide just a summary. Without this limit
 		// a log message with a BatchRequest can be very long.
 		if count >= 20 && count < len(ba.Requests)-5 {
 			if count == 20 {
-				str = append(str, fmt.Sprintf("... %d skipped ...", len(ba.Requests)-25))
+				s.Printf(",... %d skipped ...", len(ba.Requests)-25)
 			}
 			continue
 		}
+		if count > 0 {
+			s.Print(redact.SafeString(", "))
+		}
+
 		req := arg.GetInner()
 		if et, ok := req.(*EndTxnRequest); ok {
 			h := req.Header()
-			str = append(str, fmt.Sprintf("%s(commit:%t tsflex:%t) [%s] ",
-				req.Method(), et.Commit, et.CanCommitAtHigherTimestamp, h.Key))
+			s.Printf("%s(commit:%t) [%s]",
+				req.Method(), et.Commit, h.Key)
 		} else {
 			h := req.Header()
-			var s string
 			if req.Method() == PushTxn {
 				pushReq := req.(*PushTxnRequest)
-				s = fmt.Sprintf("PushTxn(%s->%s)", pushReq.PusherTxn.Short(), pushReq.PusheeTxn.Short())
+				s.Printf("PushTxn(%s->%s)", pushReq.PusherTxn.Short(), pushReq.PusheeTxn.Short())
 			} else {
-				s = req.Method().String()
+				s.Print(req.Method())
 			}
-			str = append(str, fmt.Sprintf("%s [%s,%s)", s, h.Key, h.EndKey))
+			s.Printf(" [%s,%s)", h.Key, h.EndKey)
 		}
 	}
-	return strings.Join(str, ", ")
+	{
+		if ba.Txn != nil {
+			s.Printf(", [txn: %s]", ba.Txn.Short())
+		}
+	}
+	if ba.WaitPolicy != lock.WaitPolicy_Block {
+		s.Printf(", [wait-policy: %s]", ba.WaitPolicy)
+	}
+	if ba.CanForwardReadTimestamp {
+		s.Printf(", [can-forward-ts]")
+	}
+}
+
+func (ba BatchRequest) String() string {
+	return redact.StringWithoutMarkers(ba)
 }
 
 // ValidateForEvaluation performs sanity checks on the batch when it's received
@@ -601,7 +654,7 @@ func (ba BatchRequest) ValidateForEvaluation() error {
 		return errors.AssertionFailedf("EndTxn request without transaction")
 	}
 	if ba.Txn != nil {
-		if ba.Txn.WriteTooOld && (ba.Txn.ReadTimestamp.Equal(ba.Txn.WriteTimestamp)) {
+		if ba.Txn.WriteTooOld && ba.Txn.ReadTimestamp == ba.Txn.WriteTimestamp {
 			return errors.AssertionFailedf("WriteTooOld set but no offset in timestamps. txn: %s", ba.Txn)
 		}
 	}

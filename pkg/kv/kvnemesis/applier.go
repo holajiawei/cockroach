@@ -13,7 +13,7 @@ package kvnemesis
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -24,20 +24,20 @@ import (
 
 // Applier executes Steps.
 type Applier struct {
-	dbs []*client.DB
+	dbs []*kv.DB
 	mu  struct {
 		dbIdx int
 		syncutil.Mutex
-		txns map[string]*client.Txn
+		txns map[string]*kv.Txn
 	}
 }
 
 // MakeApplier constructs an Applier that executes against the given DB.
-func MakeApplier(dbs ...*client.DB) *Applier {
+func MakeApplier(dbs ...*kv.DB) *Applier {
 	a := &Applier{
 		dbs: dbs,
 	}
-	a.mu.txns = make(map[string]*client.Txn)
+	a.mu.txns = make(map[string]*kv.Txn)
 	return a
 }
 
@@ -45,7 +45,7 @@ func MakeApplier(dbs ...*client.DB) *Applier {
 // error is only returned from Apply if there is an internal coding error within
 // Applier, errors from a Step execution are saved in the Step itself.
 func (a *Applier) Apply(ctx context.Context, step *Step) (retErr error) {
-	var db *client.DB
+	var db *kv.DB
 	db, step.DBID = a.getNextDBRoundRobin()
 
 	step.Before = db.Clock().Now()
@@ -59,7 +59,7 @@ func (a *Applier) Apply(ctx context.Context, step *Step) (retErr error) {
 	return nil
 }
 
-func (a *Applier) getNextDBRoundRobin() (*client.DB, int32) {
+func (a *Applier) getNextDBRoundRobin() (*kv.DB, int32) {
 	a.mu.Lock()
 	dbIdx := a.mu.dbIdx
 	a.mu.dbIdx = (a.mu.dbIdx + 1) % len(a.dbs)
@@ -67,24 +67,28 @@ func (a *Applier) getNextDBRoundRobin() (*client.DB, int32) {
 	return a.dbs[dbIdx], int32(dbIdx)
 }
 
-func applyOp(ctx context.Context, db *client.DB, op *Operation) {
+func applyOp(ctx context.Context, db *kv.DB, op *Operation) {
 	switch o := op.GetValue().(type) {
-	case *GetOperation, *PutOperation, *BatchOperation:
+	case *GetOperation, *PutOperation, *ScanOperation, *BatchOperation:
 		applyClientOp(ctx, db, op)
 	case *SplitOperation:
-		err := db.AdminSplit(ctx, o.Key, o.Key, hlc.MaxTimestamp)
+		err := db.AdminSplit(ctx, o.Key, hlc.MaxTimestamp)
 		o.Result = resultError(ctx, err)
 	case *MergeOperation:
 		err := db.AdminMerge(ctx, o.Key)
 		o.Result = resultError(ctx, err)
 	case *ChangeReplicasOperation:
-		ctx = client.ChangeReplicasCanMixAddAndRemoveContext(ctx)
 		desc := getRangeDesc(ctx, o.Key, db)
 		_, err := db.AdminChangeReplicas(ctx, o.Key, desc, o.Changes)
 		// TODO(dan): Save returned desc?
 		o.Result = resultError(ctx, err)
+	case *TransferLeaseOperation:
+		err := db.AdminTransferLease(ctx, o.Key, o.Target)
+		o.Result = resultError(ctx, err)
 	case *ClosureTxnOperation:
-		txnErr := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		var savedTxn *kv.Txn
+		txnErr := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			savedTxn = txn
 			for i := range o.Ops {
 				op := &o.Ops[i]
 				applyClientOp(ctx, txn, op)
@@ -111,38 +115,62 @@ func applyOp(ctx context.Context, db *client.DB, op *Operation) {
 			}
 		})
 		o.Result = resultError(ctx, txnErr)
+		if txnErr == nil {
+			o.Txn = savedTxn.Sender().TestingCloneTxn()
+		}
 	default:
 		panic(errors.AssertionFailedf(`unknown operation type: %T %v`, o, o))
 	}
 }
 
 type clientI interface {
-	Get(context.Context, interface{}) (client.KeyValue, error)
+	Get(context.Context, interface{}) (kv.KeyValue, error)
+	GetForUpdate(context.Context, interface{}) (kv.KeyValue, error)
 	Put(context.Context, interface{}, interface{}) error
-	Run(context.Context, *client.Batch) error
+	Scan(context.Context, interface{}, interface{}, int64) ([]kv.KeyValue, error)
+	ScanForUpdate(context.Context, interface{}, interface{}, int64) ([]kv.KeyValue, error)
+	Run(context.Context, *kv.Batch) error
 }
 
 func applyClientOp(ctx context.Context, db clientI, op *Operation) {
 	switch o := op.GetValue().(type) {
 	case *GetOperation:
-		result, err := db.Get(ctx, o.Key)
+		fn := db.Get
+		if o.ForUpdate {
+			fn = db.GetForUpdate
+		}
+		kv, err := fn(ctx, o.Key)
 		if err != nil {
 			o.Result = resultError(ctx, err)
 		} else {
 			o.Result.Type = ResultType_Value
-			if result.Value != nil {
-				if value, err := result.Value.GetBytes(); err != nil {
-					panic(errors.Wrapf(err, "decoding %x", result.Value.RawBytes))
-				} else {
-					o.Result.Value = value
-				}
+			if kv.Value != nil {
+				o.Result.Value = kv.Value.RawBytes
 			}
 		}
 	case *PutOperation:
 		err := db.Put(ctx, o.Key, o.Value)
 		o.Result = resultError(ctx, err)
+	case *ScanOperation:
+		fn := db.Scan
+		if o.ForUpdate {
+			fn = db.ScanForUpdate
+		}
+		kvs, err := fn(ctx, o.Key, o.EndKey, 0 /* maxRows */)
+		if err != nil {
+			o.Result = resultError(ctx, err)
+		} else {
+			o.Result.Type = ResultType_Values
+			o.Result.Values = make([]KeyValue, len(kvs))
+			for i, kv := range kvs {
+				o.Result.Values[i] = KeyValue{
+					Key:   []byte(kv.Key),
+					Value: kv.Value.RawBytes,
+				}
+			}
+		}
 	case *BatchOperation:
-		b := &client.Batch{}
+		b := &kv.Batch{}
 		applyBatchOp(ctx, b, db.Run, o)
 	default:
 		panic(errors.AssertionFailedf(`unknown batch operation type: %T %v`, o, o))
@@ -150,17 +178,24 @@ func applyClientOp(ctx context.Context, db clientI, op *Operation) {
 }
 
 func applyBatchOp(
-	ctx context.Context,
-	b *client.Batch,
-	runFn func(context.Context, *client.Batch) error,
-	o *BatchOperation,
+	ctx context.Context, b *kv.Batch, runFn func(context.Context, *kv.Batch) error, o *BatchOperation,
 ) {
 	for i := range o.Ops {
 		switch subO := o.Ops[i].GetValue().(type) {
 		case *GetOperation:
-			b.Get(subO.Key)
+			if subO.ForUpdate {
+				b.GetForUpdate(subO.Key)
+			} else {
+				b.Get(subO.Key)
+			}
 		case *PutOperation:
 			b.Put(subO.Key, subO.Value)
+		case *ScanOperation:
+			if subO.ForUpdate {
+				b.ScanForUpdate(subO.Key, subO.EndKey)
+			} else {
+				b.Scan(subO.Key, subO.EndKey)
+			}
 		default:
 			panic(errors.AssertionFailedf(`unknown batch operation type: %T %v`, subO, subO))
 		}
@@ -176,16 +211,26 @@ func applyBatchOp(
 				subO.Result.Type = ResultType_Value
 				result := b.Results[i].Rows[0]
 				if result.Value != nil {
-					if value, err := result.Value.GetBytes(); err != nil {
-						panic(errors.Wrapf(err, "decoding %x", result.Value.RawBytes))
-					} else {
-						subO.Result.Value = value
-					}
+					subO.Result.Value = result.Value.RawBytes
 				}
 			}
 		case *PutOperation:
 			err := b.Results[i].Err
 			subO.Result = resultError(ctx, err)
+		case *ScanOperation:
+			kvs, err := b.Results[i].Rows, b.Results[i].Err
+			if err != nil {
+				subO.Result = resultError(ctx, err)
+			} else {
+				subO.Result.Type = ResultType_Values
+				subO.Result.Values = make([]KeyValue, len(kvs))
+				for j, kv := range kvs {
+					subO.Result.Values[j] = KeyValue{
+						Key:   []byte(kv.Key),
+						Value: kv.Value.RawBytes,
+					}
+				}
+			}
 		default:
 			panic(errors.AssertionFailedf(`unknown batch operation type: %T %v`, subO, subO))
 		}
@@ -203,12 +248,12 @@ func resultError(ctx context.Context, err error) Result {
 	}
 }
 
-func getRangeDesc(ctx context.Context, key roachpb.Key, dbs ...*client.DB) roachpb.RangeDescriptor {
+func getRangeDesc(ctx context.Context, key roachpb.Key, dbs ...*kv.DB) roachpb.RangeDescriptor {
 	var dbIdx int
 	var opts = retry.Options{}
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); dbIdx = (dbIdx + 1) % len(dbs) {
 		sender := dbs[dbIdx].NonTransactionalSender()
-		descs, _, err := client.RangeLookup(ctx, sender, key, roachpb.CONSISTENT, 0, false)
+		descs, _, err := kv.RangeLookup(ctx, sender, key, roachpb.CONSISTENT, 0, false)
 		if err != nil {
 			log.Infof(ctx, "looking up descriptor for %s: %+v", key, err)
 			continue
@@ -222,11 +267,11 @@ func getRangeDesc(ctx context.Context, key roachpb.Key, dbs ...*client.DB) roach
 	panic(`unreachable`)
 }
 
-func newGetReplicasFn(dbs ...*client.DB) GetReplicasFn {
+func newGetReplicasFn(dbs ...*kv.DB) GetReplicasFn {
 	ctx := context.Background()
 	return func(key roachpb.Key) []roachpb.ReplicationTarget {
 		desc := getRangeDesc(ctx, key, dbs...)
-		replicas := desc.Replicas().All()
+		replicas := desc.Replicas().Descriptors()
 		targets := make([]roachpb.ReplicationTarget, len(replicas))
 		for i, replica := range replicas {
 			targets[i] = roachpb.ReplicationTarget{

@@ -26,7 +26,7 @@ func CanProvide(expr memo.RelExpr, required *physical.OrderingChoice) bool {
 	if required.Any() {
 		return true
 	}
-	if util.RaceEnabled {
+	if util.CrdbTestBuild {
 		checkRequired(expr, required)
 	}
 	return funcMap[expr.Op()].canProvideOrdering(expr, required)
@@ -39,7 +39,7 @@ func BuildChildRequired(
 	parent memo.RelExpr, required *physical.OrderingChoice, childIdx int,
 ) physical.OrderingChoice {
 	result := funcMap[parent.Op()].buildChildReqOrdering(parent, required, childIdx)
-	if util.RaceEnabled && !result.Any() {
+	if util.CrdbTestBuild && !result.Any() {
 		checkRequired(parent.Child(childIdx).(memo.RelExpr), &result)
 	}
 	return result
@@ -66,7 +66,7 @@ func BuildProvided(expr memo.RelExpr, required *physical.OrderingChoice) opt.Ord
 	}
 	provided := funcMap[expr.Op()].buildProvidedOrdering(expr, required)
 
-	if util.RaceEnabled {
+	if util.CrdbTestBuild {
 		checkProvided(expr, required, provided)
 	}
 
@@ -120,6 +120,11 @@ func init() {
 		buildChildReqOrdering: lookupOrIndexJoinBuildChildReqOrdering,
 		buildProvidedOrdering: lookupJoinBuildProvided,
 	}
+	funcMap[opt.InvertedJoinOp] = funcs{
+		canProvideOrdering:    invertedJoinCanProvideOrdering,
+		buildChildReqOrdering: invertedJoinBuildChildReqOrdering,
+		buildProvidedOrdering: invertedJoinBuildProvided,
+	}
 	funcMap[opt.OrdinalityOp] = funcs{
 		canProvideOrdering:    ordinalityCanProvideOrdering,
 		buildChildReqOrdering: ordinalityBuildChildReqOrdering,
@@ -157,7 +162,17 @@ func init() {
 		buildChildReqOrdering: distinctOnBuildChildReqOrdering,
 		buildProvidedOrdering: distinctOnBuildProvided,
 	}
+	funcMap[opt.EnsureDistinctOnOp] = funcs{
+		canProvideOrdering:    distinctOnCanProvideOrdering,
+		buildChildReqOrdering: distinctOnBuildChildReqOrdering,
+		buildProvidedOrdering: distinctOnBuildProvided,
+	}
 	funcMap[opt.UpsertDistinctOnOp] = funcs{
+		canProvideOrdering:    distinctOnCanProvideOrdering,
+		buildChildReqOrdering: distinctOnBuildChildReqOrdering,
+		buildProvidedOrdering: distinctOnBuildProvided,
+	}
+	funcMap[opt.EnsureUpsertDistinctOnOp] = funcs{
 		canProvideOrdering:    distinctOnCanProvideOrdering,
 		buildChildReqOrdering: distinctOnBuildChildReqOrdering,
 		buildProvidedOrdering: distinctOnBuildProvided,

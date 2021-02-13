@@ -9,6 +9,7 @@ func _() {
 	// Re-run the stringer command to generate them again.
 	var x [1]struct{}
 	_ = x[ServerMsgAuth-82]
+	_ = x[ServerMsgBackendKeyData-75]
 	_ = x[ServerMsgBindComplete-50]
 	_ = x[ServerMsgCommandComplete-67]
 	_ = x[ServerMsgCloseComplete-51]
@@ -16,6 +17,7 @@ func _() {
 	_ = x[ServerMsgDataRow-68]
 	_ = x[ServerMsgEmptyQuery-73]
 	_ = x[ServerMsgErrorResponse-69]
+	_ = x[ServerMsgNoticeResponse-78]
 	_ = x[ServerMsgNoData-110]
 	_ = x[ServerMsgParameterDescription-116]
 	_ = x[ServerMsgParameterStatus-83]
@@ -30,17 +32,19 @@ const (
 	_ServerMessageType_name_1 = "ServerMsgCommandCompleteServerMsgDataRowServerMsgErrorResponse"
 	_ServerMessageType_name_2 = "ServerMsgCopyInResponse"
 	_ServerMessageType_name_3 = "ServerMsgEmptyQuery"
-	_ServerMessageType_name_4 = "ServerMsgAuthServerMsgParameterStatusServerMsgRowDescription"
-	_ServerMessageType_name_5 = "ServerMsgReady"
-	_ServerMessageType_name_6 = "ServerMsgNoData"
-	_ServerMessageType_name_7 = "ServerMsgPortalSuspendedServerMsgParameterDescription"
+	_ServerMessageType_name_4 = "ServerMsgBackendKeyData"
+	_ServerMessageType_name_5 = "ServerMsgNoticeResponse"
+	_ServerMessageType_name_6 = "ServerMsgAuthServerMsgParameterStatusServerMsgRowDescription"
+	_ServerMessageType_name_7 = "ServerMsgReady"
+	_ServerMessageType_name_8 = "ServerMsgNoData"
+	_ServerMessageType_name_9 = "ServerMsgPortalSuspendedServerMsgParameterDescription"
 )
 
 var (
 	_ServerMessageType_index_0 = [...]uint8{0, 22, 43, 65}
 	_ServerMessageType_index_1 = [...]uint8{0, 24, 40, 62}
-	_ServerMessageType_index_4 = [...]uint8{0, 13, 37, 60}
-	_ServerMessageType_index_7 = [...]uint8{0, 24, 53}
+	_ServerMessageType_index_6 = [...]uint8{0, 13, 37, 60}
+	_ServerMessageType_index_9 = [...]uint8{0, 24, 53}
 )
 
 func (i ServerMessageType) String() string {
@@ -55,16 +59,20 @@ func (i ServerMessageType) String() string {
 		return _ServerMessageType_name_2
 	case i == 73:
 		return _ServerMessageType_name_3
+	case i == 75:
+		return _ServerMessageType_name_4
+	case i == 78:
+		return _ServerMessageType_name_5
 	case 82 <= i && i <= 84:
 		i -= 82
-		return _ServerMessageType_name_4[_ServerMessageType_index_4[i]:_ServerMessageType_index_4[i+1]]
+		return _ServerMessageType_name_6[_ServerMessageType_index_6[i]:_ServerMessageType_index_6[i+1]]
 	case i == 90:
-		return _ServerMessageType_name_5
+		return _ServerMessageType_name_7
 	case i == 110:
-		return _ServerMessageType_name_6
+		return _ServerMessageType_name_8
 	case 115 <= i && i <= 116:
 		i -= 115
-		return _ServerMessageType_name_7[_ServerMessageType_index_7[i]:_ServerMessageType_index_7[i+1]]
+		return _ServerMessageType_name_9[_ServerMessageType_index_9[i]:_ServerMessageType_index_9[i+1]]
 	default:
 		return "ServerMessageType(" + strconv.FormatInt(int64(i), 10) + ")"
 	}

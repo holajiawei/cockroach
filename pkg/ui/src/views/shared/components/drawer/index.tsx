@@ -11,6 +11,10 @@
 import React from "react";
 import { Drawer, Button, Divider } from "antd";
 import { Link } from "react-router-dom";
+import classNames from "classnames/bind";
+import styles from "./drawer.module.styl";
+
+const cx = classNames.bind(styles);
 
 interface IDrawerProps {
   visible: boolean;
@@ -21,18 +25,25 @@ interface IDrawerProps {
 }
 
 const openDetails = (data: any) => {
-  const base = data.app && data.app.length > 0 ? `/statements/${data.app}/${data.implicitTxn}` : `/statement/${data.implicitTxn}`;
+  const base =
+    data.app && data.app.length > 0
+      ? `/statements/${data.app}/${data.implicitTxn}`
+      : `/statement/${data.implicitTxn}`;
   const link = `${base}/${encodeURIComponent(data.statement)}`;
-  return (
-    <Link to={link}>View statement details</Link>
-  );
+  return <Link to={link}>View statement details</Link>;
 };
 
-// tslint:disable-next-line: variable-name
-export const DrawerComponent = ({ visible, onClose, children, data, details, ...props }: IDrawerProps) => (
+export const DrawerComponent = ({
+  visible,
+  onClose,
+  children,
+  data,
+  details,
+  ...props
+}: IDrawerProps) => (
   <Drawer
     title={
-      <div className="__actions">
+      <div className={cx("__actions")}>
         <Button type="default" ghost block onClick={onClose}>
           Close
         </Button>
@@ -48,7 +59,7 @@ export const DrawerComponent = ({ visible, onClose, children, data, details, ...
     closable={false}
     onClose={onClose}
     visible={visible}
-    className="drawer--preset-black"
+    className={cx("drawer--preset-black")}
     // getContainer={false}
     {...props}
   >

@@ -11,15 +11,16 @@ package changefeedccl
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
@@ -34,11 +35,11 @@ const (
 	changeFrontierProcName   = `changefntr`
 )
 
-var changefeedResultTypes = []types.T{
-	*types.Bytes,  // resolved span
-	*types.String, // topic
-	*types.Bytes,  // key
-	*types.Bytes,  // value
+var changefeedResultTypes = []*types.T{
+	types.Bytes,  // resolved span
+	types.String, // topic
+	types.Bytes,  // key
+	types.Bytes,  // value
 }
 
 // distChangefeedFlow plans and runs a distributed changefeed.
@@ -61,7 +62,7 @@ var changefeedResultTypes = []types.T{
 // progress of the changefeed's corresponding system job.
 func distChangefeedFlow(
 	ctx context.Context,
-	phs sql.PlanHookState,
+	execCtx sql.JobExecContext,
 	jobID int64,
 	details jobspb.ChangefeedDetails,
 	progress jobspb.Progress,
@@ -73,32 +74,48 @@ func distChangefeedFlow(
 		return err
 	}
 
+	// NB: A non-empty high water indicates that we have checkpointed a resolved
+	// timestamp. Skipping the initial scan is equivalent to starting the
+	// changefeed from a checkpoint at its start time. Initialize the progress
+	// based on whether we should perform an initial scan.
+	{
+		h := progress.GetHighWater()
+		noHighWater := (h == nil || h.IsEmpty())
+		// We want to set the highWater and thus avoid an initial scan if either
+		// this is a cursor and there was no request for one, or we don't have a
+		// cursor but we have a request to not have an initial scan.
+		if noHighWater && !initialScanFromOptions(details.Opts) {
+			// If there is a cursor, the statement time has already been set to it.
+			progress.Progress = &jobspb.Progress_HighWater{HighWater: &details.StatementTime}
+		}
+	}
+
 	spansTS := details.StatementTime
 	var initialHighWater hlc.Timestamp
-	if h := progress.GetHighWater(); h != nil && *h != (hlc.Timestamp{}) {
+	if h := progress.GetHighWater(); h != nil && !h.IsEmpty() {
 		initialHighWater = *h
 		// If we have a high-water set, use it to compute the spans, since the
 		// ones at the statement time may have been garbage collected by now.
 		spansTS = initialHighWater
 	}
 
-	execCfg := phs.ExecCfg()
-	trackedSpans, err := fetchSpansForTargets(ctx, execCfg.DB, details.Targets, spansTS)
+	execCfg := execCtx.ExecCfg()
+	trackedSpans, err := fetchSpansForTargets(ctx, execCfg.DB, execCfg.Codec, details.Targets, spansTS)
 	if err != nil {
 		return err
 	}
 
 	// Changefeed flows handle transactional consistency themselves.
-	var noTxn *client.Txn
-	gatewayNodeID := execCfg.NodeID.Get()
-	dsp := phs.DistSQLPlanner()
-	evalCtx := phs.ExtendedEvalContext()
-	planCtx := dsp.NewPlanningCtx(ctx, evalCtx, noTxn)
+	var noTxn *kv.Txn
+
+	dsp := execCtx.DistSQLPlanner()
+	evalCtx := execCtx.ExtendedEvalContext()
+	planCtx := dsp.NewPlanningCtx(ctx, evalCtx, nil /* planner */, noTxn, execCfg.Codec.ForSystemTenant() /* distribute */)
 
 	var spanPartitions []sql.SpanPartition
 	if details.SinkURI == `` {
 		// Sinkless feeds get one ChangeAggregator on the gateway.
-		spanPartitions = []sql.SpanPartition{{Node: gatewayNodeID, Spans: trackedSpans}}
+		spanPartitions = []sql.SpanPartition{{Node: dsp.GatewayID(), Spans: trackedSpans}}
 	} else {
 		// All other feeds get a ChangeAggregator local on the leaseholder.
 		spanPartitions, err = dsp.PartitionSpans(planCtx, trackedSpans)
@@ -107,30 +124,24 @@ func distChangefeedFlow(
 		}
 	}
 
-	changeAggregatorProcs := make([]physicalplan.Processor, 0, len(spanPartitions))
-	for _, sp := range spanPartitions {
+	corePlacement := make([]physicalplan.ProcessorCorePlacement, len(spanPartitions))
+	for i, sp := range spanPartitions {
 		// TODO(dan): Merge these watches with the span-level resolved
 		// timestamps from the job progress.
 		watches := make([]execinfrapb.ChangeAggregatorSpec_Watch, len(sp.Spans))
-		for i, nodeSpan := range sp.Spans {
-			watches[i] = execinfrapb.ChangeAggregatorSpec_Watch{
+		for watchIdx, nodeSpan := range sp.Spans {
+			watches[watchIdx] = execinfrapb.ChangeAggregatorSpec_Watch{
 				Span:            nodeSpan,
 				InitialResolved: initialHighWater,
 			}
 		}
 
-		changeAggregatorProcs = append(changeAggregatorProcs, physicalplan.Processor{
-			Node: sp.Node,
-			Spec: execinfrapb.ProcessorSpec{
-				Core: execinfrapb.ProcessorCoreUnion{
-					ChangeAggregator: &execinfrapb.ChangeAggregatorSpec{
-						Watches: watches,
-						Feed:    details,
-					},
-				},
-				Output: []execinfrapb.OutputRouterSpec{{Type: execinfrapb.OutputRouterSpec_PASS_THROUGH}},
-			},
-		})
+		corePlacement[i].NodeID = sp.Node
+		corePlacement[i].Core.ChangeAggregator = &execinfrapb.ChangeAggregatorSpec{
+			Watches:   watches,
+			Feed:      details,
+			UserProto: execCtx.User().EncodeProto(),
+		}
 	}
 	// NB: This SpanFrontier processor depends on the set of tracked spans being
 	// static. Currently there is no way for them to change after the changefeed
@@ -140,28 +151,20 @@ func distChangefeedFlow(
 		TrackedSpans: trackedSpans,
 		Feed:         details,
 		JobID:        jobID,
+		UserProto:    execCtx.User().EncodeProto(),
 	}
 
-	var p sql.PhysicalPlan
-
-	stageID := p.NewStageID()
-	p.ResultRouters = make([]physicalplan.ProcessorIdx, len(changeAggregatorProcs))
-	for i, proc := range changeAggregatorProcs {
-		proc.Spec.StageID = stageID
-		pIdx := p.AddProcessor(proc)
-		p.ResultRouters[i] = pIdx
-	}
-
+	p := planCtx.NewPhysicalPlan()
+	p.AddNoInputStage(corePlacement, execinfrapb.PostProcessSpec{}, changefeedResultTypes, execinfrapb.Ordering{})
 	p.AddSingleGroupStage(
-		gatewayNodeID,
+		dsp.GatewayID(),
 		execinfrapb.ProcessorCoreUnion{ChangeFrontier: &changeFrontierSpec},
 		execinfrapb.PostProcessSpec{},
 		changefeedResultTypes,
 	)
 
-	p.ResultTypes = changefeedResultTypes
 	p.PlanToStreamColMap = []int{1, 2, 3}
-	dsp.FinalizePlan(planCtx, &p)
+	dsp.FinalizePlan(planCtx, p)
 
 	resultRows := makeChangefeedResultWriter(resultsCh)
 	recv := sql.MakeDistSQLReceiver(
@@ -169,10 +172,10 @@ func distChangefeedFlow(
 		resultRows,
 		tree.Rows,
 		execCfg.RangeDescriptorCache,
-		execCfg.LeaseHolderCache,
 		noTxn,
-		func(ts hlc.Timestamp) {},
+		nil, /* clockUpdater */
 		evalCtx.Tracing,
+		execCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 
@@ -190,24 +193,28 @@ func distChangefeedFlow(
 
 	// Copy the evalCtx, as dsp.Run() might change it.
 	evalCtxCopy := *evalCtx
-	dsp.Run(planCtx, noTxn, &p, recv, &evalCtxCopy, finishedSetupFn)()
+	dsp.Run(planCtx, noTxn, p, recv, &evalCtxCopy, finishedSetupFn)()
 	return resultRows.Err()
 }
 
 func fetchSpansForTargets(
-	ctx context.Context, db *client.DB, targets jobspb.ChangefeedTargets, ts hlc.Timestamp,
+	ctx context.Context,
+	db *kv.DB,
+	codec keys.SQLCodec,
+	targets jobspb.ChangefeedTargets,
+	ts hlc.Timestamp,
 ) ([]roachpb.Span, error) {
 	var spans []roachpb.Span
-	err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		spans = nil
 		txn.SetFixedTimestamp(ctx, ts)
 		// Note that all targets are currently guaranteed to be tables.
 		for tableID := range targets {
-			tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+			tableDesc, err := catalogkv.MustGetTableDescByID(ctx, txn, codec, tableID)
 			if err != nil {
 				return err
 			}
-			spans = append(spans, tableDesc.PrimaryIndexSpan())
+			spans = append(spans, tableDesc.PrimaryIndexSpan(codec))
 		}
 		return nil
 	})

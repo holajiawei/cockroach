@@ -12,6 +12,7 @@ package base
 
 import (
 	"context"
+	"net"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -44,17 +45,30 @@ type TestServerArgs struct {
 	// is always set to true when the server is started via a TestCluster.
 	PartOfCluster bool
 
+	// Listener (if nonempty) is the listener to use for all incoming RPCs.
+	// If a listener is installed, it informs the RPC `Addr` used below. The
+	// Server itself knows to close it out. This is useful for when a test wants
+	// manual control over how the join flags (`JoinAddr`) are populated, and
+	// installs listeners manually to know which addresses to point to.
+	Listener net.Listener
+
 	// Addr (if nonempty) is the RPC address to use for the test server.
 	Addr string
 	// SQLAddr (if nonempty) is the SQL address to use for the test server.
 	SQLAddr string
+	// TenantAddr is the tenant KV address to use for the test server. If this
+	// is nil, the tenant server will be set up using a random port. If this
+	// is the empty string, no tenant server will be set up.
+	TenantAddr *string
 	// HTTPAddr (if nonempty) is the HTTP address to use for the test server.
 	HTTPAddr string
+	// DisableTLSForHTTP if set, disables TLS for the HTTP interface.
+	DisableTLSForHTTP bool
 
 	// JoinAddr is the address of a node we are joining.
 	//
 	// If left empty and the TestServer is being added to a nonempty cluster, this
-	// will be set to the the address of the cluster's first node.
+	// will be set to the address of the cluster's first node.
 	JoinAddr string
 
 	// StoreSpecs define the stores for this server. If you want more than
@@ -76,7 +90,7 @@ type TestServerArgs struct {
 
 	// Fields copied to the server.Config.
 	Insecure                    bool
-	RetryOptions                retry.Options
+	RetryOptions                retry.Options // TODO(tbg): make testing knob.
 	SocketFile                  string
 	ScanInterval                time.Duration
 	ScanMinIdleTime             time.Duration
@@ -86,6 +100,11 @@ type TestServerArgs struct {
 	TimeSeriesQueryMemoryBudget int64
 	SQLMemoryPoolSize           int64
 	CacheSize                   int64
+
+	// By default, test servers have AutoInitializeCluster=true set in
+	// their config. If NoAutoInitializeCluster is set, that behavior is disabled
+	// and the test becomes responsible for initializing the cluster.
+	NoAutoInitializeCluster bool
 
 	// If set, this will be appended to the Postgres URL by functions that
 	// automatically open a connection to the server. That's equivalent to running
@@ -106,6 +125,12 @@ type TestServerArgs struct {
 	// If set, web session authentication will be disabled, even if the server
 	// is running in secure mode.
 	DisableWebSessionAuthentication bool
+
+	// IF set, the demo login endpoint will be enabled.
+	EnableDemoLoginEndpoint bool
+
+	// If set, testing specific descriptor validation will be disabled. even if the server
+	DisableTestingDescriptorValidation bool
 }
 
 // TestClusterArgs contains the parameters one can set when creating a test
@@ -131,6 +156,8 @@ type TestClusterArgs struct {
 	// no entry in the map for a particular server, the default ServerArgs are
 	// used.
 	//
+	// These are indexes: the key 0 corresponds to the first node.
+	//
 	// A copy of an entry from this map will be copied to each individual server
 	// and potentially adjusted according to ReplicationMode.
 	ServerArgsPerNode map[int]TestServerArgs
@@ -148,10 +175,17 @@ var (
 // DefaultTestStoreSpec that is in-memory.
 // It has a maximum size of 100MiB.
 func DefaultTestTempStorageConfig(st *cluster.Settings) TempStorageConfig {
-	var maxSizeBytes int64 = DefaultInMemTempStorageMaxSizeBytes
-	monitor := mon.MakeMonitor(
+	return DefaultTestTempStorageConfigWithSize(st, DefaultInMemTempStorageMaxSizeBytes)
+}
+
+// DefaultTestTempStorageConfigWithSize is the associated temp storage for
+// DefaultTestStoreSpec that is in-memory with the customized maximum size.
+func DefaultTestTempStorageConfigWithSize(
+	st *cluster.Settings, maxSizeBytes int64,
+) TempStorageConfig {
+	monitor := mon.NewMonitor(
 		"in-mem temp storage",
-		mon.MemoryResource,
+		mon.DiskResource,
 		nil,             /* curCount */
 		nil,             /* maxHist */
 		1024*1024,       /* increment */
@@ -161,7 +195,8 @@ func DefaultTestTempStorageConfig(st *cluster.Settings) TempStorageConfig {
 	monitor.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
 	return TempStorageConfig{
 		InMemory: true,
-		Mon:      &monitor,
+		Mon:      monitor,
+		Settings: st,
 	}
 }
 
@@ -177,10 +212,34 @@ const (
 	// If ReplicationAuto is used, StartTestCluster() blocks until the initial
 	// ranges are fully replicated.
 	ReplicationAuto TestClusterReplicationMode = iota
-	// ReplicationManual means that the split and replication queues of all
-	// servers are stopped, and the test must manually control splitting and
-	// replication through the TestServer.
+	// ReplicationManual means that the split, merge and replication queues of all
+	// servers are stopped, and the test must manually control splitting, merging
+	// and  replication through the TestServer.
 	// Note that the server starts with a number of system ranges,
 	// all with a single replica on node 1.
 	ReplicationManual
 )
+
+// TestTenantArgs are the arguments used when creating a tenant from a
+// TestServer.
+type TestTenantArgs struct {
+	TenantID roachpb.TenantID
+
+	// Existing, if true, indicates an existing tenant, rather than a new tenant
+	// to be created by StartTenant.
+	Existing bool
+
+	// IdleExitAfter, if set will cause the tenant process to exit if idle.
+	IdleExitAfter time.Duration
+
+	// AllowSettingClusterSettings, if true, allows the tenant to set in-memory
+	// cluster settings.
+	AllowSettingClusterSettings bool
+
+	// Stopper, if not nil, is used to stop the tenant manually otherwise the
+	// TestServer stopper will be used.
+	Stopper *stop.Stopper
+
+	// TestingKnobs for the test server.
+	TestingKnobs TestingKnobs
+}

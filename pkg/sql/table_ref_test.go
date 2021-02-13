@@ -13,20 +13,25 @@ package sql_test
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestTableRefs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Populate the test database.
 	stmt := `
@@ -41,32 +46,30 @@ CREATE INDEX bc ON test.t(b, c);
 	}
 
 	// Retrieve the numeric descriptors.
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
-	tID := tableDesc.ID
-	var aID, bID, cID sqlbase.ColumnID
-	for i := range tableDesc.Columns {
-		c := &tableDesc.Columns[i]
-		switch c.Name {
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	tID := tableDesc.GetID()
+	var aID, bID, cID descpb.ColumnID
+	for _, c := range tableDesc.PublicColumns() {
+		switch c.GetName() {
 		case "a":
-			aID = c.ID
+			aID = c.GetID()
 		case "b":
-			bID = c.ID
+			bID = c.GetID()
 		case "c":
-			cID = c.ID
+			cID = c.GetID()
 		}
 	}
-	pkID := tableDesc.PrimaryIndex.ID
-	secID := tableDesc.Indexes[0].ID
+	pkID := tableDesc.GetPrimaryIndexID()
+	secID := tableDesc.PublicNonPrimaryIndexes()[0].GetID()
 
 	// Retrieve the numeric descriptors.
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "test", "hidden")
-	tIDHidden := tableDesc.ID
-	var rowIDHidden sqlbase.ColumnID
-	for i := range tableDesc.Columns {
-		c := &tableDesc.Columns[i]
-		switch c.Name {
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "hidden")
+	tIDHidden := tableDesc.GetID()
+	var rowIDHidden descpb.ColumnID
+	for _, c := range tableDesc.PublicColumns() {
+		switch c.GetName() {
 		case "rowid":
-			rowIDHidden = c.ID
+			rowIDHidden = c.GetID()
 		}
 	}
 
@@ -115,7 +118,7 @@ ALTER TABLE test.t DROP COLUMN xx;
 
 	for i, d := range testData {
 		t.Run(d.tableExpr, func(t *testing.T) {
-			sql := `SELECT columns FROM [EXPLAIN(VERBOSE) SELECT * FROM ` + d.tableExpr + "] WHERE columns != ''"
+			sql := `SELECT info FROM [EXPLAIN(VERBOSE) SELECT * FROM ` + d.tableExpr + `] WHERE info LIKE '%columns:%'`
 			var columns string
 			if err := db.QueryRow(sql).Scan(&columns); err != nil {
 				if d.expectedError != "" {
@@ -126,7 +129,8 @@ ALTER TABLE test.t DROP COLUMN xx;
 					t.Fatalf("%d: %s: query failed: %v", i, d.tableExpr, err)
 				}
 			}
-
+			r := regexp.MustCompile("^.*columns: ")
+			columns = r.ReplaceAllString(columns, "")
 			if columns != d.expectedColumns {
 				t.Fatalf("%d: %s: expected: %s, got: %s", i, d.tableExpr, d.expectedColumns, columns)
 			}

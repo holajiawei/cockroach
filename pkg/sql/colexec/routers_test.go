@@ -14,21 +14,30 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -45,7 +54,7 @@ type memoryTestCase struct {
 	expSpill bool
 }
 
-// getDiskqueueCfgAndMemoryTestCases is a test helper that creates an in-memory
+// getDiskQueueCfgAndMemoryTestCases is a test helper that creates an in-memory
 // DiskQueueCfg that can be used to create a new DiskQueue. A cleanup function
 // is also returned as well as some default memory limits that are useful to
 // test with: 0 for an immediate spill, a random memory limit up to 64 MiB, and
@@ -68,23 +77,37 @@ func getDiskQueueCfgAndMemoryTestCases(
 }
 
 // getDataAndFullSelection is a test helper that generates tuples representing
-// a one-column coltypes.Int64 batch where each element is its ordinal and an
+// a batch with single int64 column where each element is its ordinal and an
 // accompanying selection vector that selects every index in tuples.
-func getDataAndFullSelection() (tuples, []int) {
+func getDataAndFullSelection() (tuples, []*types.T, []int) {
 	data := make(tuples, coldata.BatchSize())
 	fullSelection := make([]int, coldata.BatchSize())
 	for i := range data {
 		data[i] = tuple{i}
 		fullSelection[i] = i
 	}
-	return data, fullSelection
+	return data, []*types.T{types.Int}, fullSelection
+}
+
+// pushSelectionIntoBatch updates b in-place to have the provided selection
+// vector while setting the length to minimum of b's length and len(selection).
+// Zero-length batch is not modified.
+func pushSelectionIntoBatch(b coldata.Batch, selection []int) {
+	if b.Length() > 0 {
+		b.SetSelection(true)
+		copy(b.Selection(), selection)
+		if len(selection) < b.Length() {
+			b.SetLength(len(selection))
+		}
+	}
 }
 
 func TestRouterOutputAddBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	data, fullSelection := getDataAndFullSelection()
+	data, typs, fullSelection := getDataAndFullSelection()
 
 	// Since the actual data doesn't matter, we will just be reusing data for each
 	// test case.
@@ -136,17 +159,35 @@ func TestRouterOutputAddBatch(t *testing.T) {
 	defer cleanup()
 
 	for _, tc := range testCases {
+		if len(tc.selection) == 0 {
+			// No data to work with, probably due to a low coldata.BatchSize.
+			continue
+		}
 		for _, mtc := range memoryTestCases {
 			t.Run(fmt.Sprintf("%s/memoryLimit=%s", tc.name, humanizeutil.IBytes(mtc.bytes)), func(t *testing.T) {
 				// Clear the testAllocator for use.
-				testAllocator.Clear()
-				o := newRouterOutputOpWithBlockedThresholdAndBatchSize(testAllocator, []coltypes.T{coltypes.Int64}, unblockEventsChan, mtc.bytes, queueCfg, NewTestingSemaphore(2), tc.blockedThreshold, tc.outputBatchSize)
+				testAllocator.ReleaseMemory(testAllocator.Used())
+				o := newRouterOutputOp(
+					routerOutputOpArgs{
+						types:               typs,
+						unlimitedAllocator:  testAllocator,
+						memoryLimit:         mtc.bytes,
+						diskAcc:             testDiskAcc,
+						cfg:                 queueCfg,
+						fdSemaphore:         colexecbase.NewTestingSemaphore(2),
+						unblockedEventsChan: unblockEventsChan,
+						testingKnobs: routerOutputOpTestingKnobs{
+							blockedThreshold: tc.blockedThreshold,
+						},
+					},
+				)
 				in := newOpTestInput(tc.inputBatchSize, data, nil /* typs */)
 				out := newOpTestOutput(o, data[:len(tc.selection)])
 				in.Init()
 				for {
 					b := in.Next(ctx)
-					o.addBatch(ctx, b, tc.selection)
+					pushSelectionIntoBatch(b, tc.selection)
+					o.addBatch(ctx, b)
 					if b.Length() == 0 {
 						break
 					}
@@ -173,22 +214,24 @@ func TestRouterOutputAddBatch(t *testing.T) {
 
 func TestRouterOutputNext(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	data, fullSelection := getDataAndFullSelection()
+	data, typs, fullSelection := getDataAndFullSelection()
 
 	testCases := []struct {
-		unblockEvent func(in Operator, o *routerOutputOp)
+		unblockEvent func(in colexecbase.Operator, o *routerOutputOp)
 		expected     tuples
 		name         string
 	}{
 		{
 			// ReaderWaitsForData verifies that a reader blocks in Next(ctx) until there
 			// is data available.
-			unblockEvent: func(in Operator, o *routerOutputOp) {
+			unblockEvent: func(in colexecbase.Operator, o *routerOutputOp) {
 				for {
 					b := in.Next(ctx)
-					o.addBatch(ctx, b, fullSelection)
+					pushSelectionIntoBatch(b, fullSelection)
+					o.addBatch(ctx, b)
 					if b.Length() == 0 {
 						break
 					}
@@ -200,8 +243,8 @@ func TestRouterOutputNext(t *testing.T) {
 		{
 			// ReaderWaitsForZeroBatch verifies that a reader blocking on Next will
 			// also get unblocked with no data other than the zero batch.
-			unblockEvent: func(_ Operator, o *routerOutputOp) {
-				o.addBatch(ctx, coldata.ZeroBatch, nil /* selection */)
+			unblockEvent: func(_ colexecbase.Operator, o *routerOutputOp) {
+				o.addBatch(ctx, coldata.ZeroBatch)
 			},
 			expected: tuples{},
 			name:     "ReaderWaitsForZeroBatch",
@@ -209,8 +252,8 @@ func TestRouterOutputNext(t *testing.T) {
 		{
 			// CancelUnblocksReader verifies that calling cancel on an output unblocks
 			// a reader.
-			unblockEvent: func(_ Operator, o *routerOutputOp) {
-				o.cancel(ctx)
+			unblockEvent: func(_ colexecbase.Operator, o *routerOutputOp) {
+				o.cancel(ctx, nil /* err */)
 			},
 			expected: tuples{},
 			name:     "CancelUnblocksReader",
@@ -233,7 +276,17 @@ func TestRouterOutputNext(t *testing.T) {
 				if queueCfg.FS == nil {
 					t.Fatal("FS was nil")
 				}
-				o := newRouterOutputOp(testAllocator, []coltypes.T{coltypes.Int64}, unblockedEventsChan, mtc.bytes, queueCfg, NewTestingSemaphore(2))
+				o := newRouterOutputOp(
+					routerOutputOpArgs{
+						types:               typs,
+						unlimitedAllocator:  testAllocator,
+						memoryLimit:         mtc.bytes,
+						diskAcc:             testDiskAcc,
+						cfg:                 queueCfg,
+						fdSemaphore:         colexecbase.NewTestingSemaphore(2),
+						unblockedEventsChan: unblockedEventsChan,
+					},
+				)
 				in := newOpTestInput(coldata.BatchSize(), data, nil /* typs */)
 				in.Init()
 				wg.Add(1)
@@ -260,11 +313,11 @@ func TestRouterOutputNext(t *testing.T) {
 				tc.unblockEvent(in, o)
 
 				// Should have data available, pushed by our reader goroutine.
-				batches := NewBatchBuffer()
+				batches := colexecbase.NewBatchBuffer()
 				out := newOpTestOutput(batches, tc.expected)
 				for {
 					b := <-batchChan
-					batches.Add(b)
+					batches.Add(b, typs)
 					if b.Length() == 0 {
 						break
 					}
@@ -283,8 +336,18 @@ func TestRouterOutputNext(t *testing.T) {
 		}
 
 		t.Run(fmt.Sprintf("NextAfterZeroBatchDoesntBlock/memoryLimit=%s", humanizeutil.IBytes(mtc.bytes)), func(t *testing.T) {
-			o := newRouterOutputOp(testAllocator, []coltypes.T{coltypes.Int64}, unblockedEventsChan, mtc.bytes, queueCfg, NewTestingSemaphore(2))
-			o.addBatch(ctx, coldata.ZeroBatch, fullSelection)
+			o := newRouterOutputOp(
+				routerOutputOpArgs{
+					types:               typs,
+					unlimitedAllocator:  testAllocator,
+					memoryLimit:         mtc.bytes,
+					diskAcc:             testDiskAcc,
+					cfg:                 queueCfg,
+					fdSemaphore:         colexecbase.NewTestingSemaphore(2),
+					unblockedEventsChan: unblockedEventsChan,
+				},
+			)
+			o.addBatch(ctx, coldata.ZeroBatch)
 			o.Next(ctx)
 			o.Next(ctx)
 			select {
@@ -304,9 +367,9 @@ func TestRouterOutputNext(t *testing.T) {
 				// If a full batch is smaller than our small batch size, reduce it, since
 				// this test relies on multiple batches returned from the input.
 				smallBatchSize = 2
-				if smallBatchSize >= coldata.MinBatchSize {
+				if smallBatchSize >= minBatchSize {
 					// Sanity check.
-					t.Fatalf("smallBatchSize=%d still too large (must be less than MinBatchSize=%d)", smallBatchSize, coldata.MinBatchSize)
+					t.Fatalf("smallBatchSize=%d still too large (must be less than minBatchSize=%d)", smallBatchSize, minBatchSize)
 				}
 				blockThreshold = 1
 			}
@@ -322,7 +385,20 @@ func TestRouterOutputNext(t *testing.T) {
 			}
 
 			ch := make(chan struct{}, 2)
-			o := newRouterOutputOpWithBlockedThresholdAndBatchSize(testAllocator, []coltypes.T{coltypes.Int64}, ch, mtc.bytes, queueCfg, NewTestingSemaphore(2), blockThreshold, coldata.BatchSize())
+			o := newRouterOutputOp(
+				routerOutputOpArgs{
+					types:               typs,
+					unlimitedAllocator:  testAllocator,
+					memoryLimit:         mtc.bytes,
+					diskAcc:             testDiskAcc,
+					cfg:                 queueCfg,
+					fdSemaphore:         colexecbase.NewTestingSemaphore(2),
+					unblockedEventsChan: ch,
+					testingKnobs: routerOutputOpTestingKnobs{
+						blockedThreshold: blockThreshold,
+					},
+				},
+			)
 			in := newOpTestInput(smallBatchSize, data, nil /* typs */)
 			out := newOpTestOutput(o, expected)
 			in.Init()
@@ -330,19 +406,22 @@ func TestRouterOutputNext(t *testing.T) {
 			b := in.Next(ctx)
 			// Make sure the output doesn't consider itself blocked. We're right at the
 			// limit but not over.
-			if o.addBatch(ctx, b, selection) {
+			pushSelectionIntoBatch(b, selection)
+			if o.addBatch(ctx, b) {
 				t.Fatal("unexpectedly blocked")
 			}
 			b = in.Next(ctx)
 			// This addBatch call should now block the output.
-			if !o.addBatch(ctx, b, selection) {
+			pushSelectionIntoBatch(b, selection)
+			if !o.addBatch(ctx, b) {
 				t.Fatal("unexpectedly still unblocked")
 			}
 
 			// Add the rest of the data.
 			for {
 				b = in.Next(ctx)
-				if o.addBatch(ctx, b, selection) {
+				pushSelectionIntoBatch(b, selection)
+				if o.addBatch(ctx, b) {
 					t.Fatal("should only return true when switching from unblocked to blocked")
 				}
 				if b.Length() == 0 {
@@ -364,6 +443,7 @@ func TestRouterOutputNext(t *testing.T) {
 
 func TestRouterOutputRandom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	rng, _ := randutil.NewPseudoRand()
@@ -371,10 +451,9 @@ func TestRouterOutputRandom(t *testing.T) {
 	var (
 		maxValues        = coldata.BatchSize() * 4
 		blockedThreshold = 1 + rng.Intn(maxValues-1)
-		outputSize       = 1 + rng.Intn(maxValues-1)
 	)
 
-	typs := []coltypes.T{coltypes.Int64, coltypes.Int64}
+	typs := []*types.T{types.Int, types.Int}
 
 	dataLen := 1 + rng.Intn(maxValues-1)
 	data := make(tuples, dataLen)
@@ -389,27 +468,46 @@ func TestRouterOutputRandom(t *testing.T) {
 	defer cleanup()
 
 	testName := fmt.Sprintf(
-		"blockedThreshold=%d/outputSize=%d/totalInputSize=%d", blockedThreshold, outputSize, len(data),
+		"blockedThreshold=%d/totalInputSize=%d", blockedThreshold, len(data),
 	)
 	for _, mtc := range memoryTestCases {
 		t.Run(fmt.Sprintf("%s/memoryLimit=%s", testName, humanizeutil.IBytes(mtc.bytes)), func(t *testing.T) {
-			runTestsWithFn(t, []tuples{data}, nil /* typs */, func(t *testing.T, inputs []Operator) {
+			runTestsWithFn(t, []tuples{data}, nil /* typs */, func(t *testing.T, inputs []colexecbase.Operator) {
 				var wg sync.WaitGroup
 				unblockedEventsChans := make(chan struct{}, 2)
-				o := newRouterOutputOpWithBlockedThresholdAndBatchSize(testAllocator, typs, unblockedEventsChans, mtc.bytes, queueCfg, NewTestingSemaphore(2), blockedThreshold, outputSize)
+				o := newRouterOutputOp(
+					routerOutputOpArgs{
+						types:               typs,
+						unlimitedAllocator:  testAllocator,
+						memoryLimit:         mtc.bytes,
+						diskAcc:             testDiskAcc,
+						cfg:                 queueCfg,
+						fdSemaphore:         colexecbase.NewTestingSemaphore(2),
+						unblockedEventsChan: unblockedEventsChans,
+						testingKnobs: routerOutputOpTestingKnobs{
+							blockedThreshold: blockedThreshold,
+						},
+					},
+				)
 				inputs[0].Init()
 
 				expected := make(tuples, 0, len(data))
 
+				// canceled is a boolean that specifies whether the output was canceled.
+				// If this is the case, the output should not be verified.
+				canceled := false
+
 				// Producer.
 				errCh := make(chan error)
+				wg.Add(1)
 				go func() {
+					defer wg.Done()
 					lastBlockedState := false
 					for {
 						b := inputs[0].Next(ctx)
 						selection := b.Selection()
 						if selection == nil {
-							selection = randomSel(rng, b.Length(), rng.Float64())
+							selection = coldatatestutils.RandomSel(rng, b.Length(), rng.Float64())
 						}
 
 						selection = selection[:b.Length()]
@@ -421,7 +519,8 @@ func TestRouterOutputRandom(t *testing.T) {
 							}
 						}
 
-						if o.addBatch(ctx, b, selection) {
+						pushSelectionIntoBatch(b, selection)
+						if o.addBatch(ctx, b) {
 							if lastBlockedState {
 								// We might have missed an unblock event during the last loop.
 								select {
@@ -431,6 +530,13 @@ func TestRouterOutputRandom(t *testing.T) {
 								}
 							}
 							lastBlockedState = true
+						}
+
+						if rng.Float64() < 0.1 {
+							o.cancel(ctx, nil /* err */)
+							canceled = true
+							errCh <- nil
+							return
 						}
 
 						// Read any state changes.
@@ -453,20 +559,14 @@ func TestRouterOutputRandom(t *testing.T) {
 					}
 				}()
 
-				actual := NewBatchBuffer()
+				actual := colexecbase.NewBatchBuffer()
 
 				// Consumer.
 				wg.Add(1)
 				go func() {
-					// Create a new allocator to copy the resulting batches. We need
-					// a separate allocator to testAllocator since this is a separate
-					// goroutine and allocators may not be used concurrently.
-					acc := testMemMonitor.MakeBoundAccount()
-					allocator := NewAllocator(ctx, &acc)
-					defer acc.Close(ctx)
 					for {
 						b := o.Next(ctx)
-						actual.Add(CopyBatch(allocator, b))
+						actual.Add(coldatatestutils.CopyBatch(b, typs, testColumnFactory), typs)
 						if b.Length() == 0 {
 							wg.Done()
 							return
@@ -480,6 +580,10 @@ func TestRouterOutputRandom(t *testing.T) {
 
 				wg.Wait()
 
+				if canceled {
+					return
+				}
+
 				if err := newOpTestOutput(actual, expected).Verify(); err != nil {
 					t.Fatal(err)
 				}
@@ -489,30 +593,40 @@ func TestRouterOutputRandom(t *testing.T) {
 }
 
 type callbackRouterOutput struct {
-	ZeroInputNode
-	addBatchCb func(coldata.Batch, []int) bool
-	cancelCb   func()
+	colexecbase.ZeroInputNode
+	addBatchCb   func(coldata.Batch) bool
+	cancelCb     func()
+	forwardedErr error
 }
 
-var _ routerOutput = callbackRouterOutput{}
+var _ routerOutput = &callbackRouterOutput{}
 
-func (o callbackRouterOutput) addBatch(
-	ctx context.Context, batch coldata.Batch, selection []int,
-) bool {
+func (o *callbackRouterOutput) initWithHashRouter(*HashRouter) {}
+
+func (o *callbackRouterOutput) addBatch(_ context.Context, batch coldata.Batch) bool {
 	if o.addBatchCb != nil {
-		return o.addBatchCb(batch, selection)
+		return o.addBatchCb(batch)
 	}
 	return false
 }
 
-func (o callbackRouterOutput) cancel(context.Context) {
+func (o *callbackRouterOutput) cancel(context.Context, error) {
 	if o.cancelCb != nil {
 		o.cancelCb()
 	}
 }
 
+func (o *callbackRouterOutput) forwardErr(err error) {
+	o.forwardedErr = err
+}
+
+func (o *callbackRouterOutput) resetForTests(context.Context) {
+	o.forwardedErr = nil
+}
+
 func TestHashRouterComputesDestination(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	// We have precomputed expectedNumVals only for the default batch size, so we
@@ -520,8 +634,8 @@ func TestHashRouterComputesDestination(t *testing.T) {
 	const expectedBatchSize = 1024
 	batchSize := coldata.BatchSize()
 	if batchSize != expectedBatchSize {
-		coldata.SetBatchSizeForTests(expectedBatchSize)
-		defer func(batchSize int) { coldata.SetBatchSizeForTests(batchSize) }(batchSize)
+		require.NoError(t, coldata.SetBatchSizeForTests(expectedBatchSize))
+		defer func(batchSize int) { require.NoError(t, coldata.SetBatchSizeForTests(batchSize)) }(batchSize)
 		batchSize = expectedBatchSize
 	}
 	data := make(tuples, batchSize)
@@ -548,9 +662,9 @@ func TestHashRouterComputesDestination(t *testing.T) {
 	for i := range outputs {
 		// Capture the index.
 		outputIdx := i
-		outputs[i] = callbackRouterOutput{
-			addBatchCb: func(batch coldata.Batch, sel []int) bool {
-				for _, j := range sel {
+		outputs[i] = &callbackRouterOutput{
+			addBatchCb: func(batch coldata.Batch) bool {
+				for _, j := range batch.Selection()[:batch.Length()] {
 					key := batch.ColVec(0).Int64()[j]
 					if _, ok := valsYetToSee[key]; !ok {
 						t.Fatalf("pushed alread seen value to router output: %d", key)
@@ -568,7 +682,7 @@ func TestHashRouterComputesDestination(t *testing.T) {
 		}
 	}
 
-	r := newHashRouterWithOutputs(in, []coltypes.T{coltypes.Int64}, []uint32{0}, nil /* ch */, outputs)
+	r := newHashRouterWithOutputs(in, []uint32{0}, nil /* ch */, outputs, nil /* toDrain */, nil /* toClose */)
 	for r.processNextBatch(ctx) {
 	}
 
@@ -585,31 +699,35 @@ func TestHashRouterComputesDestination(t *testing.T) {
 
 func TestHashRouterCancellation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	outputs := make([]routerOutput, 4)
+	outputs := make([]*callbackRouterOutput, 4)
+	routerOutputs := make([]routerOutput, 4)
 	numCancels := int64(0)
 	numAddBatches := int64(0)
 	for i := range outputs {
-		// We'll just be checking canceled.
-		outputs[i] = callbackRouterOutput{
-			addBatchCb: func(_ coldata.Batch, _ []int) bool {
+		outputs[i] = &callbackRouterOutput{
+			addBatchCb: func(_ coldata.Batch) bool {
 				atomic.AddInt64(&numAddBatches, 1)
 				return false
 			},
 			cancelCb: func() { atomic.AddInt64(&numCancels, 1) },
 		}
+		routerOutputs[i] = outputs[i]
 	}
 
+	typs := []*types.T{types.Int}
 	// Never-ending input of 0s.
-	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Int64})
+	batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	batch.SetLength(coldata.BatchSize())
-	in := NewRepeatableBatchSource(testAllocator, batch)
+	in := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
 
 	unbufferedCh := make(chan struct{})
-	r := newHashRouterWithOutputs(in, []coltypes.T{coltypes.Int64}, []uint32{0}, unbufferedCh, outputs)
+	r := newHashRouterWithOutputs(in, []uint32{0}, unbufferedCh, routerOutputs, nil /* toDrain */, nil /* toClose */)
 
 	t.Run("BeforeRun", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
+		r.resetForTests(ctx)
 		cancel()
 		r.Run(ctx)
 
@@ -620,10 +738,6 @@ func TestHashRouterCancellation(t *testing.T) {
 		if numAddBatches != 0 {
 			t.Fatalf("detected %d addBatch calls but expected 0", numAddBatches)
 		}
-
-		meta := r.DrainMeta(ctx)
-		require.Equal(t, 1, len(meta))
-		require.True(t, testutils.IsError(meta[0].Err, "context canceled"), meta[0].Err)
 	})
 
 	testCases := []struct {
@@ -646,6 +760,7 @@ func TestHashRouterCancellation(t *testing.T) {
 			numAddBatches = 0
 
 			ctx, cancel := context.WithCancel(context.Background())
+			r.resetForTests(ctx)
 
 			if tc.blocked {
 				r.numBlockedOutputs = len(outputs)
@@ -654,11 +769,10 @@ func TestHashRouterCancellation(t *testing.T) {
 				}()
 			}
 
-			routerMeta := make(chan []execinfrapb.ProducerMetadata)
+			doneCh := make(chan struct{})
 			go func() {
 				r.Run(ctx)
-				routerMeta <- r.DrainMeta(ctx)
-				close(routerMeta)
+				close(doneCh)
 			}()
 
 			time.Sleep(time.Millisecond)
@@ -669,14 +783,12 @@ func TestHashRouterCancellation(t *testing.T) {
 				}
 			}
 			select {
-			case <-routerMeta:
+			case <-doneCh:
 				t.Fatal("hash router goroutine unexpectedly done")
 			default:
 			}
 			cancel()
-			meta := <-routerMeta
-			require.Equal(t, 1, len(meta))
-			require.True(t, testutils.IsError(meta[0].Err, "canceled"), meta[0].Err)
+			<-doneCh
 
 			if numCancels != int64(len(outputs)) {
 				t.Fatalf("expected %d canceled outputs, actual %d", len(outputs), numCancels)
@@ -687,14 +799,14 @@ func TestHashRouterCancellation(t *testing.T) {
 
 func TestHashRouterOneOutput(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	rng, _ := randutil.NewPseudoRand()
 
-	sel := randomSel(rng, coldata.BatchSize(), rng.Float64())
+	sel := coldatatestutils.RandomSel(rng, coldata.BatchSize(), rng.Float64())
 
-	data, _ := getDataAndFullSelection()
-	typs := []coltypes.T{coltypes.Int64}
+	data, typs, _ := getDataAndFullSelection()
 
 	expected := make(tuples, 0, len(data))
 	for _, i := range sel {
@@ -707,8 +819,10 @@ func TestHashRouterOneOutput(t *testing.T) {
 	for _, mtc := range memoryTestCases {
 		t.Run(fmt.Sprintf("memoryLimit=%s", humanizeutil.IBytes(mtc.bytes)), func(t *testing.T) {
 			// Clear the testAllocator for use.
-			testAllocator.Clear()
-			r, routerOutputs := NewHashRouter([]*Allocator{testAllocator}, newOpFixedSelTestInput(sel, len(sel), data), typs, []uint32{0}, mtc.bytes, queueCfg, NewTestingSemaphore(2))
+			testAllocator.ReleaseMemory(testAllocator.Used())
+			diskAcc := testDiskMonitor.MakeBoundAccount()
+			defer diskAcc.Close(ctx)
+			r, routerOutputs := NewHashRouter([]*colmem.Allocator{testAllocator}, newOpFixedSelTestInput(sel, len(sel), data, typs), typs, []uint32{0}, mtc.bytes, queueCfg, colexecbase.NewTestingSemaphore(2), []*mon.BoundAccount{&diskAcc}, nil /* toDrain */, nil /* toClose */)
 
 			if len(routerOutputs) != 1 {
 				t.Fatalf("expected 1 router output but got %d", len(routerOutputs))
@@ -717,8 +831,6 @@ func TestHashRouterOneOutput(t *testing.T) {
 			o := newOpTestOutput(routerOutputs[0], expected)
 
 			ro := routerOutputs[0].(*routerOutputOp)
-			// Set alwaysFlush so that data is always flushed to the spillingQueue.
-			ro.testingKnobs.alwaysFlush = true
 
 			var wg sync.WaitGroup
 			wg.Add(1)
@@ -732,9 +844,9 @@ func TestHashRouterOneOutput(t *testing.T) {
 			}
 			wg.Wait()
 			// Expect no metadata, this should be a successful run.
-			unexpectedMetadata := r.DrainMeta(ctx)
+			unexpectedMetadata := ro.DrainMeta(ctx)
 			if len(unexpectedMetadata) != 0 {
-				t.Fatalf("unexpected metadata when draining HashRouter: %+v", unexpectedMetadata)
+				t.Fatalf("unexpected metadata when draining HashRouter output: %+v", unexpectedMetadata)
 			}
 			if !mtc.skipExpSpillCheck {
 				// If len(sel) == 0, no items will have been enqueued so override an
@@ -748,6 +860,7 @@ func TestHashRouterOneOutput(t *testing.T) {
 
 func TestHashRouterRandom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	rng, _ := randutil.NewPseudoRand()
@@ -756,11 +869,10 @@ func TestHashRouterRandom(t *testing.T) {
 		maxValues        = coldata.BatchSize() * 4
 		maxOutputs       = 128
 		blockedThreshold = 1 + rng.Intn(maxValues-1)
-		outputSize       = 1 + rng.Intn(maxValues-1)
 		numOutputs       = 1 + rng.Intn(maxOutputs-1)
 	)
 
-	typs := []coltypes.T{coltypes.Int64, coltypes.Int64}
+	typs := []*types.T{types.Int, types.Int}
 	dataLen := 1 + rng.Intn(maxValues-1)
 	data := make(tuples, dataLen)
 	for i := range data {
@@ -778,20 +890,50 @@ func TestHashRouterRandom(t *testing.T) {
 		}
 	}
 
-	// cancel determines whether we test cancellation.
-	cancel := false
-	if rng.Float64() < 0.25 {
-		cancel = true
+	type hashRouterTerminationScenario int
+	const (
+		// hashRouterGracefulTermination is a normal termination scenario where the
+		// input stream is fully consumed and all outputs are drained normally.
+		hashRouterGracefulTermination hashRouterTerminationScenario = iota
+		// hashRouterPrematureDrainMeta is a termination scenario where one or more
+		// outputs are drained before all output is pushed to it.
+		hashRouterPrematureDrainMeta
+		// hashRouterContextCanceled is a termination scenario where the caller of
+		// Run suddenly cancels the provided context.
+		hashRouterContextCanceled
+		// hashRouterOutputErrorOnAddBatch is a termination scenario in which the
+		// router output encounters an error when a batch is pushed to it.
+		hashRouterOutputErrorOnAddBatch
+		// hashRouterOutputErrorOnNext is a termination scenario in which the
+		// router output encounters an error when a batch is read from it.
+		hashRouterOutputErrorOnNext
+		// hashRouterChaos is a fun scenario in which maybe a bit of everything
+		// happens.
+		hashRouterChaos
+		// hashRouterMaxTerminationScenario should be kept at the end of this list
+		// for the rng to generate a valid termination scenario.
+		hashRouterMaxTerminationScenario
+	)
+	terminationScenario := hashRouterTerminationScenario(rng.Intn(int(hashRouterMaxTerminationScenario)))
+	// isTerminationScenario is a helper function that returns true with a
+	// given probability if the termination scenario is equivalent to the given
+	// scenario. This can be used before performing any disruptive behavior in
+	// order to randomize its occurrence.
+	isTerminationScenario := func(rng *rand.Rand, probability float64, ts hashRouterTerminationScenario) bool {
+		return rng.Float64() < probability && (terminationScenario == ts || terminationScenario == hashRouterChaos)
 	}
+	const (
+		addBatchErrMsg = "test induced addBatch error"
+		nextErrMsg     = "test induced Next error"
+	)
 
 	testName := fmt.Sprintf(
-		"numOutputs=%d/blockedThreshold=%d/outputSize=%d/totalInputSize=%d/hashCols=%v/cancel=%t",
+		"terminationScenario=%d/numOutputs=%d/blockedThreshold=%d/totalInputSize=%d/hashCols=%v",
+		terminationScenario,
 		numOutputs,
 		blockedThreshold,
-		outputSize,
 		len(data),
 		hashCols,
-		cancel,
 	)
 
 	queueCfg, cleanup, memoryTestCases := getDiskQueueCfgAndMemoryTestCases(t, rng)
@@ -803,41 +945,117 @@ func TestHashRouterRandom(t *testing.T) {
 	var expectedDistribution []int
 	for _, mtc := range memoryTestCases {
 		t.Run(fmt.Sprintf(testName+"/memoryLimit=%s", humanizeutil.IBytes(mtc.bytes)), func(t *testing.T) {
-			runTestsWithFn(t, []tuples{data}, nil /* typs */, func(t *testing.T, inputs []Operator) {
+			runTestsWithFn(t, []tuples{data}, nil /* typs */, func(t *testing.T, inputs []colexecbase.Operator) {
 				unblockEventsChan := make(chan struct{}, 2*numOutputs)
 				outputs := make([]routerOutput, numOutputs)
-				outputsAsOps := make([]Operator, numOutputs)
+				outputsAsOps := make([]colexecbase.DrainableOperator, numOutputs)
 				memoryLimitPerOutput := mtc.bytes / int64(len(outputs))
 				for i := range outputs {
+					// Create separate monitoring infrastructure as well as
+					// an allocator for each output as router outputs run
+					// concurrently.
 					acc := testMemMonitor.MakeBoundAccount()
 					defer acc.Close(ctx)
-					// Create a separate allocator for each output as a single allocator
-					// may not be used concurrently.
-					allocator := NewAllocator(ctx, &acc)
-					op := newRouterOutputOpWithBlockedThresholdAndBatchSize(allocator, typs, unblockEventsChan, memoryLimitPerOutput, queueCfg, NewTestingSemaphore(len(outputs)*2), blockedThreshold, outputSize)
+					diskAcc := testDiskMonitor.MakeBoundAccount()
+					defer diskAcc.Close(ctx)
+					allocator := colmem.NewAllocator(ctx, &acc, testColumnFactory)
+					op := newRouterOutputOp(
+						routerOutputOpArgs{
+							types:               typs,
+							unlimitedAllocator:  allocator,
+							memoryLimit:         memoryLimitPerOutput,
+							diskAcc:             &diskAcc,
+							cfg:                 queueCfg,
+							fdSemaphore:         colexecbase.NewTestingSemaphore(len(outputs) * 2),
+							unblockedEventsChan: unblockEventsChan,
+							testingKnobs: routerOutputOpTestingKnobs{
+								blockedThreshold: blockedThreshold,
+							},
+						},
+					)
+
+					injectErrorScenario := terminationScenario
+					if terminationScenario == hashRouterChaos {
+						switch rng.Intn(2) {
+						case 0:
+							injectErrorScenario = hashRouterOutputErrorOnAddBatch
+						case 1:
+							injectErrorScenario = hashRouterOutputErrorOnNext
+						default:
+						}
+					}
+
+					switch injectErrorScenario {
+					case hashRouterOutputErrorOnAddBatch:
+						op.testingKnobs.addBatchTestInducedErrorCb = func() error {
+							addBatchRng, _ := randutil.NewPseudoRand()
+							// Sleep between 0 and ~5 milliseconds.
+							time.Sleep(time.Microsecond * time.Duration(addBatchRng.Intn(5000)))
+							return errors.New(addBatchErrMsg)
+						}
+					case hashRouterOutputErrorOnNext:
+						op.testingKnobs.nextTestInducedErrorCb = func() error {
+							nextRng, _ := randutil.NewPseudoRand()
+							// Sleep between 0 and ~5 milliseconds.
+							time.Sleep(time.Microsecond * time.Duration(nextRng.Intn(5000)))
+							return errors.New(nextErrMsg)
+						}
+					}
 					outputs[i] = op
 					outputsAsOps[i] = op
 				}
 
+				const hashRouterMetadataMsg = "hash router test metadata"
 				r := newHashRouterWithOutputs(
-					inputs[0], typs, hashCols, unblockEventsChan, outputs,
+					inputs[0],
+					hashCols,
+					unblockEventsChan,
+					outputs,
+					[]execinfrapb.MetadataSource{
+						execinfrapb.CallbackMetadataSource{
+							DrainMetaCb: func(_ context.Context) []execinfrapb.ProducerMetadata {
+								return []execinfrapb.ProducerMetadata{{Err: errors.New(hashRouterMetadataMsg)}}
+							},
+						},
+					},
+					nil, /* toClose */
 				)
 
 				var (
 					results uint64
 					wg      sync.WaitGroup
 				)
-				resultsByOp := make([]int, len(outputsAsOps))
+				resultsByOp := make(
+					[]struct {
+						numResults int
+						err        error
+					},
+					len(outputsAsOps),
+				)
 				wg.Add(len(outputsAsOps))
+				metadataMu := struct {
+					syncutil.Mutex
+					metadata [][]execinfrapb.ProducerMetadata
+				}{}
 				for i := range outputsAsOps {
 					go func(i int) {
+						outputRng, _ := randutil.NewPseudoRand()
 						for {
-							b := outputsAsOps[i].Next(ctx)
-							if b.Length() == 0 {
+							var b coldata.Batch
+							err := colexecerror.CatchVectorizedRuntimeError(func() {
+								b = outputsAsOps[i].Next(ctx)
+							})
+							if err != nil || b.Length() == 0 || isTerminationScenario(outputRng, 0.5, hashRouterPrematureDrainMeta) {
+								resultsByOp[i].err = err
+								metadataMu.Lock()
+								if meta := outputsAsOps[i].DrainMeta(ctx); meta != nil {
+									metadataMu.metadata = append(metadataMu.metadata, meta)
+								}
+								metadataMu.Unlock()
 								break
 							}
 							atomic.AddUint64(&results, uint64(b.Length()))
-							resultsByOp[i] += b.Length()
+							resultsByOp[i].numResults += b.Length()
 						}
 						wg.Done()
 					}(i)
@@ -846,38 +1064,83 @@ func TestHashRouterRandom(t *testing.T) {
 				ctx, cancelFunc := context.WithCancel(context.Background())
 				wg.Add(1)
 				go func() {
+					if terminationScenario == hashRouterContextCanceled || terminationScenario == hashRouterChaos {
+						// cancel the context before using it so the HashRouter does not
+						// finish Run before it is canceled.
+						cancelFunc()
+					} else {
+						// Satisfy linter context leak error.
+						defer cancelFunc()
+					}
 					r.Run(ctx)
 					wg.Done()
 				}()
 
-				if cancel {
-					// Sleep between 0 and ~5 milliseconds.
-					time.Sleep(time.Microsecond * time.Duration(rng.Intn(5000)))
-					cancelFunc()
-				} else {
-					// Satisfy linter context leak error.
-					defer cancelFunc()
+				wg.Wait()
+				// The waitGroup protects metadataMu from concurrent access, so there's
+				// no need to lock the mutex here.
+				metadata := metadataMu.metadata
+				checkMetadata := func(t *testing.T, expectedErrMsgs []string) {
+					t.Helper()
+					require.Equal(t, 1, len(metadata), "one output (the last to exit) should return metadata")
+
+					require.Equal(t, len(expectedErrMsgs), len(metadata[0]), "unexpected number of metadata messages")
+					var actualErrMsgs []string
+					for _, meta := range metadata[0] {
+						require.NotNil(t, meta.Err)
+						actualErrMsgs = append(actualErrMsgs, meta.Err.Error())
+					}
+					sort.Strings(actualErrMsgs)
+					sort.Strings(expectedErrMsgs)
+					for i := range actualErrMsgs {
+						require.Contains(
+							t, actualErrMsgs[i], expectedErrMsgs[i], "expected and actual metadata mismatch at index %d: expected: %v actual: %v", i, expectedErrMsgs, actualErrMsgs,
+						)
+					}
+				}
+				requireNoErrors := func(t *testing.T) {
+					t.Helper()
+					for i := range resultsByOp {
+						require.NoError(t, resultsByOp[i].err)
+					}
+				}
+				requireErrFromEachOutput := func(t *testing.T, err error) {
+					t.Helper()
+					if err == nil {
+						t.Fatal("use requireNoErrors instead")
+					}
+					for i := range resultsByOp {
+						if resultsByOp[i].err == nil {
+							t.Fatalf("unexpectedly no error from %d output", i)
+						}
+						require.True(t, testutils.IsError(resultsByOp[i].err, err.Error()), "unexpected error %v", resultsByOp[i].err)
+					}
 				}
 
-				// Ensure all goroutines end. If a test fails with a hang here it is most
-				// likely due to a cancellation bug.
-				wg.Wait()
-				if !cancel {
-					// Expect no metadata, this should be a successful run.
-					unexpectedMetadata := r.DrainMeta(ctx)
-					if len(unexpectedMetadata) != 0 {
-						t.Fatalf("unexpected metadata when draining HashRouter: %+v", unexpectedMetadata)
+				switch terminationScenario {
+				case hashRouterGracefulTermination, hashRouterPrematureDrainMeta:
+					requireNoErrors(t)
+					checkMetadata(t, []string{hashRouterMetadataMsg})
+
+					if terminationScenario == hashRouterPrematureDrainMeta {
+						// Don't check output results if an output is prematurely drained
+						// since they differ from run to run.
+						break
 					}
-					// Only do output verification if no cancellation happened.
+
+					// Do output verification.
 					if actualTotal := atomic.LoadUint64(&results); actualTotal != uint64(len(data)) {
 						t.Fatalf("unexpected number of results %d, expected %d", actualTotal, len(data))
 					}
 					if expectedDistribution == nil {
-						expectedDistribution = resultsByOp
+						expectedDistribution = make([]int, len(resultsByOp))
+						for i := range resultsByOp {
+							expectedDistribution[i] = resultsByOp[i].numResults
+						}
 						return
 					}
 					for i, numVals := range expectedDistribution {
-						if numVals != resultsByOp[i] {
+						if numVals != resultsByOp[i].numResults {
 							t.Fatalf(
 								"distribution of results changed compared to first run at output %d. expected: %v, actual: %v",
 								i,
@@ -886,6 +1149,54 @@ func TestHashRouterRandom(t *testing.T) {
 							)
 						}
 					}
+				case hashRouterContextCanceled:
+					requireErrFromEachOutput(t, context.Canceled)
+					checkMetadata(t, []string{hashRouterMetadataMsg})
+				case hashRouterOutputErrorOnAddBatch:
+					requireErrFromEachOutput(t, errors.New(addBatchErrMsg))
+					checkMetadata(t, []string{hashRouterMetadataMsg})
+				case hashRouterOutputErrorOnNext:
+					// If an error is encountered in Next, it is returned to the caller,
+					// not as metadata by the HashRouter.
+					checkMetadata(t, []string{hashRouterMetadataMsg})
+					numNextErrs := 0
+					for i := range resultsByOp {
+						if err := resultsByOp[i].err; err != nil {
+							require.Contains(t, err.Error(), nextErrMsg)
+							numNextErrs++
+						}
+					}
+					require.GreaterOrEqual(t, numNextErrs, 1, "expected at least one test-induced next error msg")
+				case hashRouterChaos:
+					// Metadata must contain at least the hashRouterMetadataMsg and may
+					// contain metadata from the other cases.
+					require.Equal(t, 1, len(metadataMu.metadata), "one output (the last to exit) should return metadata")
+					matchedHashRouterMetadataMsg := false
+					metadata := metadataMu.metadata[0]
+					for _, meta := range metadata {
+						require.NotNil(t, meta.Err)
+						if strings.Contains(meta.Err.Error(), hashRouterMetadataMsg) {
+							matchedHashRouterMetadataMsg = true
+							continue
+						}
+
+						matched := false
+						for _, errMsg := range []string{
+							context.Canceled.Error(),
+							addBatchErrMsg,
+							nextErrMsg,
+						} {
+							if strings.Contains(meta.Err.Error(), errMsg) {
+								matched = true
+								break
+							}
+						}
+						require.True(t, matched, "unexpected metadata: %v", meta.Err)
+					}
+
+					require.True(t, matchedHashRouterMetadataMsg, "hashRouterChaos metadata must contain hashRouterMetadataMsg")
+				default:
+					t.Fatalf("unhandled terminationScenario: %d", terminationScenario)
 				}
 			})
 		})
@@ -894,15 +1205,15 @@ func TestHashRouterRandom(t *testing.T) {
 
 func BenchmarkHashRouter(b *testing.B) {
 	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
 	ctx := context.Background()
-
-	types := []coltypes.T{coltypes.Int64}
 
 	// Use only one type. Note: the more types you use, the more you inflate the
 	// numbers.
-	batch := testAllocator.NewMemBatch(types)
+	typs := []*types.T{types.Int}
+	batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	batch.SetLength(coldata.BatchSize())
-	input := NewRepeatableBatchSource(testAllocator, batch)
+	input := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
 
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(b, true /* inMem */)
 	defer cleanup()
@@ -911,13 +1222,17 @@ func BenchmarkHashRouter(b *testing.B) {
 	for _, numOutputs := range []int{2, 4, 8, 16} {
 		for _, numInputBatches := range []int{2, 4, 8, 16} {
 			b.Run(fmt.Sprintf("numOutputs=%d/numInputBatches=%d", numOutputs, numInputBatches), func(b *testing.B) {
-				allocators := make([]*Allocator, numOutputs)
+				allocators := make([]*colmem.Allocator, numOutputs)
+				diskAccounts := make([]*mon.BoundAccount, numOutputs)
 				for i := range allocators {
 					acc := testMemMonitor.MakeBoundAccount()
-					allocators[i] = NewAllocator(ctx, &acc)
+					allocators[i] = colmem.NewAllocator(ctx, &acc, testColumnFactory)
 					defer acc.Close(ctx)
+					diskAcc := testDiskMonitor.MakeBoundAccount()
+					diskAccounts[i] = &diskAcc
+					defer diskAcc.Close(ctx)
 				}
-				r, outputs := NewHashRouter(allocators, input, types, []uint32{0}, 64<<20, queueCfg, &TestingSemaphore{})
+				r, outputs := NewHashRouter(allocators, input, typs, []uint32{0}, 64<<20, queueCfg, &colexecbase.TestingSemaphore{}, diskAccounts, nil /* toDrain */, nil /* toClose */)
 				b.SetBytes(8 * int64(coldata.BatchSize()) * int64(numInputBatches))
 				// We expect distribution to not change. This is a sanity check that
 				// we're resetting properly.
@@ -929,7 +1244,7 @@ func BenchmarkHashRouter(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					input.ResetBatchesToReturn(numInputBatches)
-					r.reset()
+					r.resetForTests(ctx)
 					wg.Add(len(outputs))
 					for j := range outputs {
 						go func(j int) {
@@ -937,6 +1252,7 @@ func BenchmarkHashRouter(b *testing.B) {
 								oBatch := outputs[j].Next(ctx)
 								actualDistribution[j] += oBatch.Length()
 								if oBatch.Length() == 0 {
+									_ = outputs[j].DrainMeta(ctx)
 									break
 								}
 							}
@@ -969,6 +1285,16 @@ func BenchmarkHashRouter(b *testing.B) {
 						}
 					}
 					copy(actualDistribution, zeroDistribution)
+					// Sanity check the spilling queues' memory management.
+					for i := range outputs {
+						sq := outputs[i].(*routerOutputOp).mu.data
+						if sq.spilled() {
+							b.Fatal("unexpectedly spilling queue spilled to disk")
+						}
+						if sq.unlimitedAllocator.Used() > 0 {
+							b.Fatal("unexpectedly spilling queue's allocator has non-zero usage")
+						}
+					}
 				}
 			})
 		}

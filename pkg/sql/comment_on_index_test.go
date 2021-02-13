@@ -18,14 +18,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 func TestCommentOnIndex(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -75,10 +78,11 @@ func TestCommentOnIndex(t *testing.T) {
 
 func TestCommentOnIndexWhenDropTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -99,7 +103,7 @@ func TestCommentOnIndexWhenDropTable(t *testing.T) {
 	row := db.QueryRow(`SELECT comment FROM system.comments LIMIT 1`)
 	var comment string
 	err := row.Scan(&comment)
-	if err != gosql.ErrNoRows {
+	if !errors.Is(err, gosql.ErrNoRows) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -110,10 +114,11 @@ func TestCommentOnIndexWhenDropTable(t *testing.T) {
 
 func TestCommentOnIndexWhenDropIndex(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -134,7 +139,7 @@ func TestCommentOnIndexWhenDropIndex(t *testing.T) {
 	row := db.QueryRow(`SELECT comment FROM system.comments LIMIT 1`)
 	var comment string
 	err := row.Scan(&comment)
-	if err != gosql.ErrNoRows {
+	if !errors.Is(err, gosql.ErrNoRows) {
 		if err != nil {
 			t.Fatal(err)
 		}

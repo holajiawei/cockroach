@@ -25,16 +25,20 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 )
 
 // TestServerInterface defines test server functionality that tests need; it is
@@ -42,10 +46,17 @@ import (
 type TestServerInterface interface {
 	Stopper() *stop.Stopper
 
-	Start(params base.TestServerArgs) error
+	Start() error
+
+	// Node returns the server.Node as an interface{}.
+	Node() interface{}
 
 	// NodeID returns the ID of this node within its cluster.
 	NodeID() roachpb.NodeID
+
+	// ClusterID returns the cluster ID as understood by this node in the
+	// cluster.
+	ClusterID() uuid.UUID
 
 	// ServingRPCAddr returns the server's advertised address.
 	ServingRPCAddr() string
@@ -65,7 +76,7 @@ type TestServerInterface interface {
 	SQLAddr() string
 
 	// DB returns a *client.DB instance for talking to this KV server.
-	DB() *client.DB
+	DB() *kv.DB
 
 	// RPCContext returns the rpc context used by the test server.
 	RPCContext() *rpc.Context
@@ -81,6 +92,9 @@ type TestServerInterface interface {
 	// The real return type is sql.ExecutorConfig.
 	ExecutorConfig() interface{}
 
+	// Tracer returns a *tracing.Tracer as an interface{}.
+	Tracer() interface{}
+
 	// GossipI returns the gossip used by the TestServer.
 	// The real return type is *gossip.Gossip.
 	GossipI() interface{}
@@ -92,14 +106,30 @@ type TestServerInterface interface {
 	// The real return type is *kv.DistSender.
 	DistSenderI() interface{}
 
+	// MigrationServer returns the internal *migrationServer as in interface{}
+	MigrationServer() interface{}
+
 	// SQLServer returns the *sql.Server as an interface{}.
 	SQLServer() interface{}
 
 	// DistSQLServer returns the *distsql.ServerImpl as an interface{}.
 	DistSQLServer() interface{}
 
+	// SQLLivenessStorage returns the sqlliveness.Provider as an interface{}.
+	SQLLivenessProvider() interface{}
+
 	// JobRegistry returns the *jobs.Registry as an interface{}.
 	JobRegistry() interface{}
+
+	// SQLMigrationsManager returns the *sqlmigrations.Manager as an interface{}.
+	SQLMigrationsManager() interface{}
+
+	// NodeLiveness exposes the NodeLiveness instance used by the TestServer as an
+	// interface{}.
+	NodeLiveness() interface{}
+
+	// HeartbeatNodeLiveness heartbeats the server's NodeLiveness record.
+	HeartbeatNodeLiveness() error
 
 	// SetDistSQLSpanResolver changes the SpanResolver used for DistSQL inside the
 	// server's executor. The argument must be a physicalplan.SpanResolver
@@ -143,7 +173,7 @@ type TestServerInterface interface {
 	GetFirstStoreID() roachpb.StoreID
 
 	// GetStores returns the collection of stores from this TestServer's node.
-	// The return value is of type *storage.Stores.
+	// The return value is of type *kvserver.Stores.
 	GetStores() interface{}
 
 	// ClusterSettings returns the ClusterSettings shared by all components of
@@ -151,9 +181,7 @@ type TestServerInterface interface {
 	ClusterSettings() *cluster.Settings
 
 	// SplitRange splits the range containing splitKey.
-	SplitRange(
-		splitKey roachpb.Key,
-	) (left roachpb.RangeDescriptor, right roachpb.RangeDescriptor, err error)
+	SplitRange(splitKey roachpb.Key) (left roachpb.RangeDescriptor, right roachpb.RangeDescriptor, err error)
 
 	// MergeRanges merges the range containing leftKey with the following adjacent
 	// range.
@@ -170,13 +198,39 @@ type TestServerInterface interface {
 	// An error will be returned if the same table name exists in multiple schemas
 	// inside the specified database.
 	ForceTableGC(ctx context.Context, database, table string, timestamp hlc.Timestamp) error
+
+	// UpdateChecker returns the server's *diagnostics.UpdateChecker as an
+	// interface{}. The UpdateChecker periodically phones home to check for new
+	// updates that are available.
+	UpdateChecker() interface{}
+
+	// DiagnosticsReporter returns the server's *diagnostics.Reporter as an
+	// interface{}. The DiagnosticsReporter periodically phones home to report
+	// diagnostics and usage.
+	DiagnosticsReporter() interface{}
+
+	// StartTenant spawns off tenant process connecting to this TestServer.
+	StartTenant(params base.TestTenantArgs) (TestTenantInterface, error)
+
+	// ScratchRange splits off a range suitable to be used as KV scratch space.
+	// (it doesn't overlap system spans or SQL tables).
+	//
+	// Calling this multiple times is undefined (but see
+	// TestCluster.ScratchRange() which is idempotent).
+	ScratchRange() (roachpb.Key, error)
+
+	// Engines returns the TestServer's engines.
+	Engines() []storage.Engine
+
+	// MetricsRecorder periodically records node-level and store-level metrics.
+	MetricsRecorder() *status.MetricsRecorder
 }
 
 // TestServerFactory encompasses the actual implementation of the shim
 // service.
 type TestServerFactory interface {
 	// New instantiates a test server.
-	New(params base.TestServerArgs) interface{}
+	New(params base.TestServerArgs) (interface{}, error)
 }
 
 var srvFactoryImpl TestServerFactory
@@ -188,47 +242,109 @@ func InitTestServerFactory(impl TestServerFactory) {
 	srvFactoryImpl = impl
 }
 
-// StartServer creates a test server and sets up a gosql DB connection.
-// The server should be stopped by calling server.Stopper().Stop().
+// StartServer creates and starts a test server, and sets up a gosql DB
+// connection to it. The server should be stopped by calling
+// server.Stopper().Stop().
 func StartServer(
 	t testing.TB, params base.TestServerArgs,
-) (TestServerInterface, *gosql.DB, *client.DB) {
-	server, err := StartServerRaw(params)
+) (TestServerInterface, *gosql.DB, *kv.DB) {
+	server, err := NewServer(params)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%+v", err)
+	}
+	if err := server.Start(); err != nil {
+		t.Fatalf("%+v", err)
+	}
+	goDB := OpenDBConn(
+		t, server.ServingSQLAddr(), params.UseDatabase, params.Insecure, server.Stopper())
+	return server, goDB, server.DB()
+}
+
+// NewServer creates a test server.
+func NewServer(params base.TestServerArgs) (TestServerInterface, error) {
+	if srvFactoryImpl == nil {
+		return nil, errors.AssertionFailedf("TestServerFactory not initialized. One needs to be injected " +
+			"from the package's TestMain()")
 	}
 
-	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, server.ServingSQLAddr(), "StartServer" /* prefix */, url.User(security.RootUser))
-	pgURL.Path = params.UseDatabase
-	if params.Insecure {
+	srv, err := srvFactoryImpl.New(params)
+	if err != nil {
+		return nil, err
+	}
+	return srv.(TestServerInterface), nil
+}
+
+// OpenDBConnE is like OpenDBConn, but returns an error.
+func OpenDBConnE(
+	sqlAddr string, useDatabase string, insecure bool, stopper *stop.Stopper,
+) (*gosql.DB, error) {
+	pgURL, cleanupGoDB, err := sqlutils.PGUrlE(
+		sqlAddr, "StartServer" /* prefix */, url.User(security.RootUser))
+	if err != nil {
+		return nil, err
+	}
+
+	pgURL.Path = useDatabase
+	if insecure {
 		pgURL.RawQuery = "sslmode=disable"
 	}
 	goDB, err := gosql.Open("postgres", pgURL.String())
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	server.Stopper().AddCloser(
+
+	stopper.AddCloser(
 		stop.CloserFn(func() {
 			_ = goDB.Close()
 			cleanupGoDB()
 		}))
-	return server, goDB, server.DB()
+	return goDB, nil
+}
+
+// OpenDBConn sets up a gosql DB connection to the given server.
+func OpenDBConn(
+	t testing.TB, sqlAddr string, useDatabase string, insecure bool, stopper *stop.Stopper,
+) *gosql.DB {
+	conn, err := OpenDBConnE(sqlAddr, useDatabase, insecure, stopper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
 }
 
 // StartServerRaw creates and starts a TestServer.
 // Generally StartServer() should be used. However this function can be used
 // directly when opening a connection to the server is not desired.
 func StartServerRaw(args base.TestServerArgs) (TestServerInterface, error) {
-	if srvFactoryImpl == nil {
-		panic("TestServerFactory not initialized. One needs to be injected " +
-			"from the package's TestMain()")
+	server, err := NewServer(args)
+	if err != nil {
+		return nil, err
 	}
-	server := srvFactoryImpl.New(args).(TestServerInterface)
-	if err := server.Start(args); err != nil {
+	if err := server.Start(); err != nil {
 		return nil, err
 	}
 	return server, nil
+}
+
+// StartTenant starts a tenant SQL server connecting to the supplied test
+// server. It uses the server's stopper to shut down automatically. However,
+// the returned DB is for the caller to close.
+func StartTenant(
+	t testing.TB, ts TestServerInterface, params base.TestTenantArgs,
+) (TestTenantInterface, *gosql.DB) {
+	tenant, err := ts.StartTenant(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stopper := params.Stopper
+	if stopper == nil {
+		stopper = ts.Stopper()
+	}
+
+	goDB := OpenDBConn(
+		t, tenant.SQLAddr(), "", false /* insecure */, stopper)
+	return tenant, goDB
 }
 
 // GetJSONProto uses the supplied client to GET the URL specified by the parameters
@@ -247,6 +363,12 @@ func GetJSONProtoWithAdminOption(
 		return err
 	}
 	return httputil.GetJSON(httpClient, ts.AdminURL()+path, response)
+}
+
+// PostJSONProto uses the supplied client to POST the URL specified by the parameters
+// and unmarshals the result into response.
+func PostJSONProto(ts TestServerInterface, path string, request, response protoutil.Message) error {
+	return PostJSONProtoWithAdminOption(ts, path, request, response, true)
 }
 
 // PostJSONProtoWithAdminOption is like PostJSONProto but the caller

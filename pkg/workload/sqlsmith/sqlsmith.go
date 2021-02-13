@@ -17,8 +17,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
@@ -69,12 +69,23 @@ func (*sqlSmith) Meta() workload.Meta { return sqlSmithMeta }
 // Flags implements the Flagser interface.
 func (g *sqlSmith) Flags() workload.Flags { return g.flags }
 
+func (g *sqlSmith) Hooks() workload.Hooks {
+	return workload.Hooks{
+		PreCreate: func(db *gosql.DB) error {
+			if _, err := db.Exec(`SET CLUSTER SETTING sql.defaults.interleaved_tables.enabled = true`); err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+}
+
 // Tables implements the Generator interface.
 func (g *sqlSmith) Tables() []workload.Table {
 	rng := rand.New(rand.NewSource(g.seed))
 	var tables []workload.Table
 	for idx := 0; idx < g.tables; idx++ {
-		schema := sqlbase.RandCreateTable(rng, "table", idx)
+		schema := rowenc.RandCreateTable(rng, "table", idx)
 		table := workload.Table{
 			Name:   schema.Table.String(),
 			Schema: tree.Serialize(schema),
@@ -115,7 +126,9 @@ func (g *sqlSmith) validateErrorSetting() error {
 }
 
 // Ops implements the Opser interface.
-func (g *sqlSmith) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
+func (g *sqlSmith) Ops(
+	ctx context.Context, urls []string, reg *histogram.Registry,
+) (workload.QueryLoad, error) {
 	if err := g.validateErrorSetting(); err != nil {
 		return workload.QueryLoad{}, err
 	}

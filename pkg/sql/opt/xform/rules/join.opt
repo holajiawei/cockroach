@@ -2,29 +2,23 @@
 # join.opt contains exploration rules for the Join operator.
 # =============================================================================
 
-# CommuteJoin creates a Join with the left and right inputs swapped. This is
-# useful for other rules that convert joins to other operators (like merge
-# join).
-# If any join hints are specified, we keep the order in the query.
-[CommuteJoin, Explore]
-(InnerJoin | FullJoin
-    $left:*
-    $right:*
-    $on:*
-    $private:*
+# ReorderJoins matches the first expression of a join group and adds to the memo
+# all valid join orderings that do not introduce cross joins. If the join has
+# join hints or is the result of a previous join reordering, the join tree is
+# not reordered. For more information, see the comment in join_order_builder.go.
+#
+# Citations: [8]
+[ReorderJoins, Explore]
+(InnerJoin | SemiJoin | AntiJoin | LeftJoin | FullJoin
+    * & (ShouldReorderJoins (Root))
 )
 =>
-((OpName) $right $left $on (CommuteJoinFlags $private))
+(ReorderJoins)
 
 # CommuteLeftJoin creates a Join with the left and right inputs swapped.
 # This is symmetric with the CommuteRightJoin normalization rule.
 [CommuteLeftJoin, Explore]
-(LeftJoin
-    $left:*
-    $right:*
-    $on:*
-    $private:*
-)
+(LeftJoin $left:* $right:* $on:* $private:*)
 =>
 (RightJoin $right $left $on (CommuteJoinFlags $private))
 
@@ -58,10 +52,14 @@
 # the LHS, we only commute a SemiJoin into an InnerJoin when the On conditions
 # are only composed of equalities.
 #
-# Note: We only consier the columns of the RHS that are used in the On conditions
-# (B* in the example above). And so we can be certain that
+# Note: We only consider the columns of the RHS that are used in the On
+# conditions (B* in the example above). And so we can be certain that
 # ((Distinct(RHS*) InnerJoin LHS) will have at most 1 matching row for each row
 # in the LHS if the On conditions are simple equalities.
+#
+# Note that if the join was a result of a join reordering, the new join will not
+# be reordered again (because it inherits the the SkipReorderJoins flag in the
+# private).
 #
 # Citations: [7] (see section 2.1.1)
 [CommuteSemiJoin, Explore]
@@ -78,13 +76,49 @@
         (DistinctOn
             $right
             []
-            (MakeGrouping (IntersectionCols
-                (OutputCols $right)
-                (FilterOuterCols $on))
+            (MakeGrouping
+                (IntersectionCols
+                    (OutputCols $right)
+                    (FilterOuterCols $on)
+                )
+                (EmptyOrdering)
             )
         )
         $on
         $private
+    )
+    []
+    (OutputCols $left)
+)
+
+# ConvertSemiToInnerJoin applies in the cases where CommuteSemiJoin does not:
+# when the ON condition is not a simple equality. In this case, we must perform
+# a DisinctOn operation *after* the inner join, followed by a project to remove
+# the right-side columns.
+#
+# Similar to CommuteSemiJoin, this rule allows semi joins to be commuted. This
+# rule is also useful because it allows us to generate lookup joins and
+# inverted lookup joins for cases where the index is not covering. For inverted
+# lookup joins, the GenerateInvertedJoins* rules will also apply, and should
+# be lower cost since they avoid the DistinctOn operation.
+[ConvertSemiToInnerJoin, Explore]
+(SemiJoin
+    $left:*
+    $right:*
+    $on:* & ^(IsSimpleEquality $on)
+    $private:* & (NoJoinHints $private)
+)
+=>
+(Project
+    (DistinctOn
+        (InnerJoin
+            $newLeft:(EnsureKey $left)
+            $right
+            $on
+            $private
+        )
+        (MakeAggCols ConstAgg (NonKeyCols $newLeft))
+        (MakeGrouping (KeyCols $newLeft) (EmptyOrdering))
     )
     []
     (OutputCols $left)
@@ -110,50 +144,53 @@
 =>
 (GenerateLookupJoins (OpName) $left $scanPrivate $on $private)
 
-# GenerateZigzagJoins creates ZigzagJoin operators for all index pairs (of the
-# Scan table) where the prefix column(s) of both indexes is/are fixed to
-# constant values in the filters. See comments in GenerateZigzagJoin and
-# distsqlrun/zigzagjoiner.go for more details on when a zigzag join can be
-# planned.
-#
-# Zigzag joins are prohibited when the source Scan operator has been configured
-# with a row-level locking mode. This is mostly out of convenience so that these
-# row-level locking modes don't need to added to the ZigzagJoin operator. There
-# doesn't seem to be a strong reason to support this, but if one comes up, it
-# should be possible to lift this restriction.
-[GenerateZigzagJoins, Explore]
-(Select
-    (Scan $scan:*) & (IsCanonicalScan $scan) & ^(IsLocking $scan)
-    $filters:*
-)
-=>
-(GenerateZigzagJoins $scan $filters)
+# TODO(rytaft): The following uses paired-joins, in GenerateInvertedJoins.
+# Using paired-joins may be desirable in more cases than just spatial queries.
+# For example, it could enable the use of a lookup join with a non-covering index.
 
-# GenerateInvertedIndexZigzagJoins creates ZigzagJoin operators for inverted
-# indexes that can be constrained with two or more distinct constant values.
-# Inverted indexes contain one row for each path-to-leaf in a JSON value, so one
-# row in the primary index could generate multiple inverted index keys. This
-# property can be exploited by zigzag joining on the same inverted index, fixed
-# at any two of the JSON paths we are querying for.
-#
-# Zigzag joins are prohibited when the source Scan operator has been configured
-# with a row-level locking mode. This is mostly out of convenience so that these
-# row-level locking modes don't need to added to the ZigzagJoin operator. There
-# doesn't seem to be a strong reason to support this, but if one comes up, it
-# should be possible to lift this restriction.
-[GenerateInvertedIndexZigzagJoins, Explore]
-(Select
-    (Scan $scan:*) & (IsCanonicalScan $scan) & ^(IsLocking $scan) & (HasInvertedIndexes $scan)
-    $filters:*
+# GenerateInvertedJoins creates InvertedJoin operators for all inverted
+# indexes (of the Scan table) which allow it. See the GenerateInvertedJoins
+# custom function for more details.
+[GenerateInvertedJoins, Explore]
+(InnerJoin | LeftJoin | SemiJoin | AntiJoin
+    $left:*
+    (Scan $scanPrivate:*) &
+        (IsCanonicalScan $scanPrivate) &
+        (HasInvertedIndexes $scanPrivate)
+    $on:*
+    $private:*
 )
 =>
-(GenerateInvertedIndexZigzagJoins $scan $filters)
+(GenerateInvertedJoins (OpName) $left $scanPrivate $on $private)
+
+# GenerateInvertedJoinsFromSelect is similar to GenerateInvertedJoins, but
+# applies when the input is a Select.
+[GenerateInvertedJoinsFromSelect, Explore]
+(InnerJoin | LeftJoin | SemiJoin | AntiJoin
+    $left:*
+    (Select
+        (Scan $scanPrivate:*) &
+            (IsCanonicalScan $scanPrivate) &
+            (HasInvertedIndexes $scanPrivate)
+        $filters:*
+    )
+    $on:*
+    $private:*
+)
+=>
+(GenerateInvertedJoins
+    (OpName)
+    $left
+    $scanPrivate
+    (ConcatFilters $on $filters)
+    $private
+)
 
 # GenerateLookupJoinWithFilter creates a LookupJoin alternative for a Join which
 # has a Select->Scan combination as its right input. The filter can get merged
-# with the ON condition (this is correct for both inner and left join).
+# with the ON condition (this is correct for inner, left, and semi/anti join).
 [GenerateLookupJoinsWithFilter, Explore]
-(InnerJoin | LeftJoin
+(InnerJoin | LeftJoin | SemiJoin | AntiJoin
     $left:*
     (Select
         (Scan $scanPrivate:*) & (IsCanonicalScan $scanPrivate)
@@ -163,47 +200,120 @@
     $private:*
 )
 =>
-(GenerateLookupJoins (OpName) $left $scanPrivate (ConcatFilters $on $filters) $private)
+(GenerateLookupJoins
+    (OpName)
+    $left
+    $scanPrivate
+    (ConcatFilters $on $filters)
+    $private
+)
 
-# AssociateJoin applies the rule of join associativity. It converts an
-# expression like:
-#   (A JOIN B ON A.y = B.y) JOIN C ON B.x = C.x
-# to the logically equivalent expression:
-#   A JOIN (B JOIN C ON B.x = C.x) ON A.y = B.y
+# PushJoinIntoIndexJoin pushes an InnerJoin into an IndexJoin. The IndexJoin is
+# replaced with a LookupJoin, since it now must output columns from the right
+# side of the InnerJoin as well as from the original lookup table. This can
+# be useful when the InnerJoin that is pushed down reduces cardinality, since an
+# index lookup can be expensive.
 #
-# If any of the joins contains a hint, we do not rearrange the joins.
-[AssociateJoin, Explore]
+# Matching conditions:
+# 1. The right input of the InnerJoin does not have outer columns.
+# 2. The ON condition of the InnerJoin only references columns from its right
+#    input and the input of the IndexJoin.
+# 3. The InnerJoin does not have any join hints.
+#
+# TODO(drewk): match LeftJoins as well if a good use case is found.
+[PushJoinIntoIndexJoin, Explore]
 (InnerJoin
-    $left:(InnerJoin
-        $innerLeft:*
-        $innerRight:*
-        $innerOn:*
-        $innerPrivate:* & (NoJoinHints $innerPrivate)
-    )
-    $right:* & (ShouldReorderJoins $left $right)
-    $on:*
-    $private:* & (NoJoinHints $private)
+    $left:(IndexJoin $indexInput:* $indexPrivate:*)
+    $right:* & ^(HasOuterCols $right)
+    $on:* & (FiltersBoundBy $on (OutputCols2 $indexInput $right))
+    $joinPrivate:* & (NoJoinHints $joinPrivate)
 )
 =>
+(LookupJoin
+    (InnerJoin $indexInput $right $on $joinPrivate)
+    []
+    (ConvertIndexToLookupJoinPrivate
+        $indexPrivate
+        (OutputCols2 $left $right)
+    )
+)
+
+# HoistProjectFromInnerJoin lifts a Project from under an InnerJoin; the join
+# can then be subject to other rules, most importantly allowing it to become a
+# lookup join.
+#
+# As long as the projections are non-volatile, it is equivalent to calculate
+# them on every output row.
+#
+# Note that if the join was a result of a join reordering, the new join will not
+# be reordered again (because it inherits the the SkipReorderJoins flag in the
+# private).
+#
+# TODO(radu): we could make the rule work even when the ON condition depends on
+# a projection (by inlining the projection).
+[HoistProjectFromInnerJoin, Explore]
 (InnerJoin
-    $innerLeft
-    (InnerJoin
-        $innerRight
-        $right
-        (SortFilters
-            (ExtractBoundConditions
-                $newOn:(MapJoinOpEqualities
-                    (ConcatFilters $on $innerOn)
-                    (OutputCols $innerLeft)
-                    $cols:(OutputCols2 $innerRight $right)
-                )
-                $cols
-            )
+    $left:*
+    $proj:(Project
+        $right:*
+        $projections:* & ^(HasVolatileProjection $projections)
+        $passthrough:*
+    )
+    $on:* &
+        ^(ColsIntersect
+            (ProjectionCols $projections)
+            (FilterOuterCols $on)
         )
-        (EmptyJoinPrivate)
+    $private:*
+)
+=>
+(Project
+    (InnerJoin $left $right $on $private)
+    $projections
+    (UnionCols $passthrough (OutputCols $left))
+)
+
+# HoistProjectFromLeftJoin pulls a project from under an LeftJoin; the join can
+# then be subject to other rules, most importantly allowing it to become a
+# lookup join.
+#
+# This rule is similar to HoistProjectFromInnerJoin, except that we have to
+# handle "outer" rows correctly and make sure we project NULLs, regardless of
+# the expressions. First we find a canary column from the right input which is
+# null iff the output row is a null-extended left row. Then, we wrap each
+# projection in a CASE statement which is null if the canary column is null and
+# equivalent to the original projection if the canary column is not null".
+#
+# Note that if the join was a result of a join reordering, the new join will not
+# be reordered again (because it inherits the the SkipReorderJoins flag in the
+# private).
+#
+# TODO(radu): we could make the rule work even when the ON condition depends on
+# a projection (by inlining the projection).
+#
+# TODO(radu): we could make the rule augment an input Scan with a non-null
+# column from the table.
+[HoistProjectFromLeftJoin, Explore]
+(LeftJoin
+    $left:*
+    (Project
+        $right:*
+        $projections:* & ^(HasVolatileProjection $projections)
+        $passthrough:*
     )
-    (SortFilters
-        (ExtractUnboundConditions $newOn $cols)
-    )
-    (EmptyJoinPrivate)
+    $on:* &
+        ^(ColsIntersect
+            (ProjectionCols $projections)
+            (FilterOuterCols $on)
+        ) &
+        (FoundCanaryColumn
+            $canaryCol:(FindLeftJoinCanaryColumn $right $on)
+        )
+    $private:*
+)
+=>
+(Project
+    (LeftJoin $left $right $on $private)
+    (MakeProjectionsForOuterJoin $canaryCol $projections)
+    (UnionCols $passthrough (OutputCols $left))
 )

@@ -27,13 +27,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func registerGossip(r *testRegistry) {
 	runGossipChaos := func(ctx context.Context, t *test, c *cluster) {
+		args := startArgs("--args=--vmodule=*=1")
 		c.Put(ctx, cockroach, "./cockroach", c.All())
-		c.Start(ctx, t, c.All())
+		c.Start(ctx, t, c.All(), args)
+		waitForFullReplication(t, c.Conn(ctx, 1))
 
 		gossipNetwork := func(node int) string {
 			const query = `
@@ -65,6 +67,7 @@ SELECT string_agg(source_id::TEXT || ':' || target_id::TEXT, ',')
 				if i == deadNode {
 					continue
 				}
+				c.l.Printf("%d: checking gossip\n", i)
 				s := gossipNetwork(i)
 				if !initialized {
 					deadNodeStr := fmt.Sprint(deadNode)
@@ -88,7 +91,7 @@ SELECT string_agg(source_id::TEXT || ':' || target_id::TEXT, ',')
 					return false
 				}
 			}
-			fmt.Printf("gossip ok: %s (%0.0fs)\n", expected, timeutil.Since(start).Seconds())
+			c.l.Printf("gossip ok: %s (%0.0fs)\n", expected, timeutil.Since(start).Seconds())
 			return true
 		}
 
@@ -109,12 +112,12 @@ SELECT string_agg(source_id::TEXT || ':' || target_id::TEXT, ',')
 			deadNode = nodes.randNode()[0]
 			c.Stop(ctx, c.Node(deadNode))
 			waitForGossip()
-			c.Start(ctx, t, c.Node(deadNode))
+			c.Start(ctx, t, c.Node(deadNode), args)
 		}
 	}
 
 	r.Add(testSpec{
-		Name:    fmt.Sprintf("gossip/chaos/nodes=9"),
+		Name:    "gossip/chaos/nodes=9",
 		Owner:   OwnerKV,
 		Cluster: makeClusterSpec(9),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -268,10 +271,15 @@ func runGossipPeerings(ctx context.Context, t *test, c *cluster) {
 		t.l.Printf("%d: restarting node %d\n", i, node[0])
 		c.Stop(ctx, node)
 		c.Start(ctx, t, node)
+		// Sleep a bit to avoid hitting:
+		// https://github.com/cockroachdb/cockroach/issues/48005
+		time.Sleep(3 * time.Second)
 	}
 }
 
 func runGossipRestart(ctx context.Context, t *test, c *cluster) {
+	t.Skip("skipping flaky acceptance/gossip/restart", "https://github.com/cockroachdb/cockroach/issues/48423")
+
 	c.Put(ctx, cockroach, "./cockroach")
 	c.Start(ctx, t)
 
@@ -394,6 +402,7 @@ SELECT count(replicas)
 		`./cockroach start --insecure --background --store={store-dir} `+
 			`--log-dir={log-dir} --cache=10% --max-sql-memory=10% `+
 			`--listen-addr=:$[{pgport:1}+10000] --http-port=$[{pgport:1}+1] `+
+			`--join={pghost:1}:{pgport:1}`+
 			`> {log-dir}/cockroach.stdout 2> {log-dir}/cockroach.stderr`)
 	if err != nil {
 		t.Fatal(err)
@@ -481,9 +490,8 @@ func runCheckLocalityIPAddress(ctx context.Context, t *test, c *cluster) {
 				if !strings.Contains(advertiseAddress, "localhost") {
 					t.Fatal("Expected connect address to contain localhost")
 				}
-			} else if c.ExternalAddr(ctx, c.Node(nodeID))[0] != advertiseAddress {
-				t.Fatalf("Connection address is %s but expected %s",
-					advertiseAddress, c.ExternalAddr(ctx, c.Node(nodeID))[0])
+			} else if exp := c.ExternalAddr(ctx, c.Node(nodeID))[0]; exp != advertiseAddress {
+				t.Fatalf("Connection address is %s but expected %s", advertiseAddress, exp)
 			}
 		}
 	}

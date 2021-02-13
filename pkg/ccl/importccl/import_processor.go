@@ -15,92 +15,154 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
-var csvOutputTypes = []types.T{
-	*types.Bytes,
-	*types.Bytes,
+var csvOutputTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
 }
 
+const readImportDataProcessorName = "readImportDataProcessor"
+
+// readImportDataProcessor is a processor that does not take any inputs. It
+// starts a worker goroutine in Start(), which emits progress updates over an
+// internally maintained channel. Next() will read from this channel until
+// exhausted and then emit the summary that the worker goroutine returns. The
+// processor is built this way in order to manage parallelism internally.
 type readImportDataProcessor struct {
+	execinfra.ProcessorBase
+
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.ReadImportDataSpec
 	output  execinfra.RowReceiver
+
+	progCh chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
+
+	seqChunkProvider *row.SeqChunkProvider
+
+	importErr error
+	summary   *roachpb.BulkOpSummary
 }
 
 var _ execinfra.Processor = &readImportDataProcessor{}
-
-func (cp *readImportDataProcessor) OutputTypes() []types.T {
-	return csvOutputTypes
-}
+var _ execinfra.RowSource = &readImportDataProcessor{}
 
 func newReadImportDataProcessor(
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.ReadImportDataSpec,
+	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	cp := &readImportDataProcessor{
 		flowCtx: flowCtx,
 		spec:    spec,
 		output:  output,
+		progCh:  make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress),
 	}
+	if err := cp.Init(cp, post, csvOutputTypes, flowCtx, processorID, output, nil, /* memMonitor */
+		execinfra.ProcStateOpts{
+			// This processor doesn't have any inputs to drain.
+			InputsToDrain: nil,
+		}); err != nil {
+		return nil, err
+	}
+
+	// Load the import job running the import in case any of the columns have a
+	// default expression which uses sequences. In this case we need to update the
+	// job progress within the import processor.
+	if cp.flowCtx.Cfg.JobRegistry != nil {
+		cp.seqChunkProvider = &row.SeqChunkProvider{JobID: cp.spec.Progress.JobID,
+			Registry: cp.flowCtx.Cfg.JobRegistry}
+	}
+
 	return cp, nil
 }
 
-func (cp *readImportDataProcessor) Run(ctx context.Context) {
-	ctx, span := tracing.ChildSpan(ctx, "readImportDataProcessor")
-	defer tracing.FinishSpan(span)
-	defer cp.output.ProducerDone()
-
-	progCh := make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress)
-
-	var summary *roachpb.BulkOpSummary
-	var err error
+// Start is part of the RowSource interface.
+func (idp *readImportDataProcessor) Start(ctx context.Context) context.Context {
 	// We don't have to worry about this go routine leaking because next we loop over progCh
 	// which is closed only after the go routine returns.
 	go func() {
-		defer close(progCh)
-		summary, err = runImport(ctx, cp.flowCtx, &cp.spec, progCh)
+		defer close(idp.progCh)
+		idp.summary, idp.importErr = runImport(ctx, idp.flowCtx, &idp.spec, idp.progCh,
+			idp.seqChunkProvider)
 	}()
+	return idp.StartInternal(ctx, readImportDataProcessorName)
+}
 
-	for prog := range progCh {
-		// Take a copy so that we can send the progress address to the output processor.
-		p := prog
-		cp.output.Push(nil, &execinfrapb.ProducerMetadata{BulkProcessorProgress: &p})
+// Next is part of the RowSource interface.
+func (idp *readImportDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
+	if idp.State != execinfra.StateRunning {
+		return nil, idp.DrainHelper()
 	}
 
-	if err != nil {
-		cp.output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
-		return
+	for prog := range idp.progCh {
+		p := prog
+		return nil, &execinfrapb.ProducerMetadata{BulkProcessorProgress: &p}
+	}
+
+	if idp.importErr != nil {
+		idp.MoveToDraining(idp.importErr)
+		return nil, idp.DrainHelper()
+	}
+
+	if idp.summary == nil {
+		err := errors.Newf("no summary generated by %s", readImportDataProcessorName)
+		idp.MoveToDraining(err)
+		return nil, idp.DrainHelper()
 	}
 
 	// Once the import is done, send back to the controller the serialized
 	// summary of the import operation. For more info see roachpb.BulkOpSummary.
-	countsBytes, err := protoutil.Marshal(summary)
+	countsBytes, err := protoutil.Marshal(idp.summary)
+	idp.MoveToDraining(err)
 	if err != nil {
-		cp.output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
-		return
+		return nil, idp.DrainHelper()
 	}
-	cp.output.Push(sqlbase.EncDatumRow{
-		sqlbase.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(countsBytes))),
-		sqlbase.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes([]byte{}))),
-	}, nil)
+
+	return rowenc.EncDatumRow{
+		rowenc.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(countsBytes))),
+		rowenc.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes([]byte{}))),
+	}, nil
+}
+
+// ConsumerDone is part of the RowSource interface.
+func (idp *readImportDataProcessor) ConsumerDone() {
+	idp.MoveToDraining(nil /* err */)
+}
+
+// ConsumerClosed is part of the RowSource interface.
+func (idp *readImportDataProcessor) ConsumerClosed() {
+	// The consumer is done, Next() will not be called again.
+	idp.InternalClose()
+}
+
+func injectTimeIntoEvalCtx(ctx *tree.EvalContext, walltime int64) {
+	sec := walltime / int64(time.Second)
+	nsec := walltime % int64(time.Second)
+	unixtime := timeutil.Unix(sec, nsec)
+	ctx.StmtTimestamp = unixtime
+	ctx.TxnTimestamp = unixtime
 }
 
 func makeInputConverter(
@@ -108,13 +170,14 @@ func makeInputConverter(
 	spec *execinfrapb.ReadImportDataSpec,
 	evalCtx *tree.EvalContext,
 	kvCh chan row.KVBatch,
+	seqChunkProvider *row.SeqChunkProvider,
 ) (inputConverter, error) {
-
-	var singleTable *sqlbase.TableDescriptor
+	injectTimeIntoEvalCtx(evalCtx, spec.WalltimeNanos)
+	var singleTable catalog.TableDescriptor
 	var singleTableTargetCols tree.NameList
 	if len(spec.Tables) == 1 {
 		for _, table := range spec.Tables {
-			singleTable = table.Desc
+			singleTable = tabledesc.NewImmutable(*table.Desc)
 			singleTableTargetCols = make(tree.NameList, len(table.TargetCols))
 			for i, colName := range table.TargetCols {
 				singleTableTargetCols[i] = tree.Name(colName)
@@ -126,11 +189,35 @@ func makeInputConverter(
 		return nil, errors.Errorf("%s only supports reading a single, pre-specified table", format.String())
 	}
 
+	if singleTable != nil {
+		if idx := catalog.FindDeletableNonPrimaryIndex(singleTable, func(idx catalog.Index) bool {
+			return idx.IsPartial()
+		}); idx != nil {
+			return nil, unimplemented.NewWithIssue(50225, "cannot import into table with partial indexes")
+		}
+
+		// If we're using a format like CSV where data columns are not "named", and
+		// therefore cannot be mapped to schema columns, then require the user to
+		// use IMPORT INTO.
+		//
+		// We could potentially do something smarter here and check that only a
+		// suffix of the columns are computed, and then expect the data file to have
+		// #(visible columns) - #(computed columns).
+		if len(singleTableTargetCols) == 0 && !formatHasNamedColumns(spec.Format.Format) {
+			for _, col := range singleTable.VisibleColumns() {
+				if col.IsComputed() {
+					return nil, unimplemented.NewWithIssueDetail(56002, "import.computed",
+						"to use computed columns, use IMPORT INTO")
+				}
+			}
+		}
+	}
+
 	switch spec.Format.Format {
 	case roachpb.IOFileFormat_CSV:
 		isWorkload := true
 		for _, file := range spec.Uri {
-			if conf, err := cloud.ExternalStorageConfFromURI(file); err != nil || conf.Provider != roachpb.ExternalStorageProvider_Workload {
+			if conf, err := cloudimpl.ExternalStorageConfFromURI(file, spec.User()); err != nil || conf.Provider != roachpb.ExternalStorageProvider_Workload {
 				isWorkload = false
 				break
 			}
@@ -140,15 +227,18 @@ func makeInputConverter(
 		}
 		return newCSVInputReader(
 			kvCh, spec.Format.Csv, spec.WalltimeNanos, int(spec.ReaderParallelism),
-			singleTable, singleTableTargetCols, evalCtx), nil
+			singleTable, singleTableTargetCols, evalCtx, seqChunkProvider), nil
 	case roachpb.IOFileFormat_MysqlOutfile:
-		return newMysqloutfileReader(ctx, kvCh, spec.Format.MysqlOut, singleTable, evalCtx)
+		return newMysqloutfileReader(
+			spec.Format.MysqlOut, kvCh, spec.WalltimeNanos,
+			int(spec.ReaderParallelism), singleTable, singleTableTargetCols, evalCtx)
 	case roachpb.IOFileFormat_Mysqldump:
-		return newMysqldumpReader(ctx, kvCh, spec.Tables, evalCtx)
+		return newMysqldumpReader(ctx, kvCh, spec.WalltimeNanos, spec.Tables, evalCtx, spec.Format.MysqlDump)
 	case roachpb.IOFileFormat_PgCopy:
-		return newPgCopyReader(ctx, kvCh, spec.Format.PgCopy, singleTable, evalCtx)
+		return newPgCopyReader(spec.Format.PgCopy, kvCh, spec.WalltimeNanos,
+			int(spec.ReaderParallelism), singleTable, singleTableTargetCols, evalCtx)
 	case roachpb.IOFileFormat_PgDump:
-		return newPgDumpReader(ctx, kvCh, spec.Format.PgDump, spec.Tables, evalCtx)
+		return newPgDumpReader(ctx, kvCh, spec.Format.PgDump, spec.WalltimeNanos, spec.Tables, evalCtx)
 	case roachpb.IOFileFormat_Avro:
 		return newAvroInputReader(
 			kvCh, singleTable, spec.Format.Avro, spec.WalltimeNanos,
@@ -169,7 +259,7 @@ func ingestKvs(
 	kvCh <-chan row.KVBatch,
 ) (*roachpb.BulkOpSummary, error) {
 	ctx, span := tracing.ChildSpan(ctx, "ingestKVs")
-	defer tracing.FinishSpan(span)
+	defer span.Finish()
 
 	writeTS := hlc.Timestamp{WallTime: spec.WalltimeNanos}
 
@@ -185,7 +275,7 @@ func ingestKvs(
 	// Otherwise, as a consequence of filling up faster the pkIndexAdder buffer
 	// will hog memory as it tries to grow more aggressively.
 	minBufferSize, maxBufferSize, stepSize := storageccl.ImportBufferConfigSizes(flowCtx.Cfg.Settings, true /* isPKAdder */)
-	pkIndexAdder, err := flowCtx.Cfg.BulkAdder(ctx, flowCtx.Cfg.DB, writeTS, storagebase.BulkAdderOptions{
+	pkIndexAdder, err := flowCtx.Cfg.BulkAdder(ctx, flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{
 		Name:              "pkAdder",
 		DisallowShadowing: true,
 		SkipDuplicates:    true,
@@ -200,7 +290,7 @@ func ingestKvs(
 	defer pkIndexAdder.Close(ctx)
 
 	minBufferSize, maxBufferSize, stepSize = storageccl.ImportBufferConfigSizes(flowCtx.Cfg.Settings, false /* isPKAdder */)
-	indexAdder, err := flowCtx.Cfg.BulkAdder(ctx, flowCtx.Cfg.DB, writeTS, storagebase.BulkAdderOptions{
+	indexAdder, err := flowCtx.Cfg.BulkAdder(ctx, flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{
 		Name:              "indexAdder",
 		DisallowShadowing: true,
 		SkipDuplicates:    true,
@@ -318,7 +408,7 @@ func ingestKvs(
 		// number of L0 (and total) files, but with a lower memory usage.
 		for kvBatch := range kvCh {
 			for _, kv := range kvBatch.KVs {
-				_, _, indexID, indexErr := sqlbase.DecodeTableIDIndexID(kv.Key)
+				_, _, indexID, indexErr := flowCtx.Codec().DecodeIndexPrefix(kv.Key)
 				if indexErr != nil {
 					return indexErr
 				}
@@ -330,14 +420,14 @@ func ingestKvs(
 				// more efficient than parsing every kv.
 				if indexID == 1 {
 					if err := pkIndexAdder.Add(ctx, kv.Key, kv.Value.RawBytes); err != nil {
-						if _, ok := err.(storagebase.DuplicateKeyError); ok {
+						if errors.HasType(err, (*kvserverbase.DuplicateKeyError)(nil)) {
 							return errors.Wrap(err, "duplicate key in primary index")
 						}
 						return err
 					}
 				} else {
 					if err := indexAdder.Add(ctx, kv.Key, kv.Value.RawBytes); err != nil {
-						if _, ok := err.(storagebase.DuplicateKeyError); ok {
+						if errors.HasType(err, (*kvserverbase.DuplicateKeyError)(nil)) {
 							return errors.Wrap(err, "duplicate key in index")
 						}
 						return err
@@ -361,14 +451,14 @@ func ingestKvs(
 	}
 
 	if err := pkIndexAdder.Flush(ctx); err != nil {
-		if err, ok := err.(storagebase.DuplicateKeyError); ok {
+		if errors.HasType(err, (*kvserverbase.DuplicateKeyError)(nil)) {
 			return nil, errors.Wrap(err, "duplicate key in primary index")
 		}
 		return nil, err
 	}
 
 	if err := indexAdder.Flush(ctx); err != nil {
-		if err, ok := err.(storagebase.DuplicateKeyError); ok {
+		if errors.HasType(err, (*kvserverbase.DuplicateKeyError)(nil)) {
 			return nil, errors.Wrap(err, "duplicate key in index")
 		}
 		return nil, err

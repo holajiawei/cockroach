@@ -14,6 +14,7 @@ import moment from "moment";
 
 import { AdminUIState } from "src/redux/state";
 import * as timewindow from "src/redux/timewindow";
+import _ from "lodash";
 
 interface TimeWindowManagerProps {
   // The current timewindow redux state.
@@ -35,7 +36,10 @@ interface TimeWindowManagerState {
  * updated time window into the redux store whenever the previous time window is
  * expired.
  */
-class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWindowManagerState> {
+class TimeWindowManager extends React.Component<
+  TimeWindowManagerProps,
+  TimeWindowManagerState
+> {
   constructor(props?: TimeWindowManagerProps, context?: any) {
     super(props, context);
     this.state = { timeout: null };
@@ -70,12 +74,15 @@ class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWind
     const now = props.now ? props.now() : moment();
     const currentEnd = props.timeWindow.currentWindow.end;
     const expires = currentEnd.clone().add(props.timeWindow.scale.windowValid);
-    if (now.isAfter(expires))  {
+    if (now.isAfter(expires)) {
       // Current time window is expired, reset it.
       this.setWindow(props);
     } else {
       // Set a timeout to reset the window when the current window expires.
-      const newTimeout = window.setTimeout(() => this.setWindow(props), expires.diff(now).valueOf());
+      const newTimeout = window.setTimeout(
+        () => this.setWindow(props),
+        expires.diff(now).valueOf(),
+      );
       this.setState({
         timeout: newTimeout,
       });
@@ -88,7 +95,7 @@ class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWind
    */
   setWindow(props: TimeWindowManagerProps) {
     if (!props.timeWindow.scale.windowEnd) {
-      if (!props.timeWindow.useTimeRage) {
+      if (!props.timeWindow.useTimeRange) {
         const now = props.now ? props.now() : moment();
         props.setTimeWindow({
           start: now.clone().subtract(props.timeWindow.scale.windowSize),
@@ -104,12 +111,14 @@ class TimeWindowManager extends React.Component<TimeWindowManagerProps, TimeWind
     }
   }
 
-  componentWillMount() {
+  componentDidMount() {
     this.checkWindow(this.props);
   }
 
-  componentWillReceiveProps(props: TimeWindowManagerProps) {
-    this.checkWindow(props);
+  componentDidUpdate(prevProps: TimeWindowManagerProps) {
+    if (!_.isEqual(prevProps.timeWindow, this.props.timeWindow)) {
+      this.checkWindow(this.props);
+    }
   }
 
   render(): any {

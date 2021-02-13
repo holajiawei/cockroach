@@ -22,6 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConnRecover(t *testing.T) {
@@ -54,7 +57,7 @@ func TestConnRecover(t *testing.T) {
 	// and starts delivering ErrBadConn. We don't know the timing of
 	// this however.
 	testutils.SucceedsSoon(t, func() error {
-		if sqlRows, err := conn.Query(`SELECT 1`, nil); err != driver.ErrBadConn {
+		if sqlRows, err := conn.Query(`SELECT 1`, nil); !errors.Is(err, driver.ErrBadConn) {
 			return fmt.Errorf("expected ErrBadConn, got %v", err)
 		} else if err == nil {
 			if closeErr := sqlRows.Close(); closeErr != nil {
@@ -78,7 +81,7 @@ func TestConnRecover(t *testing.T) {
 
 	// Ditto from Query().
 	testutils.SucceedsSoon(t, func() error {
-		if err := conn.Exec(`SELECT 1`, nil); err != driver.ErrBadConn {
+		if err := conn.Exec(`SELECT 1`, nil); !errors.Is(err, driver.ErrBadConn) {
 			return fmt.Errorf("expected ErrBadConn, got %v", err)
 		}
 		return nil
@@ -150,7 +153,6 @@ SET
 
 	expectedRows := [][]string{
 		{`parentID`, `INT8`, `false`, `NULL`, ``, `{primary}`, `false`},
-		{`parentSchemaID`, `INT8`, `false`, `NULL`, ``, `{primary}`, `false`},
 		{`name`, `STRING`, `false`, `NULL`, ``, `{primary}`, `false`},
 		{`id`, `INT8`, `true`, `NULL`, ``, `{}`, `false`},
 	}
@@ -164,13 +166,12 @@ SET
 	}
 
 	expected = `
-   column_name   | data_type | is_nullable | column_default | generation_expression |  indices  | is_hidden
------------------+-----------+-------------+----------------+-----------------------+-----------+------------
-  parentID       | INT8      |    false    | NULL           |                       | {primary} |   false
-  parentSchemaID | INT8      |    false    | NULL           |                       | {primary} |   false
-  name           | STRING    |    false    | NULL           |                       | {primary} |   false
-  id             | INT8      |    true     | NULL           |                       | {}        |   false
-(4 rows)
+  column_name | data_type | is_nullable | column_default | generation_expression |  indices  | is_hidden
+--------------+-----------+-------------+----------------+-----------------------+-----------+------------
+  parentID    | INT8      |    false    | NULL           |                       | {primary} |   false
+  name        | STRING    |    false    | NULL           |                       | {primary} |   false
+  id          | INT8      |    true     | NULL           |                       | {}        |   false
+(3 rows)
 `
 
 	if a, e := b.String(), expected[1:]; a != e {
@@ -222,6 +223,62 @@ SET
 	b.Reset()
 }
 
+func TestUtfName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
+
+	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanup()
+
+	conn := makeSQLConn(url.String())
+	defer conn.Close()
+
+	setCLIDefaultsForTests()
+
+	var b bytes.Buffer
+
+	if err := runQueryAndFormatResults(conn, &b,
+		makeQuery(`CREATE DATABASE test_utf;
+CREATE TABLE test_utf.żółw (id INT PRIMARY KEY, value INT);
+ALTER TABLE test_utf.żółw ADD CONSTRAINT żó UNIQUE (value)`)); err != nil {
+		t.Fatal(err)
+	}
+
+	b.Reset()
+	if err := runQueryAndFormatResults(conn, &b,
+		makeQuery(`SHOW TABLES FROM test_utf;`)); err != nil {
+		t.Fatal(err)
+	}
+	expected := `
+  schema_name | table_name | type  | owner | estimated_row_count | locality
+--------------+------------+-------+-------+---------------------+-----------
+  public      | żółw       | table | root  |                NULL | NULL
+(1 row)
+`
+	if a, e := b.String(), expected[1:]; a != e {
+		t.Errorf("expected output:\n%s\ngot:\n%s", e, a)
+	}
+	b.Reset()
+
+	if err := runQueryAndFormatResults(conn, &b,
+		makeQuery(`SHOW CONSTRAINTS FROM test_utf.żółw;`)); err != nil {
+		t.Fatal(err)
+	}
+	expected = `
+  table_name | constraint_name | constraint_type |       details        | validated
+-------------+-----------------+-----------------+----------------------+------------
+  żółw       | primary         | PRIMARY KEY     | PRIMARY KEY (id ASC) |   true
+  żółw       | żó              | UNIQUE          | UNIQUE (value ASC)   |   true
+(2 rows)
+`
+	if a, e := b.String(), expected[1:]; a != e {
+		t.Errorf("expected output:\n%s\ngot:\n%s", e, a)
+	}
+	b.Reset()
+}
+
 func TestTransactionRetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -263,5 +320,41 @@ func TestTransactionRetry(t *testing.T) {
 	}
 	if tries <= 2 {
 		t.Fatalf("expected transaction to require at least two tries, but it only required %d", tries)
+	}
+}
+
+func TestParseBool(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testcases := []struct {
+		input     string
+		expect    bool
+		expectErr bool
+	}{
+		{"true", true, false},
+		{"on", true, false},
+		{"yes", true, false},
+		{"1", true, false},
+		{" TrUe	", true, false},
+
+		{"false", false, false},
+		{"off", false, false},
+		{"no", false, false},
+		{"0", false, false},
+		{"	FaLsE ", false, false},
+
+		{"", false, true},
+		{"foo", false, true},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.input, func(t *testing.T) {
+			b, err := parseBool(tc.input)
+			if tc.expectErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.expect, b)
+			}
+		})
 	}
 }

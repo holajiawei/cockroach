@@ -26,6 +26,10 @@ func DeriveInterestingOrderings(e memo.RelExpr) opt.OrderingSet {
 	}
 	l.SetAvailable(props.InterestingOrderings)
 
+	// We cache the interesting orderings for the entire group, so we always use
+	// the normalized expression.
+	e = e.FirstExpr()
+
 	var res opt.OrderingSet
 	switch e.Op() {
 	case opt.ScanOp:
@@ -57,6 +61,13 @@ func DeriveInterestingOrderings(e memo.RelExpr) opt.OrderingSet {
 	return res
 }
 
+// interestingOrderingsForScan calculates interesting orderings of a scan based
+// on the indexes on underlying table.
+//
+// Note that partial indexes are considered here, even though they don't provide
+// an interesting ordering for all values in the column. This is required in
+// order to consider partial indexes for certain optimization rules, such as
+// GenerateMergeJoins.
 func interestingOrderingsForScan(scan *memo.ScanExpr) opt.OrderingSet {
 	md := scan.Memo().Metadata()
 	tab := md.Table(scan.Table)
@@ -70,7 +81,7 @@ func interestingOrderingsForScan(scan *memo.ScanExpr) opt.OrderingSet {
 		var o opt.Ordering
 		for j := 0; j < numIndexCols; j++ {
 			indexCol := index.Column(j)
-			colID := scan.Table.ColumnID(indexCol.Ordinal)
+			colID := scan.Table.ColumnID(indexCol.Ordinal())
 			if !scan.Cols.Contains(colID) {
 				break
 			}

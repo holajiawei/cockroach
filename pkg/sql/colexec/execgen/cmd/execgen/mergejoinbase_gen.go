@@ -12,30 +12,27 @@ package main
 
 import (
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-func genMergeJoinBase(wr io.Writer) error {
-	d, err := ioutil.ReadFile("pkg/sql/colexec/mergejoinbase_tmpl.go")
-	if err != nil {
-		return err
-	}
+const mergeJoinBaseTmpl = "pkg/sql/colexec/mergejoinbase_tmpl.go"
 
-	s := string(d)
+func genMergeJoinBase(inputFileContents string, wr io.Writer) error {
+	r := strings.NewReplacer(
+		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"_TYPE", "{{.VecMethod}}",
+		"TemplateType", "{{.VecMethod}}",
+	)
+	s := r.Replace(inputFileContents)
 
-	// Replace the template variables.
-	s = strings.Replace(s, "_GOTYPE", "{{.LTyp.GoTypeName}}", -1)
-	s = strings.Replace(s, "_TYPES_T", "coltypes.{{.LTyp}}", -1)
-	s = strings.Replace(s, "_TemplateType", "{{.LTyp}}", -1)
+	assignEqRe := makeFunctionRegex("_ASSIGN_EQ", 6)
+	s = assignEqRe.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 6))
 
-	assignEqRe := makeFunctionRegex("_ASSIGN_EQ", 3)
-	s = assignEqRe.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 3))
-
-	s = replaceManipulationFuncs(".LTyp", s)
+	s = replaceManipulationFuncs(s)
 
 	tmpl, err := template.New("mergejoinbase").Parse(s)
 	if err != nil {
@@ -46,5 +43,5 @@ func genMergeJoinBase(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genMergeJoinBase, "mergejoinbase.eg.go")
+	registerGenerator(genMergeJoinBase, "mergejoinbase.eg.go", mergeJoinBaseTmpl)
 }

@@ -15,7 +15,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/errors"
 )
 
 //go:generate stringer -type=Kind
@@ -26,6 +28,7 @@ type Kind uint32
 
 // List of privileges. ALL is specifically encoded so that it will automatically
 // pick up new privileges.
+// New privileges must be added to the end since this is a bitfield.
 const (
 	_ Kind = iota
 	ALL
@@ -36,13 +39,36 @@ const (
 	INSERT
 	DELETE
 	UPDATE
+	USAGE
 	ZONECONFIG
+	CONNECT
+)
+
+// ObjectType represents objects that can have privileges.
+type ObjectType string
+
+const (
+	// Any represents any object type.
+	Any ObjectType = "any"
+	// Database represents a database object.
+	Database ObjectType = "database"
+	// Schema represents a schema object.
+	Schema ObjectType = "schema"
+	// Table represents a table object.
+	Table ObjectType = "table"
+	// Type represents a type object.
+	Type ObjectType = "type"
 )
 
 // Predefined sets of privileges.
 var (
-	ReadData      = List{GRANT, SELECT}
-	ReadWriteData = List{GRANT, SELECT, INSERT, DELETE, UPDATE}
+	AllPrivileges    = List{ALL, CONNECT, CREATE, DROP, GRANT, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG}
+	ReadData         = List{GRANT, SELECT}
+	ReadWriteData    = List{GRANT, SELECT, INSERT, DELETE, UPDATE}
+	DBPrivileges     = List{ALL, CONNECT, CREATE, DROP, GRANT, SELECT, INSERT, DELETE, UPDATE, ZONECONFIG}
+	TablePrivileges  = List{ALL, CREATE, DROP, GRANT, SELECT, INSERT, DELETE, UPDATE, ZONECONFIG}
+	SchemaPrivileges = List{ALL, GRANT, CREATE, USAGE}
+	TypePrivileges   = List{ALL, GRANT, USAGE}
 )
 
 // Mask returns the bitmask for a given privilege.
@@ -52,12 +78,13 @@ func (k Kind) Mask() uint32 {
 
 // ByValue is just an array of privilege kinds sorted by value.
 var ByValue = [...]Kind{
-	ALL, CREATE, DROP, GRANT, SELECT, INSERT, DELETE, UPDATE, ZONECONFIG,
+	ALL, CREATE, DROP, GRANT, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG, CONNECT,
 }
 
 // ByName is a map of string -> kind value.
 var ByName = map[string]Kind{
 	"ALL":        ALL,
+	"CONNECT":    CONNECT,
 	"CREATE":     CREATE,
 	"DROP":       DROP,
 	"GRANT":      GRANT,
@@ -66,6 +93,7 @@ var ByName = map[string]Kind{
 	"DELETE":     DELETE,
 	"UPDATE":     UPDATE,
 	"ZONECONFIG": ZONECONFIG,
+	"USAGE":      USAGE,
 }
 
 // List is a list of privileges.
@@ -136,12 +164,24 @@ func (pl List) ToBitField() uint32 {
 	return ret
 }
 
-// ListFromBitField takes a bitfield of privileges and
-// returns a list. It is ordered in increasing
-// value of privilege.Kind.
-func ListFromBitField(m uint32) List {
+// Contains returns true iff the list contains the given privilege kind.
+func (pl List) Contains(k Kind) bool {
+	for _, p := range pl {
+		if p == k {
+			return true
+		}
+	}
+	return false
+}
+
+// ListFromBitField takes a bitfield of privileges and a ObjectType
+// returns a List. It is ordered in increasing value of privilege.Kind.
+func ListFromBitField(m uint32, objectType ObjectType) List {
 	ret := List{}
-	for _, p := range ByValue {
+
+	privileges := GetValidPrivilegesForObject(objectType)
+
+	for _, p := range privileges {
 		if m&p.Mask() != 0 {
 			ret = append(ret, p)
 		}
@@ -162,4 +202,38 @@ func ListFromStrings(strs []string) (List, error) {
 		ret[i] = k
 	}
 	return ret, nil
+}
+
+// ValidatePrivileges returns an error if any privilege in
+// privileges cannot be granted on the given objectType.
+// Currently db/schema/table can all be granted the same privileges.
+func ValidatePrivileges(privileges List, objectType ObjectType) error {
+	validPrivs := GetValidPrivilegesForObject(objectType)
+	for _, priv := range privileges {
+		if validPrivs.ToBitField()&priv.Mask() == 0 {
+			return pgerror.Newf(pgcode.InvalidGrantOperation,
+				"invalid privilege type %s for %s", priv.String(), objectType)
+		}
+	}
+
+	return nil
+}
+
+// GetValidPrivilegesForObject returns the list of valid privileges for the
+// specified object type.
+func GetValidPrivilegesForObject(objectType ObjectType) List {
+	switch objectType {
+	case Table:
+		return TablePrivileges
+	case Schema:
+		return SchemaPrivileges
+	case Database:
+		return DBPrivileges
+	case Type:
+		return TypePrivileges
+	case Any:
+		return AllPrivileges
+	default:
+		panic(errors.AssertionFailedf("unknown object type %s", objectType))
+	}
 }

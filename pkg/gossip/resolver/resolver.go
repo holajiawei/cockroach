@@ -11,12 +11,16 @@
 package resolver
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"os"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/errors"
 )
 
 // Resolver is an interface which provides an abstract factory for
@@ -36,6 +40,42 @@ func NewResolver(address string) (Resolver, error) {
 	// Ensure addr has port and host set.
 	address = ensureHostPort(address, base.DefaultPort)
 	return &socketResolver{typ: "tcp", addr: address}, nil
+}
+
+// SRV returns a slice of addresses from SRV record lookup
+func SRV(ctx context.Context, name string) ([]string, error) {
+	// Ignore port
+	name, _, err := netutil.SplitHostPort(name, base.DefaultPort)
+	if err != nil {
+		return nil, err
+	}
+
+	if name == "" {
+		return nil, nil
+	}
+
+	// "" as the addr and proto forces the direct look up of the name
+	_, recs, err := lookupSRV("", "", name)
+	if err != nil {
+		if dnsErr := (*net.DNSError)(nil); errors.As(err, &dnsErr) && dnsErr.Err == "no such host" {
+			return nil, nil
+		}
+
+		if log.V(1) {
+			log.Infof(context.TODO(), "failed to lookup SRV record for %q: %v", name, err)
+		}
+
+		return nil, nil
+	}
+
+	addrs := []string{}
+	for _, r := range recs {
+		if r.Port != 0 {
+			addrs = append(addrs, net.JoinHostPort(r.Target, fmt.Sprintf("%d", r.Port)))
+		}
+	}
+
+	return addrs, nil
 }
 
 // NewResolverFromAddress takes a net.Addr and constructs a resolver.
@@ -72,4 +112,18 @@ func ensureHostPort(addr string, defaultPort string) string {
 	}
 
 	return net.JoinHostPort(host, port)
+}
+
+var (
+	lookupSRV = net.LookupSRV
+)
+
+// TestingOverrideSRVLookupFn enables a test to temporarily override
+// the SRV lookup function.
+func TestingOverrideSRVLookupFn(
+	fn func(service, proto, name string) (cname string, addrs []*net.SRV, err error),
+) func() {
+	prevFn := lookupSRV
+	lookupSRV = fn
+	return func() { lookupSRV = prevFn }
 }

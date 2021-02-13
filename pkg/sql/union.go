@@ -12,14 +12,13 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // unionNode is a planNode whose rows are the result of one of three set
@@ -65,7 +64,7 @@ type unionNode struct {
 	right, left planNode
 
 	// columns contains the metadata for the results of this node.
-	columns sqlbase.ResultColumns
+	columns colinfo.ResultColumns
 	// inverted, when true, indicates that the right plan corresponds to
 	// the left operand in the input SQL syntax, and vice-versa.
 	inverted bool
@@ -103,7 +102,7 @@ func (p *planner) newUnionNode(
 			typ, len(leftColumns), len(rightColumns),
 		)
 	}
-	unionColumns := append(sqlbase.ResultColumns(nil), leftColumns...)
+	unionColumns := append(colinfo.ResultColumns(nil), leftColumns...)
 	for i := 0; i < len(unionColumns); i++ {
 		l := leftColumns[i]
 		r := rightColumns[i]
@@ -113,9 +112,6 @@ func (p *planner) newUnionNode(
 		if !(l.Typ.Equivalent(r.Typ) || l.Typ.Family() == types.UnknownFamily || r.Typ.Family() == types.UnknownFamily) {
 			return nil, pgerror.Newf(pgcode.DatatypeMismatch,
 				"%v types %s and %s cannot be matched", typ, l.Typ, r.Typ)
-		}
-		if l.Hidden != r.Hidden {
-			return nil, fmt.Errorf("%v types cannot be matched", typ)
 		}
 		if l.Typ.Family() == types.UnknownFamily {
 			unionColumns[i].Typ = r.Typ

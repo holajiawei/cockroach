@@ -41,44 +41,31 @@ type Table interface {
 	// information_schema tables.
 	IsVirtualTable() bool
 
-	// IsInterleaved returns true if any of this table's indexes are interleaved
-	// with index(es) from other table(s).
-	IsInterleaved() bool
+	// IsMaterializedView returns true if this table is actually a materialized
+	// view. Materialized views are the same as tables in all aspects, other than
+	// that they cannot be mutated.
+	IsMaterializedView() bool
 
-	// ColumnCount returns the number of public columns in the table. Public
-	// columns are not currently being added or dropped from the table. This
-	// method should be used when mutation columns can be ignored (the common
-	// case).
+	// ColumnCount returns the number of columns in the table. This includes
+	// public columns, write-only columns, etc.
 	ColumnCount() int
 
-	// WritableColumnCount returns the number of public and write-only columns in
-	// the table. Although write-only columns are not visible, any inserts and
-	// updates must still set them. WritableColumnCount is always >= ColumnCount.
-	WritableColumnCount() int
-
-	// DeletableColumnCount returns the number of public, write-only, and
-	// delete- only columns in the table. DeletableColumnCount is always >=
-	// WritableColumnCount.
-	DeletableColumnCount() int
-
 	// Column returns a Column interface to the column at the ith ordinal
-	// position within the table, where i < ColumnCount. Note that the Columns
-	// collection includes mutation columns, if present. Mutation columns are in
-	// the process of being added or dropped from the table, and may need to have
-	// default or computed values set when inserting or updating rows. See this
-	// RFC for more details:
+	// position within the table, where i < ColumnCount. The Columns collections
+	// is the union of all columns in all indexes. It may include mutation
+	// columns. Mutation columns are in the process of being added or dropped
+	// from the table, and may need to have default or computed values set when
+	// inserting or updating rows. See this RFC for more details:
 	//
 	//   cockroachdb/cockroach/docs/RFCS/20151014_online_schema_change.md
 	//
-	// Writable columns are always situated after public columns, and are followed
-	// by deletable columns.
-	Column(i int) Column
+	Column(i int) *Column
 
 	// IndexCount returns the number of public indexes defined on this table.
 	// Public indexes are not currently being added or dropped from the table.
 	// This method should be used when mutation columns can be ignored (the common
 	// case). The returned indexes include the primary index, so the count is
-	// always >= 1 (except for virtual tables, which have no indexes).
+	// always >= 1.
 	IndexCount() int
 
 	// WritableIndexCount returns the number of public and write-only indexes
@@ -88,16 +75,16 @@ type Table interface {
 	WritableIndexCount() int
 
 	// DeletableIndexCount returns the number of public, write-only, and
-	// delete-onlyindexes defined on this table. DeletableIndexCount is always
+	// delete-only indexes defined on this table. DeletableIndexCount is always
 	// >= WritableIndexCount.
 	DeletableIndexCount() int
 
-	// Index returns the ith index, where i < DeletableIndexCount. Except for
-	// virtual tables, the table's primary index is always the 0th index, and is
-	// always present (use cat.PrimaryIndex to select it). The primary index
-	// corresponds to the table's primary key. If a primary key was not
-	// explicitly specified, then the system implicitly creates one based on a
-	// hidden rowid column.
+	// Index returns the ith index, where i < DeletableIndexCount. The table's
+	// primary index is always the 0th index, and is always present (use
+	// cat.PrimaryIndex to select it). The primary index corresponds to the
+	// table's primary key. If a primary key was not explicitly specified, then
+	// the system implicitly creates one based on a hidden rowid column. For
+	// virtual tables, the primary index contains a single, synthesized column.
 	Index(i IndexOrdinal) Index
 
 	// StatisticCount returns the number of statistics available for the table.
@@ -136,6 +123,14 @@ type Table interface {
 
 	// InboundForeignKey returns the ith inbound foreign key reference.
 	InboundForeignKey(i int) ForeignKeyConstraint
+
+	// UniqueCount returns the number of unique constraints defined on this table.
+	// Includes any unique constraints implied by unique indexes.
+	UniqueCount() int
+
+	// Unique returns the ith unique constraint defined on this table, where
+	// i < UniqueCount.
+	Unique(i UniqueOrdinal) UniqueConstraint
 }
 
 // CheckConstraint contains the SQL text and the validity status for a check
@@ -250,3 +245,48 @@ type ForeignKeyConstraint interface {
 	// constraint would be violated by an update.
 	UpdateReferenceAction() tree.ReferenceAction
 }
+
+// UniqueConstraint represents a uniqueness constraint. UniqueConstraints may
+// or may not be enforced with a unique index. For example, the following
+// statement creates a unique constraint on column a without a unique index:
+//   ALTER TABLE t ADD CONSTRAINT u UNIQUE WITHOUT INDEX (a);
+// In order to enforce this uniqueness constraint, the optimizer must add
+// a uniqueness check as a postquery to any query that inserts into or updates
+// column a.
+type UniqueConstraint interface {
+	// Name of the unique constraint.
+	Name() string
+
+	// TableID returns the stable identifier of the table on which this unique
+	// constraint is defined.
+	TableID() StableID
+
+	// ColumnCount returns the number of columns in this constraint.
+	ColumnCount() int
+
+	// ColumnOrdinal returns the table column ordinal of the ith column in this
+	// constraint.
+	ColumnOrdinal(tab Table, i int) int
+
+	// Predicate returns the partial index predicate expression and true if the
+	// constraint is a partial unique constraint. If it is not, the empty string
+	// and false are returned.
+	Predicate() (string, bool)
+
+	// WithoutIndex is true if this unique constraint is not enforced by an index.
+	WithoutIndex() bool
+
+	// Validated is true if the constraint is validated (i.e. we know that the
+	// existing data satisfies the constraint). It is possible to set up a unique
+	// constraint on existing tables without validating it, in which case we
+	// cannot make any assumptions about the data. An unvalidated constraint still
+	// needs to be enforced on new mutations.
+	Validated() bool
+}
+
+// UniqueOrdinal identifies a unique constraint (in the context of a Table).
+type UniqueOrdinal = int
+
+// UniqueOrdinals identifies a list of unique constraints (in the context of
+// a Table).
+type UniqueOrdinals = []UniqueOrdinal

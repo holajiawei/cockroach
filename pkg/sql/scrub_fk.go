@@ -14,20 +14,23 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 // sqlForeignKeyCheckOperation is a check on an indexes physical data.
 type sqlForeignKeyCheckOperation struct {
-	tableName  *tree.TableName
-	tableDesc  *sqlbase.ImmutableTableDescriptor
-	constraint *sqlbase.ConstraintDetail
-	asOf       hlc.Timestamp
+	tableName           *tree.TableName
+	tableDesc           catalog.TableDescriptor
+	referencedTableDesc catalog.TableDescriptor
+	constraint          *descpb.ConstraintDetail
+	asOf                hlc.Timestamp
 
-	colIDToRowIdx map[sqlbase.ColumnID]int
+	colIDToRowIdx catalog.TableColMap
 
 	run sqlForeignKeyConstraintCheckRun
 }
@@ -42,15 +45,16 @@ type sqlForeignKeyConstraintCheckRun struct {
 
 func newSQLForeignKeyCheckOperation(
 	tableName *tree.TableName,
-	tableDesc *sqlbase.ImmutableTableDescriptor,
-	constraint sqlbase.ConstraintDetail,
+	tableDesc catalog.TableDescriptor,
+	constraint descpb.ConstraintDetail,
 	asOf hlc.Timestamp,
 ) *sqlForeignKeyCheckOperation {
 	return &sqlForeignKeyCheckOperation{
-		tableName:  tableName,
-		tableDesc:  tableDesc,
-		constraint: &constraint,
-		asOf:       asOf,
+		tableName:           tableName,
+		tableDesc:           tableDesc,
+		constraint:          &constraint,
+		referencedTableDesc: tabledesc.NewImmutable(*constraint.ReferencedTable),
+		asOf:                asOf,
 	}
 }
 
@@ -61,9 +65,9 @@ func (o *sqlForeignKeyCheckOperation) Start(params runParams) error {
 	ctx := params.ctx
 
 	checkQuery, _, err := nonMatchingRowQuery(
-		&o.tableDesc.TableDescriptor,
+		o.tableDesc,
 		o.constraint.FK,
-		o.constraint.ReferencedTable,
+		o.referencedTableDesc,
 		false, /* limitResults */
 	)
 	if err != nil {
@@ -78,11 +82,11 @@ func (o *sqlForeignKeyCheckOperation) Start(params runParams) error {
 	}
 	o.run.rows = rows
 
-	if len(o.constraint.FK.OriginColumnIDs) > 1 && o.constraint.FK.Match == sqlbase.ForeignKeyReference_FULL {
+	if len(o.constraint.FK.OriginColumnIDs) > 1 && o.constraint.FK.Match == descpb.ForeignKeyReference_FULL {
 		// Check if there are any disallowed references where some columns are NULL
 		// and some aren't.
 		checkNullsQuery, _, err := matchFullUnacceptableKeyQuery(
-			&o.tableDesc.TableDescriptor,
+			o.tableDesc,
 			o.constraint.FK,
 			false, /* limitResults */
 		)
@@ -102,15 +106,16 @@ func (o *sqlForeignKeyCheckOperation) Start(params runParams) error {
 	// columns and extra columns in the secondary index used for foreign
 	// key referencing. This also implicitly includes all primary index
 	// columns.
-	columnsByID := make(map[sqlbase.ColumnID]*sqlbase.ColumnDescriptor, len(o.tableDesc.Columns))
-	for i := range o.tableDesc.Columns {
-		columnsByID[o.tableDesc.Columns[i].ID] = &o.tableDesc.Columns[i]
+	columnsByID := make(map[descpb.ColumnID]*descpb.ColumnDescriptor, len(o.tableDesc.PublicColumns()))
+	for _, c := range o.tableDesc.PublicColumns() {
+		columnsByID[c.GetID()] = c.ColumnDesc()
 	}
 
 	// Get primary key columns not included in the FK.
-	var colIDs []sqlbase.ColumnID
+	var colIDs []descpb.ColumnID
 	colIDs = append(colIDs, o.constraint.FK.OriginColumnIDs...)
-	for _, pkColID := range o.tableDesc.PrimaryIndex.ColumnIDs {
+	for i := 0; i < o.tableDesc.GetPrimaryIndex().NumColumns(); i++ {
+		pkColID := o.tableDesc.GetPrimaryIndex().GetColumnID(i)
 		found := false
 		for _, id := range o.constraint.FK.OriginColumnIDs {
 			if pkColID == id {
@@ -123,9 +128,8 @@ func (o *sqlForeignKeyCheckOperation) Start(params runParams) error {
 		}
 	}
 
-	o.colIDToRowIdx = make(map[sqlbase.ColumnID]int, len(colIDs))
 	for i, id := range colIDs {
-		o.colIDToRowIdx[id] = i
+		o.colIDToRowIdx.Set(id, i)
 	}
 
 	o.run.started = true
@@ -144,23 +148,25 @@ func (o *sqlForeignKeyCheckOperation) Next(params runParams) (tree.Datums, error
 
 	// Collect the primary index values for generating the primary key
 	// pretty string.
-	primaryKeyDatums := make(tree.Datums, 0, len(o.tableDesc.PrimaryIndex.ColumnIDs))
-	for _, id := range o.tableDesc.PrimaryIndex.ColumnIDs {
-		idx := o.colIDToRowIdx[id]
+	primaryKeyDatums := make(tree.Datums, 0, o.tableDesc.GetPrimaryIndex().NumColumns())
+	for i := 0; i < o.tableDesc.GetPrimaryIndex().NumColumns(); i++ {
+		id := o.tableDesc.GetPrimaryIndex().GetColumnID(i)
+		idx := o.colIDToRowIdx.GetDefault(id)
 		primaryKeyDatums = append(primaryKeyDatums, row[idx])
 	}
 
 	// Collect all of the values fetched from the index to generate a
 	// pretty JSON dictionary for row_data.
 	for _, id := range o.constraint.FK.OriginColumnIDs {
-		idx := o.colIDToRowIdx[id]
-		col, err := o.tableDesc.FindActiveColumnByID(id)
+		idx := o.colIDToRowIdx.GetDefault(id)
+		col, err := tabledesc.FindPublicColumnWithID(o.tableDesc, id)
 		if err != nil {
 			return nil, err
 		}
-		rowDetails[col.Name] = row[idx].String()
+		rowDetails[col.GetName()] = row[idx].String()
 	}
-	for _, id := range o.tableDesc.PrimaryIndex.ColumnIDs {
+	for i := 0; i < o.tableDesc.GetPrimaryIndex().NumColumns(); i++ {
+		id := o.tableDesc.GetPrimaryIndex().GetColumnID(i)
 		found := false
 		for _, fkID := range o.constraint.FK.OriginColumnIDs {
 			if id == fkID {
@@ -169,16 +175,24 @@ func (o *sqlForeignKeyCheckOperation) Next(params runParams) (tree.Datums, error
 			}
 		}
 		if !found {
-			idx := o.colIDToRowIdx[id]
-			col, err := o.tableDesc.FindActiveColumnByID(id)
+			idx := o.colIDToRowIdx.GetDefault(id)
+			col, err := tabledesc.FindPublicColumnWithID(o.tableDesc, id)
 			if err != nil {
 				return nil, err
 			}
-			rowDetails[col.Name] = row[idx].String()
+			rowDetails[col.GetName()] = row[idx].String()
 		}
 	}
 
 	detailsJSON, err := tree.MakeDJSON(details)
+	if err != nil {
+		return nil, err
+	}
+
+	ts, err := tree.MakeDTimestamp(
+		params.extendedEvalCtx.GetStmtTimestamp(),
+		time.Nanosecond,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +204,7 @@ func (o *sqlForeignKeyCheckOperation) Next(params runParams) (tree.Datums, error
 		tree.NewDString(o.tableName.Catalog()),
 		tree.NewDString(o.tableName.Table()),
 		tree.NewDString(primaryKeyDatums.String()),
-		tree.MakeDTimestamp(params.extendedEvalCtx.GetStmtTimestamp(), time.Nanosecond),
+		ts,
 		tree.DBoolFalse,
 		detailsJSON,
 	}, nil

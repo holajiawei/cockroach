@@ -29,6 +29,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
@@ -37,12 +38,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	// register some workloads for TestWorkload
 	_ "github.com/cockroachdb/cockroach/pkg/workload/examples"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -50,6 +52,7 @@ type cliTest struct {
 	*server.TestServer
 	certsDir    string
 	cleanupFunc func() error
+	prevStderr  *os.File
 
 	// t is the testing.T instance used for this test.
 	// Example_xxx tests may have this set to nil.
@@ -62,12 +65,18 @@ type cliTest struct {
 }
 
 type cliTestParams struct {
-	t          *testing.T
-	insecure   bool
-	noServer   bool
-	storeSpecs []base.StoreSpec
-	locality   roachpb.Locality
+	t           *testing.T
+	insecure    bool
+	noServer    bool
+	storeSpecs  []base.StoreSpec
+	locality    roachpb.Locality
+	noNodelocal bool
 }
+
+// testTempFilePrefix is a sentinel marker to be used as the prefix of a
+// test file name. It is used to extract the file name from a uniquely
+// generated (temp directory) file path.
+const testTempFilePrefix = "test-temp-prefix-"
 
 func (c *cliTest) fail(err interface{}) {
 	if c.t != nil {
@@ -92,10 +101,15 @@ func createTestCerts(certsDir string) (cleanup func() error) {
 		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey),
 		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootCert),
 		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootKey),
+
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedTenantClientCACert),
 	}
 
 	for _, a := range assets {
-		securitytest.RestrictedCopy(nil, a, certsDir, filepath.Base(a))
+		_, err := securitytest.RestrictedCopy(a, certsDir, filepath.Base(a))
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	return func() error {
@@ -125,27 +139,32 @@ func newCLITest(params cliTestParams) cliTest {
 			baseCfg.SSLCertsDir = certsDir
 		}
 
-		s, err := serverutils.StartServerRaw(base.TestServerArgs{
+		args := base.TestServerArgs{
 			Insecure:      params.insecure,
 			SSLCertsDir:   c.certsDir,
 			StoreSpecs:    params.storeSpecs,
 			Locality:      params.locality,
 			ExternalIODir: filepath.Join(certsDir, "extern"),
-		})
+		}
+		if params.noNodelocal {
+			args.ExternalIODir = ""
+		}
+		s, err := serverutils.StartServerRaw(args)
 		if err != nil {
 			c.fail(err)
 		}
 		c.TestServer = s.(*server.TestServer)
 
-		log.Infof(context.TODO(), "server started at %s", c.ServingRPCAddr())
-		log.Infof(context.TODO(), "SQL listener at %s", c.ServingSQLAddr())
+		log.Infof(context.Background(), "server started at %s", c.ServingRPCAddr())
+		log.Infof(context.Background(), "SQL listener at %s", c.ServingSQLAddr())
 	}
 
-	baseCfg.User = security.NodeUser
+	baseCfg.User = security.NodeUserName()
 
 	// Ensure that CLI error messages and anything meant for the
 	// original stderr is redirected to stdout, where it can be
 	// captured.
+	c.prevStderr = stderr
 	stderr = os.Stdout
 
 	return c
@@ -166,16 +185,9 @@ func setCLIDefaultsForTests() {
 // stopServer stops the test server.
 func (c *cliTest) stopServer() {
 	if c.TestServer != nil {
-		log.Infof(context.TODO(), "stopping server at %s / %s",
+		log.Infof(context.Background(), "stopping server at %s / %s",
 			c.ServingRPCAddr(), c.ServingSQLAddr())
-		select {
-		case <-c.Stopper().ShouldStop():
-			// If ShouldStop() doesn't block, that means someone has already
-			// called Stop(). We just need to wait.
-			<-c.Stopper().IsStopped()
-		default:
-			c.Stopper().Stop(context.TODO())
-		}
+		c.Stopper().Stop(context.Background())
 	}
 }
 
@@ -183,7 +195,7 @@ func (c *cliTest) stopServer() {
 // have changed after this method returns.
 func (c *cliTest) restartServer(params cliTestParams) {
 	c.stopServer()
-	log.Info(context.TODO(), "restarting server")
+	log.Info(context.Background(), "restarting server")
 	s, err := serverutils.StartServerRaw(base.TestServerArgs{
 		Insecure:    params.insecure,
 		SSLCertsDir: c.certsDir,
@@ -193,21 +205,23 @@ func (c *cliTest) restartServer(params cliTestParams) {
 		c.fail(err)
 	}
 	c.TestServer = s.(*server.TestServer)
-	log.Infof(context.TODO(), "restarted server at %s / %s",
+	log.Infof(context.Background(), "restarted server at %s / %s",
 		c.ServingRPCAddr(), c.ServingSQLAddr())
 }
 
 // cleanup cleans up after the test, stopping the server if necessary.
 // The log files are removed if the test has succeeded.
 func (c *cliTest) cleanup() {
-	if c.t != nil {
-		defer c.logScope.Close(c.t)
-	}
+	defer func() {
+		if c.t != nil {
+			c.logScope.Close(c.t)
+		}
+	}()
 
 	// Restore stderr.
-	stderr = log.OrigStderr
+	stderr = c.prevStderr
 
-	log.Info(context.TODO(), "stopping server and cleaning up CLI test")
+	log.Info(context.Background(), "stopping server and cleaning up CLI test")
 
 	c.stopServer()
 
@@ -282,26 +296,16 @@ func captureOutput(f func()) (out string, err error) {
 	return
 }
 
-func isSQLCommand(args []string) bool {
-	if len(args) == 0 {
-		return false
+func isSQLCommand(args []string) (bool, error) {
+	cmd, _, err := cockroachCmd.Find(args)
+	if err != nil {
+		return false, err
 	}
-	switch args[0] {
-	case "sql", "dump", "workload", "nodelocal":
-		return true
-	case "node":
-		if len(args) == 0 {
-			return false
-		}
-		switch args[1] {
-		case "status", "ls":
-			return true
-		default:
-			return false
-		}
-	default:
-		return false
+	// We use --echo-sql as a marker of SQL-only commands.
+	if f := flagSetForCmd(cmd).Lookup(cliflags.EchoSQL.Name); f != nil {
+		return true, nil
 	}
+	return false, nil
 }
 
 func (c cliTest) RunWithArgs(origArgs []string) {
@@ -311,7 +315,9 @@ func (c cliTest) RunWithArgs(origArgs []string) {
 		args := append([]string(nil), origArgs[:1]...)
 		if c.TestServer != nil {
 			addr := c.ServingRPCAddr()
-			if isSQLCommand(origArgs) {
+			if isSQL, err := isSQLCommand(origArgs); err != nil {
+				return err
+			} else if isSQL {
 				addr = c.ServingSQLAddr()
 			}
 			h, p, err := net.SplitHostPort(addr)
@@ -327,6 +333,16 @@ func (c cliTest) RunWithArgs(origArgs []string) {
 			}
 		}
 		args = append(args, origArgs[1:]...)
+
+		// `nodelocal upload` CLI tests create test files in unique temp
+		// directories. Given that the expected output for such tests is defined as
+		// a static comment, it is not possible to match against the full file path.
+		// So, we trim the file path upto the sentinel prefix marker, and use only
+		// the file name for comparing against the expected output.
+		if len(origArgs) >= 3 && strings.Contains(origArgs[2], testTempFilePrefix) {
+			splitFilePath := strings.Split(origArgs[2], testTempFilePrefix)
+			origArgs[2] = splitFilePath[1]
+		}
 
 		if !c.omitArgs {
 			fmt.Fprintf(os.Stderr, "%s\n", args)
@@ -362,9 +378,7 @@ func (c cliTest) RunWithCAArgs(origArgs []string) {
 func TestQuit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	if testing.Short() {
-		t.Skip("short flag")
-	}
+	skip.UnderShort(t)
 
 	c := newCLITest(cliTestParams{t: t})
 	defer c.cleanup()
@@ -398,6 +412,9 @@ func Example_demo() {
 	c := newCLITest(cliTestParams{noServer: true})
 	defer c.cleanup()
 
+	defer func(b bool) { testingForceRandomizeDemoPorts = b }(testingForceRandomizeDemoPorts)
+	testingForceRandomizeDemoPorts = true
+
 	testData := [][]string{
 		{`demo`, `-e`, `show database`},
 		{`demo`, `-e`, `show database`, `--empty`},
@@ -406,11 +423,24 @@ func Example_demo() {
 		{`demo`, `-e`, `select 1 as "1"`, `-e`, `select 3 as "3"`},
 		{`demo`, `--echo-sql`, `-e`, `select 1 as "1"`},
 		{`demo`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`},
-		{`demo`, `startrek`, `-e`, `show databases`},
-		{`demo`, `startrek`, `-e`, `show databases`, `--format=table`},
+		{`demo`, `startrek`, `-e`, `SELECT database_name, owner FROM [show databases]`},
+		{`demo`, `startrek`, `-e`, `SELECT database_name, owner FROM [show databases]`, `--format=table`},
+		// Test that if we start with --insecure we cannot perform
+		// commands that require a secure cluster.
+		{`demo`, `-e`, `CREATE USER test WITH PASSWORD 'testpass'`},
+		{`demo`, `--insecure`, `-e`, `CREATE USER test WITH PASSWORD 'testpass'`},
+		{`demo`, `--geo-partitioned-replicas`, `--disable-demo-license`},
 	}
 	setCLIDefaultsForTests()
+	// We must reset the security asset loader here, otherwise the dummy
+	// asset loader that is set by default in tests will not be able to
+	// find the certs that demo sets up.
+	security.ResetAssetLoader()
 	for _, cmd := range testData {
+		// `demo` sets up a server and log file redirection, which asserts
+		// that the logging subsystem has not been initialized yet. Fake
+		// this to be true.
+		log.TestingResetActive()
 		c.RunWithArgs(cmd)
 	}
 
@@ -443,20 +473,27 @@ func Example_demo() {
 	// SQLSTATE: 42703
 	// 123
 	// 123
-	// demo startrek -e show databases
-	// database_name
-	// defaultdb
-	// postgres
-	// startrek
-	// system
-	// demo startrek -e show databases --format=table
-	//   database_name
-	// -----------------
-	//   defaultdb
-	//   postgres
-	//   startrek
-	//   system
+	// demo startrek -e SELECT database_name, owner FROM [show databases]
+	// database_name	owner
+	// defaultdb	root
+	// postgres	root
+	// startrek	demo
+	// system	node
+	// demo startrek -e SELECT database_name, owner FROM [show databases] --format=table
+	//   database_name | owner
+	// ----------------+--------
+	//   defaultdb     | root
+	//   postgres      | root
+	//   startrek      | demo
+	//   system        | node
 	// (4 rows)
+	// demo -e CREATE USER test WITH PASSWORD 'testpass'
+	// CREATE ROLE
+	// demo --insecure -e CREATE USER test WITH PASSWORD 'testpass'
+	// ERROR: setting or updating a password is not supported in insecure mode
+	// SQLSTATE: 28P01
+	// demo --geo-partitioned-replicas --disable-demo-license
+	// ERROR: enterprise features are needed for this demo (--geo-partitioned-replicas)
 }
 
 func Example_sql() {
@@ -468,7 +505,7 @@ func Example_sql() {
 	c.RunWithArgs([]string{`sql`, `-e`, `select 3 as "3"`, `-e`, `select * from t.f`})
 	c.RunWithArgs([]string{`sql`, `-e`, `begin`, `-e`, `select 3 as "3"`, `-e`, `commit`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select * from t.f`})
-	c.RunWithArgs([]string{`sql`, `--execute=show databases`})
+	c.RunWithArgs([]string{`sql`, `--execute=SELECT database_name, owner FROM [show databases]`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "2"`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "@" where false`})
 	// CREATE TABLE AS returns a SELECT tag with a row count, check this.
@@ -486,6 +523,12 @@ func Example_sql() {
 	c.RunWithArgs([]string{`sql`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`})
 	c.RunWithArgs([]string{`sql`, `--set`, `echo=true`, `-e`, `select 123 as "123"`})
 	c.RunWithArgs([]string{`sql`, `--set`, `unknownoption`, `-e`, `select 123 as "123"`})
+	// Check that partial results + error get reported together. The query will
+	// run via the vectorized execution engine which operates on the batches of
+	// growing capacity starting at 1 (the batch sizes will be 1, 2, 4, ...),
+	// and with the query below the division by zero error will occur after the
+	// first batch consisting of 1 row has been returned to the client.
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(@1-2) from generate_series(1,3)`})
 
 	// Output:
 	// sql -e show application_name
@@ -506,12 +549,12 @@ func Example_sql() {
 	// sql -e select * from t.f
 	// x	y
 	// 42	69
-	// sql --execute=show databases
-	// database_name
-	// defaultdb
-	// postgres
-	// system
-	// t
+	// sql --execute=SELECT database_name, owner FROM [show databases]
+	// database_name	owner
+	// defaultdb	root
+	// postgres	root
+	// system	node
+	// t	root
 	// sql -e select 1 as "1"; select 2 as "2"
 	// 1
 	// 1
@@ -543,6 +586,12 @@ func Example_sql() {
 	// sql --set unknownoption -e select 123 as "123"
 	// invalid syntax: \set unknownoption. Try \? for help.
 	// ERROR: invalid syntax
+	// sql -e select 1/(@1-2) from generate_series(1,3)
+	// ?column?
+	// -1
+	// (error encountered after some results were delivered)
+	// ERROR: division by zero
+	// SQLSTATE: 22012
 }
 
 func Example_sql_watch() {
@@ -579,7 +628,7 @@ func Example_sql_format() {
 	// INSERT 1
 	// sql -e select * from t.times
 	// bare	withtz
-	// 2016-01-25 10:10:10+00:00	2016-01-25 15:10:10+00:00
+	// 2016-01-25 10:10:10+00:00:00	2016-01-25 15:10:10+00:00:00
 }
 
 func Example_sql_column_labels() {
@@ -1220,6 +1269,7 @@ func Example_sql_table() {
 
 func TestRenderHTML(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	cols := []string{"colname"}
 	align := "d"
@@ -1314,15 +1364,18 @@ func Example_misc_table() {
 	//     hai
 	// (1 row)
 	// sql --format=table -e explain select s, 'foo' from t.t
-	//     tree    |    field    | description
-	// ------------+-------------+--------------
-	//             | distributed | true
-	//             | vectorized  | false
-	//   render    |             |
-	//    └── scan |             |
-	//             | table       | t@primary
-	//             | spans       | ALL
-	// (6 rows)
+	//            info
+	// --------------------------
+	//   distribution: full
+	//   vectorized: true
+	//
+	//   • render
+	//   │
+	//   └── • scan
+	//         missing stats
+	//         table: t@primary
+	//         spans: FULL SCAN
+	// (9 rows)
 }
 
 func Example_cert() {
@@ -1339,8 +1392,7 @@ func Example_cert() {
 	// cert create-client Ομηρος
 	// cert create-client 0foo
 	// cert create-client ,foo
-	// ERROR: failed to generate client certificate and key: username ",foo" invalid
-	// SQLSTATE: 42602
+	// ERROR: failed to generate client certificate and key: username is invalid
 	// HINT: Usernames are case insensitive, must start with a letter, digit or underscore, may contain letters, digits, dashes, periods, or underscores, and must not exceed 63 characters.
 }
 
@@ -1348,6 +1400,7 @@ func Example_cert() {
 // help template does not break.
 func TestFlagUsage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	expUsage := `Usage:
   cockroach [command]
@@ -1357,31 +1410,36 @@ Available Commands:
   start-single-node start a single-node cluster
   init              initialize a cluster
   cert              create ca, node, and client certs
-  quit              drain and shutdown node
-
   sql               open a sql shell
+  statement-diag    commands for managing statement diagnostics bundles
   auth-session      log in and out of HTTP sessions
-  node              list, inspect or remove nodes
-  dump              dump sql tables
+  node              list, inspect, drain or remove nodes
 
   nodelocal         upload and delete nodelocal files
+  userfile          upload, list and delete user scoped files
+  import            import a db or table from a local PGDUMP or MYSQLDUMP file
   demo              open a demo sql shell
   gen               generate auxiliary files
   version           output version information
   debug             debugging commands
   sqlfmt            format SQL statements
-  workload          [experimental] generators for data and query loads
+  workload          generators for data and query loads
   systembench       Run systembench
   help              Help about any command
 
 Flags:
-  -h, --help                             help for cockroach
-      --logtostderr Severity[=DEFAULT]   logs at or above this threshold go to stderr (default NONE)
-      --no-color                         disable standard error log colorization
+  -h, --help                 help for cockroach
+      --log <string>         
+                                     Logging configuration. See the documentation for details.
+                                    
+      --version              version for cockroach
 
 Use "cockroach [command] --help" for more information about a command.
 `
-	helpExpected := fmt.Sprintf("CockroachDB command-line interface and server.\n\n%s", expUsage)
+	helpExpected := fmt.Sprintf("CockroachDB command-line interface and server.\n\n%s",
+		// Due to a bug in spf13/cobra, 'cockroach help' does not include the --version
+		// flag. Strangely, 'cockroach --help' does, as well as usage error messages.
+		strings.ReplaceAll(expUsage, "      --version              version for cockroach\n", ""))
 	badFlagExpected := fmt.Sprintf("%s\nError: unknown flag: --foo\n", expUsage)
 
 	testCases := []struct {
@@ -1477,7 +1535,7 @@ func Example_node() {
 func TestCLITimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	c := newCLITest(cliTestParams{})
+	c := newCLITest(cliTestParams{t: t})
 	defer c.cleanup()
 
 	// Wrap the meat of the test in a retry loop. Setting a timeout like this is
@@ -1506,7 +1564,7 @@ SQLSTATE: 57014
 func TestNodeStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	t.Skip("currently flaky: #38151")
+	skip.WithIssue(t, 38151)
 
 	start := timeutil.Now()
 	c := newCLITest(cliTestParams{})
@@ -1751,6 +1809,7 @@ func extractFields(line string) ([]string, error) {
 
 func TestGenMan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Generate man pages in a temp directory.
 	manpath, err := ioutil.TempDir("", "TestGenMan")
@@ -1784,6 +1843,7 @@ func TestGenMan(t *testing.T) {
 
 func TestGenAutocomplete(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Get a unique path to which we can write our autocomplete files.
 	acdir, err := ioutil.TempDir("", "TestGenAutoComplete")
@@ -1852,11 +1912,11 @@ func TestJunkPositionalArguments(t *testing.T) {
 		line := test + " " + junk
 		out, err := c.RunWithCapture(line)
 		if err != nil {
-			t.Fatal(errors.Wrap(err, strconv.Itoa(i)))
+			t.Fatalf("%d: %v", i, err)
 		}
 		exp := fmt.Sprintf("%s\nERROR: unknown command %q for \"cockroach %s\"\n", line, junk, test)
 		if exp != out {
-			t.Errorf("expected:\n%s\ngot:\n%s", exp, out)
+			t.Errorf("%d: expected:\n%s\ngot:\n%s", i, exp, out)
 		}
 	}
 }
@@ -1983,22 +2043,74 @@ func Example_sqlfmt() {
 	// SELECT (1 + 2) + 3
 }
 
-func Example_dump_no_visible_columns() {
+// Example_read_from_file tests the -f parameter.
+// The input file contains a mix of client-side and
+// server-side commands to ensure that both are supported with -f.
+func Example_read_from_file() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
-	c.RunWithArgs([]string{"sql", "-e", "create table t(x int); set sql_safe_updates=false; alter table t drop x"})
-	c.RunWithArgs([]string{"dump", "defaultdb"})
+	c.RunWithArgs([]string{"sql", "-e", "select 1", "-f", "testdata/inputfile.sql"})
+	c.RunWithArgs([]string{"sql", "-f", "testdata/inputfile.sql"})
 
 	// Output:
-	// sql -e create table t(x int); set sql_safe_updates=false; alter table t drop x
-	// ALTER TABLE
-	// dump defaultdb
-	// CREATE TABLE t (,
-	// 	FAMILY "primary" (rowid)
-	// );
-	// ERROR: table "defaultdb.public.t" has no visible columns
-	// HINT: To proceed with the dump, either omit this table from the list of tables to dump, drop the table, or add some visible columns.
-	// --
-	// See: https://github.com/cockroachdb/cockroach/issues/37768
+	// sql -e select 1 -f testdata/inputfile.sql
+	// ERROR: unsupported combination: --execute and --file
+	// sql -f testdata/inputfile.sql
+	// SET
+	// CREATE TABLE
+	// > INSERT INTO test(s) VALUES ('hello'), ('world');
+	// INSERT 2
+	// > SELECT * FROM test;
+	// s
+	// hello
+	// world
+	// > SELECT undefined;
+	// ERROR: column "undefined" does not exist
+	// SQLSTATE: 42703
+	// ERROR: column "undefined" does not exist
+	// SQLSTATE: 42703
+}
+
+// Example_includes tests the \i command.
+func Example_includes() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{"sql", "-f", "testdata/i_twolevels1.sql"})
+	c.RunWithArgs([]string{"sql", "-f", "testdata/i_multiline.sql"})
+	c.RunWithArgs([]string{"sql", "-f", "testdata/i_stopmiddle.sql"})
+	c.RunWithArgs([]string{"sql", "-f", "testdata/i_maxrecursion.sql"})
+
+	// Output:
+	// sql -f testdata/i_twolevels1.sql
+	// > SELECT 123;
+	// ?column?
+	// 123
+	// > SELECT 789;
+	// ?column?
+	// 789
+	// ?column?
+	// 456
+	// sql -f testdata/i_multiline.sql
+	// ERROR: at or near "\": syntax error
+	// SQLSTATE: 42601
+	// DETAIL: source SQL:
+	// SELECT -- incomplete statement, \i invalid
+	// \i testdata/i_twolevels2.sql
+	// ^
+	// HINT: try \h SELECT
+	// ERROR: at or near "\": syntax error
+	// SQLSTATE: 42601
+	// DETAIL: source SQL:
+	// SELECT -- incomplete statement, \i invalid
+	// \i testdata/i_twolevels2.sql
+	// ^
+	// HINT: try \h SELECT
+	// sql -f testdata/i_stopmiddle.sql
+	// ?column?
+	// 123
+	// sql -f testdata/i_maxrecursion.sql
+	// \i: too many recursion levels (max 10)
+	// ERROR: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: \i: too many recursion levels (max 10)
 }

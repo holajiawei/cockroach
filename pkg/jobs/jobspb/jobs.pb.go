@@ -6,15 +6,21 @@ package jobspb
 import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
+import clusterversion "github.com/cockroachdb/cockroach/pkg/clusterversion"
 import errorspb "github.com/cockroachdb/errors/errorspb"
 import roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
-import sqlbase "github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+import descpb "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+import scpb "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 import hlc "github.com/cockroachdb/cockroach/pkg/util/hlc"
 
 import github_com_cockroachdb_cockroach_pkg_roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
-import github_com_cockroachdb_cockroach_pkg_sql_sqlbase "github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-import github_com_cockroachdb_cockroach_pkg_sql_sem_tree "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+import github_com_cockroachdb_cockroach_pkg_ccl_streamingccl "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 import github_com_cockroachdb_cockroach_pkg_util_uuid "github.com/cockroachdb/cockroach/pkg/util/uuid"
+import github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+import github_com_cockroachdb_cockroach_pkg_sql_sem_tree "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+import github_com_cockroachdb_cockroach_pkg_security "github.com/cockroachdb/cockroach/pkg/security"
+
+import bytes "bytes"
 
 import github_com_gogo_protobuf_sortkeys "github.com/gogo/protobuf/sortkeys"
 import encoding_binary "encoding/binary"
@@ -31,6 +37,29 @@ var _ = math.Inf
 // A compilation error at this line likely means your copy of the
 // proto package needs to be updated.
 const _ = proto.GoGoProtoPackageIsVersion2 // please upgrade the proto package
+
+type EncryptionMode int32
+
+const (
+	EncryptionMode_Passphrase EncryptionMode = 0
+	EncryptionMode_KMS        EncryptionMode = 1
+)
+
+var EncryptionMode_name = map[int32]string{
+	0: "Passphrase",
+	1: "KMS",
+}
+var EncryptionMode_value = map[string]int32{
+	"Passphrase": 0,
+	"KMS":        1,
+}
+
+func (x EncryptionMode) String() string {
+	return proto.EnumName(EncryptionMode_name, int32(x))
+}
+func (EncryptionMode) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{0}
+}
 
 type Status int32
 
@@ -58,7 +87,7 @@ func (x Status) String() string {
 	return proto.EnumName(Status_name, int32(x))
 }
 func (Status) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{0}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{1}
 }
 
 type Type int32
@@ -72,31 +101,98 @@ const (
 	TypeChangefeed      Type = 5
 	TypeCreateStats     Type = 6
 	TypeAutoCreateStats Type = 7
+	TypeSchemaChangeGC  Type = 8
+	// We can't name this TYPE_SCHEMA_CHANGE due to how proto generates actual
+	// names for this enum, which cause a conflict with the SCHEMA_CHANGE entry.
+	TypeTypeSchemaChange Type = 9
+	TypeStreamIngestion  Type = 10
+	TypeNewSchemaChange  Type = 11
+	TypeMigration        Type = 12
 )
 
 var Type_name = map[int32]string{
-	0: "UNSPECIFIED",
-	1: "BACKUP",
-	2: "RESTORE",
-	3: "SCHEMA_CHANGE",
-	4: "IMPORT",
-	5: "CHANGEFEED",
-	6: "CREATE_STATS",
-	7: "AUTO_CREATE_STATS",
+	0:  "UNSPECIFIED",
+	1:  "BACKUP",
+	2:  "RESTORE",
+	3:  "SCHEMA_CHANGE",
+	4:  "IMPORT",
+	5:  "CHANGEFEED",
+	6:  "CREATE_STATS",
+	7:  "AUTO_CREATE_STATS",
+	8:  "SCHEMA_CHANGE_GC",
+	9:  "TYPEDESC_SCHEMA_CHANGE",
+	10: "STREAM_INGESTION",
+	11: "NEW_SCHEMA_CHANGE",
+	12: "MIGRATION",
 }
 var Type_value = map[string]int32{
-	"UNSPECIFIED":       0,
-	"BACKUP":            1,
-	"RESTORE":           2,
-	"SCHEMA_CHANGE":     3,
-	"IMPORT":            4,
-	"CHANGEFEED":        5,
-	"CREATE_STATS":      6,
-	"AUTO_CREATE_STATS": 7,
+	"UNSPECIFIED":            0,
+	"BACKUP":                 1,
+	"RESTORE":                2,
+	"SCHEMA_CHANGE":          3,
+	"IMPORT":                 4,
+	"CHANGEFEED":             5,
+	"CREATE_STATS":           6,
+	"AUTO_CREATE_STATS":      7,
+	"SCHEMA_CHANGE_GC":       8,
+	"TYPEDESC_SCHEMA_CHANGE": 9,
+	"STREAM_INGESTION":       10,
+	"NEW_SCHEMA_CHANGE":      11,
+	"MIGRATION":              12,
 }
 
 func (Type) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{1}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{2}
+}
+
+type EncryptionInfo_Scheme int32
+
+const (
+	EncryptionInfo_AES256GCM EncryptionInfo_Scheme = 0
+)
+
+var EncryptionInfo_Scheme_name = map[int32]string{
+	0: "AES256GCM",
+}
+var EncryptionInfo_Scheme_value = map[string]int32{
+	"AES256GCM": 0,
+}
+
+func (x EncryptionInfo_Scheme) String() string {
+	return proto.EnumName(EncryptionInfo_Scheme_name, int32(x))
+}
+func (EncryptionInfo_Scheme) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{2, 0}
+}
+
+type SchemaChangeGCProgress_Status int32
+
+const (
+	// Waiting for the index/table to expire.
+	SchemaChangeGCProgress_WAITING_FOR_GC SchemaChangeGCProgress_Status = 0
+	// The GC TTL has expired. This element is marked for imminent deletion
+	SchemaChangeGCProgress_DELETING SchemaChangeGCProgress_Status = 1
+	// This element has been deleted. The job is done when all elements are in
+	// this state.
+	SchemaChangeGCProgress_DELETED SchemaChangeGCProgress_Status = 2
+)
+
+var SchemaChangeGCProgress_Status_name = map[int32]string{
+	0: "WAITING_FOR_GC",
+	1: "DELETING",
+	2: "DELETED",
+}
+var SchemaChangeGCProgress_Status_value = map[string]int32{
+	"WAITING_FOR_GC": 0,
+	"DELETING":       1,
+	"DELETED":        2,
+}
+
+func (x SchemaChangeGCProgress_Status) String() string {
+	return proto.EnumName(SchemaChangeGCProgress_Status_name, int32(x))
+}
+func (SchemaChangeGCProgress_Status) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{22, 0}
 }
 
 type Lease struct {
@@ -110,7 +206,7 @@ func (m *Lease) Reset()         { *m = Lease{} }
 func (m *Lease) String() string { return proto.CompactTextString(m) }
 func (*Lease) ProtoMessage()    {}
 func (*Lease) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{0}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{0}
 }
 func (m *Lease) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -135,6 +231,201 @@ func (m *Lease) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_Lease proto.InternalMessageInfo
 
+// BackupEncryptionOptions stores information resolved during the BACKUP/RESTORE
+// planning stage, and by the BACKUP/RESTORE job to encrypt or decrypt BACKUP
+// data and manifest files.
+type BackupEncryptionOptions struct {
+	// Key specifies the key to use for encryption or decryption.
+	Key  []byte         `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Mode EncryptionMode `protobuf:"varint,2,opt,name=mode,proto3,enum=cockroach.sql.jobs.jobspb.EncryptionMode" json:"mode,omitempty"`
+	// KMSInfo specifies the KMS and encrypted DataKey pair to use for
+	// encryption or decryption when mode == KMS.
+	KMSInfo *BackupEncryptionOptions_KMSInfo `protobuf:"bytes,3,opt,name=kms_info,json=kmsInfo,proto3" json:"kms_info,omitempty"`
+}
+
+func (m *BackupEncryptionOptions) Reset()         { *m = BackupEncryptionOptions{} }
+func (m *BackupEncryptionOptions) String() string { return proto.CompactTextString(m) }
+func (*BackupEncryptionOptions) ProtoMessage()    {}
+func (*BackupEncryptionOptions) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{1}
+}
+func (m *BackupEncryptionOptions) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *BackupEncryptionOptions) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *BackupEncryptionOptions) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_BackupEncryptionOptions.Merge(dst, src)
+}
+func (m *BackupEncryptionOptions) XXX_Size() int {
+	return m.Size()
+}
+func (m *BackupEncryptionOptions) XXX_DiscardUnknown() {
+	xxx_messageInfo_BackupEncryptionOptions.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_BackupEncryptionOptions proto.InternalMessageInfo
+
+type BackupEncryptionOptions_KMSInfo struct {
+	Uri              string `protobuf:"bytes,1,opt,name=uri,proto3" json:"uri,omitempty"`
+	EncryptedDataKey []byte `protobuf:"bytes,2,opt,name=encrypted_data_key,json=encryptedDataKey,proto3" json:"encrypted_data_key,omitempty"`
+}
+
+func (m *BackupEncryptionOptions_KMSInfo) Reset()         { *m = BackupEncryptionOptions_KMSInfo{} }
+func (m *BackupEncryptionOptions_KMSInfo) String() string { return proto.CompactTextString(m) }
+func (*BackupEncryptionOptions_KMSInfo) ProtoMessage()    {}
+func (*BackupEncryptionOptions_KMSInfo) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{1, 0}
+}
+func (m *BackupEncryptionOptions_KMSInfo) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *BackupEncryptionOptions_KMSInfo) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *BackupEncryptionOptions_KMSInfo) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_BackupEncryptionOptions_KMSInfo.Merge(dst, src)
+}
+func (m *BackupEncryptionOptions_KMSInfo) XXX_Size() int {
+	return m.Size()
+}
+func (m *BackupEncryptionOptions_KMSInfo) XXX_DiscardUnknown() {
+	xxx_messageInfo_BackupEncryptionOptions_KMSInfo.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_BackupEncryptionOptions_KMSInfo proto.InternalMessageInfo
+
+// EncryptionInfo is stored IN PLAINTEXT along side collections of encrypted
+// files stored outside of cockroach, for example by BACKUP/RESTORE.
+type EncryptionInfo struct {
+	Scheme EncryptionInfo_Scheme `protobuf:"varint,1,opt,name=scheme,proto3,enum=cockroach.sql.jobs.jobspb.EncryptionInfo_Scheme" json:"scheme,omitempty"`
+	Salt   []byte                `protobuf:"bytes,2,opt,name=salt,proto3" json:"salt,omitempty"`
+	// EncryptedDataKeyByKMSMasterKeyID is a mapping from the hashed master key
+	// identifier of a KMS to the encrypted version of the DataKey obtained from
+	// that KMS.
+	EncryptedDataKeyByKMSMasterKeyID map[string][]byte `protobuf:"bytes,3,rep,name=encryptedDataKeyByKMSMasterKeyID,proto3" json:"encryptedDataKeyByKMSMasterKeyID,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+}
+
+func (m *EncryptionInfo) Reset()         { *m = EncryptionInfo{} }
+func (m *EncryptionInfo) String() string { return proto.CompactTextString(m) }
+func (*EncryptionInfo) ProtoMessage()    {}
+func (*EncryptionInfo) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{2}
+}
+func (m *EncryptionInfo) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *EncryptionInfo) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *EncryptionInfo) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_EncryptionInfo.Merge(dst, src)
+}
+func (m *EncryptionInfo) XXX_Size() int {
+	return m.Size()
+}
+func (m *EncryptionInfo) XXX_DiscardUnknown() {
+	xxx_messageInfo_EncryptionInfo.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_EncryptionInfo proto.InternalMessageInfo
+
+type StreamIngestionDetails struct {
+	// StreamAddress locates the stream. It enables the client to find the
+	// addresses of the stream's partitions.
+	StreamAddress github_com_cockroachdb_cockroach_pkg_ccl_streamingccl.StreamAddress `protobuf:"bytes,1,opt,name=stream_address,json=streamAddress,proto3,casttype=github.com/cockroachdb/cockroach/pkg/ccl/streamingccl.StreamAddress" json:"stream_address,omitempty"`
+	// Span is the keyspan into which this job will ingest KVs.
+	//
+	// The stream should emit all changes for a given span, and no changes outside
+	// a span. Note that KVs received from the stream may need to be re-keyed into
+	// this span.
+	Span roachpb.Span `protobuf:"bytes,2,opt,name=span,proto3" json:"span"`
+	// The job will ingest events from StartTime onwards.
+	StartTime hlc.Timestamp `protobuf:"bytes,3,opt,name=start_time,json=startTime,proto3" json:"start_time"`
+}
+
+func (m *StreamIngestionDetails) Reset()         { *m = StreamIngestionDetails{} }
+func (m *StreamIngestionDetails) String() string { return proto.CompactTextString(m) }
+func (*StreamIngestionDetails) ProtoMessage()    {}
+func (*StreamIngestionDetails) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{3}
+}
+func (m *StreamIngestionDetails) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *StreamIngestionDetails) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *StreamIngestionDetails) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_StreamIngestionDetails.Merge(dst, src)
+}
+func (m *StreamIngestionDetails) XXX_Size() int {
+	return m.Size()
+}
+func (m *StreamIngestionDetails) XXX_DiscardUnknown() {
+	xxx_messageInfo_StreamIngestionDetails.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_StreamIngestionDetails proto.InternalMessageInfo
+
+type StreamIngestionProgress struct {
+	// MarkedForCompletion is used to signal to the stream ingestion job to
+	// complete its ingestion. This involves stopping any subsequent ingestion,
+	// and rolling back to the latest resolved ts to bring the ingested cluster to
+	// a consistent state.
+	MarkedForCompletion bool `protobuf:"varint,1,opt,name=markedForCompletion,proto3" json:"markedForCompletion,omitempty"`
+}
+
+func (m *StreamIngestionProgress) Reset()         { *m = StreamIngestionProgress{} }
+func (m *StreamIngestionProgress) String() string { return proto.CompactTextString(m) }
+func (*StreamIngestionProgress) ProtoMessage()    {}
+func (*StreamIngestionProgress) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{4}
+}
+func (m *StreamIngestionProgress) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *StreamIngestionProgress) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *StreamIngestionProgress) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_StreamIngestionProgress.Merge(dst, src)
+}
+func (m *StreamIngestionProgress) XXX_Size() int {
+	return m.Size()
+}
+func (m *StreamIngestionProgress) XXX_DiscardUnknown() {
+	xxx_messageInfo_StreamIngestionProgress.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_StreamIngestionProgress proto.InternalMessageInfo
+
 type BackupDetails struct {
 	StartTime hlc.Timestamp `protobuf:"bytes,1,opt,name=start_time,json=startTime,proto3" json:"start_time"`
 	EndTime   hlc.Timestamp `protobuf:"bytes,2,opt,name=end_time,json=endTime,proto3" json:"end_time"`
@@ -145,16 +436,27 @@ type BackupDetails struct {
 	URI string `protobuf:"bytes,3,opt,name=uri,proto3" json:"uri,omitempty"`
 	// URIsByLocalityKV is a map of locality KVs to store URIs, used for
 	// partitioned backups.
-	URIsByLocalityKV map[string]string              `protobuf:"bytes,5,rep,name=uris_by_locality_kv,json=urisByLocalityKv,proto3" json:"uris_by_locality_kv,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	BackupManifest   []byte                         `protobuf:"bytes,4,opt,name=backup_manifest,json=backupManifest,proto3" json:"backup_manifest,omitempty"`
-	Encryption       *roachpb.FileEncryptionOptions `protobuf:"bytes,6,opt,name=encryption,proto3" json:"encryption,omitempty"`
+	URIsByLocalityKV         map[string]string        `protobuf:"bytes,5,rep,name=uris_by_locality_kv,json=urisByLocalityKv,proto3" json:"uris_by_locality_kv,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	DeprecatedBackupManifest []byte                   `protobuf:"bytes,4,opt,name=deprecated_backup_manifest,json=deprecatedBackupManifest,proto3" json:"deprecated_backup_manifest,omitempty"`
+	EncryptionOptions        *BackupEncryptionOptions `protobuf:"bytes,6,opt,name=encryption_options,json=encryptionOptions,proto3" json:"encryption_options,omitempty"`
+	EncryptionInfo           *EncryptionInfo          `protobuf:"bytes,9,opt,name=encryption_info,json=encryptionInfo,proto3" json:"encryption_info,omitempty"`
+	// ProtectedTimestampRecord is the ID of the protected timestamp record
+	// corresponding to this job. While the job ought to clean up the record
+	// when it enters a terminal state, there may be cases where it cannot or
+	// does not run the code to do so. To deal with this there is a background
+	// reconcilliation loop to ensure that protected timestamps are cleaned up.
+	ProtectedTimestampRecord *github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,7,opt,name=protected_timestamp_record,json=protectedTimestampRecord,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"protected_timestamp_record,omitempty"`
+	// CollectionURI is the path to the collection into which this backup is being
+	// written, i.e. the URI the user provided before a chosen suffix was appended
+	// to its path.
+	CollectionURI string `protobuf:"bytes,8,opt,name=collection_URI,json=collectionURI,proto3" json:"collection_URI,omitempty"`
 }
 
 func (m *BackupDetails) Reset()         { *m = BackupDetails{} }
 func (m *BackupDetails) String() string { return proto.CompactTextString(m) }
 func (*BackupDetails) ProtoMessage()    {}
 func (*BackupDetails) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{1}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{5}
 }
 func (m *BackupDetails) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -186,7 +488,7 @@ func (m *BackupProgress) Reset()         { *m = BackupProgress{} }
 func (m *BackupProgress) String() string { return proto.CompactTextString(m) }
 func (*BackupProgress) ProtoMessage()    {}
 func (*BackupProgress) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{2}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{6}
 }
 func (m *BackupProgress) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -212,27 +514,43 @@ func (m *BackupProgress) XXX_DiscardUnknown() {
 var xxx_messageInfo_BackupProgress proto.InternalMessageInfo
 
 type RestoreDetails struct {
-	EndTime       hlc.Timestamp                                                                        `protobuf:"bytes,4,opt,name=end_time,json=endTime,proto3" json:"end_time"`
-	TableRewrites map[github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID]*RestoreDetails_TableRewrite `protobuf:"bytes,2,rep,name=table_rewrites,json=tableRewrites,proto3,castkey=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"table_rewrites,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	EndTime            hlc.Timestamp                                                                                    `protobuf:"bytes,4,opt,name=end_time,json=endTime,proto3" json:"end_time"`
+	DescriptorRewrites map[github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID]*RestoreDetails_DescriptorRewrite `protobuf:"bytes,2,rep,name=descriptor_rewrites,json=descriptorRewrites,proto3,castkey=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"descriptor_rewrites,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 	// URIs contains one URI for each backup (full or incremental) corresponding
 	// to the location of the main BACKUP manifest. For partitioned backups, each
 	// backup may also have files in other stores.
-	URIs               []string                                                             `protobuf:"bytes,3,rep,name=uris,proto3" json:"uris,omitempty"`
-	BackupLocalityInfo []RestoreDetails_BackupLocalityInfo                                  `protobuf:"bytes,7,rep,name=backup_locality_info,json=backupLocalityInfo,proto3" json:"backup_locality_info"`
-	TableDescs         []*sqlbase.TableDescriptor                                           `protobuf:"bytes,5,rep,name=table_descs,json=tableDescs,proto3" json:"table_descs,omitempty"`
-	OverrideDB         string                                                               `protobuf:"bytes,6,opt,name=override_db,json=overrideDb,proto3" json:"override_db,omitempty"`
-	PrepareCompleted   bool                                                                 `protobuf:"varint,8,opt,name=prepare_completed,json=prepareCompleted,proto3" json:"prepare_completed,omitempty"`
-	StatsInserted      bool                                                                 `protobuf:"varint,9,opt,name=stats_inserted,json=statsInserted,proto3" json:"stats_inserted,omitempty"`
-	TablesPublished    bool                                                                 `protobuf:"varint,10,opt,name=tables_published,json=tablesPublished,proto3" json:"tables_published,omitempty"`
-	DescriptorCoverage github_com_cockroachdb_cockroach_pkg_sql_sem_tree.DescriptorCoverage `protobuf:"varint,11,opt,name=descriptor_coverage,json=descriptorCoverage,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sem/tree.DescriptorCoverage" json:"descriptor_coverage,omitempty"`
-	Encryption         *roachpb.FileEncryptionOptions                                       `protobuf:"bytes,12,opt,name=encryption,proto3" json:"encryption,omitempty"`
+	URIs               []string                            `protobuf:"bytes,3,rep,name=uris,proto3" json:"uris,omitempty"`
+	BackupLocalityInfo []RestoreDetails_BackupLocalityInfo `protobuf:"bytes,7,rep,name=backup_locality_info,json=backupLocalityInfo,proto3" json:"backup_locality_info"`
+	// We keep track of the descriptors that we're creating as part of the
+	// restore.
+	DatabaseDescs []*descpb.DatabaseDescriptor `protobuf:"bytes,16,rep,name=database_descs,json=databaseDescs,proto3" json:"database_descs,omitempty"`
+	TableDescs    []*descpb.TableDescriptor    `protobuf:"bytes,5,rep,name=table_descs,json=tableDescs,proto3" json:"table_descs,omitempty"`
+	// TypeDescs contains the type descriptors written as part of this restore.
+	// Note that it does not include type descriptors existing in the cluster
+	// that backed up types are remapped to.
+	TypeDescs []*descpb.TypeDescriptor `protobuf:"bytes,14,rep,name=type_descs,json=typeDescs,proto3" json:"type_descs,omitempty"`
+	// SchemaDescs contains schema descriptors written as part of this restore.
+	// Like TypeDescs, it does not include existing schema descriptors in the
+	// cluster that backed up schemas are remapped to.
+	SchemaDescs []*descpb.SchemaDescriptor `protobuf:"bytes,15,rep,name=schema_descs,json=schemaDescs,proto3" json:"schema_descs,omitempty"`
+	Tenants     []descpb.TenantInfo        `protobuf:"bytes,13,rep,name=tenants,proto3" json:"tenants"`
+	OverrideDB  string                     `protobuf:"bytes,6,opt,name=override_db,json=overrideDb,proto3" json:"override_db,omitempty"`
+	// The restore job has several atomic stages. For now, we keep track of which
+	// stages have completed via these flags.
+	PrepareCompleted bool `protobuf:"varint,8,opt,name=prepare_completed,json=prepareCompleted,proto3" json:"prepare_completed,omitempty"`
+	StatsInserted    bool `protobuf:"varint,9,opt,name=stats_inserted,json=statsInserted,proto3" json:"stats_inserted,omitempty"`
+	// DescriptorsPublished indicates whether or not the descriptors written in
+	// the job have been transactionally updated after the data was restored.
+	DescriptorsPublished bool                                                                 `protobuf:"varint,10,opt,name=descriptors_published,json=descriptorsPublished,proto3" json:"descriptors_published,omitempty"`
+	DescriptorCoverage   github_com_cockroachdb_cockroach_pkg_sql_sem_tree.DescriptorCoverage `protobuf:"varint,11,opt,name=descriptor_coverage,json=descriptorCoverage,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sem/tree.DescriptorCoverage" json:"descriptor_coverage,omitempty"`
+	Encryption           *BackupEncryptionOptions                                             `protobuf:"bytes,12,opt,name=encryption,proto3" json:"encryption,omitempty"`
 }
 
 func (m *RestoreDetails) Reset()         { *m = RestoreDetails{} }
 func (m *RestoreDetails) String() string { return proto.CompactTextString(m) }
 func (*RestoreDetails) ProtoMessage()    {}
 func (*RestoreDetails) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{3}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{7}
 }
 func (m *RestoreDetails) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -257,21 +575,24 @@ func (m *RestoreDetails) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_RestoreDetails proto.InternalMessageInfo
 
-type RestoreDetails_TableRewrite struct {
-	TableID  github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID `protobuf:"varint,1,opt,name=table_id,json=tableId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"table_id,omitempty"`
-	ParentID github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID `protobuf:"varint,2,opt,name=parent_id,json=parentId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"parent_id,omitempty"`
+type RestoreDetails_DescriptorRewrite struct {
+	ID       github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,1,opt,name=id,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"id,omitempty"`
+	ParentID github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,2,opt,name=parent_id,json=parentId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"parent_id,omitempty"`
+	// ToExisting represents whether this descriptor is being remapped to a
+	// descriptor that already exists in the cluster.
+	ToExisting bool `protobuf:"varint,3,opt,name=to_existing,json=toExisting,proto3" json:"to_existing,omitempty"`
 }
 
-func (m *RestoreDetails_TableRewrite) Reset()         { *m = RestoreDetails_TableRewrite{} }
-func (m *RestoreDetails_TableRewrite) String() string { return proto.CompactTextString(m) }
-func (*RestoreDetails_TableRewrite) ProtoMessage()    {}
-func (*RestoreDetails_TableRewrite) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{3, 0}
+func (m *RestoreDetails_DescriptorRewrite) Reset()         { *m = RestoreDetails_DescriptorRewrite{} }
+func (m *RestoreDetails_DescriptorRewrite) String() string { return proto.CompactTextString(m) }
+func (*RestoreDetails_DescriptorRewrite) ProtoMessage()    {}
+func (*RestoreDetails_DescriptorRewrite) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{7, 0}
 }
-func (m *RestoreDetails_TableRewrite) XXX_Unmarshal(b []byte) error {
+func (m *RestoreDetails_DescriptorRewrite) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *RestoreDetails_TableRewrite) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *RestoreDetails_DescriptorRewrite) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	b = b[:cap(b)]
 	n, err := m.MarshalTo(b)
 	if err != nil {
@@ -279,17 +600,17 @@ func (m *RestoreDetails_TableRewrite) XXX_Marshal(b []byte, deterministic bool) 
 	}
 	return b[:n], nil
 }
-func (dst *RestoreDetails_TableRewrite) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_RestoreDetails_TableRewrite.Merge(dst, src)
+func (dst *RestoreDetails_DescriptorRewrite) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RestoreDetails_DescriptorRewrite.Merge(dst, src)
 }
-func (m *RestoreDetails_TableRewrite) XXX_Size() int {
+func (m *RestoreDetails_DescriptorRewrite) XXX_Size() int {
 	return m.Size()
 }
-func (m *RestoreDetails_TableRewrite) XXX_DiscardUnknown() {
-	xxx_messageInfo_RestoreDetails_TableRewrite.DiscardUnknown(m)
+func (m *RestoreDetails_DescriptorRewrite) XXX_DiscardUnknown() {
+	xxx_messageInfo_RestoreDetails_DescriptorRewrite.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_RestoreDetails_TableRewrite proto.InternalMessageInfo
+var xxx_messageInfo_RestoreDetails_DescriptorRewrite proto.InternalMessageInfo
 
 type RestoreDetails_BackupLocalityInfo struct {
 	URIsByOriginalLocalityKV map[string]string `protobuf:"bytes,1,rep,name=uris_by_original_locality_kv,json=urisByOriginalLocalityKv,proto3" json:"uris_by_original_locality_kv,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
@@ -299,7 +620,7 @@ func (m *RestoreDetails_BackupLocalityInfo) Reset()         { *m = RestoreDetail
 func (m *RestoreDetails_BackupLocalityInfo) String() string { return proto.CompactTextString(m) }
 func (*RestoreDetails_BackupLocalityInfo) ProtoMessage()    {}
 func (*RestoreDetails_BackupLocalityInfo) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{3, 1}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{7, 1}
 }
 func (m *RestoreDetails_BackupLocalityInfo) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -332,7 +653,7 @@ func (m *RestoreProgress) Reset()         { *m = RestoreProgress{} }
 func (m *RestoreProgress) String() string { return proto.CompactTextString(m) }
 func (*RestoreProgress) ProtoMessage()    {}
 func (*RestoreProgress) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{4}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{8}
 }
 func (m *RestoreProgress) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -358,15 +679,16 @@ func (m *RestoreProgress) XXX_DiscardUnknown() {
 var xxx_messageInfo_RestoreProgress proto.InternalMessageInfo
 
 type ImportDetails struct {
-	Tables     []ImportDetails_Table                               `protobuf:"bytes,1,rep,name=tables,proto3" json:"tables"`
-	URIs       []string                                            `protobuf:"bytes,2,rep,name=uris,proto3" json:"uris,omitempty"`
-	Format     roachpb.IOFileFormat                                `protobuf:"bytes,3,opt,name=format,proto3" json:"format"`
-	SSTSize    int64                                               `protobuf:"varint,4,opt,name=sst_size,json=sstSize,proto3" json:"sst_size,omitempty"`
-	Oversample int64                                               `protobuf:"varint,9,opt,name=oversample,proto3" json:"oversample,omitempty"`
-	SkipFKs    bool                                                `protobuf:"varint,10,opt,name=skip_fks,json=skipFks,proto3" json:"skip_fks,omitempty"`
-	Walltime   int64                                               `protobuf:"varint,5,opt,name=walltime,proto3" json:"walltime,omitempty"`
-	ParentID   github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID `protobuf:"varint,6,opt,name=parent_id,json=parentId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"parent_id,omitempty"`
-	BackupPath string                                              `protobuf:"bytes,7,opt,name=backup_path,json=backupPath,proto3" json:"backup_path,omitempty"`
+	Tables     []ImportDetails_Table `protobuf:"bytes,1,rep,name=tables,proto3" json:"tables"`
+	URIs       []string              `protobuf:"bytes,2,rep,name=uris,proto3" json:"uris,omitempty"`
+	Format     roachpb.IOFileFormat  `protobuf:"bytes,3,opt,name=format,proto3" json:"format"`
+	SSTSize    int64                 `protobuf:"varint,4,opt,name=sst_size,json=sstSize,proto3" json:"sst_size,omitempty"`
+	Oversample int64                 `protobuf:"varint,9,opt,name=oversample,proto3" json:"oversample,omitempty"`
+	SkipFKs    bool                  `protobuf:"varint,10,opt,name=skip_fks,json=skipFks,proto3" json:"skip_fks,omitempty"`
+	// walltime is the time at which an import job will write KVs.
+	Walltime   int64                                                      `protobuf:"varint,5,opt,name=walltime,proto3" json:"walltime,omitempty"`
+	ParentID   github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,6,opt,name=parent_id,json=parentId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"parent_id,omitempty"`
+	BackupPath string                                                     `protobuf:"bytes,7,opt,name=backup_path,json=backupPath,proto3" json:"backup_path,omitempty"`
 	// samples is a sampling of cockroach KV keys generated from the input data.
 	// It is populated with the sampling phase's results. These must be
 	// used if a job is resumed to guarantee that AddSSTable will not attempt
@@ -376,14 +698,15 @@ type ImportDetails struct {
 	// produce it instead of sampling it and then setting up a distsql shuffle and
 	// sort that produced sorted, non-overlapping data to ingest. When ingesting
 	// directly, many other fields like samples, oversample, sst_size are ignored.
-	IngestDirectly  bool `protobuf:"varint,11,opt,name=ingest_directly,json=ingestDirectly,proto3" json:"ingest_directly,omitempty"`
-	PrepareComplete bool `protobuf:"varint,12,opt,name=prepare_complete,json=prepareComplete,proto3" json:"prepare_complete,omitempty"`
-	TablesPublished bool `protobuf:"varint,13,opt,name=tables_published,json=tablesPublished,proto3" json:"tables_published,omitempty"`
+	IngestDirectly    bool `protobuf:"varint,11,opt,name=ingest_directly,json=ingestDirectly,proto3" json:"ingest_directly,omitempty"`
+	PrepareComplete   bool `protobuf:"varint,12,opt,name=prepare_complete,json=prepareComplete,proto3" json:"prepare_complete,omitempty"`
+	TablesPublished   bool `protobuf:"varint,13,opt,name=tables_published,json=tablesPublished,proto3" json:"tables_published,omitempty"`
+	ParseBundleSchema bool `protobuf:"varint,14,opt,name=parse_bundle_schema,json=parseBundleSchema,proto3" json:"parse_bundle_schema,omitempty"`
 	// ProtectedTimestampRecord is the ID of the protected timestamp record
 	// corresponding to this job. While the job ought to clean up the record
 	// when it enters a terminal state, there may be cases where it cannot or
 	// does not run the code to do so. To deal with this there is a background
-	// reconcilliation loop to ensure that protected timestamps are cleaned up.
+	// reconciliation loop to ensure that protected timestamps are cleaned up.
 	ProtectedTimestampRecord *github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,22,opt,name=protected_timestamp_record,json=protectedTimestampRecord,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"protected_timestamp_record,omitempty"`
 }
 
@@ -391,7 +714,7 @@ func (m *ImportDetails) Reset()         { *m = ImportDetails{} }
 func (m *ImportDetails) String() string { return proto.CompactTextString(m) }
 func (*ImportDetails) ProtoMessage()    {}
 func (*ImportDetails) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{5}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{9}
 }
 func (m *ImportDetails) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -417,18 +740,19 @@ func (m *ImportDetails) XXX_DiscardUnknown() {
 var xxx_messageInfo_ImportDetails proto.InternalMessageInfo
 
 type ImportDetails_Table struct {
-	Desc       *sqlbase.TableDescriptor `protobuf:"bytes,1,opt,name=desc,proto3" json:"desc,omitempty"`
-	Name       string                   `protobuf:"bytes,18,opt,name=name,proto3" json:"name,omitempty"`
-	SeqVal     int64                    `protobuf:"varint,19,opt,name=seq_val,json=seqVal,proto3" json:"seq_val,omitempty"`
-	IsNew      bool                     `protobuf:"varint,20,opt,name=is_new,json=isNew,proto3" json:"is_new,omitempty"`
-	TargetCols []string                 `protobuf:"bytes,21,rep,name=target_cols,json=targetCols,proto3" json:"target_cols,omitempty"`
+	Desc       *descpb.TableDescriptor `protobuf:"bytes,1,opt,name=desc,proto3" json:"desc,omitempty"`
+	Name       string                  `protobuf:"bytes,18,opt,name=name,proto3" json:"name,omitempty"`
+	SeqVal     int64                   `protobuf:"varint,19,opt,name=seq_val,json=seqVal,proto3" json:"seq_val,omitempty"`
+	IsNew      bool                    `protobuf:"varint,20,opt,name=is_new,json=isNew,proto3" json:"is_new,omitempty"`
+	WasEmpty   bool                    `protobuf:"varint,22,opt,name=was_empty,json=wasEmpty,proto3" json:"was_empty,omitempty"`
+	TargetCols []string                `protobuf:"bytes,21,rep,name=target_cols,json=targetCols,proto3" json:"target_cols,omitempty"`
 }
 
 func (m *ImportDetails_Table) Reset()         { *m = ImportDetails_Table{} }
 func (m *ImportDetails_Table) String() string { return proto.CompactTextString(m) }
 func (*ImportDetails_Table) ProtoMessage()    {}
 func (*ImportDetails_Table) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{5, 0}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{9, 0}
 }
 func (m *ImportDetails_Table) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -453,6 +777,119 @@ func (m *ImportDetails_Table) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_ImportDetails_Table proto.InternalMessageInfo
 
+// SequenceValChunks represents a single chunk of sequence values allocated
+// during an IMPORT.
+type SequenceValChunk struct {
+	ChunkStartVal int64 `protobuf:"varint,1,opt,name=chunk_start_val,json=chunkStartVal,proto3" json:"chunk_start_val,omitempty"`
+	ChunkSize     int64 `protobuf:"varint,2,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"`
+	// The first row in the file being imported from which the current chunk of
+	// sequence values is being used.
+	ChunkStartRow int64 `protobuf:"varint,3,opt,name=chunk_start_row,json=chunkStartRow,proto3" json:"chunk_start_row,omitempty"`
+	// The row in the file being imported at which the import will need to use a
+	// new chunk of sequence values.
+	NextChunkStartRow int64 `protobuf:"varint,4,opt,name=next_chunk_start_row,json=nextChunkStartRow,proto3" json:"next_chunk_start_row,omitempty"`
+}
+
+func (m *SequenceValChunk) Reset()         { *m = SequenceValChunk{} }
+func (m *SequenceValChunk) String() string { return proto.CompactTextString(m) }
+func (*SequenceValChunk) ProtoMessage()    {}
+func (*SequenceValChunk) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{10}
+}
+func (m *SequenceValChunk) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SequenceValChunk) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SequenceValChunk) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SequenceValChunk.Merge(dst, src)
+}
+func (m *SequenceValChunk) XXX_Size() int {
+	return m.Size()
+}
+func (m *SequenceValChunk) XXX_DiscardUnknown() {
+	xxx_messageInfo_SequenceValChunk.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SequenceValChunk proto.InternalMessageInfo
+
+// SequenceDetails represents information about the sequences processed in a
+// single file during IMPORT.
+type SequenceDetails struct {
+	// Mapping from sequence ID to allocated sequence chunks.
+	SeqIdToChunks map[int32]*SequenceDetails_SequenceChunks `protobuf:"bytes,1,rep,name=seq_id_to_chunks,json=seqIdToChunks,proto3" json:"seq_id_to_chunks,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+}
+
+func (m *SequenceDetails) Reset()         { *m = SequenceDetails{} }
+func (m *SequenceDetails) String() string { return proto.CompactTextString(m) }
+func (*SequenceDetails) ProtoMessage()    {}
+func (*SequenceDetails) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{11}
+}
+func (m *SequenceDetails) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SequenceDetails) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SequenceDetails) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SequenceDetails.Merge(dst, src)
+}
+func (m *SequenceDetails) XXX_Size() int {
+	return m.Size()
+}
+func (m *SequenceDetails) XXX_DiscardUnknown() {
+	xxx_messageInfo_SequenceDetails.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SequenceDetails proto.InternalMessageInfo
+
+// SequenceChunks represents all the chunks reserved for a particular sequence
+// during an IMPORT.
+type SequenceDetails_SequenceChunks struct {
+	Chunks []*SequenceValChunk `protobuf:"bytes,1,rep,name=chunks,proto3" json:"chunks,omitempty"`
+}
+
+func (m *SequenceDetails_SequenceChunks) Reset()         { *m = SequenceDetails_SequenceChunks{} }
+func (m *SequenceDetails_SequenceChunks) String() string { return proto.CompactTextString(m) }
+func (*SequenceDetails_SequenceChunks) ProtoMessage()    {}
+func (*SequenceDetails_SequenceChunks) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{11, 0}
+}
+func (m *SequenceDetails_SequenceChunks) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SequenceDetails_SequenceChunks) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SequenceDetails_SequenceChunks) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SequenceDetails_SequenceChunks.Merge(dst, src)
+}
+func (m *SequenceDetails_SequenceChunks) XXX_Size() int {
+	return m.Size()
+}
+func (m *SequenceDetails_SequenceChunks) XXX_DiscardUnknown() {
+	xxx_messageInfo_SequenceDetails_SequenceChunks.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SequenceDetails_SequenceChunks proto.InternalMessageInfo
+
 type ImportProgress struct {
 	SamplingProgress []float32 `protobuf:"fixed32,1,rep,packed,name=sampling_progress,json=samplingProgress,proto3" json:"sampling_progress,omitempty"`
 	ReadProgress     []float32 `protobuf:"fixed32,2,rep,packed,name=read_progress,json=readProgress,proto3" json:"read_progress,omitempty"`
@@ -465,13 +902,16 @@ type ImportProgress struct {
 	// been flushed, we can advance the count here and then on resume skip over
 	// that many rows without needing to convert/process them at all.
 	ResumePos []int64 `protobuf:"varint,5,rep,packed,name=resume_pos,json=resumePos,proto3" json:"resume_pos,omitempty"`
+	// Holds metadata related to sequences for every file processed during an
+	// IMPORT.
+	SequenceDetails []*SequenceDetails `protobuf:"bytes,6,rep,name=sequence_details,json=sequenceDetails,proto3" json:"sequence_details,omitempty"`
 }
 
 func (m *ImportProgress) Reset()         { *m = ImportProgress{} }
 func (m *ImportProgress) String() string { return proto.CompactTextString(m) }
 func (*ImportProgress) ProtoMessage()    {}
 func (*ImportProgress) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{6}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{12}
 }
 func (m *ImportProgress) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -496,6 +936,150 @@ func (m *ImportProgress) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_ImportProgress proto.InternalMessageInfo
 
+// TypeSchemaChangeDetails is the job detail information for a type schema change job.
+type TypeSchemaChangeDetails struct {
+	TypeID github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,1,opt,name=type_id,json=typeId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"type_id,omitempty"`
+	// TransitioningMembers is a list of enum members, represented by their
+	// physical representation, that are transitioning in the current job. This
+	// is used to group transitions together and ensure that rollback is limited
+	// to this list in the face of job failure. It is also worth noting that we
+	// cannot use the logical representation or index of the member to identify
+	// a member, as both of these may change due to a concurrent rename or
+	// addition with a specified placement. Physical representations are
+	// guaranteed to be stable.
+	TransitioningMembers [][]byte `protobuf:"bytes,2,rep,name=transitioning_members,json=transitioningMembers,proto3" json:"transitioning_members,omitempty"`
+}
+
+func (m *TypeSchemaChangeDetails) Reset()         { *m = TypeSchemaChangeDetails{} }
+func (m *TypeSchemaChangeDetails) String() string { return proto.CompactTextString(m) }
+func (*TypeSchemaChangeDetails) ProtoMessage()    {}
+func (*TypeSchemaChangeDetails) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{13}
+}
+func (m *TypeSchemaChangeDetails) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TypeSchemaChangeDetails) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TypeSchemaChangeDetails) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TypeSchemaChangeDetails.Merge(dst, src)
+}
+func (m *TypeSchemaChangeDetails) XXX_Size() int {
+	return m.Size()
+}
+func (m *TypeSchemaChangeDetails) XXX_DiscardUnknown() {
+	xxx_messageInfo_TypeSchemaChangeDetails.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TypeSchemaChangeDetails proto.InternalMessageInfo
+
+// TypeSchemaChangeProgress is the persisted progress for a type schema change job.
+type TypeSchemaChangeProgress struct {
+}
+
+func (m *TypeSchemaChangeProgress) Reset()         { *m = TypeSchemaChangeProgress{} }
+func (m *TypeSchemaChangeProgress) String() string { return proto.CompactTextString(m) }
+func (*TypeSchemaChangeProgress) ProtoMessage()    {}
+func (*TypeSchemaChangeProgress) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{14}
+}
+func (m *TypeSchemaChangeProgress) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TypeSchemaChangeProgress) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TypeSchemaChangeProgress) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TypeSchemaChangeProgress.Merge(dst, src)
+}
+func (m *TypeSchemaChangeProgress) XXX_Size() int {
+	return m.Size()
+}
+func (m *TypeSchemaChangeProgress) XXX_DiscardUnknown() {
+	xxx_messageInfo_TypeSchemaChangeProgress.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TypeSchemaChangeProgress proto.InternalMessageInfo
+
+// TypeSchemaChangeDetails is the job detail information for the new schema change job.
+type NewSchemaChangeDetails struct {
+	Targets []*scpb.Target `protobuf:"bytes,1,rep,name=targets,proto3" json:"targets,omitempty"`
+}
+
+func (m *NewSchemaChangeDetails) Reset()         { *m = NewSchemaChangeDetails{} }
+func (m *NewSchemaChangeDetails) String() string { return proto.CompactTextString(m) }
+func (*NewSchemaChangeDetails) ProtoMessage()    {}
+func (*NewSchemaChangeDetails) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{15}
+}
+func (m *NewSchemaChangeDetails) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *NewSchemaChangeDetails) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *NewSchemaChangeDetails) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_NewSchemaChangeDetails.Merge(dst, src)
+}
+func (m *NewSchemaChangeDetails) XXX_Size() int {
+	return m.Size()
+}
+func (m *NewSchemaChangeDetails) XXX_DiscardUnknown() {
+	xxx_messageInfo_NewSchemaChangeDetails.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_NewSchemaChangeDetails proto.InternalMessageInfo
+
+// NewSchemaChangeProgress is the persisted progress for the new schema change job.
+type NewSchemaChangeProgress struct {
+	States []scpb.State `protobuf:"varint,1,rep,packed,name=states,proto3,enum=cockroach.sql.schemachanger.scpb.State" json:"states,omitempty"`
+}
+
+func (m *NewSchemaChangeProgress) Reset()         { *m = NewSchemaChangeProgress{} }
+func (m *NewSchemaChangeProgress) String() string { return proto.CompactTextString(m) }
+func (*NewSchemaChangeProgress) ProtoMessage()    {}
+func (*NewSchemaChangeProgress) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{16}
+}
+func (m *NewSchemaChangeProgress) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *NewSchemaChangeProgress) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *NewSchemaChangeProgress) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_NewSchemaChangeProgress.Merge(dst, src)
+}
+func (m *NewSchemaChangeProgress) XXX_Size() int {
+	return m.Size()
+}
+func (m *NewSchemaChangeProgress) XXX_DiscardUnknown() {
+	xxx_messageInfo_NewSchemaChangeProgress.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_NewSchemaChangeProgress proto.InternalMessageInfo
+
 type ResumeSpanList struct {
 	ResumeSpans []roachpb.Span `protobuf:"bytes,1,rep,name=resume_spans,json=resumeSpans,proto3" json:"resume_spans"`
 }
@@ -504,7 +1088,7 @@ func (m *ResumeSpanList) Reset()         { *m = ResumeSpanList{} }
 func (m *ResumeSpanList) String() string { return proto.CompactTextString(m) }
 func (*ResumeSpanList) ProtoMessage()    {}
 func (*ResumeSpanList) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{7}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{17}
 }
 func (m *ResumeSpanList) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -530,16 +1114,16 @@ func (m *ResumeSpanList) XXX_DiscardUnknown() {
 var xxx_messageInfo_ResumeSpanList proto.InternalMessageInfo
 
 type DroppedTableDetails struct {
-	Name   string                                              `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	ID     github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID `protobuf:"varint,2,opt,name=ID,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"ID,omitempty"`
-	Status Status                                              `protobuf:"varint,3,opt,name=status,proto3,enum=cockroach.sql.jobs.jobspb.Status" json:"status,omitempty"`
+	Name   string                                                     `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	ID     github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,2,opt,name=ID,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"ID,omitempty"`
+	Status Status                                                     `protobuf:"varint,3,opt,name=status,proto3,enum=cockroach.sql.jobs.jobspb.Status" json:"status,omitempty"`
 }
 
 func (m *DroppedTableDetails) Reset()         { *m = DroppedTableDetails{} }
 func (m *DroppedTableDetails) String() string { return proto.CompactTextString(m) }
 func (*DroppedTableDetails) ProtoMessage()    {}
 func (*DroppedTableDetails) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{8}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{18}
 }
 func (m *DroppedTableDetails) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -564,6 +1148,171 @@ func (m *DroppedTableDetails) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_DroppedTableDetails proto.InternalMessageInfo
 
+// SchemaChangeGCDetails should resemble one of the following:
+//
+// 1. Index (non-interleaved) deletions: One or more deletions of an index on a
+// table.
+//      details.Indexes -> the indexes to GC. These indexes must be
+//      non-interleaved.
+//      details.ParentID -> the table with the indexes.
+//
+// 2. Table deletions: The deletion of a single table.
+//      details.Tables -> the tables to be deleted.
+//
+// 3. Database deletions: The deletion of a database and therefore all its tables.
+//      details.Tables -> the IDs of the tables to GC.
+//      details.ParentID -> the ID of the database to drop.
+//
+// 4. Tenant deletion: The deletion of a tenant key range.
+//      details.TenantID -> the ID of the tenant to delete.
+type SchemaChangeGCDetails struct {
+	// Indexes to GC.
+	Indexes []SchemaChangeGCDetails_DroppedIndex `protobuf:"bytes,1,rep,name=indexes,proto3" json:"indexes"`
+	// InterleavedTable is the table being truncated. In particular, it is the
+	// TableDescriptor before any of the truncate modifications have been applied.
+	InterleavedTable *descpb.TableDescriptor `protobuf:"bytes,4,opt,name=interleaved_table,json=interleavedTable,proto3" json:"interleaved_table,omitempty"`
+	// InterleavedIndexes is the set of interleaved indexes to truncate.
+	InterleavedIndexes []descpb.IndexDescriptor `protobuf:"bytes,5,rep,name=interleaved_indexes,json=interleavedIndexes,proto3" json:"interleaved_indexes"`
+	// Entire tables to GC.
+	Tables []SchemaChangeGCDetails_DroppedID `protobuf:"bytes,2,rep,name=tables,proto3" json:"tables"`
+	// If dropping indexes, the table ID which has those indexes. If dropping a
+	// database, the database ID.
+	ParentID github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,3,opt,name=parent_id,json=parentId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"parent_id,omitempty"`
+	// Tenant to GC.
+	Tenant *SchemaChangeGCDetails_DroppedTenant `protobuf:"bytes,6,opt,name=tenant,proto3" json:"tenant,omitempty"`
+}
+
+func (m *SchemaChangeGCDetails) Reset()         { *m = SchemaChangeGCDetails{} }
+func (m *SchemaChangeGCDetails) String() string { return proto.CompactTextString(m) }
+func (*SchemaChangeGCDetails) ProtoMessage()    {}
+func (*SchemaChangeGCDetails) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{19}
+}
+func (m *SchemaChangeGCDetails) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SchemaChangeGCDetails) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SchemaChangeGCDetails) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SchemaChangeGCDetails.Merge(dst, src)
+}
+func (m *SchemaChangeGCDetails) XXX_Size() int {
+	return m.Size()
+}
+func (m *SchemaChangeGCDetails) XXX_DiscardUnknown() {
+	xxx_messageInfo_SchemaChangeGCDetails.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SchemaChangeGCDetails proto.InternalMessageInfo
+
+type SchemaChangeGCDetails_DroppedIndex struct {
+	IndexID  github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.IndexID `protobuf:"varint,1,opt,name=index_id,json=indexId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.IndexID" json:"index_id,omitempty"`
+	DropTime int64                                                           `protobuf:"varint,2,opt,name=drop_time,json=dropTime,proto3" json:"drop_time,omitempty"`
+}
+
+func (m *SchemaChangeGCDetails_DroppedIndex) Reset()         { *m = SchemaChangeGCDetails_DroppedIndex{} }
+func (m *SchemaChangeGCDetails_DroppedIndex) String() string { return proto.CompactTextString(m) }
+func (*SchemaChangeGCDetails_DroppedIndex) ProtoMessage()    {}
+func (*SchemaChangeGCDetails_DroppedIndex) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{19, 0}
+}
+func (m *SchemaChangeGCDetails_DroppedIndex) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SchemaChangeGCDetails_DroppedIndex) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SchemaChangeGCDetails_DroppedIndex) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SchemaChangeGCDetails_DroppedIndex.Merge(dst, src)
+}
+func (m *SchemaChangeGCDetails_DroppedIndex) XXX_Size() int {
+	return m.Size()
+}
+func (m *SchemaChangeGCDetails_DroppedIndex) XXX_DiscardUnknown() {
+	xxx_messageInfo_SchemaChangeGCDetails_DroppedIndex.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SchemaChangeGCDetails_DroppedIndex proto.InternalMessageInfo
+
+type SchemaChangeGCDetails_DroppedID struct {
+	ID       github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,1,opt,name=id,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"id,omitempty"`
+	DropTime int64                                                      `protobuf:"varint,2,opt,name=drop_time,json=dropTime,proto3" json:"drop_time,omitempty"`
+}
+
+func (m *SchemaChangeGCDetails_DroppedID) Reset()         { *m = SchemaChangeGCDetails_DroppedID{} }
+func (m *SchemaChangeGCDetails_DroppedID) String() string { return proto.CompactTextString(m) }
+func (*SchemaChangeGCDetails_DroppedID) ProtoMessage()    {}
+func (*SchemaChangeGCDetails_DroppedID) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{19, 1}
+}
+func (m *SchemaChangeGCDetails_DroppedID) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SchemaChangeGCDetails_DroppedID) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SchemaChangeGCDetails_DroppedID) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SchemaChangeGCDetails_DroppedID.Merge(dst, src)
+}
+func (m *SchemaChangeGCDetails_DroppedID) XXX_Size() int {
+	return m.Size()
+}
+func (m *SchemaChangeGCDetails_DroppedID) XXX_DiscardUnknown() {
+	xxx_messageInfo_SchemaChangeGCDetails_DroppedID.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SchemaChangeGCDetails_DroppedID proto.InternalMessageInfo
+
+type SchemaChangeGCDetails_DroppedTenant struct {
+	ID       uint64 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	DropTime int64  `protobuf:"varint,2,opt,name=drop_time,json=dropTime,proto3" json:"drop_time,omitempty"`
+}
+
+func (m *SchemaChangeGCDetails_DroppedTenant) Reset()         { *m = SchemaChangeGCDetails_DroppedTenant{} }
+func (m *SchemaChangeGCDetails_DroppedTenant) String() string { return proto.CompactTextString(m) }
+func (*SchemaChangeGCDetails_DroppedTenant) ProtoMessage()    {}
+func (*SchemaChangeGCDetails_DroppedTenant) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{19, 2}
+}
+func (m *SchemaChangeGCDetails_DroppedTenant) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SchemaChangeGCDetails_DroppedTenant) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SchemaChangeGCDetails_DroppedTenant) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SchemaChangeGCDetails_DroppedTenant.Merge(dst, src)
+}
+func (m *SchemaChangeGCDetails_DroppedTenant) XXX_Size() int {
+	return m.Size()
+}
+func (m *SchemaChangeGCDetails_DroppedTenant) XXX_DiscardUnknown() {
+	xxx_messageInfo_SchemaChangeGCDetails_DroppedTenant.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SchemaChangeGCDetails_DroppedTenant proto.InternalMessageInfo
+
 type SchemaChangeDetails struct {
 	// A schema change can involve running multiple processors backfilling
 	// or deleting data. They occasionally checkpoint Spans so that the
@@ -573,17 +1322,37 @@ type SchemaChangeDetails struct {
 	// mutation list containing mutations for the same mutationID.
 	ResumeSpanList []ResumeSpanList      `protobuf:"bytes,2,rep,name=resume_span_list,json=resumeSpanList,proto3" json:"resume_span_list"`
 	DroppedTables  []DroppedTableDetails `protobuf:"bytes,3,rep,name=dropped_tables,json=droppedTables,proto3" json:"dropped_tables"`
+	// dropped_types holds the set of types to drop as part of a DROP DATABASE
+	// statement. We collect the types here rather than creating individual DROP
+	// TYPE jobs for each dropped type.
+	DroppedTypes []github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,8,rep,packed,name=dropped_types,json=droppedTypes,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"dropped_types,omitempty"`
+	// dropped_schemas holds the set of schemas to drop as part of a DROP SCHEMA
+	// or DROP DATABASE cascade statement.
+	DroppedSchemas []github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,9,rep,packed,name=dropped_schemas,json=droppedSchemas,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"dropped_schemas,omitempty"`
 	// The descriptor ID of the dropped database which created this job.
-	DroppedDatabaseID github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID         `protobuf:"varint,4,opt,name=dropped_database_id,json=droppedDatabaseId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"dropped_database_id,omitempty"`
-	TableID           github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID         `protobuf:"varint,5,opt,name=table_id,json=tableId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"table_id,omitempty"`
-	MutationID        github_com_cockroachdb_cockroach_pkg_sql_sqlbase.MutationID `protobuf:"varint,6,opt,name=mutation_id,json=mutationId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.MutationID" json:"mutation_id,omitempty"`
+	DroppedDatabaseID github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,4,opt,name=dropped_database_id,json=droppedDatabaseId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"dropped_database_id,omitempty"`
+	// desc_id is the target descriptor for this schema change. Note that this ID
+	// is not always a table ID! We allow referencing any descriptor here to allow
+	// generic schema changes on descriptors whose schema change process involves
+	// only draining names and existing leases. This allows us to implement the
+	// simple schema changes on SchemaDescriptors and DatabaseDescriptors without
+	// implementing a new job for each.
+	DescID github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,5,opt,name=desc_id,json=descId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"desc_id,omitempty"`
+	// table_mutation_id is the mutation ID that the schema changer is to process. It is
+	// only set when desc_id references a TableDescriptor.
+	TableMutationID github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.MutationID `protobuf:"varint,6,opt,name=table_mutation_id,json=tableMutationId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.MutationID" json:"table_mutation_id,omitempty"`
+	// The format version of the schema change job details. This is used to
+	// distinguish between jobs as they existed in 19.2 and earlier versions
+	// (controlled and updated by a SchemaChanger) and jobs as they exist in 20.1
+	// (scheduled and run by the job registry).
+	FormatVersion SchemaChangeDetailsFormatVersion `protobuf:"varint,7,opt,name=format_version,json=formatVersion,proto3,casttype=SchemaChangeDetailsFormatVersion" json:"format_version,omitempty"`
 }
 
 func (m *SchemaChangeDetails) Reset()         { *m = SchemaChangeDetails{} }
 func (m *SchemaChangeDetails) String() string { return proto.CompactTextString(m) }
 func (*SchemaChangeDetails) ProtoMessage()    {}
 func (*SchemaChangeDetails) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{9}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{20}
 }
 func (m *SchemaChangeDetails) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -615,7 +1384,7 @@ func (m *SchemaChangeProgress) Reset()         { *m = SchemaChangeProgress{} }
 func (m *SchemaChangeProgress) String() string { return proto.CompactTextString(m) }
 func (*SchemaChangeProgress) ProtoMessage()    {}
 func (*SchemaChangeProgress) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{10}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{21}
 }
 func (m *SchemaChangeProgress) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -640,6 +1409,145 @@ func (m *SchemaChangeProgress) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_SchemaChangeProgress proto.InternalMessageInfo
 
+type SchemaChangeGCProgress struct {
+	// Indexes to GC.
+	Indexes []SchemaChangeGCProgress_IndexProgress `protobuf:"bytes,1,rep,name=indexes,proto3" json:"indexes"`
+	// Entire tables to GC.
+	Tables []SchemaChangeGCProgress_TableProgress `protobuf:"bytes,2,rep,name=tables,proto3" json:"tables"`
+	// The status of the tenant to be deleted.
+	Tenant *SchemaChangeGCProgress_TenantProgress `protobuf:"bytes,3,opt,name=tenant,proto3" json:"tenant,omitempty"`
+}
+
+func (m *SchemaChangeGCProgress) Reset()         { *m = SchemaChangeGCProgress{} }
+func (m *SchemaChangeGCProgress) String() string { return proto.CompactTextString(m) }
+func (*SchemaChangeGCProgress) ProtoMessage()    {}
+func (*SchemaChangeGCProgress) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{22}
+}
+func (m *SchemaChangeGCProgress) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SchemaChangeGCProgress) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SchemaChangeGCProgress) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SchemaChangeGCProgress.Merge(dst, src)
+}
+func (m *SchemaChangeGCProgress) XXX_Size() int {
+	return m.Size()
+}
+func (m *SchemaChangeGCProgress) XXX_DiscardUnknown() {
+	xxx_messageInfo_SchemaChangeGCProgress.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SchemaChangeGCProgress proto.InternalMessageInfo
+
+type SchemaChangeGCProgress_IndexProgress struct {
+	IndexID github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.IndexID `protobuf:"varint,1,opt,name=index_id,json=indexId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.IndexID" json:"index_id,omitempty"`
+	Status  SchemaChangeGCProgress_Status                                   `protobuf:"varint,2,opt,name=status,proto3,enum=cockroach.sql.jobs.jobspb.SchemaChangeGCProgress_Status" json:"status,omitempty"`
+}
+
+func (m *SchemaChangeGCProgress_IndexProgress) Reset()         { *m = SchemaChangeGCProgress_IndexProgress{} }
+func (m *SchemaChangeGCProgress_IndexProgress) String() string { return proto.CompactTextString(m) }
+func (*SchemaChangeGCProgress_IndexProgress) ProtoMessage()    {}
+func (*SchemaChangeGCProgress_IndexProgress) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{22, 0}
+}
+func (m *SchemaChangeGCProgress_IndexProgress) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SchemaChangeGCProgress_IndexProgress) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SchemaChangeGCProgress_IndexProgress) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SchemaChangeGCProgress_IndexProgress.Merge(dst, src)
+}
+func (m *SchemaChangeGCProgress_IndexProgress) XXX_Size() int {
+	return m.Size()
+}
+func (m *SchemaChangeGCProgress_IndexProgress) XXX_DiscardUnknown() {
+	xxx_messageInfo_SchemaChangeGCProgress_IndexProgress.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SchemaChangeGCProgress_IndexProgress proto.InternalMessageInfo
+
+type SchemaChangeGCProgress_TableProgress struct {
+	ID     github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,1,opt,name=id,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"id,omitempty"`
+	Status SchemaChangeGCProgress_Status                              `protobuf:"varint,2,opt,name=status,proto3,enum=cockroach.sql.jobs.jobspb.SchemaChangeGCProgress_Status" json:"status,omitempty"`
+}
+
+func (m *SchemaChangeGCProgress_TableProgress) Reset()         { *m = SchemaChangeGCProgress_TableProgress{} }
+func (m *SchemaChangeGCProgress_TableProgress) String() string { return proto.CompactTextString(m) }
+func (*SchemaChangeGCProgress_TableProgress) ProtoMessage()    {}
+func (*SchemaChangeGCProgress_TableProgress) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{22, 1}
+}
+func (m *SchemaChangeGCProgress_TableProgress) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SchemaChangeGCProgress_TableProgress) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SchemaChangeGCProgress_TableProgress) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SchemaChangeGCProgress_TableProgress.Merge(dst, src)
+}
+func (m *SchemaChangeGCProgress_TableProgress) XXX_Size() int {
+	return m.Size()
+}
+func (m *SchemaChangeGCProgress_TableProgress) XXX_DiscardUnknown() {
+	xxx_messageInfo_SchemaChangeGCProgress_TableProgress.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SchemaChangeGCProgress_TableProgress proto.InternalMessageInfo
+
+type SchemaChangeGCProgress_TenantProgress struct {
+	Status SchemaChangeGCProgress_Status `protobuf:"varint,1,opt,name=status,proto3,enum=cockroach.sql.jobs.jobspb.SchemaChangeGCProgress_Status" json:"status,omitempty"`
+}
+
+func (m *SchemaChangeGCProgress_TenantProgress) Reset()         { *m = SchemaChangeGCProgress_TenantProgress{} }
+func (m *SchemaChangeGCProgress_TenantProgress) String() string { return proto.CompactTextString(m) }
+func (*SchemaChangeGCProgress_TenantProgress) ProtoMessage()    {}
+func (*SchemaChangeGCProgress_TenantProgress) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{22, 2}
+}
+func (m *SchemaChangeGCProgress_TenantProgress) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SchemaChangeGCProgress_TenantProgress) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SchemaChangeGCProgress_TenantProgress) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SchemaChangeGCProgress_TenantProgress.Merge(dst, src)
+}
+func (m *SchemaChangeGCProgress_TenantProgress) XXX_Size() int {
+	return m.Size()
+}
+func (m *SchemaChangeGCProgress_TenantProgress) XXX_DiscardUnknown() {
+	xxx_messageInfo_SchemaChangeGCProgress_TenantProgress.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SchemaChangeGCProgress_TenantProgress proto.InternalMessageInfo
+
 type ChangefeedTarget struct {
 	StatementTimeName string `protobuf:"bytes,1,opt,name=statement_time_name,json=statementTimeName,proto3" json:"statement_time_name,omitempty"`
 }
@@ -648,7 +1556,7 @@ func (m *ChangefeedTarget) Reset()         { *m = ChangefeedTarget{} }
 func (m *ChangefeedTarget) String() string { return proto.CompactTextString(m) }
 func (*ChangefeedTarget) ProtoMessage()    {}
 func (*ChangefeedTarget) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{11}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{23}
 }
 func (m *ChangefeedTarget) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -691,7 +1599,7 @@ type ChangefeedDetails struct {
 	// renames can be detected. They are also used to construct an error message
 	// if the descriptor id no longer exists when the jobs is unpaused (which can
 	// happen if it was dropped or truncated).
-	Targets       ChangefeedTargets `protobuf:"bytes,6,rep,name=targets,proto3,casttype=ChangefeedTargets,castkey=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"targets" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	Targets       ChangefeedTargets `protobuf:"bytes,6,rep,name=targets,proto3,casttype=ChangefeedTargets,castkey=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"targets" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 	SinkURI       string            `protobuf:"bytes,3,opt,name=sink_uri,json=sinkUri,proto3" json:"sink_uri,omitempty"`
 	Opts          map[string]string `protobuf:"bytes,4,rep,name=opts,proto3" json:"opts,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 	StatementTime hlc.Timestamp     `protobuf:"bytes,7,opt,name=statement_time,json=statementTime,proto3" json:"statement_time"`
@@ -701,7 +1609,7 @@ func (m *ChangefeedDetails) Reset()         { *m = ChangefeedDetails{} }
 func (m *ChangefeedDetails) String() string { return proto.CompactTextString(m) }
 func (*ChangefeedDetails) ProtoMessage()    {}
 func (*ChangefeedDetails) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{12}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{24}
 }
 func (m *ChangefeedDetails) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -727,15 +1635,16 @@ func (m *ChangefeedDetails) XXX_DiscardUnknown() {
 var xxx_messageInfo_ChangefeedDetails proto.InternalMessageInfo
 
 type ResolvedSpan struct {
-	Span      roachpb.Span  `protobuf:"bytes,1,opt,name=span,proto3" json:"span"`
-	Timestamp hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
+	Span            roachpb.Span  `protobuf:"bytes,1,opt,name=span,proto3" json:"span"`
+	Timestamp       hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
+	BoundaryReached bool          `protobuf:"varint,3,opt,name=boundary_reached,json=boundaryReached,proto3" json:"boundary_reached,omitempty"`
 }
 
 func (m *ResolvedSpan) Reset()         { *m = ResolvedSpan{} }
 func (m *ResolvedSpan) String() string { return proto.CompactTextString(m) }
 func (*ResolvedSpan) ProtoMessage()    {}
 func (*ResolvedSpan) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{13}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{25}
 }
 func (m *ResolvedSpan) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -762,13 +1671,23 @@ var xxx_messageInfo_ResolvedSpan proto.InternalMessageInfo
 
 type ChangefeedProgress struct {
 	ResolvedSpans []ResolvedSpan `protobuf:"bytes,2,rep,name=resolved_spans,json=resolvedSpans,proto3" json:"resolved_spans"`
+	// ProtectedTimestampRecord is the ID of the protected timestamp record
+	// corresponding to this job. While the job ought to clean up the record
+	// when it enters a terminal state, there may be cases where it cannot or
+	// does not run the code to do so. To deal with this there is a background
+	// reconcilliation loop to ensure that protected timestamps are cleaned up.
+	//
+	// A record is created with the job if the job requires an initial backfill.
+	// Furthermore, once subsequent backfills begin, record will be created and
+	// released accordingly.
+	ProtectedTimestampRecord github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,3,opt,name=protected_timestamp_record,json=protectedTimestampRecord,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"protected_timestamp_record"`
 }
 
 func (m *ChangefeedProgress) Reset()         { *m = ChangefeedProgress{} }
 func (m *ChangefeedProgress) String() string { return proto.CompactTextString(m) }
 func (*ChangefeedProgress) ProtoMessage()    {}
 func (*ChangefeedProgress) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{14}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{26}
 }
 func (m *ChangefeedProgress) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -799,7 +1718,7 @@ var xxx_messageInfo_ChangefeedProgress proto.InternalMessageInfo
 // the table or the number of distinct values in a column.
 type CreateStatsDetails struct {
 	Name            string                       `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Table           sqlbase.TableDescriptor      `protobuf:"bytes,2,opt,name=table,proto3" json:"table"`
+	Table           descpb.TableDescriptor       `protobuf:"bytes,2,opt,name=table,proto3" json:"table"`
 	ColumnStats     []CreateStatsDetails_ColStat `protobuf:"bytes,3,rep,name=column_stats,json=columnStats,proto3" json:"column_stats"`
 	Statement       string                       `protobuf:"bytes,4,opt,name=statement,proto3" json:"statement,omitempty"`
 	AsOf            *hlc.Timestamp               `protobuf:"bytes,5,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
@@ -812,7 +1731,7 @@ func (m *CreateStatsDetails) Reset()         { *m = CreateStatsDetails{} }
 func (m *CreateStatsDetails) String() string { return proto.CompactTextString(m) }
 func (*CreateStatsDetails) ProtoMessage()    {}
 func (*CreateStatsDetails) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{15}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{27}
 }
 func (m *CreateStatsDetails) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -838,16 +1757,22 @@ func (m *CreateStatsDetails) XXX_DiscardUnknown() {
 var xxx_messageInfo_CreateStatsDetails proto.InternalMessageInfo
 
 type CreateStatsDetails_ColStat struct {
-	ColumnIDs []github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ColumnID `protobuf:"varint,1,rep,packed,name=column_ids,json=columnIds,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ColumnID" json:"column_ids,omitempty"`
+	ColumnIDs []github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ColumnID `protobuf:"varint,1,rep,packed,name=column_ids,json=columnIds,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ColumnID" json:"column_ids,omitempty"`
 	// Indicates whether this column stat should include a histogram.
 	HasHistogram bool `protobuf:"varint,2,opt,name=has_histogram,json=hasHistogram,proto3" json:"has_histogram,omitempty"`
+	// Indicates whether this column stat is over an inverted index.
+	Inverted bool `protobuf:"varint,3,opt,name=inverted,proto3" json:"inverted,omitempty"`
+	// If this column stat includes a histogram, indicates the maximum number
+	// of buckets that should be created. If this field is unset, a default
+	// maximum of 200 buckets are created.
+	HistogramMaxBuckets uint32 `protobuf:"varint,4,opt,name=histogram_max_buckets,json=histogramMaxBuckets,proto3" json:"histogram_max_buckets,omitempty"`
 }
 
 func (m *CreateStatsDetails_ColStat) Reset()         { *m = CreateStatsDetails_ColStat{} }
 func (m *CreateStatsDetails_ColStat) String() string { return proto.CompactTextString(m) }
 func (*CreateStatsDetails_ColStat) ProtoMessage()    {}
 func (*CreateStatsDetails_ColStat) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{15, 0}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{27, 0}
 }
 func (m *CreateStatsDetails_ColStat) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -879,7 +1804,7 @@ func (m *CreateStatsProgress) Reset()         { *m = CreateStatsProgress{} }
 func (m *CreateStatsProgress) String() string { return proto.CompactTextString(m) }
 func (*CreateStatsProgress) ProtoMessage()    {}
 func (*CreateStatsProgress) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{16}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{28}
 }
 func (m *CreateStatsProgress) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -904,17 +1829,82 @@ func (m *CreateStatsProgress) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_CreateStatsProgress proto.InternalMessageInfo
 
+type MigrationDetails struct {
+	ClusterVersion *clusterversion.ClusterVersion `protobuf:"bytes,1,opt,name=cluster_version,json=clusterVersion,proto3" json:"cluster_version,omitempty"`
+}
+
+func (m *MigrationDetails) Reset()         { *m = MigrationDetails{} }
+func (m *MigrationDetails) String() string { return proto.CompactTextString(m) }
+func (*MigrationDetails) ProtoMessage()    {}
+func (*MigrationDetails) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{29}
+}
+func (m *MigrationDetails) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *MigrationDetails) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *MigrationDetails) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_MigrationDetails.Merge(dst, src)
+}
+func (m *MigrationDetails) XXX_Size() int {
+	return m.Size()
+}
+func (m *MigrationDetails) XXX_DiscardUnknown() {
+	xxx_messageInfo_MigrationDetails.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_MigrationDetails proto.InternalMessageInfo
+
+type MigrationProgress struct {
+}
+
+func (m *MigrationProgress) Reset()         { *m = MigrationProgress{} }
+func (m *MigrationProgress) String() string { return proto.CompactTextString(m) }
+func (*MigrationProgress) ProtoMessage()    {}
+func (*MigrationProgress) Descriptor() ([]byte, []int) {
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{30}
+}
+func (m *MigrationProgress) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *MigrationProgress) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *MigrationProgress) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_MigrationProgress.Merge(dst, src)
+}
+func (m *MigrationProgress) XXX_Size() int {
+	return m.Size()
+}
+func (m *MigrationProgress) XXX_DiscardUnknown() {
+	xxx_messageInfo_MigrationProgress.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_MigrationProgress proto.InternalMessageInfo
+
 type Payload struct {
 	Description string `protobuf:"bytes,1,opt,name=description,proto3" json:"description,omitempty"`
 	// If empty, the description is assumed to be the statement.
-	Statement string `protobuf:"bytes,16,opt,name=statement,proto3" json:"statement,omitempty"`
-	Username  string `protobuf:"bytes,2,opt,name=username,proto3" json:"username,omitempty"`
+	Statement     string                                                         `protobuf:"bytes,16,opt,name=statement,proto3" json:"statement,omitempty"`
+	UsernameProto github_com_cockroachdb_cockroach_pkg_security.SQLUsernameProto `protobuf:"bytes,2,opt,name=username_proto,json=usernameProto,proto3,casttype=github.com/cockroachdb/cockroach/pkg/security.SQLUsernameProto" json:"username_proto,omitempty"`
 	// For consistency with the SQL timestamp type, which has microsecond
 	// precision, we avoid the timestamp.Timestamp WKT, which has nanosecond
 	// precision, and use microsecond integers directly.
-	StartedMicros  int64                                                 `protobuf:"varint,3,opt,name=started_micros,json=startedMicros,proto3" json:"started_micros,omitempty"`
-	FinishedMicros int64                                                 `protobuf:"varint,4,opt,name=finished_micros,json=finishedMicros,proto3" json:"finished_micros,omitempty"`
-	DescriptorIDs  []github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID `protobuf:"varint,6,rep,packed,name=descriptor_ids,json=descriptorIds,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"descriptor_ids,omitempty"`
+	StartedMicros  int64                                                        `protobuf:"varint,3,opt,name=started_micros,json=startedMicros,proto3" json:"started_micros,omitempty"`
+	FinishedMicros int64                                                        `protobuf:"varint,4,opt,name=finished_micros,json=finishedMicros,proto3" json:"finished_micros,omitempty"`
+	DescriptorIDs  []github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID `protobuf:"varint,6,rep,packed,name=descriptor_ids,json=descriptorIds,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID" json:"descriptor_ids,omitempty"`
 	// TODO (lucy): Deprecate the string error field and move to using the encoded
 	// errors everywhere.
 	Error         string                   `protobuf:"bytes,8,opt,name=error,proto3" json:"error,omitempty"`
@@ -937,6 +1927,11 @@ type Payload struct {
 	//	*Payload_Import
 	//	*Payload_Changefeed
 	//	*Payload_CreateStats
+	//	*Payload_SchemaChangeGC
+	//	*Payload_TypeSchemaChange
+	//	*Payload_StreamIngestion
+	//	*Payload_NewSchemaChange
+	//	*Payload_Migration
 	Details isPayload_Details `protobuf_oneof:"details"`
 }
 
@@ -944,7 +1939,7 @@ func (m *Payload) Reset()         { *m = Payload{} }
 func (m *Payload) String() string { return proto.CompactTextString(m) }
 func (*Payload) ProtoMessage()    {}
 func (*Payload) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{17}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{31}
 }
 func (m *Payload) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -993,13 +1988,33 @@ type Payload_Changefeed struct {
 type Payload_CreateStats struct {
 	CreateStats *CreateStatsDetails `protobuf:"bytes,15,opt,name=createStats,proto3,oneof"`
 }
+type Payload_SchemaChangeGC struct {
+	SchemaChangeGC *SchemaChangeGCDetails `protobuf:"bytes,21,opt,name=schemaChangeGC,proto3,oneof"`
+}
+type Payload_TypeSchemaChange struct {
+	TypeSchemaChange *TypeSchemaChangeDetails `protobuf:"bytes,22,opt,name=typeSchemaChange,proto3,oneof"`
+}
+type Payload_StreamIngestion struct {
+	StreamIngestion *StreamIngestionDetails `protobuf:"bytes,23,opt,name=streamIngestion,proto3,oneof"`
+}
+type Payload_NewSchemaChange struct {
+	NewSchemaChange *NewSchemaChangeDetails `protobuf:"bytes,24,opt,name=newSchemaChange,proto3,oneof"`
+}
+type Payload_Migration struct {
+	Migration *MigrationDetails `protobuf:"bytes,25,opt,name=migration,proto3,oneof"`
+}
 
-func (*Payload_Backup) isPayload_Details()       {}
-func (*Payload_Restore) isPayload_Details()      {}
-func (*Payload_SchemaChange) isPayload_Details() {}
-func (*Payload_Import) isPayload_Details()       {}
-func (*Payload_Changefeed) isPayload_Details()   {}
-func (*Payload_CreateStats) isPayload_Details()  {}
+func (*Payload_Backup) isPayload_Details()           {}
+func (*Payload_Restore) isPayload_Details()          {}
+func (*Payload_SchemaChange) isPayload_Details()     {}
+func (*Payload_Import) isPayload_Details()           {}
+func (*Payload_Changefeed) isPayload_Details()       {}
+func (*Payload_CreateStats) isPayload_Details()      {}
+func (*Payload_SchemaChangeGC) isPayload_Details()   {}
+func (*Payload_TypeSchemaChange) isPayload_Details() {}
+func (*Payload_StreamIngestion) isPayload_Details()  {}
+func (*Payload_NewSchemaChange) isPayload_Details()  {}
+func (*Payload_Migration) isPayload_Details()        {}
 
 func (m *Payload) GetDetails() isPayload_Details {
 	if m != nil {
@@ -1050,6 +2065,41 @@ func (m *Payload) GetCreateStats() *CreateStatsDetails {
 	return nil
 }
 
+func (m *Payload) GetSchemaChangeGC() *SchemaChangeGCDetails {
+	if x, ok := m.GetDetails().(*Payload_SchemaChangeGC); ok {
+		return x.SchemaChangeGC
+	}
+	return nil
+}
+
+func (m *Payload) GetTypeSchemaChange() *TypeSchemaChangeDetails {
+	if x, ok := m.GetDetails().(*Payload_TypeSchemaChange); ok {
+		return x.TypeSchemaChange
+	}
+	return nil
+}
+
+func (m *Payload) GetStreamIngestion() *StreamIngestionDetails {
+	if x, ok := m.GetDetails().(*Payload_StreamIngestion); ok {
+		return x.StreamIngestion
+	}
+	return nil
+}
+
+func (m *Payload) GetNewSchemaChange() *NewSchemaChangeDetails {
+	if x, ok := m.GetDetails().(*Payload_NewSchemaChange); ok {
+		return x.NewSchemaChange
+	}
+	return nil
+}
+
+func (m *Payload) GetMigration() *MigrationDetails {
+	if x, ok := m.GetDetails().(*Payload_Migration); ok {
+		return x.Migration
+	}
+	return nil
+}
+
 // XXX_OneofFuncs is for the internal use of the proto package.
 func (*Payload) XXX_OneofFuncs() (func(msg proto.Message, b *proto.Buffer) error, func(msg proto.Message, tag, wire int, b *proto.Buffer) (bool, error), func(msg proto.Message) (n int), []interface{}) {
 	return _Payload_OneofMarshaler, _Payload_OneofUnmarshaler, _Payload_OneofSizer, []interface{}{
@@ -1059,6 +2109,11 @@ func (*Payload) XXX_OneofFuncs() (func(msg proto.Message, b *proto.Buffer) error
 		(*Payload_Import)(nil),
 		(*Payload_Changefeed)(nil),
 		(*Payload_CreateStats)(nil),
+		(*Payload_SchemaChangeGC)(nil),
+		(*Payload_TypeSchemaChange)(nil),
+		(*Payload_StreamIngestion)(nil),
+		(*Payload_NewSchemaChange)(nil),
+		(*Payload_Migration)(nil),
 	}
 }
 
@@ -1094,6 +2149,31 @@ func _Payload_OneofMarshaler(msg proto.Message, b *proto.Buffer) error {
 	case *Payload_CreateStats:
 		_ = b.EncodeVarint(15<<3 | proto.WireBytes)
 		if err := b.EncodeMessage(x.CreateStats); err != nil {
+			return err
+		}
+	case *Payload_SchemaChangeGC:
+		_ = b.EncodeVarint(21<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.SchemaChangeGC); err != nil {
+			return err
+		}
+	case *Payload_TypeSchemaChange:
+		_ = b.EncodeVarint(22<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.TypeSchemaChange); err != nil {
+			return err
+		}
+	case *Payload_StreamIngestion:
+		_ = b.EncodeVarint(23<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.StreamIngestion); err != nil {
+			return err
+		}
+	case *Payload_NewSchemaChange:
+		_ = b.EncodeVarint(24<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.NewSchemaChange); err != nil {
+			return err
+		}
+	case *Payload_Migration:
+		_ = b.EncodeVarint(25<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.Migration); err != nil {
 			return err
 		}
 	case nil:
@@ -1154,6 +2234,46 @@ func _Payload_OneofUnmarshaler(msg proto.Message, tag, wire int, b *proto.Buffer
 		err := b.DecodeMessage(msg)
 		m.Details = &Payload_CreateStats{msg}
 		return true, err
+	case 21: // details.schemaChangeGC
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(SchemaChangeGCDetails)
+		err := b.DecodeMessage(msg)
+		m.Details = &Payload_SchemaChangeGC{msg}
+		return true, err
+	case 22: // details.typeSchemaChange
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(TypeSchemaChangeDetails)
+		err := b.DecodeMessage(msg)
+		m.Details = &Payload_TypeSchemaChange{msg}
+		return true, err
+	case 23: // details.streamIngestion
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(StreamIngestionDetails)
+		err := b.DecodeMessage(msg)
+		m.Details = &Payload_StreamIngestion{msg}
+		return true, err
+	case 24: // details.newSchemaChange
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(NewSchemaChangeDetails)
+		err := b.DecodeMessage(msg)
+		m.Details = &Payload_NewSchemaChange{msg}
+		return true, err
+	case 25: // details.migration
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(MigrationDetails)
+		err := b.DecodeMessage(msg)
+		m.Details = &Payload_Migration{msg}
+		return true, err
 	default:
 		return false, nil
 	}
@@ -1193,6 +2313,31 @@ func _Payload_OneofSizer(msg proto.Message) (n int) {
 		n += 1 // tag and wire
 		n += proto.SizeVarint(uint64(s))
 		n += s
+	case *Payload_SchemaChangeGC:
+		s := proto.Size(x.SchemaChangeGC)
+		n += 2 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
+	case *Payload_TypeSchemaChange:
+		s := proto.Size(x.TypeSchemaChange)
+		n += 2 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
+	case *Payload_StreamIngestion:
+		s := proto.Size(x.StreamIngestion)
+		n += 2 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
+	case *Payload_NewSchemaChange:
+		s := proto.Size(x.NewSchemaChange)
+		n += 2 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
+	case *Payload_Migration:
+		s := proto.Size(x.Migration)
+		n += 2 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
 	case nil:
 	default:
 		panic(fmt.Sprintf("proto: unexpected type %T in oneof", x))
@@ -1214,6 +2359,11 @@ type Progress struct {
 	//	*Progress_Import
 	//	*Progress_Changefeed
 	//	*Progress_CreateStats
+	//	*Progress_SchemaChangeGC
+	//	*Progress_TypeSchemaChange
+	//	*Progress_StreamIngest
+	//	*Progress_NewSchemaChange
+	//	*Progress_Migration
 	Details isProgress_Details `protobuf_oneof:"details"`
 }
 
@@ -1221,7 +2371,7 @@ func (m *Progress) Reset()         { *m = Progress{} }
 func (m *Progress) String() string { return proto.CompactTextString(m) }
 func (*Progress) ProtoMessage()    {}
 func (*Progress) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{18}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{32}
 }
 func (m *Progress) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -1281,6 +2431,21 @@ type Progress_Changefeed struct {
 type Progress_CreateStats struct {
 	CreateStats *CreateStatsProgress `protobuf:"bytes,15,opt,name=createStats,proto3,oneof"`
 }
+type Progress_SchemaChangeGC struct {
+	SchemaChangeGC *SchemaChangeGCProgress `protobuf:"bytes,16,opt,name=schemaChangeGC,proto3,oneof"`
+}
+type Progress_TypeSchemaChange struct {
+	TypeSchemaChange *TypeSchemaChangeProgress `protobuf:"bytes,17,opt,name=typeSchemaChange,proto3,oneof"`
+}
+type Progress_StreamIngest struct {
+	StreamIngest *StreamIngestionProgress `protobuf:"bytes,18,opt,name=streamIngest,proto3,oneof"`
+}
+type Progress_NewSchemaChange struct {
+	NewSchemaChange *NewSchemaChangeProgress `protobuf:"bytes,19,opt,name=newSchemaChange,proto3,oneof"`
+}
+type Progress_Migration struct {
+	Migration *MigrationProgress `protobuf:"bytes,20,opt,name=migration,proto3,oneof"`
+}
 
 func (*Progress_FractionCompleted) isProgress_Progress() {}
 func (*Progress_HighWater) isProgress_Progress()         {}
@@ -1290,6 +2455,11 @@ func (*Progress_SchemaChange) isProgress_Details()       {}
 func (*Progress_Import) isProgress_Details()             {}
 func (*Progress_Changefeed) isProgress_Details()         {}
 func (*Progress_CreateStats) isProgress_Details()        {}
+func (*Progress_SchemaChangeGC) isProgress_Details()     {}
+func (*Progress_TypeSchemaChange) isProgress_Details()   {}
+func (*Progress_StreamIngest) isProgress_Details()       {}
+func (*Progress_NewSchemaChange) isProgress_Details()    {}
+func (*Progress_Migration) isProgress_Details()          {}
 
 func (m *Progress) GetProgress() isProgress_Progress {
 	if m != nil {
@@ -1360,6 +2530,41 @@ func (m *Progress) GetCreateStats() *CreateStatsProgress {
 	return nil
 }
 
+func (m *Progress) GetSchemaChangeGC() *SchemaChangeGCProgress {
+	if x, ok := m.GetDetails().(*Progress_SchemaChangeGC); ok {
+		return x.SchemaChangeGC
+	}
+	return nil
+}
+
+func (m *Progress) GetTypeSchemaChange() *TypeSchemaChangeProgress {
+	if x, ok := m.GetDetails().(*Progress_TypeSchemaChange); ok {
+		return x.TypeSchemaChange
+	}
+	return nil
+}
+
+func (m *Progress) GetStreamIngest() *StreamIngestionProgress {
+	if x, ok := m.GetDetails().(*Progress_StreamIngest); ok {
+		return x.StreamIngest
+	}
+	return nil
+}
+
+func (m *Progress) GetNewSchemaChange() *NewSchemaChangeProgress {
+	if x, ok := m.GetDetails().(*Progress_NewSchemaChange); ok {
+		return x.NewSchemaChange
+	}
+	return nil
+}
+
+func (m *Progress) GetMigration() *MigrationProgress {
+	if x, ok := m.GetDetails().(*Progress_Migration); ok {
+		return x.Migration
+	}
+	return nil
+}
+
 // XXX_OneofFuncs is for the internal use of the proto package.
 func (*Progress) XXX_OneofFuncs() (func(msg proto.Message, b *proto.Buffer) error, func(msg proto.Message, tag, wire int, b *proto.Buffer) (bool, error), func(msg proto.Message) (n int), []interface{}) {
 	return _Progress_OneofMarshaler, _Progress_OneofUnmarshaler, _Progress_OneofSizer, []interface{}{
@@ -1371,6 +2576,11 @@ func (*Progress) XXX_OneofFuncs() (func(msg proto.Message, b *proto.Buffer) erro
 		(*Progress_Import)(nil),
 		(*Progress_Changefeed)(nil),
 		(*Progress_CreateStats)(nil),
+		(*Progress_SchemaChangeGC)(nil),
+		(*Progress_TypeSchemaChange)(nil),
+		(*Progress_StreamIngest)(nil),
+		(*Progress_NewSchemaChange)(nil),
+		(*Progress_Migration)(nil),
 	}
 }
 
@@ -1420,6 +2630,31 @@ func _Progress_OneofMarshaler(msg proto.Message, b *proto.Buffer) error {
 	case *Progress_CreateStats:
 		_ = b.EncodeVarint(15<<3 | proto.WireBytes)
 		if err := b.EncodeMessage(x.CreateStats); err != nil {
+			return err
+		}
+	case *Progress_SchemaChangeGC:
+		_ = b.EncodeVarint(16<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.SchemaChangeGC); err != nil {
+			return err
+		}
+	case *Progress_TypeSchemaChange:
+		_ = b.EncodeVarint(17<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.TypeSchemaChange); err != nil {
+			return err
+		}
+	case *Progress_StreamIngest:
+		_ = b.EncodeVarint(18<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.StreamIngest); err != nil {
+			return err
+		}
+	case *Progress_NewSchemaChange:
+		_ = b.EncodeVarint(19<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.NewSchemaChange); err != nil {
+			return err
+		}
+	case *Progress_Migration:
+		_ = b.EncodeVarint(20<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.Migration); err != nil {
 			return err
 		}
 	case nil:
@@ -1495,6 +2730,46 @@ func _Progress_OneofUnmarshaler(msg proto.Message, tag, wire int, b *proto.Buffe
 		err := b.DecodeMessage(msg)
 		m.Details = &Progress_CreateStats{msg}
 		return true, err
+	case 16: // details.schemaChangeGC
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(SchemaChangeGCProgress)
+		err := b.DecodeMessage(msg)
+		m.Details = &Progress_SchemaChangeGC{msg}
+		return true, err
+	case 17: // details.typeSchemaChange
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(TypeSchemaChangeProgress)
+		err := b.DecodeMessage(msg)
+		m.Details = &Progress_TypeSchemaChange{msg}
+		return true, err
+	case 18: // details.streamIngest
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(StreamIngestionProgress)
+		err := b.DecodeMessage(msg)
+		m.Details = &Progress_StreamIngest{msg}
+		return true, err
+	case 19: // details.newSchemaChange
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(NewSchemaChangeProgress)
+		err := b.DecodeMessage(msg)
+		m.Details = &Progress_NewSchemaChange{msg}
+		return true, err
+	case 20: // details.migration
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(MigrationProgress)
+		err := b.DecodeMessage(msg)
+		m.Details = &Progress_Migration{msg}
+		return true, err
 	default:
 		return false, nil
 	}
@@ -1548,6 +2823,31 @@ func _Progress_OneofSizer(msg proto.Message) (n int) {
 		n += 1 // tag and wire
 		n += proto.SizeVarint(uint64(s))
 		n += s
+	case *Progress_SchemaChangeGC:
+		s := proto.Size(x.SchemaChangeGC)
+		n += 2 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
+	case *Progress_TypeSchemaChange:
+		s := proto.Size(x.TypeSchemaChange)
+		n += 2 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
+	case *Progress_StreamIngest:
+		s := proto.Size(x.StreamIngest)
+		n += 2 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
+	case *Progress_NewSchemaChange:
+		s := proto.Size(x.NewSchemaChange)
+		n += 2 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
+	case *Progress_Migration:
+		s := proto.Size(x.Migration)
+		n += 2 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
 	case nil:
 	default:
 		panic(fmt.Sprintf("proto: unexpected type %T in oneof", x))
@@ -1567,7 +2867,7 @@ func (m *Job) Reset()         { *m = Job{} }
 func (m *Job) String() string { return proto.CompactTextString(m) }
 func (*Job) ProtoMessage()    {}
 func (*Job) Descriptor() ([]byte, []int) {
-	return fileDescriptor_jobs_80ac31e4c0c0e6b5, []int{19}
+	return fileDescriptor_jobs_4b9f65bb42f26fe6, []int{33}
 }
 func (m *Job) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -1594,22 +2894,44 @@ var xxx_messageInfo_Job proto.InternalMessageInfo
 
 func init() {
 	proto.RegisterType((*Lease)(nil), "cockroach.sql.jobs.jobspb.Lease")
+	proto.RegisterType((*BackupEncryptionOptions)(nil), "cockroach.sql.jobs.jobspb.BackupEncryptionOptions")
+	proto.RegisterType((*BackupEncryptionOptions_KMSInfo)(nil), "cockroach.sql.jobs.jobspb.BackupEncryptionOptions.KMSInfo")
+	proto.RegisterType((*EncryptionInfo)(nil), "cockroach.sql.jobs.jobspb.EncryptionInfo")
+	proto.RegisterMapType((map[string][]byte)(nil), "cockroach.sql.jobs.jobspb.EncryptionInfo.EncryptedDataKeyByKMSMasterKeyIDEntry")
+	proto.RegisterType((*StreamIngestionDetails)(nil), "cockroach.sql.jobs.jobspb.StreamIngestionDetails")
+	proto.RegisterType((*StreamIngestionProgress)(nil), "cockroach.sql.jobs.jobspb.StreamIngestionProgress")
 	proto.RegisterType((*BackupDetails)(nil), "cockroach.sql.jobs.jobspb.BackupDetails")
 	proto.RegisterMapType((map[string]string)(nil), "cockroach.sql.jobs.jobspb.BackupDetails.UrisByLocalityKvEntry")
 	proto.RegisterType((*BackupProgress)(nil), "cockroach.sql.jobs.jobspb.BackupProgress")
 	proto.RegisterType((*RestoreDetails)(nil), "cockroach.sql.jobs.jobspb.RestoreDetails")
-	proto.RegisterMapType((map[github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID]*RestoreDetails_TableRewrite)(nil), "cockroach.sql.jobs.jobspb.RestoreDetails.TableRewritesEntry")
-	proto.RegisterType((*RestoreDetails_TableRewrite)(nil), "cockroach.sql.jobs.jobspb.RestoreDetails.TableRewrite")
+	proto.RegisterMapType((map[github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID]*RestoreDetails_DescriptorRewrite)(nil), "cockroach.sql.jobs.jobspb.RestoreDetails.DescriptorRewritesEntry")
+	proto.RegisterType((*RestoreDetails_DescriptorRewrite)(nil), "cockroach.sql.jobs.jobspb.RestoreDetails.DescriptorRewrite")
 	proto.RegisterType((*RestoreDetails_BackupLocalityInfo)(nil), "cockroach.sql.jobs.jobspb.RestoreDetails.BackupLocalityInfo")
 	proto.RegisterMapType((map[string]string)(nil), "cockroach.sql.jobs.jobspb.RestoreDetails.BackupLocalityInfo.UrisByOriginalLocalityKvEntry")
 	proto.RegisterType((*RestoreProgress)(nil), "cockroach.sql.jobs.jobspb.RestoreProgress")
 	proto.RegisterType((*ImportDetails)(nil), "cockroach.sql.jobs.jobspb.ImportDetails")
 	proto.RegisterType((*ImportDetails_Table)(nil), "cockroach.sql.jobs.jobspb.ImportDetails.Table")
+	proto.RegisterType((*SequenceValChunk)(nil), "cockroach.sql.jobs.jobspb.SequenceValChunk")
+	proto.RegisterType((*SequenceDetails)(nil), "cockroach.sql.jobs.jobspb.SequenceDetails")
+	proto.RegisterMapType((map[int32]*SequenceDetails_SequenceChunks)(nil), "cockroach.sql.jobs.jobspb.SequenceDetails.SeqIdToChunksEntry")
+	proto.RegisterType((*SequenceDetails_SequenceChunks)(nil), "cockroach.sql.jobs.jobspb.SequenceDetails.SequenceChunks")
 	proto.RegisterType((*ImportProgress)(nil), "cockroach.sql.jobs.jobspb.ImportProgress")
+	proto.RegisterType((*TypeSchemaChangeDetails)(nil), "cockroach.sql.jobs.jobspb.TypeSchemaChangeDetails")
+	proto.RegisterType((*TypeSchemaChangeProgress)(nil), "cockroach.sql.jobs.jobspb.TypeSchemaChangeProgress")
+	proto.RegisterType((*NewSchemaChangeDetails)(nil), "cockroach.sql.jobs.jobspb.NewSchemaChangeDetails")
+	proto.RegisterType((*NewSchemaChangeProgress)(nil), "cockroach.sql.jobs.jobspb.NewSchemaChangeProgress")
 	proto.RegisterType((*ResumeSpanList)(nil), "cockroach.sql.jobs.jobspb.ResumeSpanList")
 	proto.RegisterType((*DroppedTableDetails)(nil), "cockroach.sql.jobs.jobspb.DroppedTableDetails")
+	proto.RegisterType((*SchemaChangeGCDetails)(nil), "cockroach.sql.jobs.jobspb.SchemaChangeGCDetails")
+	proto.RegisterType((*SchemaChangeGCDetails_DroppedIndex)(nil), "cockroach.sql.jobs.jobspb.SchemaChangeGCDetails.DroppedIndex")
+	proto.RegisterType((*SchemaChangeGCDetails_DroppedID)(nil), "cockroach.sql.jobs.jobspb.SchemaChangeGCDetails.DroppedID")
+	proto.RegisterType((*SchemaChangeGCDetails_DroppedTenant)(nil), "cockroach.sql.jobs.jobspb.SchemaChangeGCDetails.DroppedTenant")
 	proto.RegisterType((*SchemaChangeDetails)(nil), "cockroach.sql.jobs.jobspb.SchemaChangeDetails")
 	proto.RegisterType((*SchemaChangeProgress)(nil), "cockroach.sql.jobs.jobspb.SchemaChangeProgress")
+	proto.RegisterType((*SchemaChangeGCProgress)(nil), "cockroach.sql.jobs.jobspb.SchemaChangeGCProgress")
+	proto.RegisterType((*SchemaChangeGCProgress_IndexProgress)(nil), "cockroach.sql.jobs.jobspb.SchemaChangeGCProgress.IndexProgress")
+	proto.RegisterType((*SchemaChangeGCProgress_TableProgress)(nil), "cockroach.sql.jobs.jobspb.SchemaChangeGCProgress.TableProgress")
+	proto.RegisterType((*SchemaChangeGCProgress_TenantProgress)(nil), "cockroach.sql.jobs.jobspb.SchemaChangeGCProgress.TenantProgress")
 	proto.RegisterType((*ChangefeedTarget)(nil), "cockroach.sql.jobs.jobspb.ChangefeedTarget")
 	proto.RegisterType((*ChangefeedDetails)(nil), "cockroach.sql.jobs.jobspb.ChangefeedDetails")
 	proto.RegisterMapType((map[string]string)(nil), "cockroach.sql.jobs.jobspb.ChangefeedDetails.OptsEntry")
@@ -1619,11 +2941,16 @@ func init() {
 	proto.RegisterType((*CreateStatsDetails)(nil), "cockroach.sql.jobs.jobspb.CreateStatsDetails")
 	proto.RegisterType((*CreateStatsDetails_ColStat)(nil), "cockroach.sql.jobs.jobspb.CreateStatsDetails.ColStat")
 	proto.RegisterType((*CreateStatsProgress)(nil), "cockroach.sql.jobs.jobspb.CreateStatsProgress")
+	proto.RegisterType((*MigrationDetails)(nil), "cockroach.sql.jobs.jobspb.MigrationDetails")
+	proto.RegisterType((*MigrationProgress)(nil), "cockroach.sql.jobs.jobspb.MigrationProgress")
 	proto.RegisterType((*Payload)(nil), "cockroach.sql.jobs.jobspb.Payload")
 	proto.RegisterType((*Progress)(nil), "cockroach.sql.jobs.jobspb.Progress")
 	proto.RegisterType((*Job)(nil), "cockroach.sql.jobs.jobspb.Job")
+	proto.RegisterEnum("cockroach.sql.jobs.jobspb.EncryptionMode", EncryptionMode_name, EncryptionMode_value)
 	proto.RegisterEnum("cockroach.sql.jobs.jobspb.Status", Status_name, Status_value)
 	proto.RegisterEnum("cockroach.sql.jobs.jobspb.Type", Type_name, Type_value)
+	proto.RegisterEnum("cockroach.sql.jobs.jobspb.EncryptionInfo_Scheme", EncryptionInfo_Scheme_name, EncryptionInfo_Scheme_value)
+	proto.RegisterEnum("cockroach.sql.jobs.jobspb.SchemaChangeGCProgress_Status", SchemaChangeGCProgress_Status_name, SchemaChangeGCProgress_Status_value)
 }
 func (this *Lease) Equal(that interface{}) bool {
 	if that == nil {
@@ -1649,6 +2976,98 @@ func (this *Lease) Equal(that interface{}) bool {
 	}
 	if this.Epoch != that1.Epoch {
 		return false
+	}
+	return true
+}
+func (this *BackupEncryptionOptions) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*BackupEncryptionOptions)
+	if !ok {
+		that2, ok := that.(BackupEncryptionOptions)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !bytes.Equal(this.Key, that1.Key) {
+		return false
+	}
+	if this.Mode != that1.Mode {
+		return false
+	}
+	if !this.KMSInfo.Equal(that1.KMSInfo) {
+		return false
+	}
+	return true
+}
+func (this *BackupEncryptionOptions_KMSInfo) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*BackupEncryptionOptions_KMSInfo)
+	if !ok {
+		that2, ok := that.(BackupEncryptionOptions_KMSInfo)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Uri != that1.Uri {
+		return false
+	}
+	if !bytes.Equal(this.EncryptedDataKey, that1.EncryptedDataKey) {
+		return false
+	}
+	return true
+}
+func (this *EncryptionInfo) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*EncryptionInfo)
+	if !ok {
+		that2, ok := that.(EncryptionInfo)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Scheme != that1.Scheme {
+		return false
+	}
+	if !bytes.Equal(this.Salt, that1.Salt) {
+		return false
+	}
+	if len(this.EncryptedDataKeyByKMSMasterKeyID) != len(that1.EncryptedDataKeyByKMSMasterKeyID) {
+		return false
+	}
+	for i := range this.EncryptedDataKeyByKMSMasterKeyID {
+		if !bytes.Equal(this.EncryptedDataKeyByKMSMasterKeyID[i], that1.EncryptedDataKeyByKMSMasterKeyID[i]) {
+			return false
+		}
 	}
 	return true
 }
@@ -1680,6 +3099,200 @@ func (m *Lease) MarshalTo(dAtA []byte) (int, error) {
 	return i, nil
 }
 
+func (m *BackupEncryptionOptions) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *BackupEncryptionOptions) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.Key) > 0 {
+		dAtA[i] = 0xa
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(len(m.Key)))
+		i += copy(dAtA[i:], m.Key)
+	}
+	if m.Mode != 0 {
+		dAtA[i] = 0x10
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.Mode))
+	}
+	if m.KMSInfo != nil {
+		dAtA[i] = 0x1a
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.KMSInfo.Size()))
+		n1, err := m.KMSInfo.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n1
+	}
+	return i, nil
+}
+
+func (m *BackupEncryptionOptions_KMSInfo) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *BackupEncryptionOptions_KMSInfo) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.Uri) > 0 {
+		dAtA[i] = 0xa
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(len(m.Uri)))
+		i += copy(dAtA[i:], m.Uri)
+	}
+	if len(m.EncryptedDataKey) > 0 {
+		dAtA[i] = 0x12
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(len(m.EncryptedDataKey)))
+		i += copy(dAtA[i:], m.EncryptedDataKey)
+	}
+	return i, nil
+}
+
+func (m *EncryptionInfo) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *EncryptionInfo) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.Scheme != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.Scheme))
+	}
+	if len(m.Salt) > 0 {
+		dAtA[i] = 0x12
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(len(m.Salt)))
+		i += copy(dAtA[i:], m.Salt)
+	}
+	if len(m.EncryptedDataKeyByKMSMasterKeyID) > 0 {
+		keysForEncryptedDataKeyByKMSMasterKeyID := make([]string, 0, len(m.EncryptedDataKeyByKMSMasterKeyID))
+		for k := range m.EncryptedDataKeyByKMSMasterKeyID {
+			keysForEncryptedDataKeyByKMSMasterKeyID = append(keysForEncryptedDataKeyByKMSMasterKeyID, string(k))
+		}
+		github_com_gogo_protobuf_sortkeys.Strings(keysForEncryptedDataKeyByKMSMasterKeyID)
+		for _, k := range keysForEncryptedDataKeyByKMSMasterKeyID {
+			dAtA[i] = 0x1a
+			i++
+			v := m.EncryptedDataKeyByKMSMasterKeyID[string(k)]
+			byteSize := 0
+			if len(v) > 0 {
+				byteSize = 1 + len(v) + sovJobs(uint64(len(v)))
+			}
+			mapSize := 1 + len(k) + sovJobs(uint64(len(k))) + byteSize
+			i = encodeVarintJobs(dAtA, i, uint64(mapSize))
+			dAtA[i] = 0xa
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(len(k)))
+			i += copy(dAtA[i:], k)
+			if len(v) > 0 {
+				dAtA[i] = 0x12
+				i++
+				i = encodeVarintJobs(dAtA, i, uint64(len(v)))
+				i += copy(dAtA[i:], v)
+			}
+		}
+	}
+	return i, nil
+}
+
+func (m *StreamIngestionDetails) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *StreamIngestionDetails) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.StreamAddress) > 0 {
+		dAtA[i] = 0xa
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(len(m.StreamAddress)))
+		i += copy(dAtA[i:], m.StreamAddress)
+	}
+	dAtA[i] = 0x12
+	i++
+	i = encodeVarintJobs(dAtA, i, uint64(m.Span.Size()))
+	n2, err := m.Span.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n2
+	dAtA[i] = 0x1a
+	i++
+	i = encodeVarintJobs(dAtA, i, uint64(m.StartTime.Size()))
+	n3, err := m.StartTime.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n3
+	return i, nil
+}
+
+func (m *StreamIngestionProgress) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *StreamIngestionProgress) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.MarkedForCompletion {
+		dAtA[i] = 0x8
+		i++
+		if m.MarkedForCompletion {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i++
+	}
+	return i, nil
+}
+
 func (m *BackupDetails) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
@@ -1698,30 +3311,30 @@ func (m *BackupDetails) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintJobs(dAtA, i, uint64(m.StartTime.Size()))
-	n1, err := m.StartTime.MarshalTo(dAtA[i:])
+	n4, err := m.StartTime.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n1
+	i += n4
 	dAtA[i] = 0x12
 	i++
 	i = encodeVarintJobs(dAtA, i, uint64(m.EndTime.Size()))
-	n2, err := m.EndTime.MarshalTo(dAtA[i:])
+	n5, err := m.EndTime.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n2
+	i += n5
 	if len(m.URI) > 0 {
 		dAtA[i] = 0x1a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(len(m.URI)))
 		i += copy(dAtA[i:], m.URI)
 	}
-	if len(m.BackupManifest) > 0 {
+	if len(m.DeprecatedBackupManifest) > 0 {
 		dAtA[i] = 0x22
 		i++
-		i = encodeVarintJobs(dAtA, i, uint64(len(m.BackupManifest)))
-		i += copy(dAtA[i:], m.BackupManifest)
+		i = encodeVarintJobs(dAtA, i, uint64(len(m.DeprecatedBackupManifest)))
+		i += copy(dAtA[i:], m.DeprecatedBackupManifest)
 	}
 	if len(m.URIsByLocalityKV) > 0 {
 		keysForURIsByLocalityKV := make([]string, 0, len(m.URIsByLocalityKV))
@@ -1745,15 +3358,41 @@ func (m *BackupDetails) MarshalTo(dAtA []byte) (int, error) {
 			i += copy(dAtA[i:], v)
 		}
 	}
-	if m.Encryption != nil {
+	if m.EncryptionOptions != nil {
 		dAtA[i] = 0x32
 		i++
-		i = encodeVarintJobs(dAtA, i, uint64(m.Encryption.Size()))
-		n3, err := m.Encryption.MarshalTo(dAtA[i:])
+		i = encodeVarintJobs(dAtA, i, uint64(m.EncryptionOptions.Size()))
+		n6, err := m.EncryptionOptions.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n3
+		i += n6
+	}
+	if m.ProtectedTimestampRecord != nil {
+		dAtA[i] = 0x3a
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.ProtectedTimestampRecord.Size()))
+		n7, err := m.ProtectedTimestampRecord.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n7
+	}
+	if len(m.CollectionURI) > 0 {
+		dAtA[i] = 0x42
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(len(m.CollectionURI)))
+		i += copy(dAtA[i:], m.CollectionURI)
+	}
+	if m.EncryptionInfo != nil {
+		dAtA[i] = 0x4a
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.EncryptionInfo.Size()))
+		n8, err := m.EncryptionInfo.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n8
 	}
 	return i, nil
 }
@@ -1791,16 +3430,16 @@ func (m *RestoreDetails) MarshalTo(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if len(m.TableRewrites) > 0 {
-		keysForTableRewrites := make([]uint32, 0, len(m.TableRewrites))
-		for k := range m.TableRewrites {
-			keysForTableRewrites = append(keysForTableRewrites, uint32(k))
+	if len(m.DescriptorRewrites) > 0 {
+		keysForDescriptorRewrites := make([]uint32, 0, len(m.DescriptorRewrites))
+		for k := range m.DescriptorRewrites {
+			keysForDescriptorRewrites = append(keysForDescriptorRewrites, uint32(k))
 		}
-		github_com_gogo_protobuf_sortkeys.Uint32s(keysForTableRewrites)
-		for _, k := range keysForTableRewrites {
+		github_com_gogo_protobuf_sortkeys.Uint32s(keysForDescriptorRewrites)
+		for _, k := range keysForDescriptorRewrites {
 			dAtA[i] = 0x12
 			i++
-			v := m.TableRewrites[github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(k)]
+			v := m.DescriptorRewrites[github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(k)]
 			msgSize := 0
 			if v != nil {
 				msgSize = v.Size()
@@ -1815,11 +3454,11 @@ func (m *RestoreDetails) MarshalTo(dAtA []byte) (int, error) {
 				dAtA[i] = 0x12
 				i++
 				i = encodeVarintJobs(dAtA, i, uint64(v.Size()))
-				n4, err := v.MarshalTo(dAtA[i:])
+				n9, err := v.MarshalTo(dAtA[i:])
 				if err != nil {
 					return 0, err
 				}
-				i += n4
+				i += n9
 			}
 		}
 	}
@@ -1841,11 +3480,11 @@ func (m *RestoreDetails) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x22
 	i++
 	i = encodeVarintJobs(dAtA, i, uint64(m.EndTime.Size()))
-	n5, err := m.EndTime.MarshalTo(dAtA[i:])
+	n10, err := m.EndTime.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n5
+	i += n10
 	if len(m.TableDescs) > 0 {
 		for _, msg := range m.TableDescs {
 			dAtA[i] = 0x2a
@@ -1896,10 +3535,10 @@ func (m *RestoreDetails) MarshalTo(dAtA []byte) (int, error) {
 		}
 		i++
 	}
-	if m.TablesPublished {
+	if m.DescriptorsPublished {
 		dAtA[i] = 0x50
 		i++
-		if m.TablesPublished {
+		if m.DescriptorsPublished {
 			dAtA[i] = 1
 		} else {
 			dAtA[i] = 0
@@ -1915,16 +3554,66 @@ func (m *RestoreDetails) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x62
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Encryption.Size()))
-		n6, err := m.Encryption.MarshalTo(dAtA[i:])
+		n11, err := m.Encryption.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n6
+		i += n11
+	}
+	if len(m.Tenants) > 0 {
+		for _, msg := range m.Tenants {
+			dAtA[i] = 0x6a
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.TypeDescs) > 0 {
+		for _, msg := range m.TypeDescs {
+			dAtA[i] = 0x72
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.SchemaDescs) > 0 {
+		for _, msg := range m.SchemaDescs {
+			dAtA[i] = 0x7a
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.DatabaseDescs) > 0 {
+		for _, msg := range m.DatabaseDescs {
+			dAtA[i] = 0x82
+			i++
+			dAtA[i] = 0x1
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
 	}
 	return i, nil
 }
 
-func (m *RestoreDetails_TableRewrite) Marshal() (dAtA []byte, err error) {
+func (m *RestoreDetails_DescriptorRewrite) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalTo(dAtA)
@@ -1934,20 +3623,30 @@ func (m *RestoreDetails_TableRewrite) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *RestoreDetails_TableRewrite) MarshalTo(dAtA []byte) (int, error) {
+func (m *RestoreDetails_DescriptorRewrite) MarshalTo(dAtA []byte) (int, error) {
 	var i int
 	_ = i
 	var l int
 	_ = l
-	if m.TableID != 0 {
+	if m.ID != 0 {
 		dAtA[i] = 0x8
 		i++
-		i = encodeVarintJobs(dAtA, i, uint64(m.TableID))
+		i = encodeVarintJobs(dAtA, i, uint64(m.ID))
 	}
 	if m.ParentID != 0 {
 		dAtA[i] = 0x10
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.ParentID))
+	}
+	if m.ToExisting {
+		dAtA[i] = 0x18
+		i++
+		if m.ToExisting {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i++
 	}
 	return i, nil
 }
@@ -2061,11 +3760,11 @@ func (m *ImportDetails) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x1a
 	i++
 	i = encodeVarintJobs(dAtA, i, uint64(m.Format.Size()))
-	n7, err := m.Format.MarshalTo(dAtA[i:])
+	n12, err := m.Format.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n7
+	i += n12
 	if m.SSTSize != 0 {
 		dAtA[i] = 0x20
 		i++
@@ -2140,17 +3839,27 @@ func (m *ImportDetails) MarshalTo(dAtA []byte) (int, error) {
 		}
 		i++
 	}
+	if m.ParseBundleSchema {
+		dAtA[i] = 0x70
+		i++
+		if m.ParseBundleSchema {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i++
+	}
 	if m.ProtectedTimestampRecord != nil {
 		dAtA[i] = 0xb2
 		i++
 		dAtA[i] = 0x1
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.ProtectedTimestampRecord.Size()))
-		n8, err := m.ProtectedTimestampRecord.MarshalTo(dAtA[i:])
+		n13, err := m.ProtectedTimestampRecord.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n8
+		i += n13
 	}
 	return i, nil
 }
@@ -2174,11 +3883,11 @@ func (m *ImportDetails_Table) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0xa
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Desc.Size()))
-		n9, err := m.Desc.MarshalTo(dAtA[i:])
+		n14, err := m.Desc.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n9
+		i += n14
 	}
 	if len(m.Name) > 0 {
 		dAtA[i] = 0x92
@@ -2224,6 +3933,136 @@ func (m *ImportDetails_Table) MarshalTo(dAtA []byte) (int, error) {
 			i += copy(dAtA[i:], s)
 		}
 	}
+	if m.WasEmpty {
+		dAtA[i] = 0xb0
+		i++
+		dAtA[i] = 0x1
+		i++
+		if m.WasEmpty {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i++
+	}
+	return i, nil
+}
+
+func (m *SequenceValChunk) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SequenceValChunk) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.ChunkStartVal != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.ChunkStartVal))
+	}
+	if m.ChunkSize != 0 {
+		dAtA[i] = 0x10
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.ChunkSize))
+	}
+	if m.ChunkStartRow != 0 {
+		dAtA[i] = 0x18
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.ChunkStartRow))
+	}
+	if m.NextChunkStartRow != 0 {
+		dAtA[i] = 0x20
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.NextChunkStartRow))
+	}
+	return i, nil
+}
+
+func (m *SequenceDetails) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SequenceDetails) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.SeqIdToChunks) > 0 {
+		keysForSeqIdToChunks := make([]int32, 0, len(m.SeqIdToChunks))
+		for k := range m.SeqIdToChunks {
+			keysForSeqIdToChunks = append(keysForSeqIdToChunks, int32(k))
+		}
+		github_com_gogo_protobuf_sortkeys.Int32s(keysForSeqIdToChunks)
+		for _, k := range keysForSeqIdToChunks {
+			dAtA[i] = 0xa
+			i++
+			v := m.SeqIdToChunks[int32(k)]
+			msgSize := 0
+			if v != nil {
+				msgSize = v.Size()
+				msgSize += 1 + sovJobs(uint64(msgSize))
+			}
+			mapSize := 1 + sovJobs(uint64(k)) + msgSize
+			i = encodeVarintJobs(dAtA, i, uint64(mapSize))
+			dAtA[i] = 0x8
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(k))
+			if v != nil {
+				dAtA[i] = 0x12
+				i++
+				i = encodeVarintJobs(dAtA, i, uint64(v.Size()))
+				n15, err := v.MarshalTo(dAtA[i:])
+				if err != nil {
+					return 0, err
+				}
+				i += n15
+			}
+		}
+	}
+	return i, nil
+}
+
+func (m *SequenceDetails_SequenceChunks) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SequenceDetails_SequenceChunks) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.Chunks) > 0 {
+		for _, msg := range m.Chunks {
+			dAtA[i] = 0xa
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
 	return i, nil
 }
 
@@ -2247,8 +4086,8 @@ func (m *ImportProgress) MarshalTo(dAtA []byte) (int, error) {
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(len(m.SamplingProgress)*4))
 		for _, num := range m.SamplingProgress {
-			f10 := math.Float32bits(float32(num))
-			encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(f10))
+			f16 := math.Float32bits(float32(num))
+			encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(f16))
 			i += 4
 		}
 	}
@@ -2257,8 +4096,8 @@ func (m *ImportProgress) MarshalTo(dAtA []byte) (int, error) {
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(len(m.ReadProgress)*4))
 		for _, num := range m.ReadProgress {
-			f11 := math.Float32bits(float32(num))
-			encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(f11))
+			f17 := math.Float32bits(float32(num))
+			encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(f17))
 			i += 4
 		}
 	}
@@ -2267,8 +4106,8 @@ func (m *ImportProgress) MarshalTo(dAtA []byte) (int, error) {
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(len(m.WriteProgress)*4))
 		for _, num := range m.WriteProgress {
-			f12 := math.Float32bits(float32(num))
-			encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(f12))
+			f18 := math.Float32bits(float32(num))
+			encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(f18))
 			i += 4
 		}
 	}
@@ -2285,22 +4124,148 @@ func (m *ImportProgress) MarshalTo(dAtA []byte) (int, error) {
 		}
 	}
 	if len(m.ResumePos) > 0 {
-		dAtA14 := make([]byte, len(m.ResumePos)*10)
-		var j13 int
+		dAtA20 := make([]byte, len(m.ResumePos)*10)
+		var j19 int
 		for _, num1 := range m.ResumePos {
 			num := uint64(num1)
 			for num >= 1<<7 {
-				dAtA14[j13] = uint8(uint64(num)&0x7f | 0x80)
+				dAtA20[j19] = uint8(uint64(num)&0x7f | 0x80)
 				num >>= 7
-				j13++
+				j19++
 			}
-			dAtA14[j13] = uint8(num)
-			j13++
+			dAtA20[j19] = uint8(num)
+			j19++
 		}
 		dAtA[i] = 0x2a
 		i++
-		i = encodeVarintJobs(dAtA, i, uint64(j13))
-		i += copy(dAtA[i:], dAtA14[:j13])
+		i = encodeVarintJobs(dAtA, i, uint64(j19))
+		i += copy(dAtA[i:], dAtA20[:j19])
+	}
+	if len(m.SequenceDetails) > 0 {
+		for _, msg := range m.SequenceDetails {
+			dAtA[i] = 0x32
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	return i, nil
+}
+
+func (m *TypeSchemaChangeDetails) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *TypeSchemaChangeDetails) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.TypeID != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.TypeID))
+	}
+	if len(m.TransitioningMembers) > 0 {
+		for _, b := range m.TransitioningMembers {
+			dAtA[i] = 0x12
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(len(b)))
+			i += copy(dAtA[i:], b)
+		}
+	}
+	return i, nil
+}
+
+func (m *TypeSchemaChangeProgress) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *TypeSchemaChangeProgress) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	return i, nil
+}
+
+func (m *NewSchemaChangeDetails) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *NewSchemaChangeDetails) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.Targets) > 0 {
+		for _, msg := range m.Targets {
+			dAtA[i] = 0xa
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	return i, nil
+}
+
+func (m *NewSchemaChangeProgress) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *NewSchemaChangeProgress) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.States) > 0 {
+		dAtA22 := make([]byte, len(m.States)*10)
+		var j21 int
+		for _, num := range m.States {
+			for num >= 1<<7 {
+				dAtA22[j21] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j21++
+			}
+			dAtA22[j21] = uint8(num)
+			j21++
+		}
+		dAtA[i] = 0xa
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(j21))
+		i += copy(dAtA[i:], dAtA22[:j21])
 	}
 	return i, nil
 }
@@ -2369,6 +4334,169 @@ func (m *DroppedTableDetails) MarshalTo(dAtA []byte) (int, error) {
 	return i, nil
 }
 
+func (m *SchemaChangeGCDetails) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SchemaChangeGCDetails) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.Indexes) > 0 {
+		for _, msg := range m.Indexes {
+			dAtA[i] = 0xa
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.Tables) > 0 {
+		for _, msg := range m.Tables {
+			dAtA[i] = 0x12
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if m.ParentID != 0 {
+		dAtA[i] = 0x18
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.ParentID))
+	}
+	if m.InterleavedTable != nil {
+		dAtA[i] = 0x22
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.InterleavedTable.Size()))
+		n23, err := m.InterleavedTable.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n23
+	}
+	if len(m.InterleavedIndexes) > 0 {
+		for _, msg := range m.InterleavedIndexes {
+			dAtA[i] = 0x2a
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if m.Tenant != nil {
+		dAtA[i] = 0x32
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.Tenant.Size()))
+		n24, err := m.Tenant.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n24
+	}
+	return i, nil
+}
+
+func (m *SchemaChangeGCDetails_DroppedIndex) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SchemaChangeGCDetails_DroppedIndex) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.IndexID != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.IndexID))
+	}
+	if m.DropTime != 0 {
+		dAtA[i] = 0x10
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.DropTime))
+	}
+	return i, nil
+}
+
+func (m *SchemaChangeGCDetails_DroppedID) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SchemaChangeGCDetails_DroppedID) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.ID != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.ID))
+	}
+	if m.DropTime != 0 {
+		dAtA[i] = 0x10
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.DropTime))
+	}
+	return i, nil
+}
+
+func (m *SchemaChangeGCDetails_DroppedTenant) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SchemaChangeGCDetails_DroppedTenant) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.ID != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.ID))
+	}
+	if m.DropTime != 0 {
+		dAtA[i] = 0x10
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.DropTime))
+	}
+	return i, nil
+}
+
 func (m *SchemaChangeDetails) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
@@ -2413,15 +4541,54 @@ func (m *SchemaChangeDetails) MarshalTo(dAtA []byte) (int, error) {
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.DroppedDatabaseID))
 	}
-	if m.TableID != 0 {
+	if m.DescID != 0 {
 		dAtA[i] = 0x28
 		i++
-		i = encodeVarintJobs(dAtA, i, uint64(m.TableID))
+		i = encodeVarintJobs(dAtA, i, uint64(m.DescID))
 	}
-	if m.MutationID != 0 {
+	if m.TableMutationID != 0 {
 		dAtA[i] = 0x30
 		i++
-		i = encodeVarintJobs(dAtA, i, uint64(m.MutationID))
+		i = encodeVarintJobs(dAtA, i, uint64(m.TableMutationID))
+	}
+	if m.FormatVersion != 0 {
+		dAtA[i] = 0x38
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.FormatVersion))
+	}
+	if len(m.DroppedTypes) > 0 {
+		dAtA26 := make([]byte, len(m.DroppedTypes)*10)
+		var j25 int
+		for _, num := range m.DroppedTypes {
+			for num >= 1<<7 {
+				dAtA26[j25] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j25++
+			}
+			dAtA26[j25] = uint8(num)
+			j25++
+		}
+		dAtA[i] = 0x42
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(j25))
+		i += copy(dAtA[i:], dAtA26[:j25])
+	}
+	if len(m.DroppedSchemas) > 0 {
+		dAtA28 := make([]byte, len(m.DroppedSchemas)*10)
+		var j27 int
+		for _, num := range m.DroppedSchemas {
+			for num >= 1<<7 {
+				dAtA28[j27] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j27++
+			}
+			dAtA28[j27] = uint8(num)
+			j27++
+		}
+		dAtA[i] = 0x4a
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(j27))
+		i += copy(dAtA[i:], dAtA28[:j27])
 	}
 	return i, nil
 }
@@ -2441,6 +4608,137 @@ func (m *SchemaChangeProgress) MarshalTo(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	return i, nil
+}
+
+func (m *SchemaChangeGCProgress) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SchemaChangeGCProgress) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if len(m.Indexes) > 0 {
+		for _, msg := range m.Indexes {
+			dAtA[i] = 0xa
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.Tables) > 0 {
+		for _, msg := range m.Tables {
+			dAtA[i] = 0x12
+			i++
+			i = encodeVarintJobs(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if m.Tenant != nil {
+		dAtA[i] = 0x1a
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.Tenant.Size()))
+		n29, err := m.Tenant.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n29
+	}
+	return i, nil
+}
+
+func (m *SchemaChangeGCProgress_IndexProgress) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SchemaChangeGCProgress_IndexProgress) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.IndexID != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.IndexID))
+	}
+	if m.Status != 0 {
+		dAtA[i] = 0x10
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.Status))
+	}
+	return i, nil
+}
+
+func (m *SchemaChangeGCProgress_TableProgress) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SchemaChangeGCProgress_TableProgress) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.ID != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.ID))
+	}
+	if m.Status != 0 {
+		dAtA[i] = 0x10
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.Status))
+	}
+	return i, nil
+}
+
+func (m *SchemaChangeGCProgress_TenantProgress) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SchemaChangeGCProgress_TenantProgress) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.Status != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.Status))
+	}
 	return i, nil
 }
 
@@ -2520,7 +4818,7 @@ func (m *ChangefeedDetails) MarshalTo(dAtA []byte) (int, error) {
 		for _, k := range keysForTargets {
 			dAtA[i] = 0x32
 			i++
-			v := m.Targets[github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(k)]
+			v := m.Targets[github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(k)]
 			msgSize := 0
 			if (&v) != nil {
 				msgSize = (&v).Size()
@@ -2534,21 +4832,21 @@ func (m *ChangefeedDetails) MarshalTo(dAtA []byte) (int, error) {
 			dAtA[i] = 0x12
 			i++
 			i = encodeVarintJobs(dAtA, i, uint64((&v).Size()))
-			n15, err := (&v).MarshalTo(dAtA[i:])
+			n30, err := (&v).MarshalTo(dAtA[i:])
 			if err != nil {
 				return 0, err
 			}
-			i += n15
+			i += n30
 		}
 	}
 	dAtA[i] = 0x3a
 	i++
 	i = encodeVarintJobs(dAtA, i, uint64(m.StatementTime.Size()))
-	n16, err := m.StatementTime.MarshalTo(dAtA[i:])
+	n31, err := m.StatementTime.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n16
+	i += n31
 	return i, nil
 }
 
@@ -2570,19 +4868,29 @@ func (m *ResolvedSpan) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintJobs(dAtA, i, uint64(m.Span.Size()))
-	n17, err := m.Span.MarshalTo(dAtA[i:])
+	n32, err := m.Span.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n17
+	i += n32
 	dAtA[i] = 0x12
 	i++
 	i = encodeVarintJobs(dAtA, i, uint64(m.Timestamp.Size()))
-	n18, err := m.Timestamp.MarshalTo(dAtA[i:])
+	n33, err := m.Timestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n18
+	i += n33
+	if m.BoundaryReached {
+		dAtA[i] = 0x18
+		i++
+		if m.BoundaryReached {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i++
+	}
 	return i, nil
 }
 
@@ -2613,6 +4921,14 @@ func (m *ChangefeedProgress) MarshalTo(dAtA []byte) (int, error) {
 			i += n
 		}
 	}
+	dAtA[i] = 0x1a
+	i++
+	i = encodeVarintJobs(dAtA, i, uint64(m.ProtectedTimestampRecord.Size()))
+	n34, err := m.ProtectedTimestampRecord.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n34
 	return i, nil
 }
 
@@ -2640,11 +4956,11 @@ func (m *CreateStatsDetails) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x12
 	i++
 	i = encodeVarintJobs(dAtA, i, uint64(m.Table.Size()))
-	n19, err := m.Table.MarshalTo(dAtA[i:])
+	n35, err := m.Table.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n19
+	i += n35
 	if len(m.ColumnStats) > 0 {
 		for _, msg := range m.ColumnStats {
 			dAtA[i] = 0x1a
@@ -2667,11 +4983,11 @@ func (m *CreateStatsDetails) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x2a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.AsOf.Size()))
-		n20, err := m.AsOf.MarshalTo(dAtA[i:])
+		n36, err := m.AsOf.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n20
+		i += n36
 	}
 	if len(m.FQTableName) > 0 {
 		dAtA[i] = 0x32
@@ -2704,21 +5020,21 @@ func (m *CreateStatsDetails_ColStat) MarshalTo(dAtA []byte) (int, error) {
 	var l int
 	_ = l
 	if len(m.ColumnIDs) > 0 {
-		dAtA22 := make([]byte, len(m.ColumnIDs)*10)
-		var j21 int
+		dAtA38 := make([]byte, len(m.ColumnIDs)*10)
+		var j37 int
 		for _, num := range m.ColumnIDs {
 			for num >= 1<<7 {
-				dAtA22[j21] = uint8(uint64(num)&0x7f | 0x80)
+				dAtA38[j37] = uint8(uint64(num)&0x7f | 0x80)
 				num >>= 7
-				j21++
+				j37++
 			}
-			dAtA22[j21] = uint8(num)
-			j21++
+			dAtA38[j37] = uint8(num)
+			j37++
 		}
 		dAtA[i] = 0xa
 		i++
-		i = encodeVarintJobs(dAtA, i, uint64(j21))
-		i += copy(dAtA[i:], dAtA22[:j21])
+		i = encodeVarintJobs(dAtA, i, uint64(j37))
+		i += copy(dAtA[i:], dAtA38[:j37])
 	}
 	if m.HasHistogram {
 		dAtA[i] = 0x10
@@ -2729,6 +5045,21 @@ func (m *CreateStatsDetails_ColStat) MarshalTo(dAtA []byte) (int, error) {
 			dAtA[i] = 0
 		}
 		i++
+	}
+	if m.Inverted {
+		dAtA[i] = 0x18
+		i++
+		if m.Inverted {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i++
+	}
+	if m.HistogramMaxBuckets != 0 {
+		dAtA[i] = 0x20
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.HistogramMaxBuckets))
 	}
 	return i, nil
 }
@@ -2744,6 +5075,52 @@ func (m *CreateStatsProgress) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *CreateStatsProgress) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	return i, nil
+}
+
+func (m *MigrationDetails) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *MigrationDetails) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.ClusterVersion != nil {
+		dAtA[i] = 0xa
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.ClusterVersion.Size()))
+		n39, err := m.ClusterVersion.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n39
+	}
+	return i, nil
+}
+
+func (m *MigrationProgress) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *MigrationProgress) MarshalTo(dAtA []byte) (int, error) {
 	var i int
 	_ = i
 	var l int
@@ -2772,11 +5149,11 @@ func (m *Payload) MarshalTo(dAtA []byte) (int, error) {
 		i = encodeVarintJobs(dAtA, i, uint64(len(m.Description)))
 		i += copy(dAtA[i:], m.Description)
 	}
-	if len(m.Username) > 0 {
+	if len(m.UsernameProto) > 0 {
 		dAtA[i] = 0x12
 		i++
-		i = encodeVarintJobs(dAtA, i, uint64(len(m.Username)))
-		i += copy(dAtA[i:], m.Username)
+		i = encodeVarintJobs(dAtA, i, uint64(len(m.UsernameProto)))
+		i += copy(dAtA[i:], m.UsernameProto)
 	}
 	if m.StartedMicros != 0 {
 		dAtA[i] = 0x18
@@ -2789,21 +5166,21 @@ func (m *Payload) MarshalTo(dAtA []byte) (int, error) {
 		i = encodeVarintJobs(dAtA, i, uint64(m.FinishedMicros))
 	}
 	if len(m.DescriptorIDs) > 0 {
-		dAtA24 := make([]byte, len(m.DescriptorIDs)*10)
-		var j23 int
+		dAtA41 := make([]byte, len(m.DescriptorIDs)*10)
+		var j40 int
 		for _, num := range m.DescriptorIDs {
 			for num >= 1<<7 {
-				dAtA24[j23] = uint8(uint64(num)&0x7f | 0x80)
+				dAtA41[j40] = uint8(uint64(num)&0x7f | 0x80)
 				num >>= 7
-				j23++
+				j40++
 			}
-			dAtA24[j23] = uint8(num)
-			j23++
+			dAtA41[j40] = uint8(num)
+			j40++
 		}
 		dAtA[i] = 0x32
 		i++
-		i = encodeVarintJobs(dAtA, i, uint64(j23))
-		i += copy(dAtA[i:], dAtA24[:j23])
+		i = encodeVarintJobs(dAtA, i, uint64(j40))
+		i += copy(dAtA[i:], dAtA41[:j40])
 	}
 	if len(m.Error) > 0 {
 		dAtA[i] = 0x42
@@ -2815,18 +5192,18 @@ func (m *Payload) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x4a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Lease.Size()))
-		n25, err := m.Lease.MarshalTo(dAtA[i:])
+		n42, err := m.Lease.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n25
+		i += n42
 	}
 	if m.Details != nil {
-		nn26, err := m.Details.MarshalTo(dAtA[i:])
+		nn43, err := m.Details.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += nn26
+		i += nn43
 	}
 	if len(m.Statement) > 0 {
 		dAtA[i] = 0x82
@@ -2870,11 +5247,11 @@ func (m *Payload) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x1
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.FinalResumeError.Size()))
-		n27, err := m.FinalResumeError.MarshalTo(dAtA[i:])
+		n44, err := m.FinalResumeError.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n27
+		i += n44
 	}
 	if m.Noncancelable {
 		dAtA[i] = 0xa0
@@ -2897,11 +5274,11 @@ func (m *Payload_Backup) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x52
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Backup.Size()))
-		n28, err := m.Backup.MarshalTo(dAtA[i:])
+		n45, err := m.Backup.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n28
+		i += n45
 	}
 	return i, nil
 }
@@ -2911,11 +5288,11 @@ func (m *Payload_Restore) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x5a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Restore.Size()))
-		n29, err := m.Restore.MarshalTo(dAtA[i:])
+		n46, err := m.Restore.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n29
+		i += n46
 	}
 	return i, nil
 }
@@ -2925,11 +5302,11 @@ func (m *Payload_SchemaChange) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x62
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.SchemaChange.Size()))
-		n30, err := m.SchemaChange.MarshalTo(dAtA[i:])
+		n47, err := m.SchemaChange.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n30
+		i += n47
 	}
 	return i, nil
 }
@@ -2939,11 +5316,11 @@ func (m *Payload_Import) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x6a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Import.Size()))
-		n31, err := m.Import.MarshalTo(dAtA[i:])
+		n48, err := m.Import.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n31
+		i += n48
 	}
 	return i, nil
 }
@@ -2953,11 +5330,11 @@ func (m *Payload_Changefeed) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x72
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Changefeed.Size()))
-		n32, err := m.Changefeed.MarshalTo(dAtA[i:])
+		n49, err := m.Changefeed.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n32
+		i += n49
 	}
 	return i, nil
 }
@@ -2967,11 +5344,91 @@ func (m *Payload_CreateStats) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x7a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.CreateStats.Size()))
-		n33, err := m.CreateStats.MarshalTo(dAtA[i:])
+		n50, err := m.CreateStats.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n33
+		i += n50
+	}
+	return i, nil
+}
+func (m *Payload_SchemaChangeGC) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.SchemaChangeGC != nil {
+		dAtA[i] = 0xaa
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.SchemaChangeGC.Size()))
+		n51, err := m.SchemaChangeGC.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n51
+	}
+	return i, nil
+}
+func (m *Payload_TypeSchemaChange) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.TypeSchemaChange != nil {
+		dAtA[i] = 0xb2
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.TypeSchemaChange.Size()))
+		n52, err := m.TypeSchemaChange.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n52
+	}
+	return i, nil
+}
+func (m *Payload_StreamIngestion) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.StreamIngestion != nil {
+		dAtA[i] = 0xba
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.StreamIngestion.Size()))
+		n53, err := m.StreamIngestion.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n53
+	}
+	return i, nil
+}
+func (m *Payload_NewSchemaChange) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.NewSchemaChange != nil {
+		dAtA[i] = 0xc2
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.NewSchemaChange.Size()))
+		n54, err := m.NewSchemaChange.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n54
+	}
+	return i, nil
+}
+func (m *Payload_Migration) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.Migration != nil {
+		dAtA[i] = 0xca
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.Migration.Size()))
+		n55, err := m.Migration.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n55
 	}
 	return i, nil
 }
@@ -2991,11 +5448,11 @@ func (m *Progress) MarshalTo(dAtA []byte) (int, error) {
 	var l int
 	_ = l
 	if m.Progress != nil {
-		nn34, err := m.Progress.MarshalTo(dAtA[i:])
+		nn56, err := m.Progress.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += nn34
+		i += nn56
 	}
 	if m.ModifiedMicros != 0 {
 		dAtA[i] = 0x10
@@ -3009,11 +5466,11 @@ func (m *Progress) MarshalTo(dAtA []byte) (int, error) {
 		i += copy(dAtA[i:], m.RunningStatus)
 	}
 	if m.Details != nil {
-		nn35, err := m.Details.MarshalTo(dAtA[i:])
+		nn57, err := m.Details.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += nn35
+		i += nn57
 	}
 	return i, nil
 }
@@ -3032,11 +5489,11 @@ func (m *Progress_HighWater) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x1a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.HighWater.Size()))
-		n36, err := m.HighWater.MarshalTo(dAtA[i:])
+		n58, err := m.HighWater.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n36
+		i += n58
 	}
 	return i, nil
 }
@@ -3046,11 +5503,11 @@ func (m *Progress_Backup) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x52
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Backup.Size()))
-		n37, err := m.Backup.MarshalTo(dAtA[i:])
+		n59, err := m.Backup.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n37
+		i += n59
 	}
 	return i, nil
 }
@@ -3060,11 +5517,11 @@ func (m *Progress_Restore) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x5a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Restore.Size()))
-		n38, err := m.Restore.MarshalTo(dAtA[i:])
+		n60, err := m.Restore.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n38
+		i += n60
 	}
 	return i, nil
 }
@@ -3074,11 +5531,11 @@ func (m *Progress_SchemaChange) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x62
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.SchemaChange.Size()))
-		n39, err := m.SchemaChange.MarshalTo(dAtA[i:])
+		n61, err := m.SchemaChange.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n39
+		i += n61
 	}
 	return i, nil
 }
@@ -3088,11 +5545,11 @@ func (m *Progress_Import) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x6a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Import.Size()))
-		n40, err := m.Import.MarshalTo(dAtA[i:])
+		n62, err := m.Import.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n40
+		i += n62
 	}
 	return i, nil
 }
@@ -3102,11 +5559,11 @@ func (m *Progress_Changefeed) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x72
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Changefeed.Size()))
-		n41, err := m.Changefeed.MarshalTo(dAtA[i:])
+		n63, err := m.Changefeed.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n41
+		i += n63
 	}
 	return i, nil
 }
@@ -3116,11 +5573,91 @@ func (m *Progress_CreateStats) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x7a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.CreateStats.Size()))
-		n42, err := m.CreateStats.MarshalTo(dAtA[i:])
+		n64, err := m.CreateStats.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n42
+		i += n64
+	}
+	return i, nil
+}
+func (m *Progress_SchemaChangeGC) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.SchemaChangeGC != nil {
+		dAtA[i] = 0x82
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.SchemaChangeGC.Size()))
+		n65, err := m.SchemaChangeGC.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n65
+	}
+	return i, nil
+}
+func (m *Progress_TypeSchemaChange) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.TypeSchemaChange != nil {
+		dAtA[i] = 0x8a
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.TypeSchemaChange.Size()))
+		n66, err := m.TypeSchemaChange.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n66
+	}
+	return i, nil
+}
+func (m *Progress_StreamIngest) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.StreamIngest != nil {
+		dAtA[i] = 0x92
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.StreamIngest.Size()))
+		n67, err := m.StreamIngest.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n67
+	}
+	return i, nil
+}
+func (m *Progress_NewSchemaChange) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.NewSchemaChange != nil {
+		dAtA[i] = 0x9a
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.NewSchemaChange.Size()))
+		n68, err := m.NewSchemaChange.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n68
+	}
+	return i, nil
+}
+func (m *Progress_Migration) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.Migration != nil {
+		dAtA[i] = 0xa2
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintJobs(dAtA, i, uint64(m.Migration.Size()))
+		n69, err := m.Migration.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n69
 	}
 	return i, nil
 }
@@ -3148,21 +5685,21 @@ func (m *Job) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x12
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Progress.Size()))
-		n43, err := m.Progress.MarshalTo(dAtA[i:])
+		n70, err := m.Progress.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n43
+		i += n70
 	}
 	if m.Payload != nil {
 		dAtA[i] = 0x1a
 		i++
 		i = encodeVarintJobs(dAtA, i, uint64(m.Payload.Size()))
-		n44, err := m.Payload.MarshalTo(dAtA[i:])
+		n71, err := m.Payload.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n44
+		i += n71
 	}
 	return i, nil
 }
@@ -3191,6 +5728,100 @@ func (m *Lease) Size() (n int) {
 	return n
 }
 
+func (m *BackupEncryptionOptions) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.Key)
+	if l > 0 {
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	if m.Mode != 0 {
+		n += 1 + sovJobs(uint64(m.Mode))
+	}
+	if m.KMSInfo != nil {
+		l = m.KMSInfo.Size()
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+
+func (m *BackupEncryptionOptions_KMSInfo) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.Uri)
+	if l > 0 {
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	l = len(m.EncryptedDataKey)
+	if l > 0 {
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+
+func (m *EncryptionInfo) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Scheme != 0 {
+		n += 1 + sovJobs(uint64(m.Scheme))
+	}
+	l = len(m.Salt)
+	if l > 0 {
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	if len(m.EncryptedDataKeyByKMSMasterKeyID) > 0 {
+		for k, v := range m.EncryptedDataKeyByKMSMasterKeyID {
+			_ = k
+			_ = v
+			l = 0
+			if len(v) > 0 {
+				l = 1 + len(v) + sovJobs(uint64(len(v)))
+			}
+			mapEntrySize := 1 + len(k) + sovJobs(uint64(len(k))) + l
+			n += mapEntrySize + 1 + sovJobs(uint64(mapEntrySize))
+		}
+	}
+	return n
+}
+
+func (m *StreamIngestionDetails) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.StreamAddress)
+	if l > 0 {
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	l = m.Span.Size()
+	n += 1 + l + sovJobs(uint64(l))
+	l = m.StartTime.Size()
+	n += 1 + l + sovJobs(uint64(l))
+	return n
+}
+
+func (m *StreamIngestionProgress) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.MarkedForCompletion {
+		n += 2
+	}
+	return n
+}
+
 func (m *BackupDetails) Size() (n int) {
 	if m == nil {
 		return 0
@@ -3205,7 +5836,7 @@ func (m *BackupDetails) Size() (n int) {
 	if l > 0 {
 		n += 1 + l + sovJobs(uint64(l))
 	}
-	l = len(m.BackupManifest)
+	l = len(m.DeprecatedBackupManifest)
 	if l > 0 {
 		n += 1 + l + sovJobs(uint64(l))
 	}
@@ -3217,8 +5848,20 @@ func (m *BackupDetails) Size() (n int) {
 			n += mapEntrySize + 1 + sovJobs(uint64(mapEntrySize))
 		}
 	}
-	if m.Encryption != nil {
-		l = m.Encryption.Size()
+	if m.EncryptionOptions != nil {
+		l = m.EncryptionOptions.Size()
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	if m.ProtectedTimestampRecord != nil {
+		l = m.ProtectedTimestampRecord.Size()
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	l = len(m.CollectionURI)
+	if l > 0 {
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	if m.EncryptionInfo != nil {
+		l = m.EncryptionInfo.Size()
 		n += 1 + l + sovJobs(uint64(l))
 	}
 	return n
@@ -3239,8 +5882,8 @@ func (m *RestoreDetails) Size() (n int) {
 	}
 	var l int
 	_ = l
-	if len(m.TableRewrites) > 0 {
-		for k, v := range m.TableRewrites {
+	if len(m.DescriptorRewrites) > 0 {
+		for k, v := range m.DescriptorRewrites {
 			_ = k
 			_ = v
 			l = 0
@@ -3282,7 +5925,7 @@ func (m *RestoreDetails) Size() (n int) {
 	if m.StatsInserted {
 		n += 2
 	}
-	if m.TablesPublished {
+	if m.DescriptorsPublished {
 		n += 2
 	}
 	if m.DescriptorCoverage != 0 {
@@ -3292,20 +5935,47 @@ func (m *RestoreDetails) Size() (n int) {
 		l = m.Encryption.Size()
 		n += 1 + l + sovJobs(uint64(l))
 	}
+	if len(m.Tenants) > 0 {
+		for _, e := range m.Tenants {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	if len(m.TypeDescs) > 0 {
+		for _, e := range m.TypeDescs {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	if len(m.SchemaDescs) > 0 {
+		for _, e := range m.SchemaDescs {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	if len(m.DatabaseDescs) > 0 {
+		for _, e := range m.DatabaseDescs {
+			l = e.Size()
+			n += 2 + l + sovJobs(uint64(l))
+		}
+	}
 	return n
 }
 
-func (m *RestoreDetails_TableRewrite) Size() (n int) {
+func (m *RestoreDetails_DescriptorRewrite) Size() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	if m.TableID != 0 {
-		n += 1 + sovJobs(uint64(m.TableID))
+	if m.ID != 0 {
+		n += 1 + sovJobs(uint64(m.ID))
 	}
 	if m.ParentID != 0 {
 		n += 1 + sovJobs(uint64(m.ParentID))
+	}
+	if m.ToExisting {
+		n += 2
 	}
 	return n
 }
@@ -3394,6 +6064,9 @@ func (m *ImportDetails) Size() (n int) {
 	if m.TablesPublished {
 		n += 2
 	}
+	if m.ParseBundleSchema {
+		n += 2
+	}
 	if m.ProtectedTimestampRecord != nil {
 		l = m.ProtectedTimestampRecord.Size()
 		n += 2 + l + sovJobs(uint64(l))
@@ -3427,6 +6100,67 @@ func (m *ImportDetails_Table) Size() (n int) {
 			n += 2 + l + sovJobs(uint64(l))
 		}
 	}
+	if m.WasEmpty {
+		n += 3
+	}
+	return n
+}
+
+func (m *SequenceValChunk) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.ChunkStartVal != 0 {
+		n += 1 + sovJobs(uint64(m.ChunkStartVal))
+	}
+	if m.ChunkSize != 0 {
+		n += 1 + sovJobs(uint64(m.ChunkSize))
+	}
+	if m.ChunkStartRow != 0 {
+		n += 1 + sovJobs(uint64(m.ChunkStartRow))
+	}
+	if m.NextChunkStartRow != 0 {
+		n += 1 + sovJobs(uint64(m.NextChunkStartRow))
+	}
+	return n
+}
+
+func (m *SequenceDetails) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.SeqIdToChunks) > 0 {
+		for k, v := range m.SeqIdToChunks {
+			_ = k
+			_ = v
+			l = 0
+			if v != nil {
+				l = v.Size()
+				l += 1 + sovJobs(uint64(l))
+			}
+			mapEntrySize := 1 + sovJobs(uint64(k)) + l
+			n += mapEntrySize + 1 + sovJobs(uint64(mapEntrySize))
+		}
+	}
+	return n
+}
+
+func (m *SequenceDetails_SequenceChunks) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Chunks) > 0 {
+		for _, e := range m.Chunks {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
 	return n
 }
 
@@ -3454,6 +6188,70 @@ func (m *ImportProgress) Size() (n int) {
 	if len(m.ResumePos) > 0 {
 		l = 0
 		for _, e := range m.ResumePos {
+			l += sovJobs(uint64(e))
+		}
+		n += 1 + sovJobs(uint64(l)) + l
+	}
+	if len(m.SequenceDetails) > 0 {
+		for _, e := range m.SequenceDetails {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	return n
+}
+
+func (m *TypeSchemaChangeDetails) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.TypeID != 0 {
+		n += 1 + sovJobs(uint64(m.TypeID))
+	}
+	if len(m.TransitioningMembers) > 0 {
+		for _, b := range m.TransitioningMembers {
+			l = len(b)
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	return n
+}
+
+func (m *TypeSchemaChangeProgress) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	return n
+}
+
+func (m *NewSchemaChangeDetails) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Targets) > 0 {
+		for _, e := range m.Targets {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	return n
+}
+
+func (m *NewSchemaChangeProgress) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.States) > 0 {
+		l = 0
+		for _, e := range m.States {
 			l += sovJobs(uint64(e))
 		}
 		n += 1 + sovJobs(uint64(l)) + l
@@ -3495,6 +6293,89 @@ func (m *DroppedTableDetails) Size() (n int) {
 	return n
 }
 
+func (m *SchemaChangeGCDetails) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Indexes) > 0 {
+		for _, e := range m.Indexes {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	if len(m.Tables) > 0 {
+		for _, e := range m.Tables {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	if m.ParentID != 0 {
+		n += 1 + sovJobs(uint64(m.ParentID))
+	}
+	if m.InterleavedTable != nil {
+		l = m.InterleavedTable.Size()
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	if len(m.InterleavedIndexes) > 0 {
+		for _, e := range m.InterleavedIndexes {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	if m.Tenant != nil {
+		l = m.Tenant.Size()
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+
+func (m *SchemaChangeGCDetails_DroppedIndex) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.IndexID != 0 {
+		n += 1 + sovJobs(uint64(m.IndexID))
+	}
+	if m.DropTime != 0 {
+		n += 1 + sovJobs(uint64(m.DropTime))
+	}
+	return n
+}
+
+func (m *SchemaChangeGCDetails_DroppedID) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.ID != 0 {
+		n += 1 + sovJobs(uint64(m.ID))
+	}
+	if m.DropTime != 0 {
+		n += 1 + sovJobs(uint64(m.DropTime))
+	}
+	return n
+}
+
+func (m *SchemaChangeGCDetails_DroppedTenant) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.ID != 0 {
+		n += 1 + sovJobs(uint64(m.ID))
+	}
+	if m.DropTime != 0 {
+		n += 1 + sovJobs(uint64(m.DropTime))
+	}
+	return n
+}
+
 func (m *SchemaChangeDetails) Size() (n int) {
 	if m == nil {
 		return 0
@@ -3516,11 +6397,28 @@ func (m *SchemaChangeDetails) Size() (n int) {
 	if m.DroppedDatabaseID != 0 {
 		n += 1 + sovJobs(uint64(m.DroppedDatabaseID))
 	}
-	if m.TableID != 0 {
-		n += 1 + sovJobs(uint64(m.TableID))
+	if m.DescID != 0 {
+		n += 1 + sovJobs(uint64(m.DescID))
 	}
-	if m.MutationID != 0 {
-		n += 1 + sovJobs(uint64(m.MutationID))
+	if m.TableMutationID != 0 {
+		n += 1 + sovJobs(uint64(m.TableMutationID))
+	}
+	if m.FormatVersion != 0 {
+		n += 1 + sovJobs(uint64(m.FormatVersion))
+	}
+	if len(m.DroppedTypes) > 0 {
+		l = 0
+		for _, e := range m.DroppedTypes {
+			l += sovJobs(uint64(e))
+		}
+		n += 1 + sovJobs(uint64(l)) + l
+	}
+	if len(m.DroppedSchemas) > 0 {
+		l = 0
+		for _, e := range m.DroppedSchemas {
+			l += sovJobs(uint64(e))
+		}
+		n += 1 + sovJobs(uint64(l)) + l
 	}
 	return n
 }
@@ -3531,6 +6429,73 @@ func (m *SchemaChangeProgress) Size() (n int) {
 	}
 	var l int
 	_ = l
+	return n
+}
+
+func (m *SchemaChangeGCProgress) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Indexes) > 0 {
+		for _, e := range m.Indexes {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	if len(m.Tables) > 0 {
+		for _, e := range m.Tables {
+			l = e.Size()
+			n += 1 + l + sovJobs(uint64(l))
+		}
+	}
+	if m.Tenant != nil {
+		l = m.Tenant.Size()
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+
+func (m *SchemaChangeGCProgress_IndexProgress) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.IndexID != 0 {
+		n += 1 + sovJobs(uint64(m.IndexID))
+	}
+	if m.Status != 0 {
+		n += 1 + sovJobs(uint64(m.Status))
+	}
+	return n
+}
+
+func (m *SchemaChangeGCProgress_TableProgress) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.ID != 0 {
+		n += 1 + sovJobs(uint64(m.ID))
+	}
+	if m.Status != 0 {
+		n += 1 + sovJobs(uint64(m.Status))
+	}
+	return n
+}
+
+func (m *SchemaChangeGCProgress_TenantProgress) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Status != 0 {
+		n += 1 + sovJobs(uint64(m.Status))
+	}
 	return n
 }
 
@@ -3589,6 +6554,9 @@ func (m *ResolvedSpan) Size() (n int) {
 	n += 1 + l + sovJobs(uint64(l))
 	l = m.Timestamp.Size()
 	n += 1 + l + sovJobs(uint64(l))
+	if m.BoundaryReached {
+		n += 2
+	}
 	return n
 }
 
@@ -3604,6 +6572,8 @@ func (m *ChangefeedProgress) Size() (n int) {
 			n += 1 + l + sovJobs(uint64(l))
 		}
 	}
+	l = m.ProtectedTimestampRecord.Size()
+	n += 1 + l + sovJobs(uint64(l))
 	return n
 }
 
@@ -3659,10 +6629,38 @@ func (m *CreateStatsDetails_ColStat) Size() (n int) {
 	if m.HasHistogram {
 		n += 2
 	}
+	if m.Inverted {
+		n += 2
+	}
+	if m.HistogramMaxBuckets != 0 {
+		n += 1 + sovJobs(uint64(m.HistogramMaxBuckets))
+	}
 	return n
 }
 
 func (m *CreateStatsProgress) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	return n
+}
+
+func (m *MigrationDetails) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.ClusterVersion != nil {
+		l = m.ClusterVersion.Size()
+		n += 1 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+
+func (m *MigrationProgress) Size() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3681,7 +6679,7 @@ func (m *Payload) Size() (n int) {
 	if l > 0 {
 		n += 1 + l + sovJobs(uint64(l))
 	}
-	l = len(m.Username)
+	l = len(m.UsernameProto)
 	if l > 0 {
 		n += 1 + l + sovJobs(uint64(l))
 	}
@@ -3807,6 +6805,66 @@ func (m *Payload_CreateStats) Size() (n int) {
 	}
 	return n
 }
+func (m *Payload_SchemaChangeGC) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.SchemaChangeGC != nil {
+		l = m.SchemaChangeGC.Size()
+		n += 2 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+func (m *Payload_TypeSchemaChange) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.TypeSchemaChange != nil {
+		l = m.TypeSchemaChange.Size()
+		n += 2 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+func (m *Payload_StreamIngestion) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.StreamIngestion != nil {
+		l = m.StreamIngestion.Size()
+		n += 2 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+func (m *Payload_NewSchemaChange) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.NewSchemaChange != nil {
+		l = m.NewSchemaChange.Size()
+		n += 2 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+func (m *Payload_Migration) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Migration != nil {
+		l = m.Migration.Size()
+		n += 2 + l + sovJobs(uint64(l))
+	}
+	return n
+}
 func (m *Progress) Size() (n int) {
 	if m == nil {
 		return 0
@@ -3922,6 +6980,66 @@ func (m *Progress_CreateStats) Size() (n int) {
 	}
 	return n
 }
+func (m *Progress_SchemaChangeGC) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.SchemaChangeGC != nil {
+		l = m.SchemaChangeGC.Size()
+		n += 2 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+func (m *Progress_TypeSchemaChange) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.TypeSchemaChange != nil {
+		l = m.TypeSchemaChange.Size()
+		n += 2 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+func (m *Progress_StreamIngest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.StreamIngest != nil {
+		l = m.StreamIngest.Size()
+		n += 2 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+func (m *Progress_NewSchemaChange) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.NewSchemaChange != nil {
+		l = m.NewSchemaChange.Size()
+		n += 2 + l + sovJobs(uint64(l))
+	}
+	return n
+}
+func (m *Progress_Migration) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Migration != nil {
+		l = m.Migration.Size()
+		n += 2 + l + sovJobs(uint64(l))
+	}
+	return n
+}
 func (m *Job) Size() (n int) {
 	if m == nil {
 		return 0
@@ -4028,7 +7146,678 @@ func (m *Lease) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *BackupEncryptionOptions) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: BackupEncryptionOptions: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: BackupEncryptionOptions: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Key = append(m.Key[:0], dAtA[iNdEx:postIndex]...)
+			if m.Key == nil {
+				m.Key = []byte{}
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Mode", wireType)
+			}
+			m.Mode = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Mode |= (EncryptionMode(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field KMSInfo", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.KMSInfo == nil {
+				m.KMSInfo = &BackupEncryptionOptions_KMSInfo{}
+			}
+			if err := m.KMSInfo.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *BackupEncryptionOptions_KMSInfo) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: KMSInfo: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: KMSInfo: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Uri", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Uri = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field EncryptedDataKey", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.EncryptedDataKey = append(m.EncryptedDataKey[:0], dAtA[iNdEx:postIndex]...)
+			if m.EncryptedDataKey == nil {
+				m.EncryptedDataKey = []byte{}
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *EncryptionInfo) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: EncryptionInfo: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: EncryptionInfo: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Scheme", wireType)
+			}
+			m.Scheme = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Scheme |= (EncryptionInfo_Scheme(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Salt", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Salt = append(m.Salt[:0], dAtA[iNdEx:postIndex]...)
+			if m.Salt == nil {
+				m.Salt = []byte{}
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field EncryptedDataKeyByKMSMasterKeyID", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.EncryptedDataKeyByKMSMasterKeyID == nil {
+				m.EncryptedDataKeyByKMSMasterKeyID = make(map[string][]byte)
+			}
+			var mapkey string
+			mapvalue := []byte{}
+			for iNdEx < postIndex {
+				entryPreIndex := iNdEx
+				var wire uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowJobs
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					wire |= (uint64(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				fieldNum := int32(wire >> 3)
+				if fieldNum == 1 {
+					var stringLenmapkey uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowJobs
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						stringLenmapkey |= (uint64(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					intStringLenmapkey := int(stringLenmapkey)
+					if intStringLenmapkey < 0 {
+						return ErrInvalidLengthJobs
+					}
+					postStringIndexmapkey := iNdEx + intStringLenmapkey
+					if postStringIndexmapkey > l {
+						return io.ErrUnexpectedEOF
+					}
+					mapkey = string(dAtA[iNdEx:postStringIndexmapkey])
+					iNdEx = postStringIndexmapkey
+				} else if fieldNum == 2 {
+					var mapbyteLen uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowJobs
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						mapbyteLen |= (uint64(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					intMapbyteLen := int(mapbyteLen)
+					if intMapbyteLen < 0 {
+						return ErrInvalidLengthJobs
+					}
+					postbytesIndex := iNdEx + intMapbyteLen
+					if postbytesIndex > l {
+						return io.ErrUnexpectedEOF
+					}
+					mapvalue = make([]byte, mapbyteLen)
+					copy(mapvalue, dAtA[iNdEx:postbytesIndex])
+					iNdEx = postbytesIndex
+				} else {
+					iNdEx = entryPreIndex
+					skippy, err := skipJobs(dAtA[iNdEx:])
+					if err != nil {
+						return err
+					}
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
+						return ErrInvalidLengthJobs
+					}
+					if (iNdEx + skippy) > postIndex {
+						return io.ErrUnexpectedEOF
+					}
+					iNdEx += skippy
+				}
+			}
+			m.EncryptedDataKeyByKMSMasterKeyID[mapkey] = mapvalue
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *StreamIngestionDetails) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: StreamIngestionDetails: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: StreamIngestionDetails: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StreamAddress", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.StreamAddress = github_com_cockroachdb_cockroach_pkg_ccl_streamingccl.StreamAddress(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Span", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Span.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StartTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.StartTime.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *StreamIngestionProgress) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: StreamIngestionProgress: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: StreamIngestionProgress: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MarkedForCompletion", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.MarkedForCompletion = bool(v != 0)
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -4163,7 +7952,7 @@ func (m *BackupDetails) Unmarshal(dAtA []byte) error {
 			iNdEx = postIndex
 		case 4:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field BackupManifest", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedBackupManifest", wireType)
 			}
 			var byteLen int
 			for shift := uint(0); ; shift += 7 {
@@ -4187,9 +7976,9 @@ func (m *BackupDetails) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.BackupManifest = append(m.BackupManifest[:0], dAtA[iNdEx:postIndex]...)
-			if m.BackupManifest == nil {
-				m.BackupManifest = []byte{}
+			m.DeprecatedBackupManifest = append(m.DeprecatedBackupManifest[:0], dAtA[iNdEx:postIndex]...)
+			if m.DeprecatedBackupManifest == nil {
+				m.DeprecatedBackupManifest = []byte{}
 			}
 			iNdEx = postIndex
 		case 5:
@@ -4299,7 +8088,7 @@ func (m *BackupDetails) Unmarshal(dAtA []byte) error {
 					if err != nil {
 						return err
 					}
-					if skippy < 0 {
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
 						return ErrInvalidLengthJobs
 					}
 					if (iNdEx + skippy) > postIndex {
@@ -4312,7 +8101,7 @@ func (m *BackupDetails) Unmarshal(dAtA []byte) error {
 			iNdEx = postIndex
 		case 6:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Encryption", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field EncryptionOptions", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -4336,10 +8125,104 @@ func (m *BackupDetails) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.Encryption == nil {
-				m.Encryption = &roachpb.FileEncryptionOptions{}
+			if m.EncryptionOptions == nil {
+				m.EncryptionOptions = &BackupEncryptionOptions{}
 			}
-			if err := m.Encryption.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.EncryptionOptions.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 7:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ProtectedTimestampRecord", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			var v github_com_cockroachdb_cockroach_pkg_util_uuid.UUID
+			m.ProtectedTimestampRecord = &v
+			if err := m.ProtectedTimestampRecord.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 8:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CollectionURI", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.CollectionURI = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 9:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field EncryptionInfo", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.EncryptionInfo == nil {
+				m.EncryptionInfo = &EncryptionInfo{}
+			}
+			if err := m.EncryptionInfo.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -4349,7 +8232,7 @@ func (m *BackupDetails) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -4399,7 +8282,7 @@ func (m *BackupProgress) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -4445,7 +8328,7 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 		switch fieldNum {
 		case 2:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field TableRewrites", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DescriptorRewrites", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -4469,11 +8352,11 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.TableRewrites == nil {
-				m.TableRewrites = make(map[github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID]*RestoreDetails_TableRewrite)
+			if m.DescriptorRewrites == nil {
+				m.DescriptorRewrites = make(map[github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID]*RestoreDetails_DescriptorRewrite)
 			}
 			var mapkey uint32
-			var mapvalue *RestoreDetails_TableRewrite
+			var mapvalue *RestoreDetails_DescriptorRewrite
 			for iNdEx < postIndex {
 				entryPreIndex := iNdEx
 				var wire uint64
@@ -4533,7 +8416,7 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 					if postmsgIndex > l {
 						return io.ErrUnexpectedEOF
 					}
-					mapvalue = &RestoreDetails_TableRewrite{}
+					mapvalue = &RestoreDetails_DescriptorRewrite{}
 					if err := mapvalue.Unmarshal(dAtA[iNdEx:postmsgIndex]); err != nil {
 						return err
 					}
@@ -4544,7 +8427,7 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 					if err != nil {
 						return err
 					}
-					if skippy < 0 {
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
 						return ErrInvalidLengthJobs
 					}
 					if (iNdEx + skippy) > postIndex {
@@ -4553,7 +8436,7 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 					iNdEx += skippy
 				}
 			}
-			m.TableRewrites[github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(mapkey)] = mapvalue
+			m.DescriptorRewrites[github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(mapkey)] = mapvalue
 			iNdEx = postIndex
 		case 3:
 			if wireType != 2 {
@@ -4640,7 +8523,7 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.TableDescs = append(m.TableDescs, &sqlbase.TableDescriptor{})
+			m.TableDescs = append(m.TableDescs, &descpb.TableDescriptor{})
 			if err := m.TableDescs[len(m.TableDescs)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -4747,7 +8630,7 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 			m.StatsInserted = bool(v != 0)
 		case 10:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field TablesPublished", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DescriptorsPublished", wireType)
 			}
 			var v int
 			for shift := uint(0); ; shift += 7 {
@@ -4764,7 +8647,7 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
-			m.TablesPublished = bool(v != 0)
+			m.DescriptorsPublished = bool(v != 0)
 		case 11:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field DescriptorCoverage", wireType)
@@ -4811,9 +8694,133 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if m.Encryption == nil {
-				m.Encryption = &roachpb.FileEncryptionOptions{}
+				m.Encryption = &BackupEncryptionOptions{}
 			}
 			if err := m.Encryption.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 13:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Tenants", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Tenants = append(m.Tenants, descpb.TenantInfo{})
+			if err := m.Tenants[len(m.Tenants)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 14:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field TypeDescs", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.TypeDescs = append(m.TypeDescs, &descpb.TypeDescriptor{})
+			if err := m.TypeDescs[len(m.TypeDescs)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 15:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SchemaDescs", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.SchemaDescs = append(m.SchemaDescs, &descpb.SchemaDescriptor{})
+			if err := m.SchemaDescs[len(m.SchemaDescs)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 16:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DatabaseDescs", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.DatabaseDescs = append(m.DatabaseDescs, &descpb.DatabaseDescriptor{})
+			if err := m.DatabaseDescs[len(m.DatabaseDescs)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -4823,7 +8830,7 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -4838,7 +8845,7 @@ func (m *RestoreDetails) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *RestoreDetails_TableRewrite) Unmarshal(dAtA []byte) error {
+func (m *RestoreDetails_DescriptorRewrite) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -4861,17 +8868,17 @@ func (m *RestoreDetails_TableRewrite) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: TableRewrite: wiretype end group for non-group")
+			return fmt.Errorf("proto: DescriptorRewrite: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: TableRewrite: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: DescriptorRewrite: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field TableID", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field ID", wireType)
 			}
-			m.TableID = 0
+			m.ID = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowJobs
@@ -4881,7 +8888,7 @@ func (m *RestoreDetails_TableRewrite) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.TableID |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(b) & 0x7F) << shift
+				m.ID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
@@ -4900,18 +8907,38 @@ func (m *RestoreDetails_TableRewrite) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.ParentID |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(b) & 0x7F) << shift
+				m.ParentID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ToExisting", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.ToExisting = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipJobs(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -5062,7 +9089,7 @@ func (m *RestoreDetails_BackupLocalityInfo) Unmarshal(dAtA []byte) error {
 					if err != nil {
 						return err
 					}
-					if skippy < 0 {
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
 						return ErrInvalidLengthJobs
 					}
 					if (iNdEx + skippy) > postIndex {
@@ -5079,7 +9106,7 @@ func (m *RestoreDetails_BackupLocalityInfo) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -5160,7 +9187,7 @@ func (m *RestoreProgress) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -5346,7 +9373,7 @@ func (m *ImportDetails) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.ParentID |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(b) & 0x7F) << shift
+				m.ParentID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
@@ -5508,6 +9535,26 @@ func (m *ImportDetails) Unmarshal(dAtA []byte) error {
 				}
 			}
 			m.TablesPublished = bool(v != 0)
+		case 14:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ParseBundleSchema", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.ParseBundleSchema = bool(v != 0)
 		case 22:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field ProtectedTimestampRecord", wireType)
@@ -5546,7 +9593,7 @@ func (m *ImportDetails) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -5617,7 +9664,7 @@ func (m *ImportDetails_Table) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if m.Desc == nil {
-				m.Desc = &sqlbase.TableDescriptor{}
+				m.Desc = &descpb.TableDescriptor{}
 			}
 			if err := m.Desc.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
@@ -5720,13 +9767,402 @@ func (m *ImportDetails_Table) Unmarshal(dAtA []byte) error {
 			}
 			m.TargetCols = append(m.TargetCols, string(dAtA[iNdEx:postIndex]))
 			iNdEx = postIndex
+		case 22:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field WasEmpty", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.WasEmpty = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipJobs(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SequenceValChunk) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: SequenceValChunk: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: SequenceValChunk: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ChunkStartVal", wireType)
+			}
+			m.ChunkStartVal = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ChunkStartVal |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ChunkSize", wireType)
+			}
+			m.ChunkSize = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ChunkSize |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ChunkStartRow", wireType)
+			}
+			m.ChunkStartRow = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ChunkStartRow |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 4:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field NextChunkStartRow", wireType)
+			}
+			m.NextChunkStartRow = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.NextChunkStartRow |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SequenceDetails) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: SequenceDetails: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: SequenceDetails: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SeqIdToChunks", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.SeqIdToChunks == nil {
+				m.SeqIdToChunks = make(map[int32]*SequenceDetails_SequenceChunks)
+			}
+			var mapkey int32
+			var mapvalue *SequenceDetails_SequenceChunks
+			for iNdEx < postIndex {
+				entryPreIndex := iNdEx
+				var wire uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowJobs
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					wire |= (uint64(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				fieldNum := int32(wire >> 3)
+				if fieldNum == 1 {
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowJobs
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						mapkey |= (int32(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+				} else if fieldNum == 2 {
+					var mapmsglen int
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowJobs
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						mapmsglen |= (int(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					if mapmsglen < 0 {
+						return ErrInvalidLengthJobs
+					}
+					postmsgIndex := iNdEx + mapmsglen
+					if mapmsglen < 0 {
+						return ErrInvalidLengthJobs
+					}
+					if postmsgIndex > l {
+						return io.ErrUnexpectedEOF
+					}
+					mapvalue = &SequenceDetails_SequenceChunks{}
+					if err := mapvalue.Unmarshal(dAtA[iNdEx:postmsgIndex]); err != nil {
+						return err
+					}
+					iNdEx = postmsgIndex
+				} else {
+					iNdEx = entryPreIndex
+					skippy, err := skipJobs(dAtA[iNdEx:])
+					if err != nil {
+						return err
+					}
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
+						return ErrInvalidLengthJobs
+					}
+					if (iNdEx + skippy) > postIndex {
+						return io.ErrUnexpectedEOF
+					}
+					iNdEx += skippy
+				}
+			}
+			m.SeqIdToChunks[mapkey] = mapvalue
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SequenceDetails_SequenceChunks) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: SequenceChunks: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: SequenceChunks: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Chunks", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Chunks = append(m.Chunks, &SequenceValChunk{})
+			if err := m.Chunks[len(m.Chunks)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -6027,13 +10463,389 @@ func (m *ImportProgress) Unmarshal(dAtA []byte) error {
 			} else {
 				return fmt.Errorf("proto: wrong wireType = %d for field ResumePos", wireType)
 			}
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SequenceDetails", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.SequenceDetails = append(m.SequenceDetails, &SequenceDetails{})
+			if err := m.SequenceDetails[len(m.SequenceDetails)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipJobs(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *TypeSchemaChangeDetails) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: TypeSchemaChangeDetails: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: TypeSchemaChangeDetails: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field TypeID", wireType)
+			}
+			m.TypeID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.TypeID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field TransitioningMembers", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.TransitioningMembers = append(m.TransitioningMembers, make([]byte, postIndex-iNdEx))
+			copy(m.TransitioningMembers[len(m.TransitioningMembers)-1], dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *TypeSchemaChangeProgress) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: TypeSchemaChangeProgress: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: TypeSchemaChangeProgress: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *NewSchemaChangeDetails) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: NewSchemaChangeDetails: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: NewSchemaChangeDetails: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Targets", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Targets = append(m.Targets, &scpb.Target{})
+			if err := m.Targets[len(m.Targets)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *NewSchemaChangeProgress) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: NewSchemaChangeProgress: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: NewSchemaChangeProgress: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType == 0 {
+				var v scpb.State
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowJobs
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= (scpb.State(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.States = append(m.States, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowJobs
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthJobs
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				if elementCount != 0 && len(m.States) == 0 {
+					m.States = make([]scpb.State, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v scpb.State
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowJobs
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= (scpb.State(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.States = append(m.States, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field States", wireType)
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -6114,7 +10926,7 @@ func (m *ResumeSpanList) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -6201,7 +11013,7 @@ func (m *DroppedTableDetails) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.ID |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(b) & 0x7F) << shift
+				m.ID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
@@ -6231,7 +11043,499 @@ func (m *DroppedTableDetails) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SchemaChangeGCDetails) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: SchemaChangeGCDetails: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: SchemaChangeGCDetails: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Indexes", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Indexes = append(m.Indexes, SchemaChangeGCDetails_DroppedIndex{})
+			if err := m.Indexes[len(m.Indexes)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Tables", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Tables = append(m.Tables, SchemaChangeGCDetails_DroppedID{})
+			if err := m.Tables[len(m.Tables)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ParentID", wireType)
+			}
+			m.ParentID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ParentID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InterleavedTable", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.InterleavedTable == nil {
+				m.InterleavedTable = &descpb.TableDescriptor{}
+			}
+			if err := m.InterleavedTable.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 5:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InterleavedIndexes", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.InterleavedIndexes = append(m.InterleavedIndexes, descpb.IndexDescriptor{})
+			if err := m.InterleavedIndexes[len(m.InterleavedIndexes)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Tenant", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Tenant == nil {
+				m.Tenant = &SchemaChangeGCDetails_DroppedTenant{}
+			}
+			if err := m.Tenant.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SchemaChangeGCDetails_DroppedIndex) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: DroppedIndex: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: DroppedIndex: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IndexID", wireType)
+			}
+			m.IndexID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.IndexID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.IndexID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DropTime", wireType)
+			}
+			m.DropTime = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.DropTime |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SchemaChangeGCDetails_DroppedID) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: DroppedID: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: DroppedID: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ID", wireType)
+			}
+			m.ID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DropTime", wireType)
+			}
+			m.DropTime = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.DropTime |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SchemaChangeGCDetails_DroppedTenant) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: DroppedTenant: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: DroppedTenant: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ID", wireType)
+			}
+			m.ID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ID |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DropTime", wireType)
+			}
+			m.DropTime = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.DropTime |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -6351,16 +11655,16 @@ func (m *SchemaChangeDetails) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.DroppedDatabaseID |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(b) & 0x7F) << shift
+				m.DroppedDatabaseID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
 		case 5:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field TableID", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DescID", wireType)
 			}
-			m.TableID = 0
+			m.DescID = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowJobs
@@ -6370,16 +11674,16 @@ func (m *SchemaChangeDetails) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.TableID |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(b) & 0x7F) << shift
+				m.DescID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
 		case 6:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field MutationID", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field TableMutationID", wireType)
 			}
-			m.MutationID = 0
+			m.TableMutationID = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowJobs
@@ -6389,10 +11693,175 @@ func (m *SchemaChangeDetails) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.MutationID |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.MutationID(b) & 0x7F) << shift
+				m.TableMutationID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.MutationID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
+			}
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field FormatVersion", wireType)
+			}
+			m.FormatVersion = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.FormatVersion |= (SchemaChangeDetailsFormatVersion(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 8:
+			if wireType == 0 {
+				var v github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowJobs
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.DroppedTypes = append(m.DroppedTypes, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowJobs
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthJobs
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.DroppedTypes) == 0 {
+					m.DroppedTypes = make([]github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowJobs
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.DroppedTypes = append(m.DroppedTypes, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field DroppedTypes", wireType)
+			}
+		case 9:
+			if wireType == 0 {
+				var v github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowJobs
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.DroppedSchemas = append(m.DroppedSchemas, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowJobs
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthJobs
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.DroppedSchemas) == 0 {
+					m.DroppedSchemas = make([]github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowJobs
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.DroppedSchemas = append(m.DroppedSchemas, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field DroppedSchemas", wireType)
 			}
 		default:
 			iNdEx = preIndex
@@ -6400,7 +11869,7 @@ func (m *SchemaChangeDetails) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -6450,7 +11919,397 @@ func (m *SchemaChangeProgress) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SchemaChangeGCProgress) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: SchemaChangeGCProgress: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: SchemaChangeGCProgress: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Indexes", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Indexes = append(m.Indexes, SchemaChangeGCProgress_IndexProgress{})
+			if err := m.Indexes[len(m.Indexes)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Tables", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Tables = append(m.Tables, SchemaChangeGCProgress_TableProgress{})
+			if err := m.Tables[len(m.Tables)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Tenant", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Tenant == nil {
+				m.Tenant = &SchemaChangeGCProgress_TenantProgress{}
+			}
+			if err := m.Tenant.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SchemaChangeGCProgress_IndexProgress) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: IndexProgress: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: IndexProgress: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IndexID", wireType)
+			}
+			m.IndexID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.IndexID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.IndexID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Status", wireType)
+			}
+			m.Status = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Status |= (SchemaChangeGCProgress_Status(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SchemaChangeGCProgress_TableProgress) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: TableProgress: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: TableProgress: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ID", wireType)
+			}
+			m.ID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ID |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Status", wireType)
+			}
+			m.Status = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Status |= (SchemaChangeGCProgress_Status(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SchemaChangeGCProgress_TenantProgress) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: TenantProgress: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: TenantProgress: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Status", wireType)
+			}
+			m.Status = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Status |= (SchemaChangeGCProgress_Status(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -6529,7 +12388,7 @@ func (m *ChangefeedTarget) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -6709,7 +12568,7 @@ func (m *ChangefeedDetails) Unmarshal(dAtA []byte) error {
 					if err != nil {
 						return err
 					}
-					if skippy < 0 {
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
 						return ErrInvalidLengthJobs
 					}
 					if (iNdEx + skippy) > postIndex {
@@ -6821,7 +12680,7 @@ func (m *ChangefeedDetails) Unmarshal(dAtA []byte) error {
 					if err != nil {
 						return err
 					}
-					if skippy < 0 {
+					if (skippy < 0) || (iNdEx+skippy) < 0 {
 						return ErrInvalidLengthJobs
 					}
 					if (iNdEx + skippy) > postIndex {
@@ -6830,7 +12689,7 @@ func (m *ChangefeedDetails) Unmarshal(dAtA []byte) error {
 					iNdEx += skippy
 				}
 			}
-			m.Targets[github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(mapkey)] = *mapvalue
+			m.Targets[github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(mapkey)] = *mapvalue
 			iNdEx = postIndex
 		case 7:
 			if wireType != 2 {
@@ -6868,7 +12727,7 @@ func (m *ChangefeedDetails) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -6972,13 +12831,33 @@ func (m *ResolvedSpan) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field BoundaryReached", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.BoundaryReached = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipJobs(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -7053,13 +12932,43 @@ func (m *ChangefeedProgress) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ProtectedTimestampRecord", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.ProtectedTimestampRecord.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipJobs(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -7301,7 +13210,7 @@ func (m *CreateStatsDetails) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -7347,7 +13256,7 @@ func (m *CreateStatsDetails_ColStat) Unmarshal(dAtA []byte) error {
 		switch fieldNum {
 		case 1:
 			if wireType == 0 {
-				var v github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ColumnID
+				var v github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ColumnID
 				for shift := uint(0); ; shift += 7 {
 					if shift >= 64 {
 						return ErrIntOverflowJobs
@@ -7357,7 +13266,7 @@ func (m *CreateStatsDetails_ColStat) Unmarshal(dAtA []byte) error {
 					}
 					b := dAtA[iNdEx]
 					iNdEx++
-					v |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ColumnID(b) & 0x7F) << shift
+					v |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ColumnID(b) & 0x7F) << shift
 					if b < 0x80 {
 						break
 					}
@@ -7395,10 +13304,10 @@ func (m *CreateStatsDetails_ColStat) Unmarshal(dAtA []byte) error {
 				}
 				elementCount = count
 				if elementCount != 0 && len(m.ColumnIDs) == 0 {
-					m.ColumnIDs = make([]github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ColumnID, 0, elementCount)
+					m.ColumnIDs = make([]github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ColumnID, 0, elementCount)
 				}
 				for iNdEx < postIndex {
-					var v github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ColumnID
+					var v github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ColumnID
 					for shift := uint(0); ; shift += 7 {
 						if shift >= 64 {
 							return ErrIntOverflowJobs
@@ -7408,7 +13317,7 @@ func (m *CreateStatsDetails_ColStat) Unmarshal(dAtA []byte) error {
 						}
 						b := dAtA[iNdEx]
 						iNdEx++
-						v |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ColumnID(b) & 0x7F) << shift
+						v |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ColumnID(b) & 0x7F) << shift
 						if b < 0x80 {
 							break
 						}
@@ -7438,13 +13347,52 @@ func (m *CreateStatsDetails_ColStat) Unmarshal(dAtA []byte) error {
 				}
 			}
 			m.HasHistogram = bool(v != 0)
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Inverted", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.Inverted = bool(v != 0)
+		case 4:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field HistogramMaxBuckets", wireType)
+			}
+			m.HistogramMaxBuckets = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.HistogramMaxBuckets |= (uint32(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipJobs(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -7494,7 +13442,140 @@ func (m *CreateStatsProgress) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *MigrationDetails) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: MigrationDetails: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: MigrationDetails: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ClusterVersion", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.ClusterVersion == nil {
+				m.ClusterVersion = &clusterversion.ClusterVersion{}
+			}
+			if err := m.ClusterVersion.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthJobs
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *MigrationProgress) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowJobs
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: MigrationProgress: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: MigrationProgress: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		default:
+			iNdEx = preIndex
+			skippy, err := skipJobs(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -7569,7 +13650,7 @@ func (m *Payload) Unmarshal(dAtA []byte) error {
 			iNdEx = postIndex
 		case 2:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Username", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field UsernameProto", wireType)
 			}
 			var stringLen uint64
 			for shift := uint(0); ; shift += 7 {
@@ -7594,7 +13675,7 @@ func (m *Payload) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Username = string(dAtA[iNdEx:postIndex])
+			m.UsernameProto = github_com_cockroachdb_cockroach_pkg_security.SQLUsernameProto(dAtA[iNdEx:postIndex])
 			iNdEx = postIndex
 		case 3:
 			if wireType != 0 {
@@ -7636,7 +13717,7 @@ func (m *Payload) Unmarshal(dAtA []byte) error {
 			}
 		case 6:
 			if wireType == 0 {
-				var v github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID
+				var v github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID
 				for shift := uint(0); ; shift += 7 {
 					if shift >= 64 {
 						return ErrIntOverflowJobs
@@ -7646,7 +13727,7 @@ func (m *Payload) Unmarshal(dAtA []byte) error {
 					}
 					b := dAtA[iNdEx]
 					iNdEx++
-					v |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(b) & 0x7F) << shift
+					v |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
 					if b < 0x80 {
 						break
 					}
@@ -7684,10 +13765,10 @@ func (m *Payload) Unmarshal(dAtA []byte) error {
 				}
 				elementCount = count
 				if elementCount != 0 && len(m.DescriptorIDs) == 0 {
-					m.DescriptorIDs = make([]github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID, 0, elementCount)
+					m.DescriptorIDs = make([]github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID, 0, elementCount)
 				}
 				for iNdEx < postIndex {
-					var v github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID
+					var v github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID
 					for shift := uint(0); ; shift += 7 {
 						if shift >= 64 {
 							return ErrIntOverflowJobs
@@ -7697,7 +13778,7 @@ func (m *Payload) Unmarshal(dAtA []byte) error {
 						}
 						b := dAtA[iNdEx]
 						iNdEx++
-						v |= (github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID(b) & 0x7F) << shift
+						v |= (github_com_cockroachdb_cockroach_pkg_sql_catalog_descpb.ID(b) & 0x7F) << shift
 						if b < 0x80 {
 							break
 						}
@@ -8105,13 +14186,173 @@ func (m *Payload) Unmarshal(dAtA []byte) error {
 				}
 			}
 			m.Noncancelable = bool(v != 0)
+		case 21:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SchemaChangeGC", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &SchemaChangeGCDetails{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Details = &Payload_SchemaChangeGC{v}
+			iNdEx = postIndex
+		case 22:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field TypeSchemaChange", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &TypeSchemaChangeDetails{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Details = &Payload_TypeSchemaChange{v}
+			iNdEx = postIndex
+		case 23:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StreamIngestion", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &StreamIngestionDetails{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Details = &Payload_StreamIngestion{v}
+			iNdEx = postIndex
+		case 24:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field NewSchemaChange", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &NewSchemaChangeDetails{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Details = &Payload_NewSchemaChange{v}
+			iNdEx = postIndex
+		case 25:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Migration", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &MigrationDetails{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Details = &Payload_Migration{v}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipJobs(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -8438,13 +14679,173 @@ func (m *Progress) Unmarshal(dAtA []byte) error {
 			}
 			m.Details = &Progress_CreateStats{v}
 			iNdEx = postIndex
+		case 16:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SchemaChangeGC", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &SchemaChangeGCProgress{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Details = &Progress_SchemaChangeGC{v}
+			iNdEx = postIndex
+		case 17:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field TypeSchemaChange", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &TypeSchemaChangeProgress{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Details = &Progress_TypeSchemaChange{v}
+			iNdEx = postIndex
+		case 18:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StreamIngest", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &StreamIngestionProgress{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Details = &Progress_StreamIngest{v}
+			iNdEx = postIndex
+		case 19:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field NewSchemaChange", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &NewSchemaChangeProgress{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Details = &Progress_NewSchemaChange{v}
+			iNdEx = postIndex
+		case 20:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Migration", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowJobs
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthJobs
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &MigrationProgress{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Details = &Progress_Migration{v}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipJobs(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -8579,7 +14980,7 @@ func (m *Job) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthJobs
 			}
 			if (iNdEx + skippy) > l {
@@ -8699,201 +15100,311 @@ var (
 	ErrIntOverflowJobs   = fmt.Errorf("proto: integer overflow")
 )
 
-func init() { proto.RegisterFile("jobs/jobspb/jobs.proto", fileDescriptor_jobs_80ac31e4c0c0e6b5) }
+func init() { proto.RegisterFile("jobs/jobspb/jobs.proto", fileDescriptor_jobs_4b9f65bb42f26fe6) }
 
-var fileDescriptor_jobs_80ac31e4c0c0e6b5 = []byte{
-	// 3081 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xb4, 0x59, 0xcb, 0x6f, 0x23, 0xc7,
-	0xd1, 0x17, 0xc9, 0x21, 0x39, 0x2c, 0x8a, 0xd4, 0xa8, 0xa5, 0x5d, 0xd3, 0xc4, 0x5a, 0xe4, 0x47,
-	0x3f, 0x56, 0xbb, 0xfe, 0x4c, 0x7d, 0xdf, 0x1a, 0xb1, 0x63, 0xc7, 0x71, 0x22, 0x3e, 0xb4, 0x22,
-	0x77, 0xf5, 0x70, 0x4b, 0x5a, 0x27, 0x0e, 0x92, 0xc9, 0x88, 0xd3, 0x92, 0x26, 0x1a, 0xce, 0xcc,
-	0x4e, 0x0f, 0x77, 0x2d, 0x23, 0x40, 0x90, 0xc7, 0xc1, 0xd8, 0x53, 0x02, 0xe4, 0x12, 0xc4, 0x0b,
-	0x18, 0x48, 0x02, 0xe4, 0x12, 0xc4, 0xc8, 0x29, 0x7f, 0x82, 0x6f, 0xf1, 0xd1, 0xc9, 0x81, 0x49,
-	0xe8, 0x4b, 0x0e, 0xfe, 0x0b, 0xf6, 0x14, 0xf4, 0x63, 0x86, 0x43, 0xad, 0xac, 0xc7, 0x3a, 0xb9,
-	0x48, 0xd3, 0xd5, 0x55, 0xd5, 0xdd, 0xd5, 0x55, 0xbf, 0xaa, 0x6a, 0xc2, 0xe5, 0x1f, 0xb8, 0xbb,
-	0x74, 0x89, 0xfd, 0xf1, 0x76, 0xf9, 0xbf, 0xba, 0xe7, 0xbb, 0x81, 0x8b, 0x9e, 0xee, 0xb9, 0xbd,
-	0x43, 0xdf, 0x35, 0x7a, 0x07, 0x75, 0x7a, 0xd7, 0xae, 0xf3, 0x19, 0xc1, 0x55, 0xbe, 0x44, 0x7c,
-	0xdf, 0xf5, 0x19, 0xbf, 0xf8, 0x10, 0x12, 0xe5, 0xf9, 0x7d, 0x77, 0xdf, 0xe5, 0x9f, 0x4b, 0xec,
-	0x4b, 0x52, 0x67, 0xb9, 0x0e, 0x6f, 0x77, 0xc9, 0xf0, 0x2c, 0x49, 0x42, 0x21, 0xc9, 0x34, 0x02,
-	0x43, 0xd2, 0x4a, 0x21, 0xcd, 0x72, 0x5f, 0xda, 0x73, 0xfd, 0xbe, 0x11, 0x84, 0x6a, 0xaf, 0xd0,
-	0xbb, 0xf6, 0x12, 0xbd, 0x6b, 0xef, 0x1a, 0x94, 0x2c, 0xd1, 0xc0, 0x1f, 0xf4, 0x82, 0x81, 0x4f,
-	0xcc, 0x50, 0x6e, 0x10, 0x58, 0xf6, 0xd2, 0x81, 0xdd, 0x5b, 0x0a, 0xac, 0x3e, 0xa1, 0x81, 0xd1,
-	0xf7, 0xc4, 0x4c, 0xed, 0x47, 0x90, 0xbe, 0x4d, 0x0c, 0x4a, 0xd0, 0x3b, 0x90, 0x75, 0x5c, 0x93,
-	0xe8, 0x96, 0x59, 0x4a, 0x54, 0x13, 0x8b, 0x85, 0xc6, 0xf2, 0x68, 0x58, 0xc9, 0xac, 0xbb, 0x26,
-	0xe9, 0xb4, 0x1e, 0x0d, 0x2b, 0x2f, 0xef, 0x5b, 0xc1, 0xc1, 0x60, 0xb7, 0xde, 0x73, 0xfb, 0x4b,
-	0xd1, 0x99, 0xcd, 0xdd, 0xf1, 0xf7, 0x92, 0x77, 0xb8, 0xbf, 0x24, 0xb7, 0x57, 0x17, 0x62, 0x38,
-	0xc3, 0x34, 0x76, 0x4c, 0x34, 0x0f, 0x69, 0xe2, 0xb9, 0xbd, 0x83, 0x52, 0xb2, 0x9a, 0x58, 0x4c,
-	0x61, 0x31, 0x78, 0x5d, 0xf9, 0xd7, 0x87, 0x95, 0x44, 0xed, 0xf3, 0x14, 0x14, 0x1a, 0x46, 0xef,
-	0x70, 0xe0, 0xb5, 0x48, 0x60, 0x58, 0x36, 0x45, 0x0d, 0x00, 0x1a, 0x18, 0x7e, 0xa0, 0xb3, 0xbd,
-	0xf2, 0xcd, 0xe4, 0x6f, 0x3c, 0x53, 0x1f, 0x1b, 0x9a, 0x9d, 0xa5, 0x7e, 0x60, 0xf7, 0xea, 0xdb,
-	0xe1, 0x59, 0x1a, 0xca, 0xc7, 0xc3, 0xca, 0x14, 0xce, 0x71, 0x31, 0x46, 0x45, 0x6f, 0x82, 0x4a,
-	0x1c, 0x53, 0x68, 0x48, 0x9e, 0x5f, 0x43, 0x96, 0x38, 0x26, 0x97, 0x7f, 0x1a, 0x52, 0x03, 0xdf,
-	0x2a, 0xa5, 0xaa, 0x89, 0xc5, 0x5c, 0x23, 0x3b, 0x1a, 0x56, 0x52, 0x3b, 0xb8, 0x83, 0x19, 0x0d,
-	0x5d, 0x85, 0x99, 0x5d, 0xbe, 0x5f, 0xbd, 0x6f, 0x38, 0xd6, 0x1e, 0xa1, 0x41, 0x49, 0xa9, 0x26,
-	0x16, 0xa7, 0x71, 0x51, 0x90, 0xd7, 0x24, 0x15, 0xfd, 0x34, 0x01, 0x73, 0x03, 0xdf, 0xa2, 0xfa,
-	0xee, 0x91, 0x6e, 0xbb, 0x3d, 0xc3, 0xb6, 0x82, 0x23, 0xfd, 0xf0, 0x5e, 0x29, 0x5d, 0x4d, 0x2d,
-	0xe6, 0x6f, 0xbc, 0x59, 0xff, 0x42, 0xd7, 0xa9, 0x4f, 0xd8, 0xa3, 0xbe, 0xe3, 0x5b, 0xb4, 0x71,
-	0x74, 0x5b, 0x6a, 0xb8, 0x75, 0xaf, 0xed, 0x04, 0xfe, 0x51, 0x63, 0x7e, 0x34, 0xac, 0x68, 0x3b,
-	0xb8, 0x13, 0x9f, 0xba, 0x83, 0xb5, 0xc1, 0x31, 0x66, 0xb4, 0x0a, 0x40, 0x9c, 0x9e, 0x7f, 0xe4,
-	0x05, 0x96, 0xeb, 0x94, 0x32, 0xdc, 0x16, 0x8b, 0xb1, 0xb5, 0xc3, 0x2b, 0x5b, 0xb1, 0x6c, 0xd2,
-	0x8e, 0x18, 0x37, 0xf8, 0x5f, 0x8a, 0x63, 0xb2, 0xe5, 0x26, 0x5c, 0x3a, 0x71, 0x2b, 0x48, 0x83,
-	0xd4, 0x21, 0x39, 0xe2, 0x37, 0x95, 0xc3, 0xec, 0x93, 0x5d, 0xf8, 0x3d, 0xc3, 0x1e, 0x08, 0xdb,
-	0xe7, 0xb0, 0x18, 0xbc, 0x9e, 0xfc, 0x6a, 0xa2, 0xa6, 0x41, 0x51, 0x9c, 0x6e, 0xd3, 0x77, 0xf7,
-	0x7d, 0x42, 0x69, 0xed, 0x4f, 0x79, 0x28, 0x62, 0x42, 0x03, 0xd7, 0x27, 0xa1, 0x07, 0x7c, 0x90,
-	0x80, 0x62, 0x60, 0xec, 0xda, 0x44, 0xf7, 0xc9, 0x7d, 0xdf, 0x0a, 0x08, 0x2d, 0x25, 0xb9, 0xd1,
-	0xde, 0x38, 0xc5, 0x68, 0x93, 0x3a, 0xea, 0xdb, 0x4c, 0x1e, 0x4b, 0x71, 0x61, 0xb2, 0x57, 0x7f,
-	0xf2, 0xf7, 0x73, 0xfa, 0x71, 0x2c, 0x98, 0xea, 0x9d, 0x16, 0x2e, 0x04, 0x71, 0x65, 0xe8, 0x0a,
-	0x28, 0xcc, 0xcc, 0xa5, 0x54, 0x35, 0xb5, 0x98, 0x6b, 0xa8, 0xa3, 0x61, 0x45, 0x61, 0x17, 0x81,
-	0x39, 0x75, 0xc2, 0xf5, 0x94, 0x27, 0x70, 0xbd, 0x9b, 0x90, 0x17, 0x67, 0x37, 0x09, 0xed, 0x51,
-	0xe9, 0x2d, 0x2f, 0x1c, 0x3b, 0x78, 0xb8, 0x39, 0x7e, 0xca, 0x16, 0xa1, 0x3d, 0xdf, 0xf2, 0x02,
-	0xd7, 0xc7, 0x10, 0x84, 0x04, 0x8a, 0x96, 0x20, 0xef, 0xde, 0x23, 0xbe, 0x6f, 0x99, 0x44, 0x37,
-	0x77, 0xf9, 0xd5, 0xe7, 0x1a, 0xc5, 0xd1, 0xb0, 0x02, 0x1b, 0x92, 0xdc, 0x6a, 0x60, 0x08, 0x59,
-	0x5a, 0xbb, 0x28, 0x80, 0x79, 0xe9, 0xd9, 0x91, 0xbb, 0x5a, 0xce, 0x9e, 0x5b, 0xca, 0x5e, 0xd4,
-	0xf6, 0xe2, 0x86, 0x43, 0x37, 0xe9, 0x38, 0x7b, 0xae, 0x3c, 0x24, 0xda, 0x7d, 0x6c, 0x06, 0xbd,
-	0x08, 0xb3, 0x9e, 0x4f, 0x3c, 0xc3, 0x27, 0x7a, 0xcf, 0xed, 0x7b, 0x36, 0x09, 0x88, 0x59, 0x52,
-	0xab, 0x89, 0x45, 0x15, 0x6b, 0x72, 0xa2, 0x19, 0xd2, 0xd1, 0xf3, 0x50, 0xa4, 0x81, 0x11, 0x50,
-	0xdd, 0x72, 0x28, 0xf1, 0x19, 0x67, 0x8e, 0x73, 0x16, 0x38, 0xb5, 0x23, 0x89, 0xe8, 0x1a, 0x68,
-	0xdc, 0x10, 0x54, 0xf7, 0x06, 0xbb, 0xb6, 0x45, 0x0f, 0x88, 0x59, 0x02, 0xce, 0x38, 0x23, 0xe8,
-	0x9b, 0x21, 0x19, 0x1d, 0xc1, 0x9c, 0x19, 0xd9, 0x4f, 0xef, 0x31, 0x73, 0x18, 0xfb, 0xa4, 0x94,
-	0xaf, 0x26, 0x16, 0xd3, 0x8d, 0xd5, 0x47, 0xc3, 0x4a, 0xeb, 0xfc, 0x1e, 0x43, 0xfa, 0x4b, 0x81,
-	0x4f, 0x48, 0x7d, 0x7c, 0x21, 0x4d, 0xa9, 0x0f, 0x23, 0xf3, 0x31, 0xda, 0xb1, 0xd0, 0x9c, 0xfe,
-	0x12, 0xa1, 0xf9, 0x97, 0x04, 0x4c, 0xc7, 0x1d, 0x1e, 0x7d, 0x17, 0x54, 0xe1, 0x44, 0x11, 0x9c,
-	0x37, 0x46, 0xc3, 0x4a, 0x96, 0xf3, 0x5c, 0x00, 0xcf, 0x8f, 0xc5, 0x41, 0x96, 0xeb, 0xec, 0x98,
-	0xe8, 0xfb, 0x90, 0x63, 0xf7, 0xe2, 0x04, 0x4c, 0x7f, 0x92, 0xeb, 0x6f, 0x8e, 0x86, 0x15, 0x75,
-	0x93, 0x13, 0x9f, 0x7c, 0x01, 0x55, 0x68, 0xed, 0x98, 0xe5, 0x0f, 0x92, 0x80, 0x1e, 0x77, 0x23,
-	0xf4, 0xe7, 0x04, 0x5c, 0x09, 0x31, 0xd5, 0xf5, 0xad, 0x7d, 0xcb, 0x31, 0xec, 0x09, 0x70, 0x4d,
-	0x70, 0x5f, 0x7d, 0xe7, 0xcb, 0xf8, 0xaa, 0x04, 0xdc, 0x0d, 0xa9, 0xfe, 0x38, 0xf0, 0x5e, 0x19,
-	0x0d, 0x2b, 0x25, 0x01, 0xbc, 0x8f, 0xb1, 0xdc, 0xc1, 0xa5, 0xc1, 0x17, 0x08, 0x97, 0x6f, 0xc1,
-	0x33, 0xa7, 0x2a, 0xbe, 0x08, 0x8c, 0x96, 0xdf, 0x05, 0xf4, 0x38, 0xc0, 0xc5, 0x35, 0x14, 0x84,
-	0x86, 0xdb, 0x71, 0x0d, 0xf9, 0x1b, 0xaf, 0x3c, 0x19, 0x7e, 0xc6, 0x56, 0xee, 0x2a, 0x6a, 0x42,
-	0x4b, 0xd6, 0xfe, 0x0f, 0x66, 0x24, 0x7f, 0x88, 0xe3, 0xe8, 0x19, 0x80, 0x03, 0x6b, 0xff, 0x40,
-	0xbf, 0x6f, 0x04, 0xc4, 0xe7, 0x7b, 0x98, 0xc6, 0x39, 0x46, 0x79, 0x9b, 0x11, 0x6a, 0x3f, 0x56,
-	0xa1, 0xd0, 0xe9, 0x7b, 0xae, 0x1f, 0x84, 0x28, 0x7f, 0x1b, 0x32, 0x22, 0x18, 0xe5, 0xa5, 0xd5,
-	0x4f, 0xd9, 0xdc, 0x84, 0xa4, 0xd8, 0x9b, 0x84, 0x14, 0xa9, 0x23, 0x02, 0xe5, 0xe4, 0x89, 0xa0,
-	0xfc, 0x75, 0xc8, 0x88, 0x7a, 0x89, 0xa7, 0xf4, 0xfc, 0x8d, 0xca, 0x09, 0x61, 0xd6, 0xd9, 0x60,
-	0x81, 0xb6, 0xc2, 0xd9, 0x42, 0xe5, 0x42, 0x08, 0xbd, 0x00, 0x2a, 0xa5, 0x81, 0x4e, 0xad, 0xf7,
-	0x04, 0xa6, 0xa7, 0x1a, 0x79, 0x16, 0x4e, 0x5b, 0x5b, 0xdb, 0x5b, 0xd6, 0x7b, 0x04, 0x67, 0x29,
-	0x0d, 0xd8, 0x07, 0x2a, 0x83, 0x7a, 0xdf, 0xb0, 0x6d, 0x8e, 0xfd, 0x69, 0x5e, 0xeb, 0x44, 0xe3,
-	0xc9, 0x98, 0xc9, 0xfc, 0x17, 0x62, 0x06, 0x55, 0x20, 0x2f, 0xf1, 0xdb, 0x33, 0x82, 0x83, 0x52,
-	0x96, 0x3b, 0x0d, 0x08, 0xd2, 0xa6, 0x11, 0x1c, 0xa0, 0x12, 0x64, 0xa9, 0xc1, 0xa0, 0x94, 0x96,
-	0xd4, 0x6a, 0x6a, 0x71, 0x1a, 0x87, 0x43, 0xb4, 0x00, 0x3c, 0x11, 0x88, 0x21, 0xc7, 0xd4, 0x14,
-	0x8e, 0x51, 0xb8, 0x01, 0x0e, 0x2d, 0x4f, 0xdf, 0x3b, 0xa4, 0x02, 0x48, 0xa5, 0x01, 0x0e, 0x2d,
-	0x6f, 0xe5, 0x16, 0xc5, 0x59, 0x36, 0xb9, 0x72, 0x48, 0x59, 0x71, 0x64, 0x39, 0xfb, 0x84, 0x06,
-	0xba, 0x69, 0xf9, 0xa4, 0x17, 0xd8, 0x47, 0x1c, 0x49, 0x55, 0x5c, 0x14, 0xe4, 0x96, 0xa4, 0x32,
-	0x84, 0x3e, 0x8e, 0xfa, 0x1c, 0x01, 0x55, 0x3c, 0x73, 0x0c, 0xf4, 0x4f, 0x04, 0xf3, 0xc2, 0xc9,
-	0x60, 0xfe, 0x8b, 0x04, 0x94, 0x59, 0x5d, 0x4b, 0x7a, 0x01, 0x11, 0x29, 0x98, 0xa7, 0x58, 0xdd,
-	0x27, 0x3d, 0xd7, 0x37, 0x4b, 0x97, 0x99, 0x53, 0x36, 0xb6, 0xfe, 0x76, 0x5e, 0x4b, 0xf3, 0xaa,
-	0x79, 0x30, 0xb0, 0xcc, 0xfa, 0xce, 0x4e, 0xa7, 0xc5, 0xe2, 0x7e, 0x33, 0x54, 0x1e, 0xa5, 0x6f,
-	0xcc, 0x55, 0xe3, 0x92, 0xf7, 0x05, 0x33, 0xe5, 0xf7, 0x93, 0x90, 0xe6, 0x0e, 0x8b, 0x5e, 0x07,
-	0x85, 0x65, 0x01, 0x59, 0xd2, 0x9e, 0x37, 0xa5, 0x73, 0x19, 0x84, 0x40, 0x71, 0x8c, 0x3e, 0x29,
-	0x21, 0x7e, 0xa9, 0xfc, 0x1b, 0x3d, 0x05, 0x59, 0x4a, 0xee, 0xea, 0xf7, 0x0c, 0xbb, 0x34, 0xc7,
-	0x6f, 0x2c, 0x43, 0xc9, 0xdd, 0x3b, 0x86, 0x8d, 0x2e, 0x41, 0xc6, 0xa2, 0xba, 0x43, 0xee, 0x97,
-	0xe6, 0xb9, 0x9d, 0xd2, 0x16, 0x5d, 0x27, 0xf7, 0x99, 0x7f, 0x04, 0x86, 0xbf, 0x4f, 0x02, 0xbd,
-	0xe7, 0xda, 0xb4, 0x74, 0x89, 0x45, 0x0a, 0xab, 0x18, 0x18, 0xa9, 0xe9, 0xda, 0xb4, 0xab, 0xa8,
-	0x49, 0x2d, 0xd5, 0x55, 0xd4, 0x94, 0xa6, 0x74, 0x15, 0x55, 0xd1, 0xd2, 0x5d, 0x45, 0x4d, 0x6b,
-	0x99, 0xae, 0xa2, 0x66, 0xb4, 0x6c, 0x57, 0x51, 0xb3, 0x9a, 0xda, 0x55, 0x54, 0x55, 0xcb, 0x75,
-	0x15, 0x35, 0xa7, 0x41, 0x57, 0x51, 0x41, 0xcb, 0x77, 0x15, 0x35, 0xaf, 0x4d, 0x77, 0x15, 0x75,
-	0x5a, 0x2b, 0x74, 0x15, 0xb5, 0xa0, 0x15, 0xbb, 0x8a, 0x5a, 0xd4, 0x66, 0xba, 0x8a, 0x3a, 0xa3,
-	0x69, 0x5d, 0x45, 0xd5, 0xb4, 0xd9, 0xae, 0xa2, 0xce, 0x6a, 0xa8, 0xf6, 0x79, 0x02, 0x8a, 0x22,
-	0x92, 0x23, 0xd4, 0x78, 0x11, 0x66, 0xb9, 0x8b, 0x59, 0xce, 0xbe, 0xee, 0x49, 0x22, 0xc7, 0x83,
-	0x24, 0xd6, 0xc2, 0x89, 0x88, 0xf9, 0x59, 0x28, 0xf8, 0xc4, 0x30, 0xc7, 0x8c, 0x49, 0xce, 0x38,
-	0xcd, 0x88, 0x11, 0xd3, 0xf3, 0x50, 0xe4, 0xa0, 0x35, 0xe6, 0x4a, 0x71, 0xae, 0x02, 0xa7, 0x46,
-	0x6c, 0x0d, 0x28, 0x50, 0xcf, 0x70, 0xc6, 0x5c, 0x0a, 0x07, 0xa1, 0xa7, 0x4e, 0x00, 0x86, 0x2d,
-	0xcf, 0x70, 0x24, 0x20, 0x4c, 0x33, 0x99, 0x38, 0xe4, 0xf9, 0x84, 0x0e, 0xfa, 0x44, 0xf7, 0x5c,
-	0x51, 0xa9, 0xa5, 0x70, 0x4e, 0x50, 0x36, 0x5d, 0x5a, 0xc3, 0xbc, 0xb0, 0x1d, 0xf4, 0x09, 0x53,
-	0x70, 0xdb, 0xa2, 0x01, 0xfa, 0x26, 0x4c, 0x4b, 0x01, 0xa6, 0x27, 0x04, 0xbe, 0x33, 0xd6, 0xcc,
-	0xfb, 0x91, 0x12, 0x5a, 0xfb, 0x43, 0x02, 0xe6, 0x5a, 0xbe, 0xeb, 0x79, 0xc4, 0x94, 0x8e, 0x22,
-	0xc0, 0x34, 0xf4, 0x8f, 0x44, 0xcc, 0x3f, 0x6e, 0x42, 0xb2, 0xd3, 0x92, 0xe9, 0xf9, 0xd5, 0x27,
-	0x85, 0x97, 0x64, 0xa7, 0x85, 0x5e, 0x83, 0x0c, 0xab, 0xaf, 0x06, 0x94, 0xa3, 0x67, 0xf1, 0xc6,
-	0xff, 0x9c, 0x82, 0xd4, 0x5b, 0x9c, 0x11, 0x4b, 0x81, 0xda, 0x87, 0x0a, 0xcc, 0x6d, 0xf5, 0x0e,
-	0x48, 0xdf, 0x68, 0x1e, 0x18, 0xce, 0x7e, 0xb4, 0xdf, 0x6f, 0x83, 0x16, 0xb3, 0x84, 0x6e, 0x5b,
-	0x34, 0x90, 0x35, 0xfe, 0xb5, 0xd3, 0x73, 0x54, 0xcc, 0x9c, 0xd2, 0x3e, 0x45, 0x7f, 0xd2, 0xc8,
-	0xdf, 0x81, 0xa2, 0x29, 0x2c, 0xa4, 0xcb, 0xfc, 0x92, 0x3a, 0x33, 0xbf, 0x9c, 0x60, 0x52, 0xa9,
-	0xbd, 0x60, 0xc6, 0xa6, 0x28, 0xfa, 0x21, 0xcc, 0x85, 0xca, 0x59, 0x5f, 0xce, 0xac, 0xc4, 0xf0,
-	0x5c, 0xe1, 0x46, 0xbe, 0x3d, 0x1a, 0x56, 0x66, 0xa5, 0xaa, 0x96, 0x9c, 0x7d, 0x72, 0x60, 0x9f,
-	0x35, 0x8f, 0x69, 0x32, 0x27, 0xca, 0xba, 0xf4, 0x7f, 0xbe, 0xac, 0x73, 0x20, 0xdf, 0x1f, 0x04,
-	0x06, 0x2b, 0x29, 0xc7, 0x49, 0x6a, 0x8d, 0x75, 0x0c, 0x6b, 0x92, 0xcc, 0x17, 0xf9, 0xda, 0x85,
-	0x17, 0x19, 0x8b, 0x63, 0x08, 0x57, 0xe8, 0x98, 0xb2, 0x96, 0xb8, 0x0c, 0xf3, 0x71, 0x0f, 0x89,
-	0x1a, 0xc3, 0x06, 0x68, 0x82, 0xb2, 0x47, 0x98, 0xf9, 0x19, 0x4a, 0xa1, 0x3a, 0xcc, 0x31, 0xc7,
-	0x22, 0x7d, 0x96, 0x47, 0x19, 0xbe, 0xeb, 0x31, 0xaf, 0x9f, 0x8d, 0xa6, 0x18, 0x06, 0xaf, 0x1b,
-	0x7d, 0x52, 0xfb, 0xa3, 0x02, 0xb3, 0x63, 0x25, 0xa1, 0xf3, 0xb1, 0x6c, 0x66, 0x39, 0x87, 0xfa,
-	0xb8, 0xc5, 0x17, 0xd9, 0xcc, 0x72, 0x0e, 0x59, 0x9b, 0x9f, 0x65, 0x93, 0x3b, 0xbe, 0x85, 0xba,
-	0xa0, 0xb8, 0x5e, 0x10, 0x42, 0xc3, 0x69, 0xc5, 0xd3, 0x63, 0x6b, 0xd4, 0x37, 0xbc, 0x40, 0x54,
-	0x65, 0x98, 0xeb, 0x40, 0xbf, 0x4b, 0x40, 0x56, 0x40, 0x2d, 0x2d, 0x65, 0xb8, 0xbe, 0xd7, 0x2e,
-	0xa4, 0x4f, 0x18, 0x40, 0x76, 0xb2, 0x9b, 0xcc, 0x35, 0x1f, 0x0d, 0x2b, 0xb3, 0xc7, 0x0d, 0x44,
-	0x9f, 0xb4, 0xc5, 0x0d, 0xf7, 0x86, 0xba, 0xa2, 0xc3, 0x1a, 0x5b, 0x98, 0xd7, 0x11, 0xe7, 0x6c,
-	0x62, 0x0b, 0x13, 0x37, 0x50, 0xde, 0x67, 0x5d, 0xc9, 0x78, 0xdb, 0x27, 0xd4, 0xa7, 0xcb, 0x93,
-	0xf5, 0xe9, 0x8b, 0xe7, 0x32, 0x89, 0xd0, 0x19, 0x2f, 0x87, 0x5f, 0x85, 0x5c, 0x64, 0xef, 0x8b,
-	0xd4, 0xd1, 0xc2, 0x03, 0xa3, 0xbc, 0x97, 0xd6, 0x32, 0xb5, 0x9f, 0x25, 0x60, 0x1a, 0x13, 0xea,
-	0xda, 0xf7, 0x88, 0xc9, 0x20, 0x05, 0xfd, 0x3f, 0x28, 0x0c, 0xa2, 0x64, 0xd6, 0x3e, 0x03, 0xab,
-	0x39, 0x2b, 0x5a, 0x86, 0x5c, 0x54, 0x7b, 0x5c, 0xe4, 0xf9, 0x69, 0x2c, 0x55, 0xf3, 0x00, 0x8d,
-	0x0f, 0x1c, 0x25, 0x9c, 0x6d, 0x60, 0x60, 0xc7, 0xf7, 0x26, 0x33, 0x88, 0xc0, 0xcc, 0xab, 0xa7,
-	0x63, 0x66, 0x74, 0x98, 0xf0, 0x9a, 0xfc, 0x18, 0x8d, 0xca, 0x30, 0xfc, 0xb5, 0x02, 0xa8, 0xe9,
-	0x13, 0x23, 0x20, 0x0c, 0xc2, 0xe9, 0x69, 0x89, 0xa5, 0x01, 0x69, 0x0e, 0x19, 0xf2, 0x6c, 0xe7,
-	0xac, 0x64, 0xe4, 0xe2, 0x42, 0x14, 0x7d, 0x0f, 0xa6, 0x7b, 0xae, 0x3d, 0xe8, 0x3b, 0x3a, 0x6f,
-	0xdd, 0x25, 0x46, 0x7f, 0xe5, 0x34, 0x07, 0x78, 0x6c, 0x73, 0xf5, 0xa6, 0x6b, 0xb3, 0x71, 0x98,
-	0x28, 0x85, 0x42, 0xce, 0x81, 0xae, 0x40, 0x2e, 0x72, 0x46, 0x0e, 0xcf, 0x39, 0x3c, 0x26, 0xa0,
-	0x1b, 0x90, 0x36, 0xa8, 0xee, 0xee, 0x71, 0x14, 0x3d, 0xeb, 0x76, 0xb0, 0x62, 0xd0, 0x8d, 0x3d,
-	0xf4, 0x32, 0x14, 0xf6, 0xee, 0x8a, 0x94, 0x22, 0x50, 0x47, 0xbc, 0xa8, 0xcc, 0x8c, 0x86, 0x95,
-	0xfc, 0xca, 0x5b, 0xfc, 0xb0, 0x0c, 0x73, 0x70, 0x7e, 0xef, 0x6e, 0x34, 0x40, 0xd7, 0x61, 0xb6,
-	0x6f, 0xbc, 0xab, 0xef, 0xf9, 0x46, 0x4f, 0xc2, 0xaa, 0x2d, 0x22, 0x2a, 0x81, 0x67, 0xfa, 0xc6,
-	0xbb, 0x2b, 0x92, 0xde, 0x31, 0x6d, 0x52, 0xfe, 0x55, 0x02, 0xb2, 0xf2, 0x44, 0xc8, 0x02, 0x90,
-	0xe6, 0xb1, 0x4c, 0x51, 0x27, 0x14, 0x1a, 0xdd, 0xd1, 0xb0, 0x92, 0x6b, 0x72, 0x6a, 0xa7, 0x45,
-	0x1f, 0x0d, 0x2b, 0xaf, 0x5d, 0x38, 0xd2, 0x43, 0x69, 0x9c, 0x13, 0xda, 0x3b, 0x26, 0xaf, 0xaa,
-	0x0e, 0x0c, 0xaa, 0x1f, 0x58, 0x34, 0x70, 0xf7, 0x7d, 0xa3, 0xcf, 0x6f, 0x55, 0xc5, 0xd3, 0x07,
-	0x06, 0x5d, 0x0d, 0x69, 0xb5, 0x4b, 0x30, 0x17, 0xb3, 0x7f, 0x84, 0xd1, 0x7f, 0x55, 0x21, 0xbb,
-	0x69, 0x1c, 0xd9, 0xae, 0x61, 0xa2, 0x2a, 0xe4, 0xc3, 0x47, 0x0e, 0xcb, 0x75, 0xa4, 0xc3, 0xc4,
-	0x49, 0xac, 0x3d, 0x1a, 0x50, 0xe2, 0x73, 0xe3, 0x89, 0x50, 0x8c, 0xc6, 0xf2, 0x65, 0xc7, 0x67,
-	0x75, 0x7b, 0xdf, 0xea, 0xf9, 0xae, 0xa8, 0x35, 0x52, 0x1c, 0x52, 0x18, 0x75, 0x8d, 0x13, 0x59,
-	0x83, 0xb1, 0x67, 0x39, 0xbc, 0xda, 0x0f, 0xf9, 0x78, 0x43, 0x86, 0x8b, 0x21, 0x59, 0x32, 0xba,
-	0x50, 0x8c, 0xbd, 0xeb, 0x30, 0x23, 0x66, 0xb8, 0x11, 0x57, 0x47, 0xc3, 0x4a, 0x61, 0xec, 0x94,
-	0xc2, 0x90, 0x4f, 0xf6, 0x2a, 0x38, 0xd6, 0xcf, 0xcc, 0x38, 0x0f, 0x69, 0xfe, 0xd0, 0xcf, 0xdf,
-	0xae, 0x72, 0x58, 0x0c, 0xd0, 0x2b, 0x90, 0xb6, 0x89, 0x41, 0x45, 0x4f, 0x95, 0xbf, 0x51, 0x3d,
-	0xc5, 0xbf, 0xf9, 0x3b, 0x3c, 0x16, 0xec, 0xa8, 0x01, 0x19, 0xd1, 0xb8, 0xf1, 0x76, 0x6b, 0xf2,
-	0x5d, 0xe8, 0xd4, 0xe7, 0xe2, 0xd5, 0x29, 0x2c, 0x25, 0x51, 0x1b, 0xb2, 0xbe, 0x68, 0xd2, 0x79,
-	0x13, 0x76, 0x66, 0x69, 0x15, 0x6b, 0xff, 0x57, 0xa7, 0x70, 0x28, 0x8b, 0xb6, 0x61, 0x9a, 0xc6,
-	0xf2, 0xb3, 0x7c, 0xa8, 0x3a, 0xad, 0x9a, 0x3a, 0xa1, 0xe0, 0x5b, 0x65, 0xb5, 0x73, 0x8c, 0xcc,
-	0x0e, 0x68, 0xf1, 0x56, 0x80, 0xf7, 0x72, 0xa7, 0x1f, 0x70, 0xa2, 0xfb, 0x67, 0x07, 0x14, 0x92,
-	0x68, 0x1d, 0xa0, 0x17, 0x81, 0x64, 0xa9, 0xc8, 0xf5, 0xfc, 0xef, 0x45, 0xb2, 0xea, 0xea, 0x14,
-	0x8e, 0x69, 0x40, 0x6f, 0x41, 0xbe, 0x37, 0x76, 0xf2, 0xd2, 0x0c, 0x57, 0xf8, 0xd2, 0x85, 0x20,
-	0x69, 0x95, 0xc1, 0xd0, 0x98, 0x3a, 0x09, 0x43, 0xda, 0x71, 0x18, 0x6a, 0xb3, 0x86, 0x86, 0x57,
-	0xc1, 0xe2, 0x37, 0xa2, 0xd2, 0x2c, 0x47, 0xc1, 0xb8, 0x97, 0x84, 0xbf, 0x22, 0xd5, 0xdb, 0x4e,
-	0xcf, 0x35, 0x89, 0xd9, 0x66, 0x63, 0x2c, 0xdb, 0x08, 0x3e, 0xa0, 0xe8, 0x26, 0x14, 0x7b, 0x36,
-	0x31, 0x9c, 0x81, 0x17, 0xea, 0x41, 0xe7, 0xd4, 0x53, 0x90, 0x72, 0x52, 0xd1, 0x3a, 0xa0, 0x3d,
-	0xfe, 0xa4, 0x16, 0xdf, 0x15, 0x6f, 0x2e, 0xcf, 0xa3, 0x4c, 0xe3, 0xb2, 0x78, 0xbc, 0x33, 0xf4,
-	0x1c, 0x14, 0x1c, 0xd7, 0xe9, 0x19, 0x4e, 0x8f, 0xd8, 0x3c, 0x61, 0x88, 0x7e, 0x74, 0x92, 0xd8,
-	0xc8, 0x41, 0xd6, 0x14, 0xd6, 0x8b, 0xfa, 0xcd, 0xac, 0xa6, 0xd6, 0x3e, 0x4a, 0x83, 0x1a, 0x65,
-	0xbe, 0x25, 0x40, 0x11, 0x86, 0x8e, 0x9f, 0x89, 0x19, 0xc6, 0x24, 0x57, 0xa7, 0xf0, 0x6c, 0x38,
-	0x37, 0x7e, 0x29, 0xbe, 0x0a, 0x33, 0x7d, 0xd7, 0xb4, 0xf6, 0xac, 0x31, 0x50, 0x88, 0x5f, 0x9f,
-	0x8a, 0x21, 0x59, 0x02, 0xc5, 0x9b, 0x13, 0xef, 0x56, 0xa9, 0x73, 0xe4, 0x83, 0xd5, 0xa9, 0xd8,
-	0xc3, 0x16, 0x03, 0x2e, 0x7f, 0xe0, 0x38, 0xac, 0x81, 0x95, 0x4d, 0x92, 0xc8, 0x36, 0x05, 0x49,
-	0x15, 0x0d, 0x11, 0x6a, 0x1e, 0x0b, 0xe8, 0x6b, 0x67, 0x06, 0x74, 0x78, 0xf6, 0xd5, 0x44, 0x14,
-	0xd1, 0x2b, 0xc7, 0x23, 0xfa, 0xfa, 0xd9, 0x11, 0x1d, 0x53, 0x13, 0x85, 0xf4, 0xce, 0x89, 0x21,
-	0xbd, 0x74, 0xce, 0x90, 0x8e, 0x69, 0x9c, 0x8c, 0xe9, 0xe6, 0xb1, 0x98, 0xbe, 0x76, 0x66, 0x4c,
-	0xc7, 0xcf, 0x28, 0x83, 0x7a, 0xe3, 0x84, 0xa0, 0x7e, 0xe9, 0x5c, 0x41, 0x1d, 0x53, 0x16, 0x8f,
-	0x6a, 0x7c, 0x52, 0x54, 0xd7, 0xcf, 0x17, 0xd5, 0x31, 0x95, 0x71, 0x25, 0x0d, 0x00, 0x35, 0x7c,
-	0x38, 0x88, 0xb9, 0x6f, 0xed, 0x97, 0x09, 0x48, 0x75, 0xdd, 0x5d, 0x54, 0x84, 0xa4, 0x7c, 0x78,
-	0x4f, 0xe1, 0xa4, 0x65, 0xa2, 0x6f, 0x8c, 0xd9, 0x65, 0xcd, 0xf4, 0xec, 0x29, 0xeb, 0x87, 0x8b,
-	0xe2, 0x48, 0x08, 0xbd, 0x01, 0x59, 0x4f, 0xa4, 0x59, 0xe9, 0xa1, 0xb5, 0xd3, 0xe4, 0x05, 0x27,
-	0x0e, 0x45, 0xae, 0x7f, 0x0b, 0x32, 0xd2, 0x0b, 0x11, 0x14, 0x5b, 0x78, 0xb9, 0xb3, 0xde, 0x59,
-	0xbf, 0xa9, 0xaf, 0x2f, 0xaf, 0xb5, 0xb7, 0xb4, 0x29, 0x54, 0x82, 0xf9, 0xb7, 0x97, 0x3b, 0xdb,
-	0xfa, 0xca, 0x06, 0xd6, 0x6f, 0x36, 0xf5, 0xce, 0xfa, 0x76, 0x1b, 0xdf, 0x59, 0xbe, 0xad, 0x25,
-	0xd0, 0x65, 0x40, 0x78, 0xa3, 0x79, 0x6b, 0xab, 0xd5, 0xd0, 0x9b, 0x1b, 0x6b, 0x9b, 0xcb, 0xcd,
-	0xed, 0xce, 0xc6, 0xba, 0x96, 0x44, 0x2a, 0x28, 0xad, 0x8d, 0xf5, 0xb6, 0x06, 0xd7, 0x3f, 0x4a,
-	0x82, 0xb2, 0x7d, 0xe4, 0x11, 0xf4, 0x1c, 0xe4, 0x77, 0xd6, 0xb7, 0x36, 0xdb, 0xcd, 0xce, 0x4a,
-	0xa7, 0xdd, 0xd2, 0xa6, 0xca, 0x73, 0x0f, 0x1e, 0x56, 0x67, 0xd8, 0xd4, 0x8e, 0x43, 0x3d, 0xd2,
-	0xe3, 0x11, 0x87, 0xca, 0x90, 0x69, 0x2c, 0x37, 0x6f, 0xed, 0x6c, 0x6a, 0x89, 0x72, 0xf1, 0xc1,
-	0xc3, 0x2a, 0x30, 0x06, 0xe1, 0xed, 0xe8, 0x0a, 0x64, 0x71, 0x7b, 0x6b, 0x7b, 0x03, 0xb7, 0xb5,
-	0x64, 0x79, 0xe6, 0xc1, 0xc3, 0x6a, 0x9e, 0x4d, 0x4a, 0x27, 0x46, 0x57, 0xa1, 0xb0, 0xd5, 0x5c,
-	0x6d, 0xaf, 0x2d, 0xeb, 0xcd, 0xd5, 0xe5, 0xf5, 0x9b, 0x6d, 0x2d, 0x55, 0x9e, 0x7f, 0xf0, 0xb0,
-	0xaa, 0x31, 0x9e, 0xb8, 0x6f, 0xb2, 0x25, 0x3a, 0x6b, 0x9b, 0x1b, 0x78, 0x5b, 0x53, 0xc6, 0x4b,
-	0x08, 0x67, 0x43, 0x35, 0x00, 0x21, 0xbd, 0xd2, 0x6e, 0xb7, 0xb4, 0x74, 0x19, 0x3d, 0x78, 0x58,
-	0x2d, 0xb2, 0xf9, 0xb1, 0x0f, 0xa1, 0xe7, 0x61, 0xba, 0x89, 0xdb, 0xcb, 0xdb, 0x6d, 0x7d, 0x6b,
-	0x7b, 0x79, 0x7b, 0x4b, 0xcb, 0x8c, 0x4f, 0x12, 0xf3, 0x0b, 0x54, 0x87, 0xd9, 0xe5, 0x9d, 0xed,
-	0x0d, 0x7d, 0x82, 0x37, 0x5b, 0x7e, 0xea, 0xc1, 0xc3, 0xea, 0x1c, 0xe3, 0x5d, 0x1e, 0x04, 0x6e,
-	0x8c, 0xbf, 0xac, 0xbe, 0xff, 0x9b, 0x85, 0xa9, 0xdf, 0xff, 0x76, 0x61, 0xaa, 0xb1, 0xf8, 0xf1,
-	0x3f, 0x17, 0xa6, 0x3e, 0x1e, 0x2d, 0x24, 0x3e, 0x19, 0x2d, 0x24, 0x3e, 0x1d, 0x2d, 0x24, 0xfe,
-	0x31, 0x5a, 0x48, 0xfc, 0xfc, 0xb3, 0x85, 0xa9, 0x4f, 0x3e, 0x5b, 0x98, 0xfa, 0xf4, 0xb3, 0x85,
-	0xa9, 0x77, 0x32, 0xe2, 0x1e, 0x77, 0x33, 0xfc, 0x27, 0xfa, 0x97, 0xff, 0x1d, 0x00, 0x00, 0xff,
-	0xff, 0xd3, 0x63, 0x4b, 0xae, 0x7d, 0x20, 0x00, 0x00,
+var fileDescriptor_jobs_4b9f65bb42f26fe6 = []byte{
+	// 4845 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xc4, 0x5b, 0x4b, 0x8c, 0x1b, 0x47,
+	0x7a, 0x9e, 0x26, 0x39, 0x64, 0xf3, 0x9f, 0x21, 0xd9, 0xac, 0x19, 0x49, 0x34, 0x63, 0x8b, 0xb3,
+	0xf4, 0x4b, 0x92, 0x6d, 0x8e, 0x57, 0xce, 0x7a, 0x6d, 0xc5, 0x96, 0xcd, 0x97, 0x66, 0xc8, 0xd1,
+	0x3c, 0xd4, 0x9c, 0x91, 0x1f, 0x1b, 0x6f, 0xa7, 0xd9, 0x5d, 0x33, 0xd3, 0x19, 0xb2, 0x9b, 0xea,
+	0x6a, 0x4a, 0x9a, 0x0d, 0x90, 0x04, 0x1b, 0x04, 0x58, 0xe8, 0x94, 0x00, 0xd9, 0x5c, 0x12, 0x01,
+	0x01, 0xb2, 0x0b, 0xe4, 0x10, 0x20, 0x88, 0x11, 0x24, 0x39, 0xe4, 0x96, 0x8b, 0x0f, 0x09, 0xb0,
+	0x97, 0x00, 0x46, 0x0e, 0xdc, 0x64, 0x7c, 0xc9, 0x31, 0x48, 0x2e, 0x0b, 0x5d, 0x12, 0xd4, 0xa3,
+	0x9b, 0x4d, 0x72, 0x1e, 0x1c, 0xc9, 0xde, 0xbd, 0x48, 0xec, 0xbf, 0xfe, 0xfa, 0xaa, 0xea, 0xaf,
+	0xbf, 0xbe, 0xff, 0xaf, 0xc7, 0xc0, 0xc5, 0xdf, 0x76, 0xda, 0x64, 0x99, 0xfe, 0xd3, 0x6b, 0xb3,
+	0xff, 0x4a, 0x3d, 0xd7, 0xf1, 0x1c, 0xf4, 0x9c, 0xe1, 0x18, 0x07, 0xae, 0xa3, 0x1b, 0xfb, 0x25,
+	0x72, 0xaf, 0x53, 0x62, 0x25, 0x5c, 0x2b, 0x7f, 0x01, 0xbb, 0xae, 0xe3, 0x52, 0x7d, 0xfe, 0x83,
+	0xd7, 0xc8, 0x2f, 0xee, 0x39, 0x7b, 0x0e, 0xfb, 0xb9, 0x4c, 0x7f, 0x09, 0x29, 0x62, 0x18, 0xbd,
+	0xf6, 0xb2, 0xa9, 0x7b, 0xba, 0x90, 0xe5, 0x7c, 0x99, 0xe5, 0xbc, 0xb1, 0xeb, 0xb8, 0x5d, 0xdd,
+	0xf3, 0x31, 0x5e, 0x24, 0xf7, 0x3a, 0xcb, 0x86, 0xee, 0xe9, 0x1d, 0x67, 0x6f, 0xd9, 0xc4, 0xc4,
+	0xe8, 0xb5, 0x97, 0x89, 0xe7, 0xf6, 0x0d, 0xaf, 0xef, 0x62, 0x53, 0x28, 0x15, 0x8e, 0x51, 0xf2,
+	0xb0, 0xad, 0xdb, 0x9e, 0x8f, 0xdf, 0xf7, 0xac, 0xce, 0xf2, 0x7e, 0xc7, 0x58, 0xf6, 0xac, 0x2e,
+	0x26, 0x9e, 0xde, 0xed, 0x89, 0x92, 0x6f, 0xd1, 0xaa, 0xc4, 0xd8, 0xc7, 0x5d, 0xdd, 0xd8, 0xd7,
+	0xed, 0x3d, 0xec, 0x2e, 0xf3, 0x36, 0x8c, 0x5e, 0x5b, 0xa8, 0xbc, 0x64, 0x74, 0xfa, 0xc4, 0xc3,
+	0xee, 0x7d, 0xec, 0x12, 0xcb, 0xb1, 0x97, 0xc5, 0xa7, 0x26, 0xbe, 0xb9, 0x56, 0xf1, 0xf7, 0x60,
+	0xf6, 0x36, 0xd6, 0x09, 0x46, 0x9f, 0x42, 0xc2, 0x76, 0x4c, 0xac, 0x59, 0x66, 0x4e, 0x5a, 0x92,
+	0xae, 0xa4, 0x2a, 0xe5, 0xa3, 0x41, 0x21, 0xbe, 0xe1, 0x98, 0xb8, 0x51, 0x7b, 0x32, 0x28, 0xbc,
+	0xb5, 0x67, 0x79, 0xfb, 0xfd, 0x76, 0xc9, 0x70, 0xba, 0xcb, 0x81, 0x45, 0xcd, 0xf6, 0xf0, 0xf7,
+	0x72, 0xef, 0x60, 0x6f, 0x59, 0xd8, 0xa3, 0xc4, 0xab, 0xa9, 0x71, 0x8a, 0xd8, 0x30, 0xd1, 0x22,
+	0xcc, 0xe2, 0x9e, 0x63, 0xec, 0xe7, 0x22, 0x4b, 0xd2, 0x95, 0xa8, 0xca, 0x3f, 0x6e, 0xc4, 0xfe,
+	0xeb, 0x2f, 0x0a, 0x52, 0xf1, 0xa7, 0x11, 0xb8, 0x54, 0xd1, 0x8d, 0x83, 0x7e, 0xaf, 0x6e, 0x1b,
+	0xee, 0x61, 0xcf, 0xb3, 0x1c, 0x7b, 0x93, 0xfd, 0x4b, 0x90, 0x02, 0xd1, 0x03, 0x7c, 0xc8, 0xfa,
+	0x33, 0xaf, 0xd2, 0x9f, 0xe8, 0x7d, 0x88, 0x75, 0x1d, 0x13, 0x33, 0xa0, 0xf4, 0xf5, 0xab, 0xa5,
+	0x13, 0x27, 0xb7, 0x34, 0x44, 0x5b, 0x77, 0x4c, 0xac, 0xb2, 0x6a, 0xa8, 0x0d, 0xf2, 0x41, 0x97,
+	0x68, 0x96, 0xbd, 0xeb, 0xe4, 0xa2, 0x4b, 0xd2, 0x95, 0xb9, 0xeb, 0x37, 0x4e, 0x81, 0x38, 0xa1,
+	0x5b, 0xa5, 0xb5, 0xf5, 0x56, 0xc3, 0xde, 0x75, 0x2a, 0x73, 0x47, 0x83, 0x42, 0x42, 0x7c, 0xa8,
+	0x89, 0x83, 0x2e, 0xa1, 0x3f, 0xf2, 0x9b, 0xe0, 0xcb, 0x68, 0xff, 0xfb, 0xae, 0xc5, 0xfa, 0x9f,
+	0x54, 0xe9, 0x4f, 0xf4, 0x3a, 0x20, 0xcc, 0xf1, 0xb0, 0xa9, 0x51, 0x4f, 0xd2, 0xe8, 0x00, 0x23,
+	0x6c, 0x80, 0x4a, 0x50, 0x52, 0xd3, 0x3d, 0x7d, 0x0d, 0x1f, 0x72, 0x0b, 0x09, 0x3b, 0xfd, 0x7e,
+	0x14, 0xd2, 0xc3, 0xae, 0x30, 0xf8, 0x55, 0x88, 0x33, 0x17, 0xc0, 0xac, 0x85, 0xf4, 0xf5, 0x37,
+	0xa7, 0x32, 0x07, 0xad, 0x5a, 0x6a, 0xb1, 0x7a, 0xaa, 0xa8, 0x8f, 0x10, 0xc4, 0x88, 0xde, 0xf1,
+	0x44, 0x47, 0xd8, 0x6f, 0xf4, 0x67, 0x12, 0x2c, 0x8d, 0xf7, 0xa8, 0x72, 0xb8, 0xb6, 0xde, 0x5a,
+	0xd7, 0xa9, 0x1f, 0xad, 0xe1, 0xc3, 0x46, 0x2d, 0x17, 0x5d, 0x8a, 0x5e, 0x99, 0xbb, 0xbe, 0x39,
+	0x7d, 0xc3, 0xf5, 0x33, 0x10, 0xeb, 0xb6, 0xe7, 0x1e, 0xaa, 0x67, 0x36, 0x9c, 0x6f, 0xc1, 0xcb,
+	0x53, 0x41, 0x85, 0x7d, 0x28, 0xc9, 0x7d, 0x68, 0x11, 0x66, 0xef, 0xeb, 0x9d, 0x3e, 0x16, 0xa3,
+	0xe5, 0x1f, 0x37, 0x22, 0xef, 0x48, 0xc5, 0x4b, 0x10, 0xe7, 0x86, 0x41, 0x29, 0x48, 0x96, 0xeb,
+	0xad, 0xeb, 0xdf, 0x79, 0x7b, 0xa5, 0xba, 0xae, 0xcc, 0x88, 0x29, 0xf8, 0x3f, 0x09, 0x2e, 0xb6,
+	0x3c, 0x17, 0xeb, 0xdd, 0x86, 0xbd, 0x87, 0x09, 0x1d, 0x53, 0x0d, 0x7b, 0xba, 0xd5, 0x21, 0xc8,
+	0x86, 0x34, 0x61, 0x25, 0x9a, 0x6e, 0x9a, 0x2e, 0x26, 0x84, 0x37, 0x58, 0x59, 0x79, 0x32, 0x28,
+	0x54, 0xa7, 0x5a, 0x3a, 0x86, 0xd1, 0x59, 0xe6, 0x10, 0x96, 0xbd, 0x67, 0x18, 0x9d, 0x12, 0x6f,
+	0xa9, 0xcc, 0xe1, 0xd4, 0x14, 0x09, 0x7f, 0xa2, 0x6f, 0x43, 0x8c, 0xf4, 0x74, 0x9b, 0x0d, 0x61,
+	0xee, 0xfa, 0xa5, 0x90, 0xfd, 0xfd, 0x25, 0xd8, 0xea, 0xe9, 0x76, 0x25, 0xf6, 0xc5, 0xa0, 0x30,
+	0xa3, 0x32, 0x55, 0x54, 0x01, 0x20, 0x9e, 0xee, 0x7a, 0x1a, 0xe5, 0x12, 0xe1, 0xfd, 0x2f, 0x84,
+	0x2a, 0x52, 0xae, 0x29, 0xed, 0x77, 0x8c, 0xd2, 0xb6, 0xcf, 0x35, 0xa2, 0x7a, 0x92, 0x55, 0xa3,
+	0xd2, 0xe2, 0x1a, 0x5c, 0x1a, 0x33, 0xc0, 0x96, 0xeb, 0xec, 0xb1, 0x1e, 0xbd, 0x09, 0x0b, 0x5d,
+	0xdd, 0x3d, 0xc0, 0xe6, 0x2d, 0xc7, 0xad, 0x3a, 0xdd, 0x5e, 0x07, 0xd3, 0x62, 0x66, 0x06, 0x59,
+	0x3d, 0xae, 0xa8, 0xf8, 0x4f, 0x71, 0x48, 0xf1, 0x25, 0xe6, 0x5b, 0x71, 0xb4, 0x8b, 0xd2, 0xd3,
+	0x74, 0x11, 0xdd, 0x04, 0x19, 0xdb, 0x26, 0x47, 0x88, 0x4c, 0x8f, 0x90, 0xc0, 0xb6, 0xc9, 0xea,
+	0x3f, 0xc7, 0xd7, 0x6c, 0x94, 0x4d, 0x5f, 0xe2, 0x68, 0x50, 0x88, 0xee, 0xa8, 0x0d, 0xbe, 0x78,
+	0xdf, 0x83, 0xbc, 0x89, 0x7b, 0x2e, 0x36, 0x74, 0xba, 0x7a, 0xdb, 0xac, 0xeb, 0x5a, 0x57, 0xb7,
+	0xad, 0x5d, 0x4c, 0xbc, 0x5c, 0x8c, 0x79, 0x53, 0x6e, 0xa8, 0xc1, 0xc7, 0xb6, 0x2e, 0xca, 0xd1,
+	0x1f, 0x48, 0xb0, 0xd0, 0x77, 0x2d, 0xa2, 0xb5, 0x0f, 0xb5, 0x8e, 0x63, 0xe8, 0x1d, 0xcb, 0x3b,
+	0xd4, 0x0e, 0xee, 0xe7, 0x66, 0xd9, 0x12, 0xba, 0x79, 0x26, 0x0f, 0x09, 0x23, 0x95, 0x76, 0x5c,
+	0x8b, 0x54, 0x0e, 0x6f, 0x0b, 0x84, 0xb5, 0xfb, 0xcc, 0xcd, 0x2b, 0x8b, 0x47, 0x83, 0x82, 0xb2,
+	0xa3, 0x36, 0xc2, 0x45, 0x77, 0x55, 0xa5, 0x3f, 0xa6, 0x8c, 0xf4, 0x80, 0x80, 0x2c, 0xc7, 0xd6,
+	0x1c, 0xce, 0x68, 0xb9, 0x38, 0x33, 0xd4, 0xf5, 0xf3, 0x73, 0xa1, 0x9a, 0xc5, 0x13, 0xac, 0xfd,
+	0xc7, 0x12, 0xe4, 0x69, 0x70, 0xc1, 0x06, 0x35, 0x53, 0x10, 0xb9, 0x34, 0x17, 0x1b, 0x8e, 0x6b,
+	0xe6, 0x12, 0xd4, 0x4e, 0x95, 0xd6, 0xbf, 0x4f, 0x1b, 0x53, 0x58, 0x0c, 0xec, 0xf7, 0x2d, 0xb3,
+	0xb4, 0xb3, 0xd3, 0xa8, 0x1d, 0x0d, 0x0a, 0xb9, 0x2d, 0x1f, 0x3c, 0x98, 0x44, 0x95, 0x41, 0xab,
+	0xb9, 0xde, 0x09, 0x25, 0xe8, 0x1d, 0x48, 0x1b, 0x4e, 0xa7, 0x83, 0x0d, 0x36, 0xec, 0x1d, 0xb5,
+	0x91, 0x93, 0xd9, 0x04, 0x67, 0x8f, 0x06, 0x85, 0x54, 0x35, 0x28, 0xa1, 0x53, 0x9d, 0x32, 0xc2,
+	0x9f, 0x48, 0x85, 0x4c, 0xc8, 0x60, 0x2c, 0x72, 0x24, 0x99, 0xb5, 0xae, 0x4e, 0x4d, 0x7a, 0x6a,
+	0x1a, 0x8f, 0x7c, 0xe7, 0xab, 0x70, 0xe1, 0xd8, 0x59, 0x3c, 0x8b, 0xac, 0x92, 0x61, 0xb2, 0x52,
+	0x20, 0xcd, 0x27, 0xc5, 0x5f, 0x82, 0xc5, 0xcf, 0xd3, 0x90, 0x56, 0x31, 0xf1, 0x1c, 0x17, 0xfb,
+	0x2b, 0xea, 0x73, 0x09, 0x16, 0x68, 0x66, 0xe1, 0x5a, 0x3d, 0xcf, 0x71, 0x35, 0x17, 0x3f, 0x70,
+	0x2d, 0x0f, 0x93, 0x5c, 0x84, 0x39, 0x5d, 0xf9, 0x94, 0x21, 0x8c, 0x02, 0x95, 0x6a, 0x01, 0x88,
+	0x2a, 0x30, 0xb8, 0xdf, 0xdd, 0xfc, 0xe1, 0xcf, 0x0b, 0x37, 0xa6, 0x9a, 0xc7, 0xc9, 0x64, 0xa7,
+	0xd4, 0xa8, 0xa9, 0xc8, 0x9c, 0x00, 0x46, 0xcf, 0x43, 0x8c, 0xfa, 0x2d, 0x0b, 0x2e, 0xc9, 0x8a,
+	0x7c, 0x34, 0x28, 0xc4, 0xa8, 0x67, 0xab, 0x4c, 0x3a, 0xb2, 0xc0, 0x63, 0x4f, 0xb1, 0xc0, 0x57,
+	0x60, 0xce, 0xd3, 0xdb, 0x1d, 0xac, 0xd1, 0x96, 0x89, 0x58, 0x7e, 0xaf, 0x8c, 0x59, 0x82, 0xdc,
+	0xeb, 0xb4, 0x75, 0x82, 0x4b, 0xdb, 0x54, 0x33, 0x34, 0x76, 0xf0, 0x7c, 0x01, 0x41, 0xcb, 0x30,
+	0xe7, 0xdc, 0xc7, 0xae, 0x6b, 0x99, 0x58, 0x33, 0xdb, 0x6c, 0x0d, 0x25, 0x2b, 0xe9, 0xa3, 0x41,
+	0x01, 0x36, 0x85, 0xb8, 0x56, 0x51, 0xc1, 0x57, 0xa9, 0xb5, 0x91, 0x07, 0x8b, 0x82, 0x34, 0x82,
+	0xf5, 0xcf, 0xfc, 0x29, 0xc1, 0xba, 0xf0, 0xde, 0xf4, 0x93, 0xc1, 0xe7, 0xdd, 0x77, 0x1e, 0x96,
+	0x8b, 0xf0, 0x41, 0xa2, 0xf6, 0x44, 0x09, 0x7a, 0x0d, 0xb2, 0x3d, 0x17, 0xf7, 0x74, 0x17, 0x6b,
+	0x06, 0x27, 0x5f, 0x6c, 0x32, 0xef, 0x97, 0x55, 0x45, 0x14, 0x54, 0x7d, 0x39, 0x7a, 0x99, 0xc6,
+	0x31, 0xdd, 0xa3, 0x29, 0x12, 0xc1, 0x2e, 0xd5, 0x4c, 0x32, 0xcd, 0x14, 0x93, 0x36, 0x84, 0x10,
+	0xbd, 0x05, 0x17, 0x86, 0xf3, 0x46, 0xb4, 0x5e, 0xbf, 0xdd, 0xb1, 0xc8, 0x3e, 0x36, 0x73, 0xc0,
+	0xb4, 0x17, 0x43, 0x85, 0x5b, 0x7e, 0x19, 0x3a, 0x1c, 0x71, 0x45, 0x83, 0x1a, 0x46, 0xdf, 0xc3,
+	0xb9, 0xb9, 0x25, 0xe9, 0xca, 0x6c, 0x65, 0xf5, 0xc9, 0xa0, 0x50, 0x9b, 0xda, 0x8f, 0x08, 0xee,
+	0x2e, 0x7b, 0x2e, 0xc6, 0x21, 0xb7, 0xac, 0x0a, 0xbc, 0xb0, 0x47, 0xf9, 0x32, 0xa4, 0x02, 0x0c,
+	0x97, 0x60, 0x6e, 0xfe, 0xa9, 0xd9, 0x2e, 0x84, 0x82, 0xca, 0x90, 0xe0, 0xc9, 0x3a, 0xc9, 0xa5,
+	0xd8, 0x04, 0x7e, 0xeb, 0x24, 0x1f, 0x62, 0x5a, 0xa1, 0x59, 0xf2, 0xeb, 0xa1, 0x1a, 0x80, 0x77,
+	0xd8, 0xf3, 0x3d, 0x31, 0xcd, 0x50, 0x5e, 0x3e, 0x09, 0xe5, 0xb0, 0x17, 0x76, 0xc4, 0xa4, 0x27,
+	0xbe, 0x09, 0x6a, 0xc2, 0x3c, 0xdf, 0x09, 0x08, 0x9c, 0x0c, 0xc3, 0x79, 0xf5, 0x04, 0x1c, 0x96,
+	0xe0, 0xe8, 0x21, 0xa4, 0x39, 0x12, 0x48, 0x08, 0xda, 0x82, 0x34, 0xcd, 0x4a, 0xa9, 0xa6, 0x40,
+	0x53, 0x18, 0xda, 0xd5, 0x13, 0xd0, 0x6a, 0x42, 0x39, 0x84, 0x97, 0x32, 0x43, 0x32, 0x92, 0xff,
+	0x5f, 0x09, 0xb2, 0x13, 0xe4, 0x81, 0xb6, 0x21, 0x12, 0x6c, 0x34, 0x28, 0xa7, 0x47, 0xd8, 0x26,
+	0xe3, 0x59, 0x88, 0x24, 0x62, 0x99, 0x68, 0x0f, 0x92, 0xd4, 0x9d, 0x6d, 0x8f, 0xee, 0x62, 0x22,
+	0x0c, 0xbc, 0x79, 0x34, 0x28, 0xc8, 0x5b, 0x4c, 0xf8, 0xcc, 0x4d, 0xc8, 0x1c, 0xbc, 0x61, 0xa2,
+	0x02, 0xcc, 0x79, 0x8e, 0x86, 0x1f, 0x5a, 0xc4, 0xb3, 0xec, 0x3d, 0x96, 0x2c, 0xc8, 0x2a, 0x78,
+	0x4e, 0x5d, 0x48, 0xf2, 0x7f, 0x1e, 0x01, 0x34, 0xb9, 0x4a, 0xd1, 0x3f, 0x4a, 0xf0, 0xbc, 0x9f,
+	0x03, 0x38, 0xae, 0xb5, 0x67, 0xd9, 0x7a, 0x67, 0x24, 0x19, 0x90, 0x98, 0xb5, 0x3f, 0x7d, 0x16,
+	0x2a, 0x10, 0x09, 0xc2, 0xa6, 0x80, 0x1f, 0x4f, 0x14, 0x9e, 0xa7, 0x11, 0x94, 0x27, 0x0a, 0x13,
+	0x2a, 0x77, 0xd5, 0x5c, 0xff, 0x84, 0xca, 0xf9, 0x35, 0x78, 0xe1, 0x54, 0xe0, 0xf3, 0xc4, 0xae,
+	0xfc, 0x0f, 0x25, 0xb8, 0x74, 0x42, 0x44, 0x09, 0xe3, 0xa4, 0x38, 0xce, 0x9d, 0x30, 0xce, 0xdc,
+	0xf5, 0xdf, 0x78, 0x86, 0xa8, 0x15, 0xea, 0x44, 0x33, 0x26, 0x4b, 0x4a, 0xa4, 0xf8, 0x26, 0x64,
+	0x44, 0xa5, 0x20, 0x95, 0x7d, 0x01, 0x60, 0xdf, 0xda, 0xdb, 0xd7, 0x1e, 0xe8, 0x1e, 0x76, 0xc5,
+	0xee, 0x33, 0x49, 0x25, 0x1f, 0x51, 0x41, 0xf1, 0xdf, 0x64, 0x48, 0x35, 0xba, 0x3d, 0xc7, 0xf5,
+	0xfc, 0x28, 0x7b, 0x1b, 0xe2, 0x2c, 0x2e, 0x10, 0x31, 0x7f, 0xa5, 0x53, 0x7a, 0x38, 0x52, 0x93,
+	0xc7, 0x17, 0x41, 0x0b, 0x02, 0x23, 0x08, 0x7f, 0x91, 0x63, 0xc3, 0xdf, 0xfb, 0x10, 0xe7, 0x47,
+	0x0d, 0x22, 0x85, 0x2f, 0x1c, 0x93, 0xfb, 0x37, 0x36, 0x6f, 0x59, 0x1d, 0x7c, 0x8b, 0xa9, 0xf9,
+	0xe0, 0xbc, 0x12, 0x7a, 0x05, 0x64, 0x42, 0x3c, 0x8d, 0x58, 0x3f, 0xe0, 0xd1, 0x33, 0xca, 0x77,
+	0xb1, 0xad, 0xd6, 0x76, 0xcb, 0xfa, 0x01, 0x56, 0x13, 0x84, 0x78, 0xf4, 0x07, 0xca, 0x83, 0xfc,
+	0x40, 0xef, 0x74, 0x58, 0x94, 0x9d, 0x65, 0xbb, 0xf6, 0xe0, 0x7b, 0x74, 0x99, 0xc5, 0xbf, 0xd9,
+	0x65, 0x26, 0x02, 0x66, 0x4f, 0xf7, 0xf6, 0x59, 0xe6, 0x98, 0x54, 0x81, 0x8b, 0xb6, 0x74, 0x6f,
+	0x1f, 0xe5, 0x20, 0x41, 0x74, 0x1a, 0xbb, 0x48, 0x4e, 0x5e, 0x8a, 0x5e, 0x99, 0x57, 0xfd, 0x4f,
+	0x74, 0x19, 0x58, 0xe4, 0xe5, 0x9f, 0x2c, 0x88, 0x45, 0xd5, 0x90, 0x84, 0xd9, 0xe1, 0xc0, 0xea,
+	0x69, 0xbb, 0x07, 0x84, 0x07, 0x2d, 0x61, 0x87, 0x03, 0xab, 0x77, 0x6b, 0x8d, 0xa8, 0x09, 0x5a,
+	0x78, 0xeb, 0x80, 0xa0, 0x57, 0x21, 0x63, 0xb1, 0xbd, 0x8e, 0x66, 0x5a, 0x2e, 0x36, 0xbc, 0xce,
+	0x21, 0x0b, 0x58, 0xb2, 0x9a, 0xe6, 0xe2, 0x9a, 0x90, 0xa2, 0xab, 0xa0, 0x8c, 0x87, 0x59, 0x16,
+	0x68, 0x64, 0x35, 0x33, 0x16, 0x65, 0xa9, 0x2a, 0x9f, 0xea, 0x50, 0xe0, 0x4c, 0x71, 0x55, 0x2e,
+	0x1f, 0xc6, 0xcc, 0x12, 0x2c, 0xf4, 0x74, 0x97, 0x60, 0xad, 0xdd, 0xb7, 0xcd, 0x0e, 0xd6, 0x38,
+	0x57, 0xe7, 0xd2, 0x4c, 0x3b, 0xcb, 0x8a, 0x2a, 0xac, 0x84, 0xd3, 0xfa, 0x59, 0xb9, 0xf7, 0xc5,
+	0x5f, 0x41, 0xee, 0x9d, 0xff, 0x69, 0x04, 0x66, 0x99, 0x9f, 0xa3, 0x1b, 0x10, 0xa3, 0xd3, 0x2c,
+	0x76, 0x76, 0xd3, 0xe6, 0x5c, 0xac, 0x0e, 0x42, 0x10, 0xb3, 0xf5, 0x2e, 0xce, 0x21, 0xe6, 0x04,
+	0xec, 0x37, 0xba, 0x04, 0x09, 0x82, 0xef, 0x69, 0xf7, 0xf5, 0x4e, 0x6e, 0x81, 0xcd, 0x70, 0x9c,
+	0xe0, 0x7b, 0x77, 0xf5, 0x0e, 0xba, 0x00, 0x71, 0x8b, 0x68, 0x36, 0x7e, 0x90, 0x5b, 0x64, 0x96,
+	0x9a, 0xb5, 0xc8, 0x06, 0x7e, 0xc0, 0x68, 0x5b, 0x77, 0xf7, 0xb0, 0xa7, 0x19, 0x4e, 0x87, 0xe4,
+	0x2e, 0xd0, 0x05, 0x46, 0x53, 0x3a, 0x2a, 0xaa, 0x3a, 0x1d, 0x82, 0x7e, 0x0d, 0x92, 0x0f, 0x74,
+	0xa2, 0xe1, 0x6e, 0xcf, 0x3b, 0x64, 0xc6, 0x92, 0xa9, 0xdb, 0x93, 0x3a, 0xfd, 0x6e, 0xc6, 0xe4,
+	0x88, 0x12, 0x6d, 0xc6, 0xe4, 0xa8, 0x12, 0x6b, 0xc6, 0xe4, 0x98, 0x32, 0xdb, 0x8c, 0xc9, 0xb3,
+	0x4a, 0xbc, 0x19, 0x93, 0xe3, 0x4a, 0xa2, 0x19, 0x93, 0x13, 0x8a, 0xdc, 0x8c, 0xc9, 0xb2, 0x92,
+	0x6c, 0xc6, 0xe4, 0xa4, 0x02, 0xcd, 0x98, 0x0c, 0xca, 0x5c, 0x33, 0x26, 0xcf, 0x29, 0xf3, 0xcd,
+	0x98, 0x3c, 0xaf, 0xa4, 0x9a, 0x31, 0x39, 0xa5, 0xa4, 0x9b, 0x31, 0x39, 0xad, 0x64, 0x9a, 0x31,
+	0x39, 0xa3, 0x28, 0xcd, 0x98, 0xac, 0x28, 0xd9, 0x66, 0x4c, 0xce, 0x2a, 0xa8, 0xf8, 0xb9, 0x04,
+	0x4a, 0x0b, 0xdf, 0xeb, 0x63, 0xdb, 0xc0, 0x77, 0xf5, 0x4e, 0x75, 0xbf, 0x6f, 0x1f, 0xa0, 0x57,
+	0x20, 0x63, 0xd0, 0x1f, 0x1a, 0xdf, 0x18, 0xd3, 0xa1, 0x4a, 0x6c, 0xa8, 0x29, 0x26, 0x6e, 0x51,
+	0x29, 0x1d, 0xf1, 0x0b, 0x00, 0x42, 0x8f, 0xae, 0x6c, 0x7e, 0xce, 0x96, 0xe4, 0x2a, 0x74, 0x39,
+	0x8f, 0xc1, 0xb8, 0xce, 0x03, 0x46, 0x1f, 0x23, 0x30, 0xaa, 0xf3, 0x00, 0x2d, 0xc3, 0xa2, 0x8d,
+	0x1f, 0x7a, 0xda, 0xb8, 0x32, 0xa3, 0x0a, 0x35, 0x4b, 0xcb, 0xaa, 0xe1, 0x0a, 0xc5, 0x7f, 0x8d,
+	0x40, 0xc6, 0xef, 0xb4, 0x4f, 0x87, 0xbb, 0xa0, 0xd0, 0x69, 0xb1, 0x4c, 0xcd, 0x73, 0x38, 0x92,
+	0x4f, 0x8c, 0xef, 0x9f, 0x42, 0x8c, 0x63, 0x28, 0xf4, 0xbb, 0x61, 0x6e, 0x3b, 0xac, 0x39, 0x1e,
+	0x1a, 0xd4, 0x14, 0x09, 0xcb, 0xf2, 0x3b, 0x90, 0xf6, 0x2b, 0x71, 0x09, 0xaa, 0x42, 0x7c, 0xa4,
+	0xbd, 0xd7, 0xa6, 0x68, 0xcf, 0x37, 0xb5, 0x2a, 0xaa, 0xe6, 0x7f, 0x07, 0xd0, 0x64, 0xdb, 0xe1,
+	0xb0, 0x34, 0xcb, 0xc3, 0xd2, 0xe6, 0x68, 0x58, 0x7a, 0xf7, 0x7c, 0x63, 0x0b, 0x75, 0x3b, 0xbc,
+	0xab, 0xfb, 0xe7, 0x08, 0xa4, 0x79, 0x88, 0x08, 0xc2, 0xd1, 0x6b, 0x90, 0x65, 0xa4, 0x65, 0xd9,
+	0x7b, 0x5a, 0x4f, 0x08, 0xd9, 0xf8, 0x22, 0xaa, 0xe2, 0x17, 0x04, 0xca, 0x2f, 0x42, 0xca, 0xc5,
+	0xba, 0x39, 0x54, 0x8c, 0x30, 0xc5, 0x79, 0x2a, 0x0c, 0x94, 0x5e, 0x86, 0x34, 0x8b, 0x86, 0x43,
+	0xad, 0x28, 0xd3, 0x4a, 0x31, 0x69, 0xa0, 0x56, 0x81, 0x14, 0xe9, 0xe9, 0xf6, 0x50, 0x2b, 0xc6,
+	0x8c, 0x7a, 0xc6, 0x69, 0xd3, 0x3c, 0xad, 0x13, 0x8e, 0xa5, 0x2e, 0x26, 0xfd, 0x2e, 0xd6, 0x7a,
+	0x0e, 0xdf, 0x6c, 0x45, 0xd5, 0x24, 0x97, 0x6c, 0x39, 0x04, 0xed, 0x30, 0x57, 0x61, 0xb6, 0xd0,
+	0x4c, 0x6e, 0x9c, 0x5c, 0x9c, 0xb5, 0x72, 0x6d, 0x7a, 0x73, 0xaa, 0x19, 0x32, 0x2a, 0x28, 0xfe,
+	0xad, 0x04, 0x97, 0x68, 0xc2, 0xcc, 0x59, 0xb1, 0xca, 0x4e, 0xc8, 0x7d, 0xef, 0xd4, 0x21, 0xc1,
+	0x92, 0xee, 0x20, 0xff, 0x5c, 0x3d, 0x1a, 0x14, 0xe2, 0x54, 0xfb, 0x99, 0x23, 0x57, 0x9c, 0x02,
+	0x37, 0xd8, 0xf6, 0xc8, 0x73, 0x75, 0x9b, 0x58, 0x74, 0xa3, 0x40, 0xa7, 0xad, 0x8b, 0xbb, 0x6d,
+	0xec, 0xf2, 0xc9, 0x98, 0x57, 0x17, 0x47, 0x0a, 0xd7, 0x79, 0x59, 0x31, 0x0f, 0xb9, 0xf1, 0x2e,
+	0x07, 0x3b, 0xfb, 0xdf, 0x84, 0x8b, 0x1b, 0xf8, 0xc1, 0x71, 0xa3, 0xa9, 0x40, 0x82, 0xf3, 0x97,
+	0xef, 0xf2, 0x57, 0xc6, 0x59, 0x35, 0x7c, 0x49, 0x50, 0x62, 0x3d, 0xdd, 0x66, 0x15, 0x54, 0xbf,
+	0x62, 0xf1, 0x53, 0xb8, 0x34, 0x86, 0x1e, 0x4c, 0xdf, 0x07, 0x10, 0xa7, 0x3b, 0x3f, 0x91, 0xd9,
+	0xa4, 0x27, 0x77, 0x15, 0x93, 0xe8, 0x2d, 0xaa, 0xaf, 0x8a, 0x6a, 0x45, 0x95, 0x1d, 0x49, 0xf4,
+	0xbb, 0x98, 0x7a, 0xc8, 0x6d, 0x8b, 0x78, 0xe8, 0x43, 0x98, 0x17, 0x1e, 0x41, 0x1d, 0xc5, 0xef,
+	0xf6, 0x19, 0x4e, 0x35, 0xe7, 0x06, 0x20, 0xa4, 0xf8, 0x77, 0x12, 0x2c, 0xd4, 0x5c, 0xa7, 0xd7,
+	0xc3, 0xa6, 0x88, 0x15, 0xdc, 0x16, 0x7e, 0x88, 0x90, 0x42, 0x21, 0x62, 0x03, 0x22, 0x8d, 0x9a,
+	0xd8, 0x0b, 0xdc, 0x7c, 0xd6, 0x2d, 0x46, 0xa3, 0x86, 0xde, 0xe5, 0x06, 0xe9, 0x13, 0xc6, 0x9f,
+	0xe9, 0x89, 0x4d, 0xdf, 0x88, 0x9b, 0x32, 0x45, 0x55, 0x54, 0x28, 0xfe, 0x24, 0x01, 0x17, 0xc2,
+	0x46, 0x5e, 0xa9, 0xfa, 0x1d, 0xff, 0x0c, 0x12, 0x96, 0x6d, 0xe2, 0x87, 0x78, 0x2a, 0x9e, 0x3c,
+	0x0e, 0xa2, 0x24, 0xec, 0xd1, 0xa0, 0x30, 0xfe, 0x36, 0x53, 0x60, 0xa2, 0x8f, 0x83, 0xf4, 0x94,
+	0x1f, 0xfb, 0xdc, 0x78, 0x6a, 0xf4, 0xda, 0x58, 0xaa, 0x3a, 0x92, 0x09, 0xb2, 0x80, 0xf2, 0x0d,
+	0x65, 0x82, 0x2d, 0xc8, 0x5a, 0xb6, 0x87, 0xdd, 0x0e, 0xd6, 0xef, 0xd3, 0xc4, 0x86, 0x36, 0x2f,
+	0x4e, 0x7f, 0xa6, 0x4d, 0x23, 0x94, 0x10, 0x00, 0x4f, 0x47, 0x3e, 0x83, 0x85, 0x30, 0xa8, 0x3f,
+	0x05, 0xa7, 0x9f, 0x08, 0x31, 0x0b, 0x0f, 0x61, 0xfd, 0x83, 0x97, 0x10, 0x50, 0x43, 0x98, 0xfd,
+	0x2e, 0xc4, 0xf9, 0x46, 0x5f, 0x1c, 0xaf, 0xde, 0x7c, 0x5a, 0xb3, 0xf3, 0x03, 0x04, 0x55, 0xa0,
+	0xe5, 0xff, 0x54, 0x82, 0xf9, 0xf0, 0x74, 0x23, 0x0b, 0x64, 0xd6, 0x77, 0x9f, 0xd2, 0xa2, 0x95,
+	0x0d, 0x9a, 0xcb, 0xb2, 0x42, 0x36, 0x07, 0x1f, 0x3c, 0xf5, 0x1c, 0x70, 0x08, 0xe1, 0x4a, 0x0d,
+	0x93, 0x26, 0x48, 0xa6, 0xeb, 0xf4, 0x86, 0xc7, 0xeb, 0x51, 0x55, 0xa6, 0x02, 0x9a, 0xf3, 0xe5,
+	0x7f, 0x17, 0x92, 0x81, 0xa3, 0x84, 0x76, 0xf8, 0xd1, 0xaf, 0x71, 0x87, 0x7f, 0x6a, 0xfb, 0x35,
+	0x48, 0x8d, 0x58, 0x0c, 0x5d, 0x0c, 0xfa, 0x10, 0xab, 0xc4, 0x79, 0x1f, 0xce, 0x44, 0x29, 0xfe,
+	0x3c, 0x0e, 0x0b, 0xc7, 0x31, 0xed, 0x27, 0xa0, 0x84, 0x78, 0x4b, 0xeb, 0x58, 0xc4, 0x13, 0xeb,
+	0xe9, 0xea, 0xe9, 0x1b, 0xd2, 0x10, 0xf9, 0x09, 0x6f, 0x49, 0xbb, 0xa3, 0x94, 0xf8, 0x3d, 0x48,
+	0x9b, 0xbc, 0xe3, 0x9a, 0x58, 0xa8, 0xd1, 0x33, 0xf7, 0x91, 0xc7, 0x10, 0xa0, 0x40, 0x4f, 0x99,
+	0xa1, 0x22, 0xc2, 0xee, 0x1d, 0x7c, 0xf4, 0xe0, 0x6c, 0xc7, 0x32, 0xd9, 0xea, 0x49, 0x55, 0x5a,
+	0x47, 0x83, 0x42, 0x56, 0x60, 0xf9, 0x87, 0x39, 0xcf, 0x3c, 0x53, 0x59, 0x73, 0x0c, 0xd0, 0xa4,
+	0x51, 0x97, 0x96, 0xd3, 0x86, 0x67, 0x87, 0x51, 0x97, 0xae, 0xa3, 0x67, 0x8f, 0xba, 0xf4, 0x67,
+	0xc3, 0x44, 0x7f, 0x28, 0x41, 0x96, 0x9f, 0xec, 0x76, 0xfb, 0x9e, 0xce, 0x8f, 0xeb, 0xfd, 0xfd,
+	0xe9, 0x27, 0x47, 0x83, 0x42, 0x86, 0x19, 0x64, 0x5d, 0x94, 0xb1, 0x66, 0x2b, 0x4f, 0xdb, 0xec,
+	0x10, 0x45, 0xec, 0xd9, 0x02, 0x81, 0x89, 0xd6, 0x20, 0xcd, 0x37, 0xdb, 0xfe, 0x55, 0x3b, 0xdb,
+	0xb8, 0xa6, 0x2a, 0x2f, 0x3d, 0x19, 0x14, 0x96, 0x8e, 0xf1, 0x2c, 0xbe, 0x4f, 0xbf, 0xcb, 0x75,
+	0xd5, 0xd4, 0x6e, 0xf8, 0x13, 0x19, 0x90, 0x0a, 0x5c, 0xe3, 0xb0, 0x27, 0xf6, 0xb9, 0xcf, 0x1e,
+	0xca, 0xe6, 0x7d, 0x1f, 0xa1, 0x98, 0x68, 0x0f, 0x32, 0x7e, 0x23, 0x3c, 0xa0, 0x93, 0x5c, 0xf2,
+	0x6b, 0x69, 0xc6, 0x77, 0x6b, 0x3e, 0x6a, 0x22, 0x8e, 0x5c, 0x2e, 0xc2, 0xe2, 0xb1, 0x59, 0xce,
+	0x97, 0x71, 0xb8, 0x38, 0x4a, 0x84, 0x41, 0x1e, 0xa2, 0x8d, 0x47, 0xc8, 0x0f, 0xa6, 0x26, 0x53,
+	0x1f, 0x83, 0x93, 0x99, 0xff, 0x35, 0x1e, 0x23, 0x3f, 0x1b, 0x8b, 0x91, 0x4f, 0x81, 0xcf, 0xdc,
+	0x6b, 0x0c, 0xdf, 0x0f, 0x94, 0x1f, 0x07, 0xb1, 0x80, 0x9f, 0xda, 0x7c, 0xf8, 0x14, 0xf0, 0xac,
+	0xbe, 0xff, 0x19, 0x44, 0x83, 0x7f, 0x91, 0x20, 0x35, 0x32, 0xb2, 0x5f, 0x66, 0x38, 0xd8, 0x0a,
+	0xb2, 0x21, 0xfe, 0x20, 0xe3, 0x9d, 0xf3, 0x0f, 0x6b, 0x34, 0x49, 0xca, 0xff, 0x83, 0x04, 0xa9,
+	0x11, 0x43, 0x7e, 0x43, 0x81, 0xe4, 0xeb, 0xef, 0x79, 0x1b, 0xd2, 0xa3, 0x53, 0x14, 0x6a, 0x43,
+	0xfa, 0x7a, 0xda, 0x28, 0x7e, 0x17, 0xe2, 0x5c, 0x82, 0x10, 0xa4, 0x3f, 0x2a, 0x37, 0xb6, 0x1b,
+	0x1b, 0x2b, 0xda, 0xad, 0x4d, 0x55, 0x5b, 0xa9, 0x2a, 0x33, 0x68, 0x1e, 0xe4, 0x5a, 0xfd, 0x76,
+	0x9d, 0x0a, 0x15, 0x09, 0xcd, 0x41, 0x82, 0x7d, 0xd5, 0x6b, 0x4a, 0xa4, 0x58, 0x01, 0x85, 0x63,
+	0xef, 0x62, 0x1a, 0x18, 0x68, 0xde, 0x8f, 0x4a, 0xb0, 0xc0, 0x92, 0xf4, 0x2e, 0xcd, 0xdf, 0x68,
+	0x28, 0xd4, 0x42, 0xd9, 0x73, 0x36, 0x28, 0xa2, 0x41, 0x71, 0x43, 0xef, 0xe2, 0xe2, 0xdf, 0xc7,
+	0x20, 0x3b, 0x04, 0xf1, 0xc3, 0xe2, 0x2b, 0x20, 0x13, 0xcb, 0x3e, 0xd0, 0x86, 0x97, 0xe6, 0xfc,
+	0x20, 0xcd, 0xb2, 0x0f, 0x76, 0xd4, 0x86, 0x9a, 0xa0, 0x85, 0x3b, 0xae, 0x85, 0x9a, 0x10, 0x73,
+	0x7a, 0x9e, 0xbf, 0x87, 0x7c, 0xfb, 0x14, 0x53, 0x4c, 0xb4, 0x51, 0xda, 0xec, 0x79, 0xe2, 0x04,
+	0x80, 0x61, 0xa0, 0xbf, 0x96, 0x86, 0xbb, 0x1e, 0xbe, 0x5b, 0x7c, 0xf7, 0x5c, 0x78, 0xdc, 0x00,
+	0xe2, 0x06, 0xf3, 0x23, 0xba, 0x50, 0x9f, 0x0c, 0x0a, 0xd9, 0x71, 0x03, 0x91, 0x67, 0xbc, 0xda,
+	0xf4, 0xbb, 0x88, 0x9a, 0xfc, 0x52, 0x6d, 0x68, 0x68, 0x16, 0x10, 0xa6, 0xbc, 0xb7, 0x4c, 0x8d,
+	0x4c, 0x44, 0x7e, 0x0f, 0xe6, 0xc3, 0xbd, 0x3f, 0xe6, 0xb4, 0xbc, 0x3c, 0x7a, 0x2c, 0xf1, 0xda,
+	0x54, 0x96, 0x11, 0x5b, 0xc2, 0xd0, 0x11, 0xfd, 0x77, 0x21, 0x19, 0x98, 0xfd, 0x3c, 0x67, 0xfb,
+	0x9c, 0xe3, 0x83, 0xc3, 0xb2, 0x59, 0x25, 0x5e, 0xfc, 0x1b, 0x09, 0xe6, 0x55, 0x4c, 0x9c, 0xce,
+	0x7d, 0x6c, 0xd2, 0x9c, 0x27, 0x78, 0xbd, 0x22, 0x4d, 0xff, 0x7a, 0xa5, 0x0c, 0xc9, 0xe0, 0x34,
+	0xf3, 0x3c, 0xef, 0x3a, 0x86, 0xb5, 0xd0, 0x55, 0x50, 0xda, 0x4e, 0xdf, 0x36, 0x75, 0xf7, 0x50,
+	0x73, 0xb1, 0x6e, 0xec, 0x63, 0x53, 0xdc, 0xdc, 0x64, 0x7c, 0xb9, 0xca, 0xc5, 0xc5, 0x1f, 0x45,
+	0x00, 0x0d, 0x8d, 0x13, 0xa2, 0x22, 0x9a, 0xb9, 0xb1, 0x71, 0x88, 0xcd, 0x6b, 0xe4, 0xd8, 0xbb,
+	0xb6, 0xb1, 0x04, 0x30, 0x18, 0xb8, 0x3f, 0xa5, 0x6e, 0x48, 0x46, 0xd0, 0x8f, 0x4f, 0x3f, 0xb3,
+	0x8d, 0xb2, 0x33, 0x5b, 0xe6, 0xa5, 0xbf, 0xd4, 0x73, 0x5b, 0x11, 0xac, 0xff, 0x27, 0x06, 0xa8,
+	0xea, 0x62, 0xdd, 0xc3, 0x94, 0x79, 0xc8, 0x69, 0x7b, 0xed, 0x0a, 0xcc, 0xf2, 0x8d, 0x59, 0xe4,
+	0x3c, 0x1b, 0x33, 0x61, 0x14, 0x5e, 0x15, 0x7d, 0x1f, 0xe6, 0x0d, 0xa7, 0xd3, 0xef, 0xda, 0x1a,
+	0xbb, 0x71, 0x16, 0x89, 0xf0, 0x77, 0x4e, 0x73, 0xe2, 0x89, 0xce, 0x95, 0xaa, 0x4e, 0x87, 0x7e,
+	0xfb, 0x67, 0x07, 0x1c, 0x90, 0x69, 0xa0, 0xe7, 0x21, 0x19, 0x2c, 0x28, 0x96, 0x02, 0x27, 0xd5,
+	0xa1, 0x00, 0x5d, 0x87, 0x59, 0x9d, 0x68, 0xce, 0x2e, 0xcb, 0x51, 0xcf, 0xf2, 0x30, 0x35, 0xa6,
+	0x93, 0xcd, 0x5d, 0xf4, 0x16, 0xa4, 0x76, 0xef, 0xf1, 0xbc, 0x9d, 0x13, 0x28, 0x7f, 0x08, 0x90,
+	0x39, 0x1a, 0x14, 0xe6, 0x6e, 0xdd, 0x61, 0x83, 0xa5, 0xf4, 0xa9, 0xce, 0xed, 0xde, 0x0b, 0x3e,
+	0xd0, 0x35, 0xc8, 0x76, 0xf5, 0x87, 0xda, 0xae, 0xab, 0x1b, 0x22, 0x51, 0xed, 0x70, 0x56, 0x90,
+	0xd4, 0x4c, 0x57, 0x7f, 0x78, 0x4b, 0xc8, 0x1b, 0x66, 0x07, 0xe7, 0xff, 0x5b, 0x82, 0x84, 0x18,
+	0x11, 0xea, 0x01, 0x08, 0xf3, 0x58, 0x26, 0x4f, 0x85, 0x52, 0x95, 0x3b, 0x47, 0x83, 0x42, 0xb2,
+	0xca, 0xa4, 0x8d, 0x1a, 0x79, 0x32, 0x28, 0x7c, 0xf8, 0xb4, 0xa4, 0xe5, 0x83, 0xa8, 0x49, 0xde,
+	0x48, 0xc3, 0x64, 0x07, 0x8a, 0xfb, 0x3a, 0xd1, 0xf6, 0x2d, 0xe2, 0x39, 0x7b, 0xae, 0xde, 0x65,
+	0x93, 0x2b, 0xab, 0xf3, 0xfb, 0x3a, 0x59, 0xf5, 0x65, 0x28, 0x4f, 0x53, 0x8e, 0xfb, 0xfc, 0xc1,
+	0x00, 0x5f, 0x52, 0xc1, 0x37, 0xba, 0x0e, 0x17, 0x82, 0xca, 0x1a, 0x1d, 0x74, 0xbb, 0x6f, 0x1c,
+	0x60, 0x16, 0x09, 0x28, 0x67, 0x2d, 0x04, 0x85, 0xeb, 0xfa, 0xc3, 0x0a, 0x2f, 0x2a, 0x5e, 0x80,
+	0x85, 0xd0, 0xb4, 0x06, 0x09, 0x22, 0x06, 0x65, 0xdd, 0xda, 0x73, 0xf5, 0xf0, 0xcb, 0xbb, 0x3b,
+	0x90, 0x19, 0x7b, 0xd9, 0x2a, 0x68, 0x25, 0x7c, 0x10, 0x36, 0xfa, 0x14, 0xb6, 0x54, 0xe5, 0x9f,
+	0x7e, 0xca, 0x9d, 0x36, 0x46, 0xbe, 0x8b, 0x0b, 0x90, 0x0d, 0x9a, 0x09, 0xda, 0xfe, 0xc5, 0x3c,
+	0x24, 0xb6, 0xf4, 0xc3, 0x8e, 0xa3, 0x9b, 0x68, 0x09, 0xe6, 0xfc, 0x47, 0x06, 0x7e, 0x7b, 0x49,
+	0x35, 0x2c, 0x42, 0x16, 0xa4, 0xfb, 0x04, 0xbb, 0xd4, 0x1f, 0x34, 0xf6, 0xd0, 0x96, 0xf3, 0x64,
+	0xa5, 0xf2, 0x64, 0x50, 0xb8, 0x39, 0xdd, 0xf4, 0x60, 0xa3, 0xef, 0x5a, 0xde, 0x61, 0xa9, 0x75,
+	0xe7, 0xf6, 0x8e, 0x80, 0xa2, 0x8b, 0xd8, 0x51, 0x53, 0xfd, 0xf0, 0xa7, 0x78, 0xb2, 0x41, 0x4d,
+	0xad, 0x75, 0x2d, 0xc3, 0x75, 0x88, 0x7f, 0xb2, 0x2f, 0xa4, 0xeb, 0x4c, 0x88, 0x5e, 0x85, 0xcc,
+	0xae, 0x65, 0xb3, 0x5b, 0x25, 0x5f, 0x8f, 0x1f, 0xea, 0xa7, 0x7d, 0xb1, 0x50, 0xbc, 0x0f, 0xe9,
+	0xd0, 0x33, 0x0d, 0xea, 0x66, 0x71, 0xe6, 0x66, 0x9b, 0x47, 0x83, 0x42, 0x6a, 0xb8, 0x6c, 0xb9,
+	0xab, 0x3d, 0x4b, 0x7c, 0x4c, 0x0d, 0x9b, 0xa1, 0x8e, 0xb6, 0x08, 0xb3, 0xec, 0x19, 0x36, 0x7f,
+	0x99, 0xa5, 0xf2, 0x0f, 0xf4, 0x36, 0xcc, 0x76, 0xb0, 0x4e, 0xb0, 0x78, 0x74, 0xb5, 0x74, 0x0a,
+	0x11, 0xb0, 0x77, 0xcc, 0x2a, 0x57, 0x47, 0x15, 0x88, 0xf3, 0x7b, 0x42, 0x76, 0xbb, 0x37, 0x79,
+	0x2c, 0x7a, 0xe2, 0xfb, 0xba, 0xd5, 0x19, 0x55, 0xd4, 0x44, 0x75, 0x48, 0xb8, 0xfc, 0x6a, 0x98,
+	0xdd, 0xf9, 0x9d, 0xb9, 0xd1, 0x0f, 0xdd, 0x3c, 0xaf, 0xce, 0xa8, 0x7e, 0x5d, 0xb4, 0xed, 0xbf,
+	0xcf, 0xe0, 0x11, 0x45, 0x3c, 0x3f, 0x29, 0x4d, 0x99, 0x0c, 0x0e, 0x01, 0x47, 0x50, 0xe8, 0x00,
+	0x2d, 0x76, 0x4f, 0xc0, 0xae, 0x0e, 0x4f, 0x1f, 0xe0, 0xc8, 0x9d, 0x33, 0x1d, 0x20, 0xaf, 0x89,
+	0x36, 0x00, 0x8c, 0x20, 0xca, 0xb1, 0x4b, 0xc5, 0xb9, 0xeb, 0xaf, 0x9f, 0x27, 0x93, 0x5a, 0x9d,
+	0x51, 0x43, 0x08, 0xe8, 0x0e, 0xcc, 0x19, 0xc3, 0x65, 0x9b, 0xcb, 0x30, 0xc0, 0x37, 0xce, 0xc5,
+	0xdd, 0xab, 0x94, 0xaf, 0x87, 0xd2, 0x51, 0xbe, 0x56, 0xc6, 0xf9, 0xba, 0x0e, 0x29, 0x71, 0x26,
+	0xc3, 0x5f, 0xf0, 0xe7, 0xb2, 0x2c, 0x5c, 0x84, 0xbd, 0xc4, 0x7f, 0xe3, 0x5f, 0xaa, 0xdb, 0x86,
+	0x63, 0x62, 0xb3, 0x4e, 0xbf, 0x55, 0x71, 0x04, 0xcd, 0x3e, 0x08, 0x5a, 0x81, 0xb4, 0xd1, 0xc1,
+	0xba, 0xdd, 0xef, 0xf9, 0x38, 0x68, 0x4a, 0x9c, 0x94, 0xa8, 0x27, 0x80, 0x36, 0x00, 0xed, 0xb2,
+	0x37, 0x1d, 0xe1, 0x5e, 0xb1, 0xbb, 0xc9, 0x69, 0xc0, 0x14, 0x56, 0x57, 0x1d, 0xf6, 0x0c, 0xbd,
+	0x04, 0x29, 0xdb, 0xb1, 0x0d, 0xdd, 0x36, 0x70, 0x87, 0x45, 0x56, 0x7e, 0x9d, 0x39, 0x2a, 0x44,
+	0x9f, 0x42, 0x9a, 0x8c, 0x6c, 0x1f, 0x72, 0x17, 0x58, 0x8b, 0x6f, 0x9e, 0xf7, 0xc0, 0x71, 0x75,
+	0x46, 0x1d, 0x43, 0x42, 0xbf, 0x05, 0x8a, 0x37, 0x76, 0x2b, 0xc1, 0x2e, 0x46, 0x4f, 0x7f, 0x3f,
+	0x75, 0xc2, 0xdd, 0xcb, 0xea, 0x8c, 0x3a, 0x81, 0x86, 0x3e, 0x83, 0x0c, 0x19, 0x7d, 0x53, 0x9c,
+	0xbb, 0xc4, 0x1a, 0xf8, 0xf6, 0xa9, 0x47, 0xeb, 0xc7, 0x3d, 0xc3, 0x5e, 0x9d, 0x51, 0xc7, 0xb1,
+	0x28, 0xbc, 0x3d, 0x7a, 0xb9, 0x91, 0xcb, 0x9d, 0x09, 0x7f, 0xfc, 0x65, 0x0b, 0x85, 0x1f, 0xc3,
+	0x42, 0x6b, 0x90, 0xec, 0xfa, 0xb1, 0x22, 0xf7, 0xdc, 0x99, 0x19, 0xf7, 0x78, 0xf8, 0x5a, 0x9d,
+	0x51, 0x87, 0xf5, 0x2b, 0x49, 0x48, 0x88, 0x4b, 0xb0, 0xe0, 0x6a, 0x39, 0xa1, 0xc8, 0xc5, 0x5f,
+	0xc8, 0x20, 0x07, 0x39, 0xe8, 0x32, 0xa0, 0x20, 0x6b, 0x18, 0xbe, 0xe7, 0xa3, 0x21, 0x28, 0xb2,
+	0x3a, 0xa3, 0x66, 0xfd, 0xb2, 0xe1, 0x93, 0xbe, 0x57, 0x21, 0xd3, 0x75, 0x4c, 0x6b, 0xd7, 0x1a,
+	0x12, 0x3f, 0x3f, 0xf2, 0x4c, 0xfb, 0x62, 0x41, 0xfc, 0x37, 0x47, 0x9e, 0xbd, 0x4c, 0xf3, 0x40,
+	0x9c, 0xf6, 0x3e, 0x78, 0x17, 0x43, 0x03, 0x91, 0xdb, 0xb7, 0xd9, 0x7d, 0x97, 0xd8, 0xf6, 0xf2,
+	0xfc, 0x2a, 0x25, 0xa4, 0x62, 0xe7, 0x5a, 0x1d, 0x63, 0xe6, 0xab, 0x67, 0x32, 0xb3, 0x3f, 0xf6,
+	0x55, 0x29, 0xa0, 0xe6, 0x5b, 0xe3, 0xd4, 0x7c, 0xed, 0x6c, 0x6a, 0x0e, 0xc1, 0x04, 0xdc, 0xbc,
+	0x73, 0x2c, 0x37, 0x2f, 0x4f, 0xb9, 0x70, 0x42, 0x88, 0xa3, 0xe4, 0x5c, 0x1d, 0x23, 0xe7, 0xab,
+	0x67, 0x92, 0x73, 0x78, 0x8c, 0x82, 0x9d, 0x37, 0x8f, 0x61, 0xe7, 0x37, 0xa6, 0x62, 0xe7, 0x10,
+	0x58, 0x98, 0x9e, 0xd5, 0xe3, 0xe8, 0xb9, 0x34, 0x1d, 0x3d, 0x87, 0x20, 0x47, 0xf8, 0xf9, 0x7b,
+	0x13, 0xdc, 0xa3, 0x9c, 0xbd, 0x78, 0x8f, 0x3d, 0xeb, 0x58, 0x95, 0x26, 0xc8, 0x47, 0x3f, 0x86,
+	0x7c, 0xb2, 0x0c, 0xfe, 0xad, 0x73, 0x90, 0x4f, 0xa8, 0x81, 0x49, 0xf6, 0xf9, 0x18, 0xe6, 0xc3,
+	0x8c, 0xc1, 0x9e, 0x97, 0x9c, 0xce, 0x6d, 0x27, 0xfc, 0x01, 0x04, 0xf3, 0x81, 0x50, 0x11, 0xfa,
+	0xfe, 0x24, 0xf1, 0x2c, 0x9c, 0x09, 0x7e, 0xc2, 0x3d, 0xec, 0xaa, 0x34, 0xc9, 0x3c, 0xb7, 0xc3,
+	0xcc, 0xb3, 0x78, 0x66, 0xec, 0x9e, 0xc8, 0x68, 0x57, 0xa5, 0x30, 0xf5, 0x00, 0xc8, 0xfe, 0x35,
+	0x7f, 0x88, 0x86, 0x8a, 0x7f, 0x22, 0x41, 0xb4, 0xe9, 0xb4, 0x51, 0x7a, 0x78, 0x08, 0xc7, 0x8e,
+	0xcf, 0x3e, 0x18, 0xaa, 0x8b, 0xdd, 0xde, 0x8b, 0xa7, 0xb4, 0x1d, 0x1c, 0x5a, 0x06, 0x95, 0xd0,
+	0x7b, 0x90, 0xe8, 0xf1, 0x6c, 0x5a, 0x30, 0x4d, 0xf1, 0xb4, 0xfa, 0x5c, 0x53, 0xf5, 0xab, 0x5c,
+	0xbb, 0x1a, 0xfe, 0x5b, 0xa8, 0x75, 0xc7, 0xc4, 0x28, 0x0d, 0xb0, 0xa5, 0x13, 0xd2, 0xdb, 0x77,
+	0x75, 0x82, 0x95, 0x19, 0x94, 0x80, 0xe8, 0xda, 0x7a, 0x4b, 0x91, 0xae, 0x7d, 0x1c, 0x3e, 0x32,
+	0xab, 0xa9, 0xe5, 0xc6, 0x46, 0x63, 0x63, 0x45, 0xdb, 0x28, 0xaf, 0xd7, 0x5b, 0xca, 0x0c, 0xca,
+	0xc1, 0xe2, 0x47, 0xe5, 0xc6, 0xb6, 0x38, 0x43, 0xd3, 0x1a, 0x1b, 0xdb, 0x75, 0xf5, 0x6e, 0xf9,
+	0xb6, 0x22, 0xa1, 0x8b, 0x80, 0xd4, 0xcd, 0xea, 0x5a, 0xab, 0x56, 0xd1, 0xaa, 0x9b, 0xeb, 0x5b,
+	0xe5, 0xea, 0x76, 0x63, 0x73, 0x43, 0x89, 0x20, 0x19, 0x62, 0xb5, 0xcd, 0x8d, 0xba, 0x02, 0xd7,
+	0x7e, 0x1c, 0x83, 0x18, 0xf5, 0x35, 0xf4, 0x12, 0xcc, 0xed, 0x6c, 0xb4, 0xb6, 0xea, 0xd5, 0xc6,
+	0xad, 0x46, 0xbd, 0xa6, 0xcc, 0xe4, 0x17, 0x1e, 0x3d, 0x5e, 0xca, 0xd0, 0xa2, 0x1d, 0x9b, 0xf4,
+	0xb0, 0xc1, 0x48, 0x16, 0xe5, 0x21, 0x5e, 0x29, 0x57, 0xd7, 0x76, 0xb6, 0x14, 0x29, 0x9f, 0x7e,
+	0xf4, 0x78, 0x09, 0xa8, 0x02, 0x27, 0x38, 0xf4, 0x3c, 0x24, 0xd4, 0x7a, 0x6b, 0x7b, 0x53, 0xad,
+	0x2b, 0x91, 0x7c, 0xe6, 0xd1, 0xe3, 0xa5, 0x39, 0x5a, 0x28, 0x78, 0x0b, 0xbd, 0x0a, 0xa9, 0x56,
+	0x75, 0xb5, 0xbe, 0x5e, 0xd6, 0xaa, 0xab, 0xe5, 0x8d, 0x95, 0xba, 0x12, 0xcd, 0x2f, 0x3e, 0x7a,
+	0xbc, 0xa4, 0x8c, 0x3b, 0x3a, 0x6d, 0xa2, 0xb1, 0xbe, 0xb5, 0xa9, 0x6e, 0x2b, 0xb1, 0x61, 0x13,
+	0x9c, 0x5f, 0x50, 0x11, 0x80, 0xd7, 0xbe, 0x55, 0xaf, 0xd7, 0x94, 0xd9, 0x3c, 0x7a, 0xf4, 0x78,
+	0x29, 0x4d, 0xcb, 0x87, 0xb4, 0x81, 0x5e, 0x86, 0xf9, 0xaa, 0x5a, 0x2f, 0x6f, 0xd7, 0xb5, 0xd6,
+	0x76, 0x79, 0xbb, 0xa5, 0xc4, 0x87, 0x23, 0x09, 0x51, 0x01, 0x2a, 0x41, 0xb6, 0xbc, 0xb3, 0xbd,
+	0xa9, 0x8d, 0xe8, 0x26, 0xf2, 0x97, 0x1e, 0x3d, 0x5e, 0x5a, 0xa0, 0xba, 0xe5, 0xbe, 0xe7, 0x84,
+	0xf5, 0x5f, 0x07, 0x65, 0xa4, 0xff, 0xda, 0x4a, 0x55, 0x91, 0xf3, 0x17, 0x1f, 0x3d, 0x5e, 0x42,
+	0xe3, 0x43, 0x58, 0xa9, 0xa2, 0x5f, 0x87, 0x8b, 0xdb, 0x9f, 0x6c, 0xd5, 0x6b, 0xf5, 0x56, 0x55,
+	0x1b, 0x1d, 0x76, 0x32, 0x9f, 0x7b, 0xf4, 0x78, 0x69, 0x91, 0xd6, 0x99, 0x18, 0xfa, 0x1b, 0xa0,
+	0xb4, 0xb6, 0xd5, 0x7a, 0x79, 0x5d, 0x6b, 0x6c, 0xac, 0xd4, 0x5b, 0x6c, 0xb2, 0x60, 0xd8, 0xa5,
+	0xb1, 0x45, 0x4b, 0x87, 0xb0, 0x51, 0xff, 0x68, 0x0c, 0x7f, 0x6e, 0xa8, 0x3f, 0xb6, 0x0e, 0xd1,
+	0x12, 0x24, 0xd7, 0x1b, 0x2b, 0x6a, 0x99, 0xe1, 0xce, 0xe7, 0xb3, 0x8f, 0x1e, 0x2f, 0xa5, 0xa8,
+	0x5e, 0xb0, 0xaa, 0xf2, 0xf2, 0x8f, 0xfe, 0xf2, 0xf2, 0xcc, 0x5f, 0xfd, 0xe4, 0xf2, 0x4c, 0xe5,
+	0xca, 0x17, 0xff, 0x79, 0x79, 0xe6, 0x8b, 0xa3, 0xcb, 0xd2, 0xcf, 0x8e, 0x2e, 0x4b, 0x5f, 0x1e,
+	0x5d, 0x96, 0xfe, 0xe3, 0xe8, 0xb2, 0xf4, 0x47, 0x5f, 0x5d, 0x9e, 0xf9, 0xd9, 0x57, 0x97, 0x67,
+	0xbe, 0xfc, 0xea, 0xf2, 0xcc, 0xa7, 0x71, 0xee, 0xd7, 0xed, 0x38, 0xdb, 0x1a, 0xbe, 0xf5, 0xff,
+	0x01, 0x00, 0x00, 0xff, 0xff, 0xdb, 0x22, 0x5f, 0x7b, 0xbc, 0x3a, 0x00, 0x00,
 }

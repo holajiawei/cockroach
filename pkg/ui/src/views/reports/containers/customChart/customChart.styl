@@ -10,6 +10,7 @@
 
 @require nib
 @require "~styl/base/palette.styl"
+@require "~src/components/core/index.styl"
 
 .metric-table-dropdown
   line-height 17px
@@ -34,6 +35,15 @@
     &:hover
       background-color $dropdown-hover-color
 
+    .Select-menu-outer
+      margin-top $spacing-base
+
+  .Select-control
+    width 100%!important
+
+  .Select-placeholder
+    padding-left 10px!important
+
 button.edit-button
   padding 12px 24px
   margin 0px 9px
@@ -55,7 +65,7 @@ button.edit-button
   &__header
     background white
     padding 10px 20px
-    font-family Lato-Regular
+    font-family $font-family--base
     font-size 12px
     font-weight bold
     letter-spacing 2px
@@ -66,3 +76,7 @@ button.edit-button
   &__cell
     text-align center
 
+.custom-metric__chart-controls-container
+  display flex
+  flex-direction row
+  margin-bottom $spacing-medium

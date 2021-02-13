@@ -15,10 +15,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -26,39 +26,34 @@ import (
 
 func TestDecodeTableValueToCol(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
-	var buf []byte
-	var scratch []byte
+	var (
+		da           rowenc.DatumAlloc
+		buf, scratch []byte
+	)
 	nCols := 1000
 	datums := make([]tree.Datum, nCols)
-	colTyps := make([]*types.T, nCols)
-	typs := make([]coltypes.T, nCols)
+	typs := make([]*types.T, nCols)
 	for i := 0; i < nCols; i++ {
-		ct := sqlbase.RandType(rng)
-		et := typeconv.FromColumnType(ct)
-		if et == coltypes.Unhandled {
-			i--
-			continue
-		}
-		datum := sqlbase.RandDatum(rng, ct, false /* nullOk */)
-		colTyps[i] = ct
-		typs[i] = et
+		ct := rowenc.RandType(rng)
+		datum := rowenc.RandDatum(rng, ct, false /* nullOk */)
+		typs[i] = ct
 		datums[i] = datum
 		var err error
 		fmt.Println(datum)
-		buf, err = sqlbase.EncodeTableValue(buf, sqlbase.ColumnID(encoding.NoColumnID), datum, scratch)
+		buf, err = rowenc.EncodeTableValue(buf, descpb.ColumnID(encoding.NoColumnID), datum, scratch)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	batch := coldata.NewMemBatchWithSize(typs, 1)
+	batch := coldata.NewMemBatchWithCapacity(typs, 1 /* capacity */, coldataext.NewExtendedColumnFactory(nil /*evalCtx */))
 	for i := 0; i < nCols; i++ {
 		typeOffset, dataOffset, _, typ, err := encoding.DecodeValueTag(buf)
 		fmt.Println(typ)
 		if err != nil {
 			t.Fatal(err)
 		}
-		buf, err = DecodeTableValueToCol(batch.ColVec(i), 0 /* rowIdx */, typ,
-			dataOffset, colTyps[i], buf[typeOffset:])
+		buf, err = DecodeTableValueToCol(&da, batch.ColVec(i), 0 /* rowIdx */, typ,
+			dataOffset, typs[i], buf[typeOffset:])
 		if err != nil {
 			t.Fatal(err)
 		}

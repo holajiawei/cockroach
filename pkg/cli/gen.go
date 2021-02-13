@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
 )
@@ -55,7 +56,7 @@ func runGenManCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	if _, err := os.Stat(manPath); err != nil {
-		if os.IsNotExist(err) {
+		if oserror.IsNotExist(err) {
 			if err := os.MkdirAll(manPath, 0755); err != nil {
 				return err
 			}
@@ -146,10 +147,10 @@ The resulting key file will be 32 bytes (random key ID) + key_size in bytes.
 		}
 
 		// 32 bytes are reserved for key ID.
-		keySize := aesSize/8 + 32
-		b := make([]byte, keySize)
+		kSize := aesSize/8 + 32
+		b := make([]byte, kSize)
 		if _, err := rand.Read(b); err != nil {
-			return fmt.Errorf("failed to create key with size %d bytes", keySize)
+			return fmt.Errorf("failed to create key with size %d bytes", kSize)
 		}
 
 		// Write key to the file with owner read/write permission.
@@ -213,7 +214,7 @@ Output the list of cluster settings known to this binary.
 				panic(fmt.Sprintf("unknown setting type %q", setting.Typ()))
 			}
 			var defaultVal string
-			if sm, ok := setting.(*settings.StateMachineSetting); ok {
+			if sm, ok := setting.(*settings.VersionSetting); ok {
 				defaultVal = sm.SettingsListDefault()
 			} else {
 				defaultVal = setting.String(&s.SV)
@@ -265,7 +266,7 @@ func init() {
 		"path to generated autocomplete file")
 	genHAProxyCmd.PersistentFlags().StringVar(&haProxyPath, "out", "haproxy.cfg",
 		"path to generated haproxy configuration file")
-	VarFlag(genHAProxyCmd.Flags(), &haProxyLocality, cliflags.Locality)
+	varFlag(genHAProxyCmd.Flags(), &haProxyLocality, cliflags.Locality)
 	genEncryptionKeyCmd.PersistentFlags().IntVarP(&aesSize, "size", "s", 128,
 		"AES key size for encryption at rest (one of: 128, 192, 256)")
 	genEncryptionKeyCmd.PersistentFlags().BoolVar(&overwriteKey, "overwrite", false,

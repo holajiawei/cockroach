@@ -289,6 +289,51 @@ func (s *Set) ExtractConstCols(evalCtx *tree.EvalContext) opt.ColSet {
 	return res
 }
 
+// ExtractValueForConstCol extracts the value for a constant column returned
+// by ExtractConstCols.
+func (s *Set) ExtractValueForConstCol(evalCtx *tree.EvalContext, col opt.ColumnID) tree.Datum {
+	if s == Unconstrained || s == Contradiction {
+		return nil
+	}
+	for i := 0; i < s.Length(); i++ {
+		c := s.Constraint(i)
+		colOrd := -1
+		for j := 0; j < c.Columns.Count(); j++ {
+			if c.Columns.Get(j).ID() == col {
+				colOrd = j
+				break
+			}
+		}
+		// The column must be part of the constraint's "exact prefix".
+		if colOrd != -1 && c.ExactPrefix(evalCtx) > colOrd {
+			return c.Spans.Get(0).StartKey().Value(colOrd)
+		}
+	}
+	return nil
+}
+
+// HasSingleColumnConstValues returns true if the Set contains a single
+// constraint on a single column which allows for one or more non-ranging
+// constant values. On success, returns the column and the constant value.
+func (s *Set) HasSingleColumnConstValues(
+	evalCtx *tree.EvalContext,
+) (col opt.ColumnID, constValues tree.Datums, ok bool) {
+	if s.Length() != 1 {
+		return 0, nil, false
+	}
+	c := s.Constraint(0)
+	if c.Columns.Count() != 1 || c.Prefix(evalCtx) != 1 {
+		return 0, nil, false
+	}
+	numSpans := c.Spans.Count()
+	constValues = make(tree.Datums, numSpans)
+	for i := range constValues {
+		val := c.Spans.Get(i).StartKey().Value(0)
+		constValues[i] = val
+	}
+	return c.Columns.Get(0).ID(), constValues, true
+}
+
 // allocConstraint allocates space for a new constraint in the set and returns
 // a pointer to it. The first constraint is stored inline, and subsequent
 // constraints are stored in the otherConstraints slice.

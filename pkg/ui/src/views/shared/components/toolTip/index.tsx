@@ -10,12 +10,19 @@
 
 import { Tooltip } from "antd";
 import React from "react";
+import { AbstractTooltipProps } from "antd/es/tooltip";
+import classNames from "classnames/bind";
 
-interface ToolTipWrapperProps {
+import styles from "./tooltip.module.styl";
+
+interface ToolTipWrapperProps extends AbstractTooltipProps {
   text: React.ReactNode;
   short?: boolean;
   children?: React.ReactNode;
 }
+
+const cx = classNames.bind(styles);
+
 /**
  * ToolTipWrapper wraps its children with an area that detects mouseover events
  * and, when hovered, displays a floating tooltip to the immediate right of
@@ -26,13 +33,21 @@ interface ToolTipWrapperProps {
  * contents.
  */
 
-export class ToolTipWrapper extends React.Component<ToolTipWrapperProps, {}> {
-  render() {
-    const { text, children } = this.props;
-    return (
-      <Tooltip title={ text } placement="bottom" overlayClassName="tooltip__preset--white">
-        {children}
-      </Tooltip>
-    );
-  }
-}
+export const ToolTipWrapper = (props: ToolTipWrapperProps) => {
+  const { text, children, placement = "bottom" } = props;
+  const overlayClassName = cx("tooltip-wrapper", "tooltip__preset--white");
+  return (
+    <Tooltip
+      title={text}
+      placement={placement}
+      overlayClassName={overlayClassName}
+      {...props}
+    >
+      {children}
+    </Tooltip>
+  );
+};
+
+ToolTipWrapper.defaultProps = {
+  placement: "bottom",
+};

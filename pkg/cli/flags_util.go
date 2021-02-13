@@ -21,13 +21,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/keysutil"
+	"github.com/cockroachdb/errors"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/elastic/gosigar"
-	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -168,14 +168,14 @@ func (m *dumpMode) Set(s string) error {
 	return nil
 }
 
-type mvccKey engine.MVCCKey
+type mvccKey storage.MVCCKey
 
 // Type implements the pflag.Value interface.
 func (k *mvccKey) Type() string { return "engine.MVCCKey" }
 
 // String implements the pflag.Value interface.
 func (k *mvccKey) String() string {
-	return engine.MVCCKey(*k).String()
+	return storage.MVCCKey(*k).String()
 }
 
 // Set implements the pflag.Value interface.
@@ -200,9 +200,9 @@ func (k *mvccKey) Set(value string) error {
 		if err != nil {
 			return err
 		}
-		newK, err := engine.DecodeMVCCKey(b)
+		newK, err := storage.DecodeMVCCKey(b)
 		if err != nil {
-			encoded := gohex.EncodeToString(engine.EncodeKey(engine.MakeMVCCMetadataKey(roachpb.Key(b))))
+			encoded := gohex.EncodeToString(storage.EncodeKey(storage.MakeMVCCMetadataKey(roachpb.Key(b))))
 			return errors.Wrapf(err, "perhaps this is just a hex-encoded key; you need an "+
 				"encoded MVCCKey (i.e. with a timestamp component); here's one with a zero timestamp: %s",
 				encoded)
@@ -213,20 +213,20 @@ func (k *mvccKey) Set(value string) error {
 		if err != nil {
 			return err
 		}
-		*k = mvccKey(engine.MakeMVCCMetadataKey(roachpb.Key(unquoted)))
+		*k = mvccKey(storage.MakeMVCCMetadataKey(roachpb.Key(unquoted)))
 	case human:
 		scanner := keysutil.MakePrettyScanner(nil /* tableParser */)
 		key, err := scanner.Scan(keyStr)
 		if err != nil {
 			return err
 		}
-		*k = mvccKey(engine.MakeMVCCMetadataKey(key))
+		*k = mvccKey(storage.MakeMVCCMetadataKey(key))
 	case rangeID:
 		fromID, err := parseRangeID(keyStr)
 		if err != nil {
 			return err
 		}
-		*k = mvccKey(engine.MakeMVCCMetadataKey(keys.MakeRangeIDPrefix(fromID)))
+		*k = mvccKey(storage.MakeMVCCMetadataKey(keys.MakeRangeIDPrefix(fromID)))
 	default:
 		return fmt.Errorf("unknown key type %s", typ)
 	}
@@ -282,7 +282,6 @@ type nodeDecommissionWaitType int
 
 const (
 	nodeDecommissionWaitAll nodeDecommissionWaitType = iota
-	nodeDecommissionWaitLive
 	nodeDecommissionWaitNone
 )
 
@@ -294,12 +293,11 @@ func (s *nodeDecommissionWaitType) String() string {
 	switch *s {
 	case nodeDecommissionWaitAll:
 		return "all"
-	case nodeDecommissionWaitLive:
-		return "live"
 	case nodeDecommissionWaitNone:
 		return "none"
+	default:
+		panic("unexpected node decommission wait type (possible values: all, none)")
 	}
-	return ""
 }
 
 // Set implements the pflag.Value interface.
@@ -307,13 +305,11 @@ func (s *nodeDecommissionWaitType) Set(value string) error {
 	switch value {
 	case "all":
 		*s = nodeDecommissionWaitAll
-	case "live":
-		*s = nodeDecommissionWaitLive
 	case "none":
 		*s = nodeDecommissionWaitNone
 	default:
 		return fmt.Errorf("invalid node decommission parameter: %s "+
-			"(possible values: all, live, none)", value)
+			"(possible values: all, none)", value)
 	}
 	return nil
 }
@@ -402,7 +398,6 @@ func (f *tableDisplayFormat) Set(s string) error {
 // known once other flags are parsed (e.g. --max-disk-temp-storage=10% depends
 // on --store).
 type bytesOrPercentageValue struct {
-	val  *int64
 	bval *humanizeutil.BytesValue
 
 	origVal string
@@ -451,11 +446,7 @@ func diskPercentResolverFactory(dir string) (percentResolverFunc, error) {
 func newBytesOrPercentageValue(
 	v *int64, percentResolver func(percent int) (int64, error),
 ) *bytesOrPercentageValue {
-	if v == nil {
-		v = new(int64)
-	}
 	return &bytesOrPercentageValue{
-		val:             v,
 		bval:            humanizeutil.NewBytesValue(v),
 		percentResolver: percentResolver,
 	}
@@ -506,7 +497,6 @@ func (b *bytesOrPercentageValue) Resolve(v *int64, percentResolver percentResolv
 		return nil
 	}
 	b.percentResolver = percentResolver
-	b.val = v
 	b.bval = humanizeutil.NewBytesValue(v)
 	return b.Set(b.origVal)
 }

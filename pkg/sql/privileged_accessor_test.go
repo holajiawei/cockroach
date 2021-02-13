@@ -14,11 +14,13 @@ import (
 	"context"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,16 +29,17 @@ import (
 // onto system.namespace_deprecated.
 func TestLookupNamespaceIDFallback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	err := kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		return txn.Put(
 			ctx,
-			sqlbase.NewDeprecatedTableKey(999, "bob").Key(),
+			catalogkeys.NewDeprecatedTableKey(999, "bob").Key(keys.SystemSQLCodec),
 			9999,
 		)
 	})

@@ -19,17 +19,16 @@ import (
 	"math/rand"
 	"reflect"
 	"strings"
-	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
 	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -91,7 +90,7 @@ func (w *random) Tables() []workload.Table {
 	tables := make([]workload.Table, w.tables)
 	rng := rand.New(rand.NewSource(w.seed))
 	for i := 0; i < w.tables; i++ {
-		createTable := sqlbase.RandCreateTable(rng, "table", rng.Int())
+		createTable := rowenc.RandCreateTable(rng, "table", rng.Int())
 		ctx := tree.NewFmtCtx(tree.FmtParsable)
 		createTable.FormatBody(ctx)
 		tables[i] = workload.Table{
@@ -112,7 +111,9 @@ type col struct {
 }
 
 // Ops implements the Opser interface.
-func (w *random) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
+func (w *random) Ops(
+	ctx context.Context, urls []string, reg *histogram.Registry,
+) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -262,10 +263,6 @@ AND    i.indisprimary`, relid)
 
 	buf.WriteString(dmlSuffix.String())
 
-	if testing.Verbose() {
-		fmt.Println(buf.String())
-	}
-
 	writeStmt, err := db.Prepare(buf.String())
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -344,6 +341,8 @@ func DatumToGoSQL(d tree.Datum) (interface{}, error) {
 		return d.UUID, nil
 	case *tree.DIPAddr:
 		return d.IPAddr.String(), nil
+	case *tree.DJSON:
+		return d.JSON.String(), nil
 	}
 	return nil, errors.Errorf("unhandled datum type: %s", reflect.TypeOf(d))
 }
@@ -364,7 +363,7 @@ func (o *randOp) run(ctx context.Context) (err error) {
 			if c.isNullable && o.config.nullPct > 0 {
 				nullPct = 100 / o.config.nullPct
 			}
-			d := sqlbase.RandDatumWithNullChance(o.rng, c.dataType, nullPct)
+			d := rowenc.RandDatumWithNullChance(o.rng, c.dataType, nullPct)
 			params[k], err = DatumToGoSQL(d)
 			if err != nil {
 				return err

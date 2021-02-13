@@ -17,8 +17,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/testutils"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFlatten(t *testing.T) {
@@ -33,14 +36,22 @@ func TestFlatten(t *testing.T) {
 			func(t testutils.T, e *pgerror.Error) {
 				t.CheckEqual(e.Message, "woo")
 				// Errors without code flatten to Uncategorized.
-				t.CheckEqual(e.Code, pgcode.Uncategorized)
+				t.CheckEqual(pgcode.MakeCode(e.Code), pgcode.Uncategorized)
+				t.CheckEqual(e.Severity, "ERROR")
 			},
 		},
 		{
 			pgerror.WithCandidateCode(baseErr, pgcode.Syntax),
 			func(t testutils.T, e *pgerror.Error) {
 				t.CheckEqual(e.Message, "woo")
-				t.CheckEqual(e.Code, pgcode.Syntax)
+				t.CheckEqual(pgcode.MakeCode(e.Code), pgcode.Syntax)
+			},
+		},
+		{
+			pgerror.WithSeverity(baseErr, "DEBUG"),
+			func(t testutils.T, e *pgerror.Error) {
+				t.CheckEqual(e.Message, "woo")
+				t.CheckEqual(e.Severity, "DEBUG")
 			},
 		},
 		{
@@ -58,18 +69,9 @@ func TestFlatten(t *testing.T) {
 			},
 		},
 		{
-			// This case for backward compatibility with 19.1.
-			// Remove when the .TelemetryKey is removed from Error.
-			errors.WithTelemetry(baseErr, "My Key"),
-			func(t testutils.T, e *pgerror.Error) {
-				t.CheckEqual(e.Message, "woo")
-				t.CheckEqual(e.TelemetryKey, "My Key")
-			},
-		},
-		{
 			unimplemented.New("woo", "woo"),
 			func(t testutils.T, e *pgerror.Error) {
-				t.CheckEqual(e.Code, pgcode.FeatureNotSupported)
+				t.CheckEqual(pgcode.MakeCode(e.Code), pgcode.FeatureNotSupported)
 				t.CheckRegexpEqual(e.Hint, "You have attempted to use a feature that is not yet implemented")
 				t.CheckRegexpEqual(e.Hint, "support form")
 			},
@@ -77,7 +79,7 @@ func TestFlatten(t *testing.T) {
 		{
 			errors.AssertionFailedf("woo"),
 			func(t testutils.T, e *pgerror.Error) {
-				t.CheckEqual(e.Code, pgcode.Internal)
+				t.CheckEqual(pgcode.MakeCode(e.Code), pgcode.Internal)
 				t.CheckRegexpEqual(e.Hint, "You have encountered an unexpected error")
 				t.CheckRegexpEqual(e.Hint, "support form")
 			},
@@ -86,14 +88,66 @@ func TestFlatten(t *testing.T) {
 			errors.Wrap(&roachpb.TransactionRetryWithProtoRefreshError{Msg: "woo"}, ""),
 			func(t testutils.T, e *pgerror.Error) {
 				t.CheckRegexpEqual(e.Message, "restart transaction: .* woo")
-				t.CheckEqual(e.Code, pgcode.SerializationFailure)
+				t.CheckEqual(pgcode.MakeCode(e.Code), pgcode.SerializationFailure)
 			},
 		},
 		{
 			errors.Wrap(&roachpb.AmbiguousResultError{Message: "woo"}, ""),
 			func(t testutils.T, e *pgerror.Error) {
 				t.CheckRegexpEqual(e.Message, "result is ambiguous.*woo")
-				t.CheckEqual(e.Code, pgcode.StatementCompletionUnknown)
+				t.CheckEqual(pgcode.MakeCode(e.Code), pgcode.StatementCompletionUnknown)
+			},
+		},
+		{
+			errors.Wrap(
+				roachpb.NewTransactionRetryWithProtoRefreshError(
+					"test",
+					uuid.MakeV4(),
+					roachpb.Transaction{},
+				),
+				"",
+			),
+			func(t testutils.T, e *pgerror.Error) {
+				require.Regexp(t, `transaction-retry-error-reference\.html`, e.Hint)
+			},
+		},
+		{
+			errors.Wrap(
+				roachpb.NewTransactionRetryWithProtoRefreshError(
+					roachpb.NewReadWithinUncertaintyIntervalError(hlc.Timestamp{}, hlc.Timestamp{}, hlc.Timestamp{}, nil).Error(),
+					uuid.MakeV4(),
+					roachpb.Transaction{},
+				),
+				"",
+			),
+			func(t testutils.T, e *pgerror.Error) {
+				require.Regexp(t, `transaction-retry-error-reference\.html#readwithinuncertaintyinterval`, e.Hint)
+			},
+		},
+		{
+			errors.Wrap(
+				roachpb.NewTransactionRetryWithProtoRefreshError(
+					roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "").Error(),
+					uuid.MakeV4(),
+					roachpb.Transaction{},
+				),
+				"",
+			),
+			func(t testutils.T, e *pgerror.Error) {
+				require.Regexp(t, `transaction-retry-error-reference\.html#retry_serializable`, e.Hint)
+			},
+		},
+		{
+			errors.Wrap(
+				roachpb.NewTransactionRetryWithProtoRefreshError(
+					roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_PUSHER_ABORTED).Error(),
+					uuid.MakeV4(),
+					roachpb.Transaction{},
+				),
+				"",
+			),
+			func(t testutils.T, e *pgerror.Error) {
+				require.Regexp(t, `transaction-retry-error-reference\.html#abort_reason_pusher_aborted`, e.Hint)
 			},
 		},
 	}

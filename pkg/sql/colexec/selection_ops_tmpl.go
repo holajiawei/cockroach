@@ -20,53 +20,49 @@
 package colexec
 
 import (
-	"bytes"
 	"context"
-	"math"
-	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+)
+
+// Workaround for bazel auto-generated code. goimports does not automatically
+// pick up the right packages when run within the bazel sandbox.
+var (
+	_ apd.Context
+	_ duration.Duration
+	_ coldataext.Datum
 )
 
 // {{/*
 // Declarations to make the template compile properly.
 
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
+// _LEFT_CANONICAL_TYPE_FAMILY is the template variable.
+const _LEFT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
 
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
+// _LEFT_TYPE_WIDTH is the template variable.
+const _LEFT_TYPE_WIDTH = 0
 
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
+// _RIGHT_CANONICAL_TYPE_FAMILY is the template variable.
+const _RIGHT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
 
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
-
-// Dummy import to pull in "coltypes" package.
-var _ = coltypes.Bool
+// _RIGHT_TYPE_WIDTH is the template variable.
+const _RIGHT_TYPE_WIDTH = 0
 
 // _ASSIGN_CMP is the template function for assigning the result of comparing
 // the second input to the third input into the first input.
-func _ASSIGN_CMP(_, _, _ interface{}) int {
-	execerror.VectorizedInternalPanic("")
+func _ASSIGN_CMP(_, _, _, _, _, _ interface{}) int {
+	colexecerror.InternalError(errors.AssertionFailedf(""))
 }
 
 // */}}
@@ -80,12 +76,12 @@ func _SEL_CONST_LOOP(_HAS_NULLS bool) { // */}}
 		sel = sel[:n]
 		for _, i := range sel {
 			var cmp bool
-			arg := execgen.UNSAFEGET(col, i)
-			_ASSIGN_CMP(cmp, arg, p.constArg)
+			arg := col.Get(i)
+			_ASSIGN_CMP(cmp, arg, p.constArg, _, col, _)
 			// {{if _HAS_NULLS}}
-			isNull := nulls.NullAt(i)
+			isNull = nulls.NullAt(i)
 			// {{else}}
-			isNull := false
+			isNull = false
 			// {{end}}
 			if cmp && !isNull {
 				sel[idx] = i
@@ -95,15 +91,18 @@ func _SEL_CONST_LOOP(_HAS_NULLS bool) { // */}}
 	} else {
 		batch.SetSelection(true)
 		sel := batch.Selection()
-		col = execgen.SLICE(col, 0, n)
-		for execgen.RANGE(i, col, 0, n) {
+		_ = col.Get(n - 1)
+		for i := 0; i < n; i++ {
 			var cmp bool
-			arg := execgen.UNSAFEGET(col, i)
-			_ASSIGN_CMP(cmp, arg, p.constArg)
+			// {{if .Left.Sliceable}}
+			//gcassert:bce
+			// {{end}}
+			arg := col.Get(i)
+			_ASSIGN_CMP(cmp, arg, p.constArg, _, col, _)
 			// {{if _HAS_NULLS}}
-			isNull := nulls.NullAt(i)
+			isNull = nulls.NullAt(i)
 			// {{else}}
-			isNull := false
+			isNull = false
 			// {{end}}
 			if cmp && !isNull {
 				sel[idx] = i
@@ -125,13 +124,13 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 		sel = sel[:n]
 		for _, i := range sel {
 			var cmp bool
-			arg1 := execgen.UNSAFEGET(col1, i)
-			arg2 := _R_UNSAFEGET(col2, i)
-			_ASSIGN_CMP(cmp, arg1, arg2)
+			arg1 := col1.Get(i)
+			arg2 := col2.Get(i)
+			_ASSIGN_CMP(cmp, arg1, arg2, _, col1, col2)
 			// {{if _HAS_NULLS}}
-			isNull := nulls.NullAt(i)
+			isNull = nulls.NullAt(i)
 			// {{else}}
-			isNull := false
+			isNull = false
 			// {{end}}
 			if cmp && !isNull {
 				sel[idx] = i
@@ -141,23 +140,23 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 	} else {
 		batch.SetSelection(true)
 		sel := batch.Selection()
-		// {{if not (eq .LTyp.String "Bytes")}}
-		// {{/* Slice is a noop for Bytes type, so col1Len below might contain an
-		// incorrect value. In order to keep bounds check elimination for all other
-		// types, we simply omit this code snippet for Bytes. */}}
-		col1 = execgen.SLICE(col1, 0, n)
-		col1Len := execgen.LEN(col1)
-		col2 = _R_SLICE(col2, 0, col1Len)
-		// {{end}}
-		for execgen.RANGE(i, col1, 0, n) {
+		_ = col1.Get(n - 1)
+		_ = col2.Get(n - 1)
+		for i := 0; i < n; i++ {
 			var cmp bool
-			arg1 := execgen.UNSAFEGET(col1, i)
-			arg2 := _R_UNSAFEGET(col2, i)
-			_ASSIGN_CMP(cmp, arg1, arg2)
+			// {{if .Left.Sliceable}}
+			//gcassert:bce
+			// {{end}}
+			arg1 := col1.Get(i)
+			// {{if .Right.Sliceable}}
+			//gcassert:bce
+			// {{end}}
+			arg2 := col2.Get(i)
+			_ASSIGN_CMP(cmp, arg1, arg2, _, col1, col2)
 			// {{if _HAS_NULLS}}
-			isNull := nulls.NullAt(i)
+			isNull = nulls.NullAt(i)
 			// {{else}}
-			isNull := false
+			isNull = false
 			// {{end}}
 			if cmp && !isNull {
 				sel[idx] = i
@@ -175,7 +174,7 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 type selConstOpBase struct {
 	OneInputNode
 	colIdx         int
-	decimalScratch decimalOverloadScratch
+	overloadHelper execgen.OverloadHelper
 }
 
 // selOpBase contains all of the fields for non-constant binary selections.
@@ -183,7 +182,7 @@ type selOpBase struct {
 	OneInputNode
 	col1Idx        int
 	col2Idx        int
-	decimalScratch decimalOverloadScratch
+	overloadHelper execgen.OverloadHelper
 }
 
 // {{define "selConstOp"}}
@@ -194,11 +193,12 @@ type _OP_CONST_NAME struct {
 
 func (p *_OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
 	// In order to inline the templated code of overloads, we need to have a
-	// `decimalScratch` local variable of type `decimalOverloadScratch`.
-	decimalScratch := p.decimalScratch
+	// `_overloadHelper` local variable of type `execgen.OverloadHelper`.
+	_overloadHelper := p.overloadHelper
 	// However, the scratch is not used in all of the selection operators, so
 	// we add this to go around "unused" error.
-	_ = decimalScratch
+	_ = _overloadHelper
+	var isNull bool
 	for {
 		batch := p.input.Next(ctx)
 		if batch.Length() == 0 {
@@ -235,11 +235,12 @@ type _OP_NAME struct {
 
 func (p *_OP_NAME) Next(ctx context.Context) coldata.Batch {
 	// In order to inline the templated code of overloads, we need to have a
-	// `decimalScratch` local variable of type `decimalOverloadScratch`.
-	decimalScratch := p.decimalScratch
+	// `_overloadHelper` local variable of type `execgen.OverloadHelper`.
+	_overloadHelper := p.overloadHelper
 	// However, the scratch is not used in all of the selection operators, so
 	// we add this to go around "unused" error.
-	_ = decimalScratch
+	_ = _overloadHelper
+	var isNull bool
 	for {
 		batch := p.input.Next(ctx)
 		if batch.Length() == 0 {
@@ -272,16 +273,17 @@ func (p *_OP_NAME) Init() {
 
 // {{end}}
 
-// {{/*
-// The outer range is a coltypes.T (the left type). The middle range is also a
-// coltypes.T (the right type). The inner is the overloads associated with
-// those two types.
-// */}}
-// {{range .}}
-// {{range .}}
-// {{range .}}
+// {{range .CmpOps}}
+// {{range .LeftFamilies}}
+// {{range .LeftWidths}}
+// {{range .RightFamilies}}
+// {{range .RightWidths}}
+
 // {{template "selConstOp" .}}
 // {{template "selOp" .}}
+
+// {{end}}
+// {{end}}
 // {{end}}
 // {{end}}
 // {{end}}
@@ -289,80 +291,110 @@ func (p *_OP_NAME) Init() {
 // GetSelectionConstOperator returns the appropriate constant selection operator
 // for the given left and right column types and comparison.
 func GetSelectionConstOperator(
-	leftColType *types.T,
-	constColType *types.T,
 	cmpOp tree.ComparisonOperator,
-	input Operator,
+	input colexecbase.Operator,
+	inputTypes []*types.T,
 	colIdx int,
 	constArg tree.Datum,
-) (Operator, error) {
-	c, err := typeconv.GetDatumToPhysicalFn(constColType)(constArg)
-	if err != nil {
-		return nil, err
-	}
+	evalCtx *tree.EvalContext,
+	cmpExpr *tree.ComparisonExpr,
+) (colexecbase.Operator, error) {
+	leftType, constType := inputTypes[colIdx], constArg.ResolvedType()
+	c := colconv.GetDatumToPhysicalFn(constType)(constArg)
 	selConstOpBase := selConstOpBase{
 		OneInputNode: NewOneInputNode(input),
 		colIdx:       colIdx,
 	}
-	switch leftType := typeconv.FromColumnType(leftColType); leftType {
-	// {{range $lTyp, $rTypToOverloads := .}}
-	case coltypes._L_TYP_VAR:
-		switch rightType := typeconv.FromColumnType(constColType); rightType {
-		// {{range $rTyp, $overloads := $rTypToOverloads}}
-		case coltypes._R_TYP_VAR:
-			switch cmpOp {
-			// {{range $overloads}}
-			case tree._NAME:
-				return &_OP_CONST_NAME{selConstOpBase: selConstOpBase, constArg: c.(_R_GO_TYPE)}, nil
+	if leftType.Family() != types.TupleFamily && constType.Family() != types.TupleFamily {
+		// Tuple comparison has special null-handling semantics, so we will
+		// fallback to the default comparison operator if either of the
+		// input vectors is of a tuple type.
+		switch cmpOp {
+		// {{range .CmpOps}}
+		case tree._NAME:
+			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
+			// {{range .LeftFamilies}}
+			case _LEFT_CANONICAL_TYPE_FAMILY:
+				switch leftType.Width() {
+				// {{range .LeftWidths}}
+				case _LEFT_TYPE_WIDTH:
+					switch typeconv.TypeFamilyToCanonicalTypeFamily(constType.Family()) {
+					// {{range .RightFamilies}}
+					case _RIGHT_CANONICAL_TYPE_FAMILY:
+						switch constType.Width() {
+						// {{range .RightWidths}}
+						case _RIGHT_TYPE_WIDTH:
+							return &_OP_CONST_NAME{selConstOpBase: selConstOpBase, constArg: c.(_R_GO_TYPE)}, nil
+							// {{end}}
+						}
+						// {{end}}
+					}
+					// {{end}}
+				}
 				// {{end}}
-			default:
-				return nil, errors.Errorf("unhandled comparison operator: %s", cmpOp)
 			}
 			// {{end}}
-		default:
-			return nil, errors.Errorf("unhandled right type: %s", rightType)
 		}
-		// {{end}}
-	default:
-		return nil, errors.Errorf("unhandled left type: %s", leftType)
 	}
+	return &defaultCmpConstSelOp{
+		selConstOpBase:   selConstOpBase,
+		adapter:          newComparisonExprAdapter(cmpExpr, evalCtx),
+		constArg:         constArg,
+		toDatumConverter: colconv.NewVecToDatumConverter(len(inputTypes), []int{colIdx}),
+	}, nil
 }
 
 // GetSelectionOperator returns the appropriate two column selection operator
 // for the given left and right column types and comparison.
 func GetSelectionOperator(
-	leftColType *types.T,
-	rightColType *types.T,
 	cmpOp tree.ComparisonOperator,
-	input Operator,
+	input colexecbase.Operator,
+	inputTypes []*types.T,
 	col1Idx int,
 	col2Idx int,
-) (Operator, error) {
+	evalCtx *tree.EvalContext,
+	cmpExpr *tree.ComparisonExpr,
+) (colexecbase.Operator, error) {
+	leftType, rightType := inputTypes[col1Idx], inputTypes[col2Idx]
 	selOpBase := selOpBase{
 		OneInputNode: NewOneInputNode(input),
 		col1Idx:      col1Idx,
 		col2Idx:      col2Idx,
 	}
-	switch leftType := typeconv.FromColumnType(leftColType); leftType {
-	// {{range $lTyp, $rTypToOverloads := .}}
-	case coltypes._L_TYP_VAR:
-		switch rightType := typeconv.FromColumnType(rightColType); rightType {
-		// {{range $rTyp, $overloads := $rTypToOverloads}}
-		case coltypes._R_TYP_VAR:
-			switch cmpOp {
-			// {{range $overloads}}
-			case tree._NAME:
-				return &_OP_NAME{selOpBase: selOpBase}, nil
-				// {{end }}
-			default:
-				return nil, errors.Errorf("unhandled comparison operator: %s", cmpOp)
+	if leftType.Family() != types.TupleFamily && rightType.Family() != types.TupleFamily {
+		// Tuple comparison has special null-handling semantics, so we will
+		// fallback to the default comparison operator if either of the
+		// input vectors is of a tuple type.
+		switch cmpOp {
+		// {{range .CmpOps}}
+		case tree._NAME:
+			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
+			// {{range .LeftFamilies}}
+			case _LEFT_CANONICAL_TYPE_FAMILY:
+				switch leftType.Width() {
+				// {{range .LeftWidths}}
+				case _LEFT_TYPE_WIDTH:
+					switch typeconv.TypeFamilyToCanonicalTypeFamily(rightType.Family()) {
+					// {{range .RightFamilies}}
+					case _RIGHT_CANONICAL_TYPE_FAMILY:
+						switch rightType.Width() {
+						// {{range .RightWidths}}
+						case _RIGHT_TYPE_WIDTH:
+							return &_OP_NAME{selOpBase: selOpBase}, nil
+							// {{end}}
+						}
+						// {{end}}
+					}
+					// {{end}}
+				}
+				// {{end}}
 			}
 			// {{end}}
-		default:
-			return nil, errors.Errorf("unhandled right type: %s", rightType)
 		}
-		// {{end}}
-	default:
-		return nil, errors.Errorf("unhandled left type: %s", leftType)
 	}
+	return &defaultCmpSelOp{
+		selOpBase:        selOpBase,
+		adapter:          newComparisonExprAdapter(cmpExpr, evalCtx),
+		toDatumConverter: colconv.NewVecToDatumConverter(len(inputTypes), []int{col1Idx, col2Idx}),
+	}, nil
 }

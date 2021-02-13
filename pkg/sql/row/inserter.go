@@ -14,20 +14,22 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // Inserter abstracts the key/value operations for inserting table rows.
 type Inserter struct {
 	Helper                rowHelper
-	InsertCols            []sqlbase.ColumnDescriptor
-	InsertColIDtoRowIndex map[sqlbase.ColumnID]int
-	Fks                   fkExistenceCheckForInsert
+	InsertCols            []descpb.ColumnDescriptor
+	InsertColIDtoRowIndex catalog.TableColMap
 
 	// For allocation avoidance.
 	marshaled []roachpb.Value
@@ -38,36 +40,36 @@ type Inserter struct {
 
 // MakeInserter creates a Inserter for the given table.
 //
-// insertCols must contain every column in the primary key.
+// insertCols must contain every column in the primary key. Virtual columns must
+// be present if they are part of any index.
 func MakeInserter(
 	ctx context.Context,
-	txn *client.Txn,
-	tableDesc *sqlbase.ImmutableTableDescriptor,
-	insertCols []sqlbase.ColumnDescriptor,
-	checkFKs checkFKConstraints,
-	fkTables FkTableMetadata,
-	alloc *sqlbase.DatumAlloc,
+	txn *kv.Txn,
+	codec keys.SQLCodec,
+	tableDesc catalog.TableDescriptor,
+	insertCols []descpb.ColumnDescriptor,
+	alloc *rowenc.DatumAlloc,
 ) (Inserter, error) {
+	writableIndexes := tableDesc.WritableNonPrimaryIndexes()
+	writableIndexDescs := make([]descpb.IndexDescriptor, len(writableIndexes))
+	for i, index := range writableIndexes {
+		writableIndexDescs[i] = *index.IndexDesc()
+	}
+
 	ri := Inserter{
-		Helper:                newRowHelper(tableDesc, tableDesc.WritableIndexes()),
+		Helper:                newRowHelper(codec, tableDesc, writableIndexDescs),
 		InsertCols:            insertCols,
 		InsertColIDtoRowIndex: ColIDtoRowIndexFromCols(insertCols),
 		marshaled:             make([]roachpb.Value, len(insertCols)),
 	}
 
-	for i, col := range tableDesc.PrimaryIndex.ColumnIDs {
-		if _, ok := ri.InsertColIDtoRowIndex[col]; !ok {
-			return Inserter{}, fmt.Errorf("missing %q primary key column", tableDesc.PrimaryIndex.ColumnNames[i])
+	for i := 0; i < tableDesc.GetPrimaryIndex().NumColumns(); i++ {
+		colID := tableDesc.GetPrimaryIndex().GetColumnID(i)
+		if _, ok := ri.InsertColIDtoRowIndex.Get(colID); !ok {
+			return Inserter{}, fmt.Errorf("missing %q primary key column", tableDesc.GetPrimaryIndex().GetColumnName(i))
 		}
 	}
 
-	if checkFKs == CheckFKs {
-		var err error
-		if ri.Fks, err = makeFkExistenceCheckHelperForInsert(ctx, txn, tableDesc, fkTables,
-			ri.InsertColIDtoRowIndex, alloc); err != nil {
-			return ri, err
-		}
-	}
 	return ri, nil
 }
 
@@ -113,7 +115,7 @@ func insertInvertedPutFn(
 }
 
 type putter interface {
-	CPut(key, value interface{}, expValue *roachpb.Value)
+	CPut(key, value interface{}, expValue []byte)
 	Put(key, value interface{})
 	InitPut(key, value interface{}, failOnTombstones bool)
 	Del(key ...interface{})
@@ -125,8 +127,8 @@ func (ri *Inserter) InsertRow(
 	ctx context.Context,
 	b putter,
 	values []tree.Datum,
+	pm PartialIndexUpdateHelper,
 	overwrite bool,
-	checkFKs checkFKConstraints,
 	traceKV bool,
 ) error {
 	if len(values) != len(ri.InsertCols) {
@@ -144,16 +146,7 @@ func (ri *Inserter) InsertRow(
 	for i, val := range values {
 		// Make sure the value can be written to the column before proceeding.
 		var err error
-		if ri.marshaled[i], err = sqlbase.MarshalColumnValue(&ri.InsertCols[i], val); err != nil {
-			return err
-		}
-	}
-
-	if ri.Fks.checker != nil && checkFKs == CheckFKs {
-		if err := ri.Fks.addAllIdxChecks(ctx, values, traceKV); err != nil {
-			return err
-		}
-		if err := ri.Fks.checker.runCheck(ctx, nil, values); err != nil {
+		if ri.marshaled[i], err = rowenc.MarshalColumnValue(&ri.InsertCols[i], val); err != nil {
 			return err
 		}
 	}
@@ -171,7 +164,7 @@ func (ri *Inserter) InsertRow(
 	// We don't want to insert empty k/v's like this, so we
 	// set includeEmpty to false.
 	primaryIndexKey, secondaryIndexEntries, err := ri.Helper.encodeIndexes(
-		ri.InsertColIDtoRowIndex, values, false /* includeEmpty */)
+		ri.InsertColIDtoRowIndex, values, pm.IgnoreForPut, false /* includeEmpty */)
 	if err != nil {
 		return err
 	}

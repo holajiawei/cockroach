@@ -17,10 +17,13 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 // SchemaID uniquely identifies the usage of a schema within the scope of a
@@ -36,23 +39,14 @@ type SchemaID int32
 type privilegeBitmap uint32
 
 // Metadata assigns unique ids to the columns, tables, and other metadata used
-// within the scope of a particular query. Because it is specific to one query,
-// the ids tend to be small integers that can be efficiently stored and
-// manipulated.
+// for global identification within the scope of a particular query. These ids
+// tend to be small integers that can be efficiently stored and manipulated.
 //
-// Within a query, every unique column and every projection (that is more than
-// just a pass through of a column) is assigned a unique column id.
-// Additionally, every separate reference to a table in the query gets a new
-// set of output column ids. Consider the query:
+// Within a query, every unique column and every projection should be assigned a
+// unique column id. Additionally, every separate reference to a table in the
+// query should get a new set of output column ids.
 //
-//   SELECT * FROM a AS l JOIN a AS r ON (l.x = r.y)
-//
-// In this query, `l.x` is not equivalent to `r.x` and `l.y` is not equivalent
-// to `r.y`. In order to achieve this, we need to give these columns different
-// ids.
-//
-// In all cases, the column ids are global to the query. For example, consider
-// the query:
+// For example, consider the query:
 //
 //   SELECT x FROM a WHERE y > 0
 //
@@ -62,6 +56,24 @@ type privilegeBitmap uint32
 //   SELECT [0] FROM a WHERE [1] > 0
 //   -- [0] -> x
 //   -- [1] -> y
+//
+// An operator is allowed to reuse some or all of the column ids of an input if:
+//
+// 1. For every output row, there exists at least one input row having identical
+//    values for those columns.
+// 2. OR if no such input row exists, there is at least one output row having
+//    NULL values for all those columns (e.g. when outer join NULL-extends).
+//
+// For example, is it safe for a Select to use its input's column ids because it
+// only filters rows. Likewise, pass-through column ids of a Project can be
+// reused.
+//
+// For an example where columns cannot be reused, consider the query:
+//
+//   SELECT * FROM a AS l JOIN a AS r ON (l.x = r.y)
+//
+// In this query, `l.x` is not equivalent to `r.x` and `l.y` is not equivalent
+// to `r.y`. Therefore, we need to give these columns different ids.
 type Metadata struct {
 	// schemas stores each schema used in the query, indexed by SchemaID.
 	schemas []cat.Schema
@@ -76,6 +88,15 @@ type Metadata struct {
 
 	// sequences stores information about each metadata sequence, indexed by SequenceID.
 	sequences []cat.Sequence
+
+	// userDefinedTypes contains all user defined types present in expressions
+	// in this query.
+	// TODO (rohany): This only contains user defined types present in the query
+	//  because the installation of type metadata in tables doesn't go through
+	//  the type resolver that the optimizer hijacks. However, we could update
+	//  this map when adding a table via metadata.AddTable.
+	userDefinedTypes      map[oid.Oid]struct{}
+	userDefinedTypesSlice []*types.T
 
 	// deps stores information about all data source objects depended on by the
 	// query, as well as the privileges required to access them. The objects are
@@ -93,7 +114,12 @@ type Metadata struct {
 	// currUniqueID is the highest UniqueID that has been assigned.
 	currUniqueID UniqueID
 
-	// NOTE! When adding fields here, update Init, CopyFrom and TestMetadata.
+	// withBindings store bindings for relational expressions inside With or
+	// mutation operators, used to determine the logical properties of WithScan.
+	withBindings map[WithID]Expr
+
+	// NOTE! When adding fields here, update Init (if reusing allocated
+	// data structures is desired), CopyFrom and TestMetadata.
 }
 
 type mdDep struct {
@@ -125,37 +151,42 @@ func (n *MDDepName) equals(other *MDDepName) bool {
 func (md *Metadata) Init() {
 	// Clear the metadata objects to release memory (this clearing pattern is
 	// optimized by Go).
+	// TODO(mgartner): determine if the new clearing pattern is still optimized
+	// by Go. Look at original commit message and assembly.
 	for i := range md.schemas {
 		md.schemas[i] = nil
 	}
-	md.schemas = md.schemas[:0]
 
 	for i := range md.cols {
 		md.cols[i] = ColumnMeta{}
 	}
-	md.cols = md.cols[:0]
 
 	for i := range md.tables {
 		md.tables[i] = TableMeta{}
 	}
-	md.tables = md.tables[:0]
 
 	for i := range md.sequences {
 		md.sequences[i] = nil
 	}
-	md.sequences = md.sequences[:0]
 
 	for i := range md.deps {
 		md.deps[i] = mdDep{}
 	}
-	md.deps = md.deps[:0]
 
 	for i := range md.views {
 		md.views[i] = nil
 	}
-	md.views = md.views[:0]
 
-	md.currUniqueID = 0
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*md = Metadata{
+		schemas:   md.schemas[:0],
+		cols:      md.cols[:0],
+		tables:    md.tables[:0],
+		sequences: md.sequences[:0],
+		deps:      md.deps[:0],
+		views:     md.views[:0],
+	}
 }
 
 // CopyFrom initializes the metadata with a copy of the provided metadata.
@@ -165,12 +196,22 @@ func (md *Metadata) Init() {
 // the copy.
 func (md *Metadata) CopyFrom(from *Metadata) {
 	if len(md.schemas) != 0 || len(md.cols) != 0 || len(md.tables) != 0 ||
-		len(md.sequences) != 0 || len(md.deps) != 0 || len(md.views) != 0 {
+		len(md.sequences) != 0 || len(md.deps) != 0 || len(md.views) != 0 ||
+		len(md.userDefinedTypes) != 0 || len(md.userDefinedTypesSlice) != 0 {
 		panic(errors.AssertionFailedf("CopyFrom requires empty destination"))
 	}
 	md.schemas = append(md.schemas, from.schemas...)
 	md.cols = append(md.cols, from.cols...)
 	md.tables = append(md.tables, from.tables...)
+
+	if (md.userDefinedTypes) == nil {
+		md.userDefinedTypes = make(map[oid.Oid]struct{})
+	}
+	for i := range from.userDefinedTypesSlice {
+		typ := from.userDefinedTypesSlice[i]
+		md.userDefinedTypes[typ.Oid()] = struct{}{}
+		md.userDefinedTypesSlice = append(md.userDefinedTypesSlice, typ)
+	}
 
 	// Clear table annotations. These objects can be mutable and can't be safely
 	// shared between different metadata instances.
@@ -184,6 +225,9 @@ func (md *Metadata) CopyFrom(from *Metadata) {
 	md.deps = append(md.deps, from.deps...)
 	md.views = append(md.views, from.views...)
 	md.currUniqueID = from.currUniqueID
+
+	// We cannot copy the bound expressions; they must be rebuilt in the new memo.
+	md.withBindings = nil
 }
 
 // DepByName is used with AddDependency when the data source was looked up using a
@@ -265,6 +309,20 @@ func (md *Metadata) CheckDependencies(
 			privs &= ^(1 << priv)
 		}
 	}
+	// Check that all of the user defined types present have not changed.
+	for _, typ := range md.AllUserDefinedTypes() {
+		toCheck, err := catalog.ResolveTypeByOID(ctx, typ.Oid())
+		if err != nil {
+			// Handle when the type no longer exists.
+			if pgerror.GetPGCode(err) == pgcode.UndefinedObject {
+				return false, nil
+			}
+			return false, err
+		}
+		if typ.TypeMeta.Version != toCheck.TypeMeta.Version {
+			return false, nil
+		}
+	}
 	return true, nil
 }
 
@@ -278,6 +336,25 @@ func (md *Metadata) AddSchema(sch cat.Schema) SchemaID {
 // id.
 func (md *Metadata) Schema(schID SchemaID) cat.Schema {
 	return md.schemas[schID-1]
+}
+
+// AddUserDefinedType adds a user defined type to the metadata for this query.
+func (md *Metadata) AddUserDefinedType(typ *types.T) {
+	if !typ.UserDefined() {
+		return
+	}
+	if md.userDefinedTypes == nil {
+		md.userDefinedTypes = make(map[oid.Oid]struct{})
+	}
+	if _, ok := md.userDefinedTypes[typ.Oid()]; !ok {
+		md.userDefinedTypes[typ.Oid()] = struct{}{}
+		md.userDefinedTypesSlice = append(md.userDefinedTypesSlice, typ)
+	}
+}
+
+// AllUserDefinedTypes returns all user defined types contained in this query.
+func (md *Metadata) AllUserDefinedTypes() []*types.T {
+	return md.userDefinedTypesSlice
 }
 
 // AddTable indexes a new reference to a table within the query. Separate
@@ -295,7 +372,7 @@ func (md *Metadata) AddTable(tab cat.Table, alias *tree.TableName) TableID {
 	}
 	md.tables = append(md.tables, TableMeta{MetaID: tabID, Table: tab, Alias: *alias})
 
-	colCount := tab.DeletableColumnCount()
+	colCount := tab.ColumnCount()
 	if md.cols == nil {
 		md.cols = make([]ColumnMeta, 0, colCount)
 	}
@@ -307,6 +384,90 @@ func (md *Metadata) AddTable(tab cat.Table, alias *tree.TableName) TableID {
 	}
 
 	return tabID
+}
+
+// DuplicateTable creates a new reference to the table with the given ID. All
+// columns are added to the metadata with new column IDs. If mutation columns
+// are present, they are added after active columns. The ID of the new table
+// reference is returned. This function panics if a table with the given ID does
+// not exists in the metadata.
+//
+// remapColumnIDs must be a function that remaps the column IDs within a
+// ScalarExpr to new column IDs. It takes as arguments a ScalarExpr and a
+// mapping of old column IDs to new column IDs, and returns a new ScalarExpr.
+// This function is used when duplicating Constraints, ComputedCols, and
+// partialIndexPredicates. DuplicateTable requires this callback function,
+// rather than performing the remapping itself, because remapping column IDs
+// requires constructing new expressions with norm.Factory. The norm package
+// depends on opt, and cannot be imported here.
+//
+// The ExplicitCatalog/ExplicitSchema fields of the table's alias are honored so
+// that its original formatting is preserved for error messages,
+// pretty-printing, etc.
+func (md *Metadata) DuplicateTable(
+	tabID TableID, remapColumnIDs func(e ScalarExpr, colMap ColMap) ScalarExpr,
+) TableID {
+	if md.tables == nil || tabID.index() >= len(md.tables) {
+		panic(errors.AssertionFailedf("table with ID %d does not exist", tabID))
+	}
+
+	tabMeta := md.TableMeta(tabID)
+	tab := tabMeta.Table
+	newTabID := makeTableID(len(md.tables), ColumnID(len(md.cols)+1))
+
+	// Generate new column IDs for each column in the table, and keep track of
+	// a mapping from the original TableMeta's column IDs to the new ones.
+	var colMap ColMap
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		col := tab.Column(i)
+		oldColID := tabID.ColumnID(i)
+		newColID := md.AddColumn(string(col.ColName()), col.DatumType())
+		md.ColumnMeta(newColID).Table = tabID
+		colMap.Set(int(oldColID), int(newColID))
+	}
+
+	// Create new constraints by remapping the column IDs to the new TableMeta's
+	// column IDs.
+	var constraints ScalarExpr
+	if tabMeta.Constraints != nil {
+		constraints = remapColumnIDs(tabMeta.Constraints, colMap)
+	}
+
+	// Create new computed column expressions by remapping the column IDs in
+	// each ScalarExpr.
+	var computedCols map[ColumnID]ScalarExpr
+	if len(tabMeta.ComputedCols) > 0 {
+		computedCols = make(map[ColumnID]ScalarExpr, len(tabMeta.ComputedCols))
+		for colID, e := range tabMeta.ComputedCols {
+			newColID, ok := colMap.Get(int(colID))
+			if !ok {
+				panic(errors.AssertionFailedf("column with ID %d does not exist in map", colID))
+			}
+			computedCols[ColumnID(newColID)] = remapColumnIDs(e, colMap)
+		}
+	}
+
+	// Create new partial index predicate expressions by remapping the column
+	// IDs in each ScalarExpr.
+	var partialIndexPredicates map[cat.IndexOrdinal]ScalarExpr
+	if len(tabMeta.partialIndexPredicates) > 0 {
+		partialIndexPredicates = make(map[cat.IndexOrdinal]ScalarExpr, len(tabMeta.partialIndexPredicates))
+		for idxOrd, e := range tabMeta.partialIndexPredicates {
+			partialIndexPredicates[idxOrd] = remapColumnIDs(e, colMap)
+		}
+	}
+
+	md.tables = append(md.tables, TableMeta{
+		MetaID:                 newTabID,
+		Table:                  tabMeta.Table,
+		Alias:                  tabMeta.Alias,
+		IgnoreForeignKeys:      tabMeta.IgnoreForeignKeys,
+		Constraints:            constraints,
+		ComputedCols:           computedCols,
+		partialIndexPredicates: partialIndexPredicates,
+	})
+
+	return newTabID
 }
 
 // TableMeta looks up the metadata for the table associated with the given table
@@ -326,17 +487,6 @@ func (md *Metadata) Table(tabID TableID) cat.Table {
 // modified.
 func (md *Metadata) AllTables() []TableMeta {
 	return md.tables
-}
-
-// TableByStableID looks up the catalog table associated with the given
-// StableID (unique across all tables and stable across queries).
-func (md *Metadata) TableByStableID(id cat.StableID) cat.Table {
-	for _, mdTab := range md.tables {
-		if mdTab.Table.ID() == id {
-			return mdTab.Table
-		}
-	}
-	return nil
 }
 
 // AddColumn assigns a new unique id to a column within the query and records
@@ -460,12 +610,6 @@ func (md *Metadata) Sequence(seqID SequenceID) cat.Sequence {
 	return md.sequences[seqID.index()]
 }
 
-// AllSequences returns the metadata for all sequences. The result must not be
-// modified.
-func (md *Metadata) AllSequences() []cat.Sequence {
-	return md.sequences
-}
-
 // UniqueID should be used to disambiguate multiple uses of an expression
 // within the scope of a query. For example, a UniqueID field should be
 // added to an expression type if two instances of that type might otherwise
@@ -492,7 +636,71 @@ func (md *Metadata) AllViews() []cat.View {
 	return md.views
 }
 
+// AllDataSourceNames returns the fully qualified names of all datasources
+// referenced by the metadata.
+func (md *Metadata) AllDataSourceNames(
+	fullyQualifiedName func(ds cat.DataSource) (cat.DataSourceName, error),
+) (tables, sequences, views []tree.TableName, _ error) {
+	// Catalog objects can show up multiple times in our lists, so deduplicate
+	// them.
+	seen := make(map[tree.TableName]struct{})
+
+	getNames := func(count int, get func(int) cat.DataSource) ([]tree.TableName, error) {
+		result := make([]tree.TableName, 0, count)
+		for i := 0; i < count; i++ {
+			ds := get(i)
+			tn, err := fullyQualifiedName(ds)
+			if err != nil {
+				return nil, err
+			}
+			if _, ok := seen[tn]; !ok {
+				seen[tn] = struct{}{}
+				result = append(result, tn)
+			}
+		}
+		return result, nil
+	}
+	var err error
+	tables, err = getNames(len(md.tables), func(i int) cat.DataSource {
+		return md.tables[i].Table
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	sequences, err = getNames(len(md.sequences), func(i int) cat.DataSource {
+		return md.sequences[i]
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	views, err = getNames(len(md.views), func(i int) cat.DataSource {
+		return md.views[i]
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return tables, sequences, views, nil
+}
+
 // WithID uniquely identifies a With expression within the scope of a query.
 // WithID=0 is reserved to mean "unknown expression".
 // See the comment for Metadata for more details on identifiers.
 type WithID uint64
+
+// AddWithBinding associates a WithID to its bound expression.
+func (md *Metadata) AddWithBinding(id WithID, expr Expr) {
+	if md.withBindings == nil {
+		md.withBindings = make(map[WithID]Expr)
+	}
+	md.withBindings[id] = expr
+}
+
+// WithBinding returns the bound expression for the given WithID.
+// Panics with an assertion error if there is none.
+func (md *Metadata) WithBinding(id WithID) Expr {
+	res, ok := md.withBindings[id]
+	if !ok {
+		panic(errors.AssertionFailedf("no binding for WithID %d", id))
+	}
+	return res
+}

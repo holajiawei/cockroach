@@ -19,24 +19,23 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
-const noFilterIdx = -1
-
 func TestWindowerAccountingForResults(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	monitor := mon.MakeMonitorWithLimit(
+	monitor := mon.NewMonitorWithLimit(
 		"test-monitor",
 		mon.MemoryResource,
 		100000,        /* limit */
@@ -46,11 +45,11 @@ func TestWindowerAccountingForResults(t *testing.T) {
 		math.MaxInt64, /* noteworthy */
 		st,
 	)
-	evalCtx := tree.MakeTestingEvalContextWithMon(st, &monitor)
+	evalCtx := tree.MakeTestingEvalContextWithMon(st, monitor)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
-	tempEngine, _, err := engine.NewTempEngine(ctx, engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +65,7 @@ func TestWindowerAccountingForResults(t *testing.T) {
 	}
 
 	post := &execinfrapb.PostProcessSpec{}
-	input := execinfra.NewRepeatableRowSource(sqlbase.OneIntCol, sqlbase.MakeIntRows(1000, 1))
+	input := execinfra.NewRepeatableRowSource(rowenc.OneIntCol, rowenc.MakeIntRows(1000, 1))
 	aggSpec := execinfrapb.AggregatorSpec_ARRAY_AGG
 	spec := execinfrapb.WindowerSpec{
 		PartitionBy: []uint32{},
@@ -74,8 +73,8 @@ func TestWindowerAccountingForResults(t *testing.T) {
 			Func:         execinfrapb.WindowerSpec_Func{AggregateFunc: &aggSpec},
 			ArgsIdxs:     []uint32{0},
 			Ordering:     execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{{ColIdx: 0}}},
-			OutputColIdx: 0,
-			FilterColIdx: noFilterIdx,
+			OutputColIdx: 1,
+			FilterColIdx: tree.NoColumnIdx,
 			Frame: &execinfrapb.WindowerSpec_Frame{
 				Mode: execinfrapb.WindowerSpec_Frame_ROWS,
 				Bounds: execinfrapb.WindowerSpec_Frame_Bounds{
@@ -88,7 +87,7 @@ func TestWindowerAccountingForResults(t *testing.T) {
 		}},
 	}
 	output := distsqlutils.NewRowBuffer(
-		sqlbase.OneIntCol, nil, distsqlutils.RowBufferArgs{},
+		rowenc.OneIntCol, nil, distsqlutils.RowBufferArgs{},
 	)
 
 	d, err := newWindower(flowCtx, 0 /* processorID */, &spec, input, post, output)
@@ -123,7 +122,7 @@ type windowTestSpec struct {
 type windowFnTestSpec struct {
 	funcName       string
 	argsIdxs       []uint32
-	columnOrdering sqlbase.ColumnOrdering
+	columnOrdering colinfo.ColumnOrdering
 }
 
 func windows(windowTestSpecs []windowTestSpec) ([]execinfrapb.WindowerSpec, error) {
@@ -150,7 +149,7 @@ func windows(windowTestSpecs []windowTestSpec) ([]execinfrapb.WindowerSpec, erro
 			}
 			windowFnSpec.Ordering = execinfrapb.Ordering{Columns: ordCols}
 		}
-		windowFnSpec.FilterColIdx = noFilterIdx
+		windowFnSpec.FilterColIdx = tree.NoColumnIdx
 		windows[i].WindowFns[0] = windowFnSpec
 	}
 	return windows, nil
@@ -172,7 +171,7 @@ func BenchmarkWindower(b *testing.B) {
 			windowFn: windowFnTestSpec{
 				funcName:       "SUM",
 				argsIdxs:       []uint32{0},
-				columnOrdering: sqlbase.ColumnOrdering{{ColIdx: 2, Direction: encoding.Ascending}},
+				columnOrdering: colinfo.ColumnOrdering{{ColIdx: 2, Direction: encoding.Ascending}},
 			},
 		},
 		{ // sum(@1) OVER (PARTITION BY @2)
@@ -187,7 +186,7 @@ func BenchmarkWindower(b *testing.B) {
 			windowFn: windowFnTestSpec{
 				funcName:       "SUM",
 				argsIdxs:       []uint32{0},
-				columnOrdering: sqlbase.ColumnOrdering{{ColIdx: 2, Direction: encoding.Ascending}},
+				columnOrdering: colinfo.ColumnOrdering{{ColIdx: 2, Direction: encoding.Ascending}},
 			},
 		},
 	})
@@ -210,10 +209,10 @@ func BenchmarkWindower(b *testing.B) {
 		},
 	}
 
-	rowsGenerators := []func(int, int) sqlbase.EncDatumRows{
-		sqlbase.MakeIntRows,
-		func(numRows, numCols int) sqlbase.EncDatumRows {
-			return sqlbase.MakeRepeatedIntRows(numRows/100, numRows, numCols)
+	rowsGenerators := []func(int, int) rowenc.EncDatumRows{
+		rowenc.MakeIntRows,
+		func(numRows, numCols int) rowenc.EncDatumRows {
+			return rowenc.MakeRepeatedIntRows(numRows/100, numRows, numCols)
 		},
 	}
 	skipRepeatedSpecs := map[int]bool{0: true, 1: true}
@@ -239,11 +238,12 @@ func BenchmarkWindower(b *testing.B) {
 				runName = runName + "ORDER BY"
 			}
 			runName = runName + ")"
+			spec.WindowFns[0].OutputColIdx = 3
 
 			b.Run(runName, func(b *testing.B) {
 				post := &execinfrapb.PostProcessSpec{}
-				disposer := &execinfra.RowDisposer{}
-				input := execinfra.NewRepeatableRowSource(sqlbase.ThreeIntCols, rowsGenerator(numRows, numCols))
+				disposer := &rowDisposer{}
+				input := execinfra.NewRepeatableRowSource(rowenc.ThreeIntCols, rowsGenerator(numRows, numCols))
 
 				b.SetBytes(int64(8 * numRows * numCols))
 				b.ResetTimer()
@@ -252,7 +252,7 @@ func BenchmarkWindower(b *testing.B) {
 					if err != nil {
 						b.Fatal(err)
 					}
-					d.Run(context.TODO())
+					d.Run(context.Background())
 					input.Reset()
 				}
 				b.StopTimer()

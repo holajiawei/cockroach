@@ -12,7 +12,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -23,36 +22,39 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
 )
 
 func createStore(t *testing.T, path string) {
 	t.Helper()
-	cache := engine.NewRocksDBCache(server.DefaultCacheSize)
-	defer cache.Release()
-	db, err := engine.NewRocksDB(
-		engine.RocksDBConfig{
-			StorageConfig: base.StorageConfig{
-				Dir:       path,
-				MustExist: false,
-			},
+	cache := pebble.NewCache(server.DefaultCacheSize)
+	defer cache.Unref()
+	cfg := storage.PebbleConfig{
+		StorageConfig: base.StorageConfig{
+			Dir:       path,
+			MustExist: false,
 		},
-		cache,
-	)
+	}
+	cfg.Opts = storage.DefaultPebbleOptions()
+	cfg.Opts.Cache = cache
+	db, err := storage.NewPebble(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,6 +63,7 @@ func createStore(t *testing.T, path string) {
 
 func TestOpenExistingStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
@@ -95,6 +98,7 @@ func TestOpenExistingStore(t *testing.T) {
 
 func TestOpenReadOnlyStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
@@ -122,10 +126,11 @@ func TestOpenReadOnlyStore(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer db.Close()
 
-			key := engine.MakeMVCCMetadataKey(roachpb.Key("key"))
+			key := roachpb.Key("key")
 			val := []byte("value")
-			err = db.Put(key, val)
+			err = db.PutUnversioned(key, val)
 			if !testutils.IsError(err, test.expErr) {
 				t.Fatalf("wanted %s but got %v", test.expErr, err)
 			}
@@ -135,13 +140,12 @@ func TestOpenReadOnlyStore(t *testing.T) {
 
 func TestRemoveDeadReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// This test is pretty slow under race (200+ cpu-seconds) because it
 	// uses multiple real disk-backed stores and goes through multiple
 	// cycles of rereplicating all ranges.
-	if util.RaceEnabled {
-		t.Skip("skipping under race")
-	}
+	skip.UnderRace(t)
 
 	ctx := context.Background()
 
@@ -226,7 +230,7 @@ func TestRemoveDeadReplicas(t *testing.T) {
 					// we restart the cluster, so just write a setting.
 					s.Exec(t, "set cluster setting cluster.organization='remove dead replicas test'")
 
-					txn := client.NewTxn(ctx, tc.Servers[0].DB(), 1)
+					txn := kv.NewTxn(ctx, tc.Servers[0].DB(), 1)
 					var desc roachpb.RangeDescriptor
 					// Pick one of the predefined split points.
 					rdKey := keys.RangeDescriptorKey(roachpb.RKey(keys.TimeseriesPrefix))
@@ -353,7 +357,7 @@ func TestRemoveDeadReplicas(t *testing.T) {
 				}
 
 				for i := 0; i < len(tc.Servers); i++ {
-					err = tc.Servers[i].Stores().VisitStores(func(store *storage.Store) error {
+					err = tc.Servers[i].Stores().VisitStores(func(store *kvserver.Store) error {
 						store.SetReplicateQueueActive(true)
 						return nil
 					})
@@ -366,7 +370,7 @@ func TestRemoveDeadReplicas(t *testing.T) {
 				}
 
 				for i := 0; i < len(tc.Servers); i++ {
-					err = tc.Servers[i].Stores().VisitStores(func(store *storage.Store) error {
+					err = tc.Servers[i].Stores().VisitStores(func(store *kvserver.Store) error {
 						return store.ForceConsistencyQueueProcess()
 					})
 					if err != nil {
@@ -419,6 +423,7 @@ func TestRemoveDeadReplicas(t *testing.T) {
 
 func TestParseGossipValues(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{})

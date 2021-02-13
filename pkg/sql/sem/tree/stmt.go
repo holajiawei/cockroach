@@ -69,6 +69,7 @@ const (
 type Statement interface {
 	fmt.Stringer
 	NodeFormatter
+
 	StatementType() StatementType
 	// StatementTag is a short string identifying the type of statement
 	// (usually a single verb). This is different than the Stringer output,
@@ -111,26 +112,6 @@ func CanWriteData(stmt Statement) bool {
 	return false
 }
 
-// IsStmtParallelized determines if a given statement's execution should be
-// parallelized. This means that its results should be mocked out, and that
-// it should be run asynchronously and in parallel with other statements that
-// are independent.
-func IsStmtParallelized(stmt Statement) bool {
-	parallelizedRetClause := func(ret ReturningClause) bool {
-		_, ok := ret.(*ReturningNothing)
-		return ok
-	}
-	switch s := stmt.(type) {
-	case *Delete:
-		return parallelizedRetClause(s.Returning)
-	case *Insert:
-		return parallelizedRetClause(s.Returning)
-	case *Update:
-		return parallelizedRetClause(s.Returning)
-	}
-	return false
-}
-
 // HiddenFromShowQueries is a pseudo-interface to be implemented
 // by statements that should not show up in SHOW QUERIES (and are hence
 // not cancellable using CANCEL QUERIES either). Usually implemented by
@@ -165,13 +146,51 @@ type CCLOnlyStatement interface {
 var _ CCLOnlyStatement = &Backup{}
 var _ CCLOnlyStatement = &ShowBackup{}
 var _ CCLOnlyStatement = &Restore{}
-var _ CCLOnlyStatement = &CreateRole{}
-var _ CCLOnlyStatement = &DropRole{}
-var _ CCLOnlyStatement = &GrantRole{}
-var _ CCLOnlyStatement = &RevokeRole{}
 var _ CCLOnlyStatement = &CreateChangefeed{}
 var _ CCLOnlyStatement = &Import{}
 var _ CCLOnlyStatement = &Export{}
+var _ CCLOnlyStatement = &ScheduledBackup{}
+var _ CCLOnlyStatement = &StreamIngestion{}
+
+// StatementType implements the Statement interface.
+func (*AlterDatabaseOwner) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterDatabaseOwner) StatementTag() string { return "ALTER DATABASE OWNER" }
+
+func (*AlterDatabaseOwner) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterDatabaseAddRegion) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterDatabaseAddRegion) StatementTag() string { return "ALTER DATABASE ADD REGION" }
+
+func (*AlterDatabaseAddRegion) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterDatabaseDropRegion) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterDatabaseDropRegion) StatementTag() string { return "ALTER DATABASE DROP REGION" }
+
+func (*AlterDatabaseDropRegion) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterDatabasePrimaryRegion) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterDatabasePrimaryRegion) StatementTag() string { return "ALTER DATABASE PRIMARY REGION" }
+
+func (*AlterDatabasePrimaryRegion) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterDatabaseSurvivalGoal) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterDatabaseSurvivalGoal) StatementTag() string { return "ALTER DATABASE SURVIVE" }
+
+func (*AlterDatabaseSurvivalGoal) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
 func (*AlterIndex) StatementType() StatementType { return DDL }
@@ -190,26 +209,66 @@ func (*AlterTable) StatementTag() string { return "ALTER TABLE" }
 func (*AlterTable) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
+func (*AlterTableLocality) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterTableLocality) StatementTag() string { return "ALTER TABLE SET LOCALITY" }
+
+func (*AlterTableLocality) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterTableOwner) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterTableOwner) StatementTag() string { return "ALTER TABLE OWNER" }
+
+func (*AlterTableOwner) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterTableSetSchema) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterTableSetSchema) StatementTag() string { return "ALTER TABLE SET SCHEMA" }
+
+func (*AlterTableSetSchema) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterSchema) StatementType() StatementType { return DDL }
+
+// StatementTag implements the Statement interface.
+func (*AlterSchema) StatementTag() string { return "ALTER SCHEMA" }
+
+func (*AlterSchema) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterType) StatementType() StatementType { return DDL }
+
+// StatementTag implements the Statement interface.
+func (*AlterType) StatementTag() string { return "ALTER TYPE" }
+
+func (*AlterType) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
 func (*AlterSequence) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*AlterSequence) StatementTag() string { return "ALTER SEQUENCE" }
 
 // StatementType implements the Statement interface.
-func (*AlterUserSetPassword) StatementType() StatementType { return RowsAffected }
+func (*AlterRole) StatementType() StatementType { return Ack }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*AlterUserSetPassword) StatementTag() string { return "ALTER USER" }
+func (*AlterRole) StatementTag() string { return "ALTER ROLE" }
 
-func (*AlterUserSetPassword) hiddenFromShowQueries() {}
+func (*AlterRole) cclOnlyStatement() {}
+
+func (*AlterRole) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
-func (*AlterRolePrivileges) StatementType() StatementType { return RowsAffected }
+func (*Analyze) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*AlterRolePrivileges) StatementTag() string { return "ALTER USER" }
-
-func (*AlterRolePrivileges) hiddenFromShowQueries() {}
+func (*Analyze) StatementTag() string { return "ANALYZE" }
 
 // StatementType implements the Statement interface.
 func (*Backup) StatementType() StatementType { return Rows }
@@ -220,6 +279,16 @@ func (*Backup) StatementTag() string { return "BACKUP" }
 func (*Backup) cclOnlyStatement() {}
 
 func (*Backup) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*ScheduledBackup) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ScheduledBackup) StatementTag() string { return "SCHEDULED BACKUP" }
+
+func (*ScheduledBackup) cclOnlyStatement() {}
+
+func (*ScheduledBackup) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
 func (*BeginTransaction) StatementType() StatementType { return Ack }
@@ -233,6 +302,22 @@ func (*ControlJobs) StatementType() StatementType { return RowsAffected }
 // StatementTag returns a short string identifying the type of statement.
 func (n *ControlJobs) StatementTag() string {
 	return fmt.Sprintf("%s JOBS", JobCommandToStatement[n.Command])
+}
+
+// StatementType implements the Statement interface.
+func (*ControlSchedules) StatementType() StatementType { return RowsAffected }
+
+// StatementTag returns a short string identifying the type of statement.
+func (n *ControlSchedules) StatementTag() string {
+	return fmt.Sprintf("%s SCHEDULES", n.Command)
+}
+
+// StatementType implements the Statement interface.
+func (*ControlJobsForSchedules) StatementType() StatementType { return RowsAffected }
+
+// StatementTag returns a short string identifying the type of statement.
+func (n *ControlJobsForSchedules) StatementTag() string {
+	return fmt.Sprintf("%s JOBS FOR SCHEDULES", JobCommandToStatement[n.Command])
 }
 
 // StatementType implements the Statement interface.
@@ -309,10 +394,27 @@ func (*CreateDatabase) StatementType() StatementType { return DDL }
 func (*CreateDatabase) StatementTag() string { return "CREATE DATABASE" }
 
 // StatementType implements the Statement interface.
+func (*CreateExtension) StatementType() StatementType { return Ack }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*CreateExtension) StatementTag() string { return "CREATE EXTENSION" }
+
+// StatementType implements the Statement interface.
 func (*CreateIndex) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*CreateIndex) StatementTag() string { return "CREATE INDEX" }
+
+// StatementType implements the Statement interface.
+func (n *CreateSchema) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (n *CreateSchema) StatementTag() string {
+	return "CREATE SCHEMA"
+}
+
+// modifiesSchema implements the canModifySchema interface.
+func (*CreateSchema) modifiesSchema() bool { return true }
 
 // StatementType implements the Statement interface.
 func (n *CreateTable) StatementType() StatementType { return DDL }
@@ -329,20 +431,18 @@ func (n *CreateTable) StatementTag() string {
 func (*CreateTable) modifiesSchema() bool { return true }
 
 // StatementType implements the Statement interface.
-func (*CreateUser) StatementType() StatementType { return RowsAffected }
+func (*CreateType) StatementType() StatementType { return DDL }
 
-// StatementTag returns a short string identifying the type of statement.
-func (*CreateUser) StatementTag() string { return "CREATE USER" }
+// StatementTag implements the Statement interface.
+func (*CreateType) StatementTag() string { return "CREATE TYPE" }
 
-func (*CreateUser) hiddenFromShowQueries() {}
+func (*CreateType) modifiesSchema() bool { return true }
 
 // StatementType implements the Statement interface.
-func (*CreateRole) StatementType() StatementType { return RowsAffected }
+func (*CreateRole) StatementType() StatementType { return Ack }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*CreateRole) StatementTag() string { return "CREATE ROLE" }
-
-func (*CreateRole) cclOnlyStatement() {}
 
 func (*CreateRole) hiddenFromShowQueries() {}
 
@@ -419,18 +519,26 @@ func (*DropSequence) StatementType() StatementType { return DDL }
 func (*DropSequence) StatementTag() string { return "DROP SEQUENCE" }
 
 // StatementType implements the Statement interface.
-func (*DropUser) StatementType() StatementType { return RowsAffected }
-
-// StatementTag returns a short string identifying the type of statement.
-func (*DropUser) StatementTag() string { return "DROP USER" }
-
-// StatementType implements the Statement interface.
-func (*DropRole) StatementType() StatementType { return RowsAffected }
+func (*DropRole) StatementType() StatementType { return Ack }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*DropRole) StatementTag() string { return "DROP ROLE" }
 
 func (*DropRole) cclOnlyStatement() {}
+
+func (*DropRole) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*DropType) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*DropType) StatementTag() string { return "DROP TYPE" }
+
+// StatementType implements the Statement interface.
+func (*DropSchema) StatementType() StatementType { return DDL }
+
+// StatementTag implements the Statement interface.
+func (*DropSchema) StatementTag() string { return "DROP SCHEMA" }
 
 // StatementType implements the Statement interface.
 func (*Execute) StatementType() StatementType { return Unknown }
@@ -443,6 +551,12 @@ func (*Explain) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*Explain) StatementTag() string { return "EXPLAIN" }
+
+// StatementType implements the Statement interface.
+func (*ExplainAnalyze) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ExplainAnalyze) StatementTag() string { return "EXPLAIN ANALYZE" }
 
 // StatementType implements the Statement interface.
 func (*Export) StatementType() StatementType { return Rows }
@@ -463,8 +577,6 @@ func (*GrantRole) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*GrantRole) StatementTag() string { return "GRANT" }
-
-func (*GrantRole) cclOnlyStatement() {}
 
 // StatementType implements the Statement interface.
 func (n *Insert) StatementType() StatementType { return n.Returning.statementType() }
@@ -493,6 +605,24 @@ func (*Prepare) StatementType() StatementType { return Ack }
 func (*Prepare) StatementTag() string { return "PREPARE" }
 
 // StatementType implements the Statement interface.
+func (*ReassignOwnedBy) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ReassignOwnedBy) StatementTag() string { return "REASSIGN OWNED BY" }
+
+// StatementType implements the Statement interface.
+func (*DropOwnedBy) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*DropOwnedBy) StatementTag() string { return "DROP OWNED BY" }
+
+// StatementType implements the Statement interface.
+func (*RefreshMaterializedView) StatementType() StatementType { return DDL }
+
+// StatementTag implements the Statement interface.
+func (*RefreshMaterializedView) StatementTag() string { return "REFRESH MATERIALIZED VIEW" }
+
+// StatementType implements the Statement interface.
 func (*ReleaseSavepoint) StatementType() StatementType { return Ack }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -509,6 +639,12 @@ func (*RenameDatabase) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*RenameDatabase) StatementTag() string { return "RENAME DATABASE" }
+
+// StatementType implements the Statement interface.
+func (*ReparentDatabase) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ReparentDatabase) StatementTag() string { return "CONVERT TO SCHEMA" }
 
 // StatementType implements the Statement interface.
 func (*RenameIndex) StatementType() StatementType { return DDL }
@@ -561,8 +697,6 @@ func (*RevokeRole) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*RevokeRole) StatementTag() string { return "REVOKE" }
-
-func (*RevokeRole) cclOnlyStatement() {}
 
 // StatementType implements the Statement interface.
 func (*RollbackToSavepoint) StatementType() StatementType { return Ack }
@@ -696,6 +830,18 @@ func (*ShowDatabases) StatementType() StatementType { return Rows }
 func (*ShowDatabases) StatementTag() string { return "SHOW DATABASES" }
 
 // StatementType implements the Statement interface.
+func (*ShowEnums) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowEnums) StatementTag() string { return "SHOW ENUMS" }
+
+// StatementType implements the Statement interface.
+func (*ShowTypes) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowTypes) StatementTag() string { return "SHOW TYPES" }
+
+// StatementType implements the Statement interface.
 func (*ShowTraceForSession) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -729,7 +875,7 @@ func (*ShowPartitions) StatementTag() string { return "SHOW PARTITIONS" }
 func (*ShowQueries) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*ShowQueries) StatementTag() string { return "SHOW QUERIES" }
+func (*ShowQueries) StatementTag() string { return "SHOW STATEMENTS" }
 
 // StatementType implements the Statement interface.
 func (*ShowJobs) StatementType() StatementType { return Rows }
@@ -762,6 +908,12 @@ func (*ShowHistogram) StatementType() StatementType { return Rows }
 func (*ShowHistogram) StatementTag() string { return "SHOW HISTOGRAM" }
 
 // StatementType implements the Statement interface.
+func (*ShowSchedules) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowSchedules) StatementTag() string { return "SHOW SCHEDULES" }
+
+// StatementType implements the Statement interface.
 func (*ShowSyntax) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -776,6 +928,22 @@ func (*ShowTransactionStatus) StatementType() StatementType { return Rows }
 func (*ShowTransactionStatus) StatementTag() string { return "SHOW TRANSACTION STATUS" }
 
 func (*ShowTransactionStatus) observerStatement() {}
+
+// StatementType implements the Statement interface.
+func (*ShowSavepointStatus) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowSavepointStatus) StatementTag() string { return "SHOW SAVEPOINT STATUS" }
+
+func (*ShowSavepointStatus) observerStatement() {}
+
+// StatementType implements the Statement interface.
+func (*ShowLastQueryStatistics) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowLastQueryStatistics) StatementTag() string { return "SHOW LAST QUERY STATISTICS" }
+
+func (*ShowLastQueryStatistics) observerStatement() {}
 
 // StatementType implements the Statement interface.
 func (*ShowUsers) StatementType() StatementType { return Rows }
@@ -808,6 +976,18 @@ func (*ShowRangeForRow) StatementType() StatementType { return Rows }
 func (*ShowRangeForRow) StatementTag() string { return "SHOW RANGE FOR ROW" }
 
 // StatementType implements the Statement interface.
+func (*ShowSurvivalGoal) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowSurvivalGoal) StatementTag() string { return "SHOW SURVIVAL GOAL" }
+
+// StatementType implements the Statement interface.
+func (*ShowRegions) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowRegions) StatementTag() string { return "SHOW REGIONS" }
+
+// StatementType implements the Statement interface.
 func (*ShowFingerprints) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -824,6 +1004,12 @@ func (*ShowTables) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*ShowTables) StatementTag() string { return "SHOW TABLES" }
+
+// StatementType implements the Statement interface
+func (*ShowTransactions) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowTransactions) StatementTag() string { return "SHOW TRANSACTIONS" }
 
 // StatementType implements the Statement interface.
 func (*ShowSchemas) StatementType() StatementType { return Rows }
@@ -842,6 +1028,14 @@ func (*Split) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*Split) StatementTag() string { return "SPLIT" }
+
+// StatementType implements the Statement interface.
+func (*StreamIngestion) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*StreamIngestion) StatementTag() string { return "RESTORE FROM REPLICATION STREAM" }
+
+func (*StreamIngestion) cclOnlyStatement() {}
 
 // StatementType implements the Statement interface.
 func (*Unsplit) StatementType() StatementType { return Rows }
@@ -877,6 +1071,12 @@ func (*ValuesClause) StatementType() StatementType { return Rows }
 func (*ValuesClause) StatementTag() string { return "VALUES" }
 
 func (n *AlterIndex) String() string                     { return AsString(n) }
+func (n *AlterDatabaseOwner) String() string             { return AsString(n) }
+func (n *AlterDatabaseAddRegion) String() string         { return AsString(n) }
+func (n *AlterDatabaseDropRegion) String() string        { return AsString(n) }
+func (n *AlterDatabaseSurvivalGoal) String() string      { return AsString(n) }
+func (n *AlterDatabasePrimaryRegion) String() string     { return AsString(n) }
+func (n *AlterSchema) String() string                    { return AsString(n) }
 func (n *AlterTable) String() string                     { return AsString(n) }
 func (n *AlterTableCmds) String() string                 { return AsString(n) }
 func (n *AlterTableAddColumn) String() string            { return AsString(n) }
@@ -886,14 +1086,20 @@ func (n *AlterTableDropColumn) String() string           { return AsString(n) }
 func (n *AlterTableDropConstraint) String() string       { return AsString(n) }
 func (n *AlterTableDropNotNull) String() string          { return AsString(n) }
 func (n *AlterTableDropStored) String() string           { return AsString(n) }
+func (n *AlterTableLocality) String() string             { return AsString(n) }
 func (n *AlterTableSetDefault) String() string           { return AsString(n) }
 func (n *AlterTableSetNotNull) String() string           { return AsString(n) }
-func (n *AlterUserSetPassword) String() string           { return AsString(n) }
-func (n *AlterRolePrivileges) String() string            { return AsString(n) }
+func (n *AlterTableOwner) String() string                { return AsString(n) }
+func (n *AlterTableSetSchema) String() string            { return AsString(n) }
+func (n *AlterType) String() string                      { return AsString(n) }
+func (n *AlterRole) String() string                      { return AsString(n) }
 func (n *AlterSequence) String() string                  { return AsString(n) }
+func (n *Analyze) String() string                        { return AsString(n) }
 func (n *Backup) String() string                         { return AsString(n) }
 func (n *BeginTransaction) String() string               { return AsString(n) }
 func (n *ControlJobs) String() string                    { return AsString(n) }
+func (n *ControlSchedules) String() string               { return AsString(n) }
+func (n *ControlJobsForSchedules) String() string        { return AsString(n) }
 func (n *CancelQueries) String() string                  { return AsString(n) }
 func (n *CancelSessions) String() string                 { return AsString(n) }
 func (n *CannedOptPlan) String() string                  { return AsString(n) }
@@ -905,24 +1111,28 @@ func (n *CommitTransaction) String() string              { return AsString(n) }
 func (n *CopyFrom) String() string                       { return AsString(n) }
 func (n *CreateChangefeed) String() string               { return AsString(n) }
 func (n *CreateDatabase) String() string                 { return AsString(n) }
+func (n *CreateExtension) String() string                { return AsString(n) }
 func (n *CreateIndex) String() string                    { return AsString(n) }
 func (n *CreateRole) String() string                     { return AsString(n) }
 func (n *CreateTable) String() string                    { return AsString(n) }
+func (n *CreateSchema) String() string                   { return AsString(n) }
 func (n *CreateSequence) String() string                 { return AsString(n) }
 func (n *CreateStats) String() string                    { return AsString(n) }
-func (n *CreateUser) String() string                     { return AsString(n) }
 func (n *CreateView) String() string                     { return AsString(n) }
 func (n *Deallocate) String() string                     { return AsString(n) }
 func (n *Delete) String() string                         { return AsString(n) }
 func (n *DropDatabase) String() string                   { return AsString(n) }
 func (n *DropIndex) String() string                      { return AsString(n) }
-func (n *DropRole) String() string                       { return AsString(n) }
-func (n *DropTable) String() string                      { return AsString(n) }
-func (n *DropView) String() string                       { return AsString(n) }
+func (n *DropOwnedBy) String() string                    { return AsString(n) }
+func (n *DropSchema) String() string                     { return AsString(n) }
 func (n *DropSequence) String() string                   { return AsString(n) }
-func (n *DropUser) String() string                       { return AsString(n) }
+func (n *DropTable) String() string                      { return AsString(n) }
+func (n *DropType) String() string                       { return AsString(n) }
+func (n *DropView) String() string                       { return AsString(n) }
+func (n *DropRole) String() string                       { return AsString(n) }
 func (n *Execute) String() string                        { return AsString(n) }
 func (n *Explain) String() string                        { return AsString(n) }
+func (n *ExplainAnalyze) String() string                 { return AsString(n) }
 func (n *Export) String() string                         { return AsString(n) }
 func (n *Grant) String() string                          { return AsString(n) }
 func (n *GrantRole) String() string                      { return AsString(n) }
@@ -930,10 +1140,13 @@ func (n *Insert) String() string                         { return AsString(n) }
 func (n *Import) String() string                         { return AsString(n) }
 func (n *ParenSelect) String() string                    { return AsString(n) }
 func (n *Prepare) String() string                        { return AsString(n) }
+func (n *ReassignOwnedBy) String() string                { return AsString(n) }
 func (n *ReleaseSavepoint) String() string               { return AsString(n) }
 func (n *Relocate) String() string                       { return AsString(n) }
+func (n *RefreshMaterializedView) String() string        { return AsString(n) }
 func (n *RenameColumn) String() string                   { return AsString(n) }
 func (n *RenameDatabase) String() string                 { return AsString(n) }
+func (n *ReparentDatabase) String() string               { return AsString(n) }
 func (n *RenameIndex) String() string                    { return AsString(n) }
 func (n *RenameTable) String() string                    { return AsString(n) }
 func (n *Restore) String() string                        { return AsString(n) }
@@ -943,6 +1156,7 @@ func (n *RollbackToSavepoint) String() string            { return AsString(n) }
 func (n *RollbackTransaction) String() string            { return AsString(n) }
 func (n *Savepoint) String() string                      { return AsString(n) }
 func (n *Scatter) String() string                        { return AsString(n) }
+func (n *ScheduledBackup) String() string                { return AsString(n) }
 func (n *Scrub) String() string                          { return AsString(n) }
 func (n *Select) String() string                         { return AsString(n) }
 func (n *SelectClause) String() string                   { return AsString(n) }
@@ -961,29 +1175,38 @@ func (n *ShowConstraints) String() string                { return AsString(n) }
 func (n *ShowCreate) String() string                     { return AsString(n) }
 func (n *ShowDatabases) String() string                  { return AsString(n) }
 func (n *ShowDatabaseIndexes) String() string            { return AsString(n) }
+func (n *ShowEnums) String() string                      { return AsString(n) }
 func (n *ShowGrants) String() string                     { return AsString(n) }
 func (n *ShowHistogram) String() string                  { return AsString(n) }
+func (n *ShowSchedules) String() string                  { return AsString(n) }
 func (n *ShowIndexes) String() string                    { return AsString(n) }
 func (n *ShowPartitions) String() string                 { return AsString(n) }
 func (n *ShowJobs) String() string                       { return AsString(n) }
 func (n *ShowQueries) String() string                    { return AsString(n) }
 func (n *ShowRanges) String() string                     { return AsString(n) }
 func (n *ShowRangeForRow) String() string                { return AsString(n) }
+func (n *ShowSurvivalGoal) String() string               { return AsString(n) }
+func (n *ShowRegions) String() string                    { return AsString(n) }
 func (n *ShowRoleGrants) String() string                 { return AsString(n) }
 func (n *ShowRoles) String() string                      { return AsString(n) }
+func (n *ShowSavepointStatus) String() string            { return AsString(n) }
 func (n *ShowSchemas) String() string                    { return AsString(n) }
 func (n *ShowSequences) String() string                  { return AsString(n) }
 func (n *ShowSessions) String() string                   { return AsString(n) }
 func (n *ShowSyntax) String() string                     { return AsString(n) }
 func (n *ShowTableStats) String() string                 { return AsString(n) }
 func (n *ShowTables) String() string                     { return AsString(n) }
+func (n *ShowTypes) String() string                      { return AsString(n) }
 func (n *ShowTraceForSession) String() string            { return AsString(n) }
 func (n *ShowTransactionStatus) String() string          { return AsString(n) }
+func (n *ShowTransactions) String() string               { return AsString(n) }
+func (n *ShowLastQueryStatistics) String() string        { return AsString(n) }
 func (n *ShowUsers) String() string                      { return AsString(n) }
 func (n *ShowVar) String() string                        { return AsString(n) }
 func (n *ShowZoneConfig) String() string                 { return AsString(n) }
 func (n *ShowFingerprints) String() string               { return AsString(n) }
 func (n *Split) String() string                          { return AsString(n) }
+func (n *StreamIngestion) String() string                { return AsString(n) }
 func (n *Unsplit) String() string                        { return AsString(n) }
 func (n *Truncate) String() string                       { return AsString(n) }
 func (n *UnionClause) String() string                    { return AsString(n) }

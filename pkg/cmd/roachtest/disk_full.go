@@ -22,9 +22,8 @@ import (
 func registerDiskFull(r *testRegistry) {
 	r.Add(testSpec{
 		Name:       "disk-full",
-		Owner:      OwnerKV,
-		MinVersion: `v2.1.0`,
-		Skip:       "https://github.com/cockroachdb/cockroach/issues/35328#issuecomment-478540195",
+		Owner:      OwnerStorage,
+		MinVersion: `v20.2.0`,
 		Cluster:    makeClusterSpec(5),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			if c.isLocal() {
@@ -68,7 +67,7 @@ func registerDiskFull(r *testRegistry) {
 					m.ExpectDeath()
 					if err := c.StartE(ctx, c.Node(n)); err == nil {
 						t.Fatalf("node successfully started unexpectedly")
-					} else if strings.Contains(err.Error(), "a panic has occurred") {
+					} else if strings.Contains(GetStderr(err), "a panic has occurred") {
 						t.Fatal(err)
 					}
 				}

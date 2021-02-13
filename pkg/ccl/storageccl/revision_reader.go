@@ -11,9 +11,9 @@ package storageccl
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -29,10 +29,7 @@ type VersionedValues struct {
 // revisions between startTime and endTime.
 // TODO(dt): if/when client gets a ScanRevisionsRequest or similar, use that.
 func GetAllRevisions(
-	ctx context.Context,
-	db *client.DB,
-	startKey, endKey roachpb.Key,
-	startTime, endTime hlc.Timestamp,
+	ctx context.Context, db *kv.DB, startKey, endKey roachpb.Key, startTime, endTime hlc.Timestamp,
 ) ([]VersionedValues, error) {
 	// TODO(dt): version check.
 	header := roachpb.Header{Timestamp: endTime}
@@ -43,27 +40,39 @@ func GetAllRevisions(
 		ReturnSST:     true,
 		OmitChecksum:  true,
 	}
-	resp, pErr := client.SendWrappedWith(ctx, db.NonTransactionalSender(), header, req)
+	resp, pErr := kv.SendWrappedWith(ctx, db.NonTransactionalSender(), header, req)
 	if pErr != nil {
 		return nil, pErr.GoError()
 	}
 
 	var res []VersionedValues
 	for _, file := range resp.(*roachpb.ExportResponse).Files {
-		sst := engine.MakeRocksDBSstFileReader()
-		defer sst.Close()
-
-		if err := sst.IngestExternalFile(file.SST); err != nil {
+		iter, err := storage.NewMemSSTIterator(file.SST, false)
+		if err != nil {
 			return nil, err
 		}
-		if err := sst.Iterate(startKey, endKey, func(kv engine.MVCCKeyValue) (bool, error) {
-			if len(res) == 0 || !res[len(res)-1].Key.Equal(kv.Key.Key) {
-				res = append(res, VersionedValues{Key: kv.Key.Key})
+		defer iter.Close()
+		iter.SeekGE(storage.MVCCKey{Key: startKey})
+
+		for ; ; iter.Next() {
+			if valid, err := iter.Valid(); !valid || err != nil {
+				if err != nil {
+					return nil, err
+				}
+				break
+			} else if iter.UnsafeKey().Key.Compare(endKey) >= 0 {
+				break
 			}
-			res[len(res)-1].Values = append(res[len(res)-1].Values, roachpb.Value{Timestamp: kv.Key.Timestamp, RawBytes: kv.Value})
-			return false, nil
-		}); err != nil {
-			return nil, err
+			key := iter.UnsafeKey()
+			keyCopy := make([]byte, len(key.Key))
+			copy(keyCopy, key.Key)
+			key.Key = keyCopy
+			value := make([]byte, len(iter.UnsafeValue()))
+			copy(value, iter.UnsafeValue())
+			if len(res) == 0 || !res[len(res)-1].Key.Equal(key.Key) {
+				res = append(res, VersionedValues{Key: key.Key})
+			}
+			res[len(res)-1].Values = append(res[len(res)-1].Values, roachpb.Value{Timestamp: key.Timestamp, RawBytes: value})
 		}
 	}
 	return res, nil

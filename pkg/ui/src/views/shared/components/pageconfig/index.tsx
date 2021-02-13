@@ -8,25 +8,26 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import classnames from "classnames";
+import classnames from "classnames/bind";
 import React from "react";
+import styles from "./pageConfig.module.styl";
 
 export interface PageConfigProps {
   layout?: "list" | "spread";
   children?: React.ReactNode;
 }
 
+const cx = classnames.bind(styles);
+
 export function PageConfig(props: PageConfigProps) {
-  const classes = classnames({
+  const classes = cx({
     "page-config__list": props.layout !== "spread",
     "page-config__spread": props.layout === "spread",
   });
 
   return (
-    <div className="page-config">
-      <ul className={ classes }>
-        { props.children }
-      </ul>
+    <div className={cx("page-config")}>
+      <ul className={classes}>{props.children}</ul>
     </div>
   );
 }
@@ -36,9 +37,5 @@ export interface PageConfigItemProps {
 }
 
 export function PageConfigItem(props: PageConfigItemProps) {
-  return (
-    <li className="page-config__item">
-      { props.children }
-    </li>
-  );
+  return <li className={cx("page-config__item")}>{props.children}</li>;
 }

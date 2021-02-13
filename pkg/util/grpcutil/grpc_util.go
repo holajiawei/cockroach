@@ -16,8 +16,9 @@ import (
 	"io"
 	"strings"
 
+	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
@@ -27,7 +28,9 @@ import (
 // ErrCannotReuseClientConn is returned when a failed connection is
 // being reused. We require that new connections be created with
 // pkg/rpc.GRPCDial instead.
-var ErrCannotReuseClientConn = errors.New("cannot reuse client connection")
+var ErrCannotReuseClientConn = errors.New(errCannotReuseClientConnMsg)
+
+const errCannotReuseClientConnMsg = "cannot reuse client connection"
 
 type localRequestKey struct{}
 
@@ -41,20 +44,42 @@ func IsLocalRequestContext(ctx context.Context) bool {
 	return ctx.Value(localRequestKey{}) != nil
 }
 
+// IsTimeout returns true if err's Cause is a gRPC timeout, or the request
+// was canceled by a context timeout.
+func IsTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	err = errors.Cause(err)
+	if s, ok := status.FromError(err); ok {
+		return s.Code() == codes.DeadlineExceeded
+	}
+	return false
+}
+
+// IsContextCanceled returns true if err's Cause is an error produced by gRPC
+// on context cancellation.
+func IsContextCanceled(err error) bool {
+	if s, ok := status.FromError(errors.UnwrapAll(err)); ok {
+		return s.Code() == codes.Canceled && s.Message() == context.Canceled.Error()
+	}
+	return false
+}
+
 // IsClosedConnection returns true if err's Cause is an error produced by gRPC
 // on closed connections.
 func IsClosedConnection(err error) bool {
-	err = errors.Cause(err)
-	if err == ErrCannotReuseClientConn {
+	if errors.Is(err, ErrCannotReuseClientConn) {
 		return true
 	}
+	err = errors.Cause(err)
 	if s, ok := status.FromError(err); ok {
 		if s.Code() == codes.Canceled ||
 			s.Code() == codes.Unavailable {
 			return true
 		}
 	}
-	if err == context.Canceled ||
+	if errors.Is(err, context.Canceled) ||
 		strings.Contains(err.Error(), "is closing") ||
 		strings.Contains(err.Error(), "tls: use of closed connection") ||
 		strings.Contains(err.Error(), "use of closed network connection") ||
@@ -64,6 +89,15 @@ func IsClosedConnection(err error) bool {
 		return true
 	}
 	return netutil.IsClosedConnection(err)
+}
+
+// IsAuthenticationError returns true if err's Cause is an error produced by
+// gRPC due to invalid authentication credentials for the operation.
+func IsAuthenticationError(err error) bool {
+	if s, ok := status.FromError(errors.UnwrapAll(err)); ok {
+		return s.Code() == codes.Unauthenticated
+	}
+	return false
 }
 
 // RequestDidNotStart returns true if the given error from gRPC
@@ -77,13 +111,12 @@ func IsClosedConnection(err error) bool {
 // TODO(bdarnell): Replace this with a cleaner mechanism when/if
 // https://github.com/grpc/grpc-go/issues/1443 is resolved.
 func RequestDidNotStart(err error) bool {
-	if _, ok := err.(connectionNotReadyError); ok {
+	if errors.HasType(err, connectionNotReadyError{}) ||
+		errors.HasType(err, (*netutil.InitialHeartbeatFailedError)(nil)) ||
+		errors.Is(err, circuit.ErrBreakerOpen) {
 		return true
 	}
-	if _, ok := err.(*netutil.InitialHeartbeatFailedError); ok {
-		return true
-	}
-	s, ok := status.FromError(err)
+	s, ok := status.FromError(errors.Cause(err))
 	if !ok {
 		// This is a non-gRPC error; assume nothing.
 		return false

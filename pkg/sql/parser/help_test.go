@@ -44,6 +44,13 @@ func TestContextualHelp(t *testing.T) {
 		{`ALTER TABLE blah RENAME TO blih ??`, `ALTER TABLE`},
 		{`ALTER TABLE blah SPLIT AT (SELECT 1) ??`, `ALTER TABLE`},
 
+		{`ALTER TYPE ??`, `ALTER TYPE`},
+		{`ALTER TYPE t ??`, `ALTER TYPE`},
+		{`ALTER TYPE t ADD VALUE ??`, `ALTER TYPE`},
+		{`ALTER TYPE t SET ??`, `ALTER TYPE`},
+		{`ALTER TYPE t RENAME ??`, `ALTER TYPE`},
+		{`ALTER TYPE t DROP VALUE ??`, `ALTER TYPE`},
+
 		{`ALTER INDEX foo@bar RENAME ??`, `ALTER INDEX`},
 		{`ALTER INDEX foo@bar RENAME TO blih ??`, `ALTER INDEX`},
 		{`ALTER INDEX foo@bar SPLIT ??`, `ALTER INDEX`},
@@ -63,8 +70,12 @@ func TestContextualHelp(t *testing.T) {
 		{`ALTER SEQUENCE blah RENAME ??`, `ALTER SEQUENCE`},
 		{`ALTER SEQUENCE blah RENAME TO blih ??`, `ALTER SEQUENCE`},
 
-		{`ALTER USER IF ??`, `ALTER USER`},
-		{`ALTER USER foo WITH PASSWORD ??`, `ALTER USER`},
+		{`ALTER SCHEMA ??`, `ALTER SCHEMA`},
+		{`ALTER SCHEMA x RENAME ??`, `ALTER SCHEMA`},
+		{`ALTER SCHEMA x OWNER ??`, `ALTER SCHEMA`},
+
+		{`ALTER USER IF ??`, `ALTER ROLE`},
+		{`ALTER USER foo WITH PASSWORD ??`, `ALTER ROLE`},
 
 		{`ALTER ROLE bleh ?? WITH NOCREATEROLE`, `ALTER ROLE`},
 
@@ -73,6 +84,11 @@ func TestContextualHelp(t *testing.T) {
 
 		{`ALTER PARTITION ??`, `ALTER PARTITION`},
 		{`ALTER PARTITION p OF INDEX tbl@idx ??`, `ALTER PARTITION`},
+
+		{`ANALYZE ??`, `ANALYZE`},
+		{`ANALYZE blah ??`, `ANALYZE`},
+		{`ANALYSE ??`, `ANALYZE`},
+		{`ANALYSE blah ??`, `ANALYZE`},
 
 		{`CANCEL ??`, `CANCEL`},
 		{`CANCEL JOB ??`, `CANCEL JOBS`},
@@ -102,8 +118,10 @@ func TestContextualHelp(t *testing.T) {
 		{`CREATE DATABASE IF NOT ??`, `CREATE DATABASE`},
 		{`CREATE DATABASE blih ??`, `CREATE DATABASE`},
 
-		{`CREATE USER blih ??`, `CREATE USER`},
-		{`CREATE USER blih WITH ??`, `CREATE USER`},
+		{`CREATE EXTENSION ??`, `CREATE EXTENSION`},
+
+		{`CREATE USER blih ??`, `CREATE ROLE`},
+		{`CREATE USER blih WITH ??`, `CREATE ROLE`},
 
 		{`CREATE ROLE bleh ??`, `CREATE ROLE`},
 		{`CREATE ROLE bleh ?? WITH CREATEROLE`, `CREATE ROLE`},
@@ -125,6 +143,13 @@ func TestContextualHelp(t *testing.T) {
 		{`CREATE TABLE blah AS (SELECT 1) ??`, `CREATE TABLE`},
 		{`CREATE TABLE blah AS SELECT 1 ??`, `SELECT`},
 
+		{`CREATE TYPE blah AS ENUM ??`, `CREATE TYPE`},
+		{`DROP TYPE ??`, `DROP TYPE`},
+
+		{`CREATE SCHEMA IF ??`, `CREATE SCHEMA`},
+		{`CREATE SCHEMA IF NOT ??`, `CREATE SCHEMA`},
+		{`CREATE SCHEMA bli ??`, `CREATE SCHEMA`},
+
 		{`DELETE FROM ??`, `DELETE`},
 		{`DELETE FROM blah ??`, `DELETE`},
 		{`DELETE FROM blah WHERE ??`, `DELETE`},
@@ -140,6 +165,10 @@ func TestContextualHelp(t *testing.T) {
 
 		{`DROP INDEX blah, ??`, `DROP INDEX`},
 		{`DROP INDEX blah@blih ??`, `DROP INDEX`},
+
+		{`DROP USER ??`, `DROP ROLE`},
+		{`DROP USER IF ??`, `DROP ROLE`},
+		{`DROP USER IF EXISTS bluh ??`, `DROP ROLE`},
 
 		{`DROP ROLE ??`, `DROP ROLE`},
 		{`DROP ROLE IF ??`, `DROP ROLE`},
@@ -157,9 +186,10 @@ func TestContextualHelp(t *testing.T) {
 		{`DROP VIEW IF ??`, `DROP VIEW`},
 		{`DROP VIEW IF EXISTS blih, bloh ??`, `DROP VIEW`},
 
-		{`DROP USER ??`, `DROP USER`},
-		{`DROP USER IF ??`, `DROP USER`},
-		{`DROP USER IF EXISTS bloh ??`, `DROP USER`},
+		{`DROP SCHEDULE ???`, `DROP SCHEDULES`},
+		{`DROP SCHEDULES ???`, `DROP SCHEDULES`},
+
+		{`DROP SCHEMA ??`, `DROP SCHEMA`},
 
 		{`EXPLAIN (??`, `EXPLAIN`},
 		{`EXPLAIN SELECT 1 ??`, `SELECT`},
@@ -209,9 +239,21 @@ func TestContextualHelp(t *testing.T) {
 		{`GRANT ALL ON foo TO ??`, `GRANT`},
 		{`GRANT ALL ON foo TO bar ??`, `GRANT`},
 
-		{`PAUSE ??`, `PAUSE JOBS`},
+		{`PAUSE ??`, `PAUSE`},
+		{`PAUSE JOB ??`, `PAUSE JOBS`},
+		{`PAUSE JOBS ??`, `PAUSE JOBS`},
+		{`PAUSE SCHEDULE ??`, `PAUSE SCHEDULES`},
+		{`PAUSE SCHEDULES ??`, `PAUSE SCHEDULES`},
 
-		{`RESUME ??`, `RESUME JOBS`},
+		{`REASSIGN OWNED BY ?? TO ??`, `REASSIGN OWNED BY`},
+		{`REASSIGN OWNED BY foo, bar TO ??`, `REASSIGN OWNED BY`},
+		{`DROP OWNED BY ??`, `DROP OWNED BY`},
+
+		{`RESUME ??`, `RESUME`},
+		{`RESUME JOB ??`, `RESUME JOBS`},
+		{`RESUME JOBS ??`, `RESUME JOBS`},
+		{`RESUME SCHEDULE ??`, `RESUME SCHEDULES`},
+		{`RESUME SCHEDULES ??`, `RESUME SCHEDULES`},
 
 		{`REVOKE ALL ??`, `REVOKE`},
 		{`REVOKE ALL ON foo FROM ??`, `REVOKE`},
@@ -235,13 +277,19 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW SESSIONS ??`, `SHOW SESSIONS`},
 		{`SHOW LOCAL SESSIONS ??`, `SHOW SESSIONS`},
 
+		{`SHOW TRANSACTIONS ??`, `SHOW TRANSACTIONS`},
+		{`SHOW LOCAL TRANSACTIONS ??`, `SHOW TRANSACTIONS`},
+
 		{`SHOW STATISTICS ??`, `SHOW STATISTICS`},
 		{`SHOW STATISTICS FOR TABLE ??`, `SHOW STATISTICS`},
 
 		{`SHOW HISTOGRAM ??`, `SHOW HISTOGRAM`},
 
-		{`SHOW QUERIES ??`, `SHOW QUERIES`},
-		{`SHOW LOCAL QUERIES ??`, `SHOW QUERIES`},
+		{`SHOW QUERIES ??`, `SHOW STATEMENTS`},
+		{`SHOW LOCAL QUERIES ??`, `SHOW STATEMENTS`},
+
+		{`SHOW STATEMENTS ??`, `SHOW STATEMENTS`},
+		{`SHOW LOCAL STATEMENTS ??`, `SHOW STATEMENTS`},
 
 		{`SHOW TRACE ??`, `SHOW TRACE`},
 		{`SHOW TRACE FOR SESSION ??`, `SHOW TRACE`},
@@ -250,6 +298,9 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW JOB ??`, `SHOW JOBS`},
 		{`SHOW JOBS ??`, `SHOW JOBS`},
 		{`SHOW AUTOMATIC JOBS ??`, `SHOW JOBS`},
+
+		{`SHOW SCHEDULE ??`, `SHOW SCHEDULES`},
+		{`SHOW SCHEDULES ??`, `SHOW SCHEDULES`},
 
 		{`SHOW BACKUP 'foo' ??`, `SHOW BACKUP`},
 
@@ -269,6 +320,9 @@ func TestContextualHelp(t *testing.T) {
 
 		{`SHOW DATABASES ??`, `SHOW DATABASES`},
 
+		{`SHOW ENUMS ??`, `SHOW ENUMS`},
+		{`SHOW TYPES ??`, `SHOW TYPES`},
+
 		{`SHOW GRANTS ON ??`, `SHOW GRANTS`},
 		{`SHOW GRANTS ON foo FOR ??`, `SHOW GRANTS`},
 		{`SHOW GRANTS ON foo FOR bar ??`, `SHOW GRANTS`},
@@ -283,6 +337,8 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW INDEXES FROM blah ??`, `SHOW INDEXES`},
 
 		{`SHOW PARTITIONS FROM ??`, `SHOW PARTITIONS`},
+
+		{`SHOW REGIONS ??`, `SHOW REGIONS`},
 
 		{`SHOW ROLES ??`, `SHOW ROLES`},
 
@@ -301,6 +357,7 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW TRANSACTION ISOLATION LEVEL ??`, `SHOW TRANSACTION`},
 		{`SHOW SYNTAX ??`, `SHOW SYNTAX`},
 		{`SHOW SYNTAX 'foo' ??`, `SHOW SYNTAX`},
+		{`SHOW SAVEPOINT STATUS ??`, `SHOW SAVEPOINT`},
 
 		{`SHOW RANGE ??`, `SHOW RANGE`},
 
@@ -358,6 +415,8 @@ func TestContextualHelp(t *testing.T) {
 		{`COMMIT TRANSACTION ??`, `COMMIT`},
 		{`END ??`, `COMMIT`},
 
+		{`REFRESH ??`, `REFRESH`},
+
 		{`ROLLBACK TRANSACTION ??`, `ROLLBACK`},
 		{`ROLLBACK TO ??`, `ROLLBACK`},
 
@@ -383,6 +442,7 @@ func TestContextualHelp(t *testing.T) {
 		{`EXPORT ??`, `EXPORT`},
 		{`EXPORT INTO CSV 'a' ??`, `EXPORT`},
 		{`EXPORT INTO CSV 'a' FROM SELECT a ??`, `SELECT`},
+		{`CREATE SCHEDULE FOR BACKUP ??`, `CREATE SCHEDULE FOR BACKUP`},
 	}
 
 	// The following checks that the test definition above exercises all

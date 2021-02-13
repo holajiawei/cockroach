@@ -14,22 +14,24 @@ import (
 	"context"
 	"sync/atomic"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // CTASPlanResultTypes is the result types for EXPORT plans.
-var CTASPlanResultTypes = []types.T{
-	*types.Bytes, // rows
+var CTASPlanResultTypes = []*types.T{
+	types.Bytes, // rows
 }
 
 type bulkRowWriter struct {
@@ -37,6 +39,7 @@ type bulkRowWriter struct {
 	flowCtx        *execinfra.FlowCtx
 	processorID    int32
 	batchIdxAtomic int64
+	tableDesc      catalog.TableDescriptor
 	spec           execinfrapb.BulkRowWriterSpec
 	input          execinfra.RowSource
 	output         execinfra.RowReceiver
@@ -57,6 +60,7 @@ func newBulkRowWriterProcessor(
 		flowCtx:        flowCtx,
 		processorID:    processorID,
 		batchIdxAtomic: 0,
+		tableDesc:      tabledesc.NewImmutable(spec.Table),
 		spec:           spec,
 		input:          input,
 		output:         output,
@@ -80,15 +84,15 @@ func (sp *bulkRowWriter) Start(ctx context.Context) context.Context {
 }
 
 // Next is part of the RowSource interface.
-func (sp *bulkRowWriter) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
+func (sp *bulkRowWriter) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	// If there wasn't an error while processing, output the summary.
 	if sp.ProcessorBase.State == execinfra.StateRunning {
 		countsBytes, marshalErr := protoutil.Marshal(&sp.summary)
 		sp.MoveToDraining(marshalErr)
 		if marshalErr == nil {
 			// Output the summary.
-			return sqlbase.EncDatumRow{
-				sqlbase.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(countsBytes))),
+			return rowenc.EncDatumRow{
+				rowenc.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(countsBytes))),
 			}, nil
 		}
 	}
@@ -100,7 +104,7 @@ func (sp *bulkRowWriter) work(ctx context.Context) error {
 	var g ctxgroup.Group
 
 	conv, err := row.NewDatumRowConverter(ctx,
-		&sp.spec.Table, nil /* targetColNames */, sp.EvalCtx, kvCh)
+		sp.tableDesc, nil /* targetColNames */, sp.EvalCtx, kvCh, nil /* seqChunkProvider */)
 	if err != nil {
 		return err
 	}
@@ -118,15 +122,25 @@ func (sp *bulkRowWriter) work(ctx context.Context) error {
 	return g.Wait()
 }
 
-func (sp *bulkRowWriter) OutputTypes() []types.T {
-	return CTASPlanResultTypes
+func (sp *bulkRowWriter) wrapDupError(ctx context.Context, orig error) error {
+	var typed *kvserverbase.DuplicateKeyError
+	if !errors.As(orig, &typed) {
+		return orig
+	}
+	v := &roachpb.Value{RawBytes: typed.Value}
+	return row.NewUniquenessConstraintViolationError(ctx, sp.tableDesc, typed.Key, v)
 }
 
 func (sp *bulkRowWriter) ingestLoop(ctx context.Context, kvCh chan row.KVBatch) error {
 	writeTS := sp.spec.Table.CreateAsOfTime
 	const bufferSize = 64 << 20
 	adder, err := sp.flowCtx.Cfg.BulkAdder(
-		ctx, sp.flowCtx.Cfg.DB, writeTS, storagebase.BulkAdderOptions{MinBufferSize: bufferSize},
+		ctx, sp.flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{
+			MinBufferSize: bufferSize,
+			// We disallow shadowing here to ensure that we report errors when builds
+			// of unique indexes fail when there are duplicate values.
+			DisallowShadowing: true,
+		},
 	)
 	if err != nil {
 		return err
@@ -139,19 +153,13 @@ func (sp *bulkRowWriter) ingestLoop(ctx context.Context, kvCh chan row.KVBatch) 
 		for kvBatch := range kvCh {
 			for _, kv := range kvBatch.KVs {
 				if err := adder.Add(ctx, kv.Key, kv.Value.RawBytes); err != nil {
-					if _, ok := err.(storagebase.DuplicateKeyError); ok {
-						return errors.WithStack(err)
-					}
-					return err
+					return sp.wrapDupError(ctx, err)
 				}
 			}
 		}
 
 		if err := adder.Flush(ctx); err != nil {
-			if err, ok := err.(storagebase.DuplicateKeyError); ok {
-				return errors.WithStack(err)
-			}
-			return err
+			return sp.wrapDupError(ctx, err)
 		}
 		return nil
 	}
@@ -171,7 +179,7 @@ func (sp *bulkRowWriter) convertLoop(
 	defer close(kvCh)
 
 	done := false
-	alloc := &sqlbase.DatumAlloc{}
+	alloc := &rowenc.DatumAlloc{}
 	typs := sp.input.OutputTypes()
 
 	for {
@@ -196,7 +204,7 @@ func (sp *bulkRowWriter) convertLoop(
 					conv.Datums[i] = tree.DNull
 					continue
 				}
-				if err := ed.EnsureDecoded(&typs[i], alloc); err != nil {
+				if err := ed.EnsureDecoded(typs[i], alloc); err != nil {
 					return err
 				}
 				conv.Datums[i] = ed.Datum

@@ -79,7 +79,7 @@ func (s *Smither) tableExpr(table *tableRef, name *tree.TableName) (tree.TableEx
 	refs := make(colRefs, len(table.Columns))
 	for i, c := range table.Columns {
 		refs[i] = &colRef{
-			typ: c.Type,
+			typ: tree.MustBeStaticallyKnownType(c.Type),
 			item: tree.NewColumnItem(
 				name,
 				c.Name,
@@ -289,16 +289,16 @@ func makeMergeJoinExpr(s *Smither, _ colRefs, forJoin bool) (tree.TableExpr, col
 					if rightColElem.Direction != leftColElem.Direction {
 						break
 					}
-					if !rightCol.Type.Equivalent(leftCol.Type) {
+					if !tree.MustBeStaticallyKnownType(rightCol.Type).Equivalent(tree.MustBeStaticallyKnownType(leftCol.Type)) {
 						break
 					}
 					cols = append(cols, [2]colRef{
 						{
-							typ:  leftCol.Type,
+							typ:  tree.MustBeStaticallyKnownType(leftCol.Type),
 							item: tree.NewColumnItem(leftAliasName, leftColElem.Column),
 						},
 						{
-							typ:  rightCol.Type,
+							typ:  tree.MustBeStaticallyKnownType(rightCol.Type),
 							item: tree.NewColumnItem(rightAliasName, rightColElem.Column),
 						},
 					})
@@ -879,6 +879,34 @@ func makeBegin(s *Smither) (tree.Statement, bool) {
 	return &tree.BeginTransaction{}, true
 }
 
+func makeSavepoint(s *Smither) (tree.Statement, bool) {
+	savepointName := s.randString(s.d9(), letters)
+	s.activeSavepoints = append(s.activeSavepoints, savepointName)
+	return &tree.Savepoint{Name: tree.Name(savepointName)}, true
+}
+
+func makeReleaseSavepoint(s *Smither) (tree.Statement, bool) {
+	if len(s.activeSavepoints) == 0 {
+		return nil, false
+	}
+	idx := s.rnd.Intn(len(s.activeSavepoints))
+	savepoint := s.activeSavepoints[idx]
+	// Remove the released savepoint from our set of active savepoints.
+	s.activeSavepoints = append(s.activeSavepoints[:idx], s.activeSavepoints[idx+1:]...)
+	return &tree.ReleaseSavepoint{Savepoint: tree.Name(savepoint)}, true
+}
+
+func makeRollbackToSavepoint(s *Smither) (tree.Statement, bool) {
+	if len(s.activeSavepoints) == 0 {
+		return nil, false
+	}
+	idx := s.rnd.Intn(len(s.activeSavepoints))
+	savepoint := s.activeSavepoints[idx]
+	// Destroy all savepoints that come after the savepoint we rollback to.
+	s.activeSavepoints = s.activeSavepoints[:idx+1]
+	return &tree.RollbackToSavepoint{Savepoint: tree.Name(savepoint)}, true
+}
+
 func makeCommit(s *Smither) (tree.Statement, bool) {
 	return &tree.CommitTransaction{}, true
 }
@@ -918,7 +946,7 @@ func (s *Smither) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
 				continue
 			}
 			if unnamed || c.Nullable.Nullability == tree.NotNull || s.coin() {
-				desiredTypes = append(desiredTypes, c.Type)
+				desiredTypes = append(desiredTypes, tree.MustBeStaticallyKnownType(c.Type))
 				names = append(names, c.Name)
 			}
 		}
@@ -1102,7 +1130,7 @@ func (s *Smither) makeReturning(table *tableRef) (*tree.ReturningExprs, colRefs)
 	refs := make(colRefs, len(table.Columns))
 	for i, c := range table.Columns {
 		refs[i] = &colRef{
-			typ:  c.Type,
+			typ:  tree.MustBeStaticallyKnownType(c.Type),
 			item: &tree.ColumnItem{ColumnName: c.Name},
 		}
 	}

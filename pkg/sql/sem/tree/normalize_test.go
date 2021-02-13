@@ -20,10 +20,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestContainsVars(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testData := []struct {
 		expr     string
 		expected bool
@@ -52,6 +54,7 @@ func TestContainsVars(t *testing.T) {
 
 func TestNormalizeExpr(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	defer tree.MockNameTypes(map[string]*types.T{
 		"a":  types.Int,
 		"b":  types.Int,
@@ -231,8 +234,8 @@ func TestNormalizeExpr(t *testing.T) {
 		{`NULL IS DISTINCT FROM NULL`, `false`},
 		{`1 IS NOT DISTINCT FROM NULL`, `false`},
 		{`1 IS DISTINCT FROM NULL`, `true`},
-		{`d IS NOT DISTINCT FROM NULL`, `d IS NULL`},
-		{`d IS DISTINCT FROM NULL`, `d IS NOT NULL`},
+		{`d IS NOT DISTINCT FROM NULL`, `d IS NOT DISTINCT FROM NULL`},
+		{`d IS DISTINCT FROM NULL`, `d IS DISTINCT FROM NULL`},
 		{`NULL IS NOT DISTINCT FROM TRUE`, `false`},
 		{`NULL IS DISTINCT FROM TRUE`, `true`},
 		{`false IS NOT DISTINCT FROM TRUE`, `false`},
@@ -243,8 +246,8 @@ func TestNormalizeExpr(t *testing.T) {
 		{`false IS DISTINCT FROM FALSE`, `false`},
 		{`NULL IS NOT DISTINCT FROM 1`, `false`},
 		{`NULL IS DISTINCT FROM 1`, `true`},
-		{`NULL IS NOT DISTINCT FROM d`, `d IS NULL`},
-		{`NULL IS DISTINCT FROM d`, `d IS NOT NULL`},
+		{`NULL IS NOT DISTINCT FROM d`, `d IS NOT DISTINCT FROM NULL`},
+		{`NULL IS DISTINCT FROM d`, `d IS DISTINCT FROM NULL`},
 		// #15454: ensure that operators are pretty-printed correctly after normalization.
 		{`(random() + 1.0)::INT8`, `(random() + 1.0)::INT8`},
 		{`('a' || left('b', random()::INT8)) COLLATE en`, `('a' || left('b', random()::INT8)) COLLATE en`},
@@ -276,6 +279,7 @@ func TestNormalizeExpr(t *testing.T) {
 		{`(ROW (a) AS a)`, `((a,) AS a)`}, // Tuple
 	}
 
+	ctx := context.Background()
 	semaCtx := tree.MakeSemaContext()
 	for _, d := range testData {
 		t.Run(d.expr, func(t *testing.T) {
@@ -283,7 +287,7 @@ func TestNormalizeExpr(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: %v", d.expr, err)
 			}
-			typedExpr, err := expr.TypeCheck(&semaCtx, types.Any)
+			typedExpr, err := expr.TypeCheck(ctx, &semaCtx, types.Any)
 			if err != nil {
 				t.Fatalf("%s: %v", d.expr, err)
 			}

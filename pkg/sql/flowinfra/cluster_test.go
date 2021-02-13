@@ -19,16 +19,19 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -36,8 +39,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,8 +49,8 @@ func TestClusterFlow(t *testing.T) {
 	const numRows = 100
 
 	args := base.TestClusterArgs{ReplicationMode: base.ReplicationManual}
-	tc := serverutils.StartTestCluster(t, 3, args)
-	defer tc.Stopper().Stop(context.TODO())
+	tc := serverutils.StartNewTestCluster(t, 3, args)
+	defer tc.Stopper().Stop(context.Background())
 
 	sumDigitsFn := func(row int) tree.Datum {
 		sum := 0
@@ -64,10 +67,10 @@ func TestClusterFlow(t *testing.T) {
 		sqlutils.ToRowFn(sqlutils.RowIdxFn, sumDigitsFn, sqlutils.RowEnglishFn))
 
 	kvDB := tc.Server(0).DB()
-	desc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
+	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 	makeIndexSpan := func(start, end int) execinfrapb.TableReaderSpan {
 		var span roachpb.Span
-		prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(desc, desc.Indexes[0].ID))
+		prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.PublicNonPrimaryIndexes()[0].GetID()))
 		span.Key = append(prefix, encoding.EncodeVarintAscending(nil, int64(start))...)
 		span.EndKey = append(span.EndKey, prefix...)
 		span.EndKey = append(span.EndKey, encoding.EncodeVarintAscending(nil, int64(end))...)
@@ -83,34 +86,34 @@ func TestClusterFlow(t *testing.T) {
 
 	// Start a span (useful to look at spans using Lightstep).
 	sp := tc.Server(0).ClusterSettings().Tracer.StartSpan("cluster test")
-	ctx := opentracing.ContextWithSpan(context.Background(), sp)
+	ctx := tracing.ContextWithSpan(context.Background(), sp)
 	defer sp.Finish()
 
-	now := tc.Server(0).Clock().Now()
+	now := tc.Server(0).Clock().NowAsClockTimestamp()
 	txnProto := roachpb.MakeTransaction(
 		"cluster-test",
 		nil, // baseKey
 		roachpb.NormalUserPriority,
-		now,
+		now.ToTimestamp(),
 		0, // maxOffset
 	)
-	txn := client.NewTxnFromProto(ctx, kvDB, tc.Server(0).NodeID(), now, client.RootTxn, &txnProto)
+	txn := kv.NewTxnFromProto(ctx, kvDB, tc.Server(0).NodeID(), now, kv.RootTxn, &txnProto)
 	leafInputState := txn.GetLeafTxnInputState(ctx)
 
 	tr1 := execinfrapb.TableReaderSpec{
-		Table:    *desc,
+		Table:    *desc.TableDesc(),
 		IndexIdx: 1,
 		Spans:    []execinfrapb.TableReaderSpan{makeIndexSpan(0, 8)},
 	}
 
 	tr2 := execinfrapb.TableReaderSpec{
-		Table:    *desc,
+		Table:    *desc.TableDesc(),
 		IndexIdx: 1,
 		Spans:    []execinfrapb.TableReaderSpan{makeIndexSpan(8, 12)},
 	}
 
 	tr3 := execinfrapb.TableReaderSpec{
-		Table:    *desc,
+		Table:    *desc.TableDesc(),
 		IndexIdx: 1,
 		Spans:    []execinfrapb.TableReaderSpan{makeIndexSpan(12, 100)},
 	}
@@ -135,6 +138,7 @@ func TestClusterFlow(t *testing.T) {
 						{Type: execinfrapb.StreamEndpointSpec_REMOTE, StreamID: 0, TargetNodeID: tc.Server(2).NodeID()},
 					},
 				}},
+				ResultTypes: rowenc.TwoIntCols,
 			}},
 		},
 	}
@@ -157,6 +161,7 @@ func TestClusterFlow(t *testing.T) {
 						{Type: execinfrapb.StreamEndpointSpec_REMOTE, StreamID: 1, TargetNodeID: tc.Server(2).NodeID()},
 					},
 				}},
+				ResultTypes: rowenc.TwoIntCols,
 			}},
 		},
 	}
@@ -180,6 +185,7 @@ func TestClusterFlow(t *testing.T) {
 							{Type: execinfrapb.StreamEndpointSpec_LOCAL, StreamID: 2},
 						},
 					}},
+					ResultTypes: rowenc.TwoIntCols,
 				},
 				{
 					ProcessorID: 4,
@@ -192,9 +198,9 @@ func TestClusterFlow(t *testing.T) {
 							{Type: execinfrapb.StreamEndpointSpec_REMOTE, StreamID: 1},
 							{Type: execinfrapb.StreamEndpointSpec_LOCAL, StreamID: 2},
 						},
-						ColumnTypes: sqlbase.TwoIntCols,
+						ColumnTypes: rowenc.TwoIntCols,
 					}},
-					Core: execinfrapb.ProcessorCoreUnion{JoinReader: &execinfrapb.JoinReaderSpec{Table: *desc}},
+					Core: execinfrapb.ProcessorCoreUnion{JoinReader: &execinfrapb.JoinReaderSpec{Table: *desc.TableDesc(), MaintainOrdering: true}},
 					Post: execinfrapb.PostProcessSpec{
 						Projection:    true,
 						OutputColumns: []uint32{2},
@@ -203,6 +209,7 @@ func TestClusterFlow(t *testing.T) {
 						Type:    execinfrapb.OutputRouterSpec_PASS_THROUGH,
 						Streams: []execinfrapb.StreamEndpointSpec{{Type: execinfrapb.StreamEndpointSpec_SYNC_RESPONSE}},
 					}},
+					ResultTypes: []*types.T{types.String},
 				},
 			},
 		},
@@ -244,7 +251,7 @@ func TestClusterFlow(t *testing.T) {
 	}
 
 	var decoder StreamDecoder
-	var rows sqlbase.EncDatumRows
+	var rows rowenc.EncDatumRows
 	var metas []execinfrapb.ProducerMetadata
 	for {
 		msg, err := stream.Recv()
@@ -263,6 +270,7 @@ func TestClusterFlow(t *testing.T) {
 	metas = ignoreMisplannedRanges(metas)
 	metas = ignoreLeafTxnState(metas)
 	metas = ignoreMetricsMeta(metas)
+	metas = ignoreTraceData(metas)
 	if len(metas) != 0 {
 		t.Fatalf("unexpected metadata (%d): %+v", len(metas), metas)
 	}
@@ -278,13 +286,13 @@ func TestClusterFlow(t *testing.T) {
 	}
 	expected := strings.Join(results, " ")
 	expected = "[" + expected + "]"
-	if rowStr := rows.String([]types.T{*types.String}); rowStr != expected {
+	if rowStr := rows.String([]*types.T{types.String}); rowStr != expected {
 		t.Errorf("Result: %s\n Expected: %s\n", rowStr, expected)
 	}
 }
 
 // ignoreMisplannedRanges takes a slice of metadata and returns the entries that
-// are not about range info from mis-planned ranges.
+// are not about range info from misplanned ranges.
 func ignoreMisplannedRanges(metas []execinfrapb.ProducerMetadata) []execinfrapb.ProducerMetadata {
 	res := make([]execinfrapb.ProducerMetadata, 0)
 	for _, m := range metas {
@@ -319,13 +327,25 @@ func ignoreMetricsMeta(metas []execinfrapb.ProducerMetadata) []execinfrapb.Produ
 	return res
 }
 
+// ignoreTraceData takes a slice of metadata and returns the entries
+// excluding the ones with trace data.
+func ignoreTraceData(metas []execinfrapb.ProducerMetadata) []execinfrapb.ProducerMetadata {
+	res := make([]execinfrapb.ProducerMetadata, 0)
+	for _, m := range metas {
+		if m.TraceData == nil {
+			res = append(res, m)
+		}
+	}
+	return res
+}
+
 // TestLimitedBufferingDeadlock sets up a scenario which leads to deadlock if
 // a single consumer can block the entire router (#17097).
 func TestLimitedBufferingDeadlock(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	tc := serverutils.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(context.TODO())
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(context.Background())
 
 	// Set up the following network - a simplification of the one described in
 	// #17097 (the numbers on the streams are the StreamIDs in the spec below):
@@ -368,13 +388,13 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	// value.
 
 	// All our rows have a single integer column.
-	typs := []types.T{*types.Int}
+	typs := []*types.T{types.Int}
 
 	// The left values rows are consecutive values.
-	leftRows := make(sqlbase.EncDatumRows, 20)
+	leftRows := make(rowenc.EncDatumRows, 20)
 	for i := range leftRows {
-		leftRows[i] = sqlbase.EncDatumRow{
-			sqlbase.DatumToEncDatum(&typs[0], tree.NewDInt(tree.DInt(i))),
+		leftRows[i] = rowenc.EncDatumRow{
+			rowenc.DatumToEncDatum(typs[0], tree.NewDInt(tree.DInt(i))),
 		}
 	}
 	leftValuesSpec, err := execinfra.GenerateValuesSpec(typs, leftRows, 10 /* rows per chunk */)
@@ -384,11 +404,11 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 
 	// The right values rows have groups of identical values (ensuring that large
 	// groups of rows go to the same hash bucket).
-	rightRows := make(sqlbase.EncDatumRows, 0)
+	rightRows := make(rowenc.EncDatumRows, 0)
 	for i := 1; i <= 20; i++ {
 		for j := 1; j <= 4*execinfra.RowChannelBufSize; j++ {
-			rightRows = append(rightRows, sqlbase.EncDatumRow{
-				sqlbase.DatumToEncDatum(&typs[0], tree.NewDInt(tree.DInt(i))),
+			rightRows = append(rightRows, rowenc.EncDatumRow{
+				rowenc.DatumToEncDatum(typs[0], tree.NewDInt(tree.DInt(i))),
 			})
 		}
 	}
@@ -405,21 +425,21 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		RightOrdering: execinfrapb.Ordering{
 			Columns: []execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 		},
-		Type: sqlbase.InnerJoin,
+		Type: descpb.InnerJoin,
 	}
 
-	now := tc.Server(0).Clock().Now()
+	now := tc.Server(0).Clock().NowAsClockTimestamp()
 	txnProto := roachpb.MakeTransaction(
 		"deadlock-test",
 		nil, // baseKey
 		roachpb.NormalUserPriority,
-		now,
+		now.ToTimestamp(),
 		0, // maxOffset
 	)
-	txn := client.NewTxnFromProto(
-		context.TODO(), tc.Server(0).DB(), tc.Server(0).NodeID(),
-		now, client.RootTxn, &txnProto)
-	leafInputState := txn.GetLeafTxnInputState(context.TODO())
+	txn := kv.NewTxnFromProto(
+		context.Background(), tc.Server(0).DB(), tc.Server(0).NodeID(),
+		now, kv.RootTxn, &txnProto)
+	leafInputState := txn.GetLeafTxnInputState(context.Background())
 
 	req := execinfrapb.SetupFlowRequest{
 		Version:           execinfra.Version,
@@ -436,6 +456,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 							{Type: execinfrapb.StreamEndpointSpec_LOCAL, StreamID: 1},
 						},
 					}},
+					ResultTypes: typs,
 				},
 				// The right-hand Values processor in the diagram above.
 				{
@@ -448,6 +469,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 							{Type: execinfrapb.StreamEndpointSpec_LOCAL, StreamID: 3},
 						},
 					}},
+					ResultTypes: typs,
 				},
 				// The MergeJoin processor.
 				{
@@ -475,6 +497,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 							{Type: execinfrapb.StreamEndpointSpec_LOCAL, StreamID: 4},
 						},
 					}},
+					ResultTypes: typs,
 				},
 				// The final (Response) processor.
 				{
@@ -493,6 +516,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 						Type:    execinfrapb.OutputRouterSpec_PASS_THROUGH,
 						Streams: []execinfrapb.StreamEndpointSpec{{Type: execinfrapb.StreamEndpointSpec_SYNC_RESPONSE}},
 					}},
+					ResultTypes: typs,
 				},
 			},
 		},
@@ -504,7 +528,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stream, err := execinfrapb.NewDistSQLClient(conn).RunSyncFlow(context.TODO())
+	stream, err := execinfrapb.NewDistSQLClient(conn).RunSyncFlow(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +538,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	}
 
 	var decoder StreamDecoder
-	var rows sqlbase.EncDatumRows
+	var rows rowenc.EncDatumRows
 	var metas []execinfrapb.ProducerMetadata
 	for {
 		msg, err := stream.Recv()
@@ -524,7 +548,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 			}
 			t.Fatal(err)
 		}
-		err = decoder.AddMessage(context.TODO(), msg)
+		err = decoder.AddMessage(context.Background(), msg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -533,6 +557,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	metas = ignoreMisplannedRanges(metas)
 	metas = ignoreLeafTxnState(metas)
 	metas = ignoreMetricsMeta(metas)
+	metas = ignoreTraceData(metas)
 	if len(metas) != 0 {
 		t.Errorf("unexpected metadata (%d): %+v", len(metas), metas)
 	}
@@ -552,14 +577,14 @@ func TestDistSQLReadsFillGatewayID(t *testing.T) {
 	var foundReq int64 // written atomically
 	var expectedGateway roachpb.NodeID
 
-	tc := serverutils.StartTestCluster(t, 3, /* numNodes */
+	tc := serverutils.StartNewTestCluster(t, 3, /* numNodes */
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
 				UseDatabase: "test",
-				Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
-					EvalKnobs: storagebase.BatchEvalTestingKnobs{
-						TestingEvalFilter: func(filterArgs storagebase.FilterArgs) *roachpb.Error {
+				Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
+					EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
+						TestingEvalFilter: func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
 							scanReq, ok := filterArgs.Req.(*roachpb.ScanRequest)
 							if !ok {
 								return nil
@@ -580,7 +605,7 @@ func TestDistSQLReadsFillGatewayID(t *testing.T) {
 				},
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	db := tc.ServerConn(0)
 	sqlutils.CreateTable(t, db, "t",
@@ -611,7 +636,7 @@ func TestEvalCtxTxnOnRemoteNodes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	tc := serverutils.StartTestCluster(t, 2, /* numNodes */
+	tc := serverutils.StartNewTestCluster(t, 2, /* numNodes */
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
@@ -626,14 +651,16 @@ func TestEvalCtxTxnOnRemoteNodes(t *testing.T) {
 		1, /* numRows */
 		sqlutils.ToRowFn(sqlutils.RowIdxFn))
 
-	// Relocate the table to a remote node.
-	_, err := db.Exec("ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1)")
-	require.NoError(t, err)
+	// Relocate the table to a remote node. We use SucceedsSoon since in very
+	// rare circumstances the relocation query can result in an error (e.g.
+	// "cannot up-replicate to s2; missing gossiped StoreDescriptor") which
+	// shouldn't fail the test.
+	testutils.SucceedsSoon(t, func() error {
+		_, err := db.Exec("ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1)")
+		return err
+	})
 
 	testutils.RunTrueAndFalse(t, "vectorize", func(t *testing.T, vectorize bool) {
-		if vectorize {
-			t.Skip("skipped because we can't yet vectorize queries using DECIMALs")
-		}
 		// We're going to use the first node as the gateway and expect everything to
 		// be planned remotely.
 		db := tc.ServerConn(0)
@@ -652,7 +679,8 @@ func TestEvalCtxTxnOnRemoteNodes(t *testing.T) {
 		require.NoError(t, err)
 
 		// Query again just in case the previous query executed on the gateway
-		// because the leaseholder cache wasn't populated and we fooled ourselves.
+		// because the we didn't have a leaseholder in the cache and we fooled
+		// ourselves.
 		_, err = db.Exec("SELECT cluster_logical_timestamp() FROM t")
 		require.NoError(t, err)
 	})
@@ -664,7 +692,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 	defer leaktest.AfterTest(b)()
 
 	args := base.TestClusterArgs{ReplicationMode: base.ReplicationManual}
-	tc := serverutils.StartTestCluster(b, 3, args)
+	tc := serverutils.StartNewTestCluster(b, 3, args)
 	defer tc.Stopper().Stop(context.Background())
 
 	for _, numNodes := range []int{1, 3} {
@@ -678,18 +706,18 @@ func BenchmarkInfrastructure(b *testing.B) {
 					valSpecs := make([]execinfrapb.ValuesCoreSpec, numNodes)
 					for i := range valSpecs {
 						se := StreamEncoder{}
-						se.Init(sqlbase.ThreeIntCols)
+						se.Init(rowenc.ThreeIntCols)
 						for j := 0; j < numRows; j++ {
-							row := make(sqlbase.EncDatumRow, 3)
+							row := make(rowenc.EncDatumRow, 3)
 							lastVal += rng.Intn(10)
-							row[0] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(lastVal)))
-							row[1] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(rng.Intn(100000))))
-							row[2] = sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(rng.Intn(100000))))
+							row[0] = rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(lastVal)))
+							row[1] = rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(rng.Intn(100000))))
+							row[2] = rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(rng.Intn(100000))))
 							if err := se.AddRow(row); err != nil {
 								b.Fatal(err)
 							}
 						}
-						msg := se.FormMessage(context.TODO())
+						msg := se.FormMessage(context.Background())
 						valSpecs[i] = execinfrapb.ValuesCoreSpec{
 							Columns:  msg.Typing,
 							RawBytes: [][]byte{msg.Data.RawBytes},
@@ -723,18 +751,18 @@ func BenchmarkInfrastructure(b *testing.B) {
 						}
 						return execinfrapb.StreamEndpointSpec_REMOTE
 					}
-					now := tc.Server(0).Clock().Now()
+					now := tc.Server(0).Clock().NowAsClockTimestamp()
 					txnProto := roachpb.MakeTransaction(
 						"cluster-test",
 						nil, // baseKey
 						roachpb.NormalUserPriority,
-						now,
+						now.ToTimestamp(),
 						0, // maxOffset
 					)
-					txn := client.NewTxnFromProto(
-						context.TODO(), tc.Server(0).DB(), tc.Server(0).NodeID(),
-						now, client.RootTxn, &txnProto)
-					leafInputState := txn.GetLeafTxnInputState(context.TODO())
+					txn := kv.NewTxnFromProto(
+						context.Background(), tc.Server(0).DB(), tc.Server(0).NodeID(),
+						now, kv.RootTxn, &txnProto)
+					leafInputState := txn.GetLeafTxnInputState(context.Background())
 					for i := range reqs {
 						reqs[i] = execinfrapb.SetupFlowRequest{
 							Version:           execinfra.Version,
@@ -748,6 +776,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 											{Type: streamType(i), StreamID: execinfrapb.StreamID(i), TargetNodeID: tc.Server(0).NodeID()},
 										},
 									}},
+									ResultTypes: rowenc.ThreeIntCols,
 								}},
 							},
 						}
@@ -769,13 +798,14 @@ func BenchmarkInfrastructure(b *testing.B) {
 							Ordering: execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{
 								{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}}},
 							Streams:     inStreams,
-							ColumnTypes: sqlbase.ThreeIntCols,
+							ColumnTypes: rowenc.ThreeIntCols,
 						}},
 						Core: execinfrapb.ProcessorCoreUnion{Noop: &execinfrapb.NoopCoreSpec{}},
 						Output: []execinfrapb.OutputRouterSpec{{
 							Type:    execinfrapb.OutputRouterSpec_PASS_THROUGH,
 							Streams: []execinfrapb.StreamEndpointSpec{{Type: execinfrapb.StreamEndpointSpec_SYNC_RESPONSE}},
 						}},
+						ResultTypes: rowenc.ThreeIntCols,
 					}
 					if numNodes == 1 {
 						lastProc.Input[0].Type = execinfrapb.InputSyncSpec_UNORDERED
@@ -802,13 +832,13 @@ func BenchmarkInfrastructure(b *testing.B) {
 						}
 
 						for i := 1; i < numNodes; i++ {
-							if resp, err := clients[i].SetupFlow(context.TODO(), &reqs[i]); err != nil {
+							if resp, err := clients[i].SetupFlow(context.Background(), &reqs[i]); err != nil {
 								b.Fatal(err)
 							} else if resp.Error != nil {
 								b.Fatal(resp.Error)
 							}
 						}
-						stream, err := clients[0].RunSyncFlow(context.TODO())
+						stream, err := clients[0].RunSyncFlow(context.Background())
 						if err != nil {
 							b.Fatal(err)
 						}
@@ -818,7 +848,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 						}
 
 						var decoder StreamDecoder
-						var rows sqlbase.EncDatumRows
+						var rows rowenc.EncDatumRows
 						var metas []execinfrapb.ProducerMetadata
 						for {
 							msg, err := stream.Recv()
@@ -828,7 +858,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 								}
 								b.Fatal(err)
 							}
-							err = decoder.AddMessage(context.TODO(), msg)
+							err = decoder.AddMessage(context.Background(), msg)
 							if err != nil {
 								b.Fatal(err)
 							}
@@ -837,13 +867,14 @@ func BenchmarkInfrastructure(b *testing.B) {
 						metas = ignoreMisplannedRanges(metas)
 						metas = ignoreLeafTxnState(metas)
 						metas = ignoreMetricsMeta(metas)
+						metas = ignoreTraceData(metas)
 						if len(metas) != 0 {
 							b.Fatalf("unexpected metadata (%d): %+v", len(metas), metas)
 						}
 						if len(rows) != numNodes*numRows {
 							b.Errorf("got %d rows, expected %d", len(rows), numNodes*numRows)
 						}
-						var a sqlbase.DatumAlloc
+						var a rowenc.DatumAlloc
 						for i := range rows {
 							if err := rows[i][0].EnsureDecoded(types.Int, &a); err != nil {
 								b.Fatal(err)

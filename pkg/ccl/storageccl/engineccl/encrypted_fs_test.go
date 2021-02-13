@@ -19,9 +19,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/baseccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl/enginepbccl"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/pebble"
@@ -34,7 +35,7 @@ func TestEncryptedFS(t *testing.T) {
 
 	memFS := vfs.NewMem()
 
-	fileRegistry := &engine.PebbleFileRegistry{FS: memFS, DBDir: "/bar"}
+	fileRegistry := &storage.PebbleFileRegistry{FS: memFS, DBDir: "/bar"}
 	require.NoError(t, fileRegistry.Load())
 
 	// Using a StoreKeyManager for the test since it is easy to create. Write a key for the
@@ -189,7 +190,7 @@ func TestEncryptedFS(t *testing.T) {
 func TestPebbleEncryption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	opts := engine.DefaultPebbleOptions()
+	opts := storage.DefaultPebbleOptions()
 	opts.Cache = pebble.NewCache(1 << 20)
 	defer opts.Cache.Unref()
 
@@ -206,9 +207,9 @@ func TestPebbleEncryption(t *testing.T) {
 	encOptions.DataKeyRotationPeriod = 1000 // arbitrary seconds
 	encOptionsBytes, err := protoutil.Marshal(&encOptions)
 	require.NoError(t, err)
-	db, err := engine.NewPebble(
+	db, err := storage.NewPebble(
 		context.Background(),
-		engine.PebbleConfig{
+		storage.PebbleConfig{
 			StorageConfig: base.StorageConfig{
 				Attrs:           roachpb.Attributes{},
 				MaxSize:         512 << 20,
@@ -218,34 +219,44 @@ func TestPebbleEncryption(t *testing.T) {
 			Opts: opts,
 		})
 	require.NoError(t, err)
-	// Only exercising the stats code paths and not checking the returned values.
-	// TODO(sbhola): Make this better once stats are complete. Also ensure that we are
-	// not returning the secret data keys by mistake.
+	// TODO(sbhola): Ensure that we are not returning the secret data keys by mistake.
 	r, err := db.GetEncryptionRegistries()
 	require.NoError(t, err)
-	t.Logf("FileRegistry:\n%s\n\n", r.FileRegistry)
-	t.Logf("KeyRegistry:\n%s\n\n", r.KeyRegistry)
+
+	var fileRegistry enginepb.FileRegistry
+	require.NoError(t, protoutil.Unmarshal(r.FileRegistry, &fileRegistry))
+	var keyRegistry enginepbccl.DataKeysRegistry
+	require.NoError(t, protoutil.Unmarshal(r.KeyRegistry, &keyRegistry))
+
 	stats, err := db.GetEnvStats()
 	require.NoError(t, err)
+	// Opening the DB should've created OPTIONS, CURRENT, MANIFEST and the
+	// WAL, all under the active key.
+	require.Equal(t, uint64(4), stats.TotalFiles)
+	require.Equal(t, uint64(4), stats.ActiveKeyFiles)
+	var s enginepbccl.EncryptionStatus
+	require.NoError(t, protoutil.Unmarshal(stats.EncryptionStatus, &s))
+	require.Equal(t, "16.key", s.ActiveStoreKey.Source)
+	require.Equal(t, int32(enginepbccl.EncryptionType_AES128_CTR), stats.EncryptionType)
 	t.Logf("EnvStats:\n%+v\n\n", *stats)
 
-	batch := db.NewWriteOnlyBatch()
-	require.NoError(t, batch.Put(engine.MVCCKey{Key: roachpb.Key("a")}, []byte("a")))
+	batch := db.NewUnindexedBatch(true /* writeOnly */)
+	require.NoError(t, batch.PutUnversioned(roachpb.Key("a"), []byte("a")))
 	require.NoError(t, batch.Commit(true))
 	require.NoError(t, db.Flush())
-	val, err := db.Get(engine.MVCCKey{Key: roachpb.Key("a")})
+	val, err := db.MVCCGet(storage.MVCCKey{Key: roachpb.Key("a")})
 	require.NoError(t, err)
 	require.Equal(t, "a", string(val))
 	db.Close()
 
-	opts2 := engine.DefaultPebbleOptions()
+	opts2 := storage.DefaultPebbleOptions()
 	opts2.Cache = pebble.NewCache(1 << 20)
 	defer opts2.Cache.Unref()
 
 	opts2.FS = memFS
-	db, err = engine.NewPebble(
+	db, err = storage.NewPebble(
 		context.Background(),
-		engine.PebbleConfig{
+		storage.PebbleConfig{
 			StorageConfig: base.StorageConfig{
 				Attrs:           roachpb.Attributes{},
 				MaxSize:         512 << 20,
@@ -255,8 +266,17 @@ func TestPebbleEncryption(t *testing.T) {
 			Opts: opts2,
 		})
 	require.NoError(t, err)
-	val, err = db.Get(engine.MVCCKey{Key: roachpb.Key("a")})
+	val, err = db.MVCCGet(storage.MVCCKey{Key: roachpb.Key("a")})
 	require.NoError(t, err)
 	require.Equal(t, "a", string(val))
+
+	// Flushing should've created a new sstable under the active key.
+	stats, err = db.GetEnvStats()
+	require.NoError(t, err)
+	t.Logf("EnvStats:\n%+v\n\n", *stats)
+	require.Equal(t, uint64(5), stats.TotalFiles)
+	require.LessOrEqual(t, uint64(5), stats.ActiveKeyFiles)
+	require.Equal(t, stats.TotalBytes, stats.ActiveKeyBytes)
+
 	db.Close()
 }

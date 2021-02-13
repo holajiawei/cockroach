@@ -1,40 +1,45 @@
-query T
+# LogicTest: !3node-tenant(49854)
+query TTTTT
 SHOW DATABASES
 ----
-defaultdb
-postgres
-system
-test
+defaultdb  root  NULL  {}  NULL
+postgres   root  NULL  {}  NULL
+system     node  NULL  {}  NULL
+test       root  NULL  {}  NULL
 
-query T
+query TTTTIT
 SHOW TABLES FROM system
 ----
-comments
-descriptor
-eventlog
-jobs
-lease
-locations
-namespace
-namespace_deprecated
-protected_ts_meta
-protected_ts_records
-rangelog
-replication_constraint_stats
-replication_critical_localities
-replication_stats
-reports_meta
-role_members
-role_options
-settings
-statement_bundle_chunks
-statement_diagnostics
-statement_diagnostics_requests
-table_statistics
-ui
-users
-web_sessions
-zones
+public  comments                         table  NULL  NULL  NULL
+public  descriptor                       table  NULL  NULL  NULL
+public  eventlog                         table  NULL  NULL  NULL
+public  jobs                             table  NULL  NULL  NULL
+public  lease                            table  NULL  NULL  NULL
+public  locations                        table  NULL  NULL  NULL
+public  migrations                       table  NULL  NULL  NULL
+public  namespace                        table  NULL  NULL  NULL
+public  namespace2                       table  NULL  NULL  NULL
+public  protected_ts_meta                table  NULL  NULL  NULL
+public  protected_ts_records             table  NULL  NULL  NULL
+public  rangelog                         table  NULL  NULL  NULL
+public  replication_constraint_stats     table  NULL  NULL  NULL
+public  replication_critical_localities  table  NULL  NULL  NULL
+public  replication_stats                table  NULL  NULL  NULL
+public  reports_meta                     table  NULL  NULL  NULL
+public  role_members                     table  NULL  NULL  NULL
+public  role_options                     table  NULL  NULL  NULL
+public  scheduled_jobs                   table  NULL  NULL  NULL
+public  settings                         table  NULL  NULL  NULL
+public  sqlliveness                      table  NULL  NULL  NULL
+public  statement_bundle_chunks          table  NULL  NULL  NULL
+public  statement_diagnostics            table  NULL  NULL  NULL
+public  statement_diagnostics_requests   table  NULL  NULL  NULL
+public  table_statistics                 table  NULL  NULL  NULL
+public  tenants                          table  NULL  NULL  NULL
+public  ui                               table  NULL  NULL  NULL
+public  users                            table  NULL  NULL  NULL
+public  web_sessions                     table  NULL  NULL  NULL
+public  zones                            table  NULL  NULL  NULL
 
 query I rowsort
 SELECT id FROM system.descriptor
@@ -45,6 +50,7 @@ SELECT id FROM system.descriptor
 4
 5
 6
+8
 11
 12
 13
@@ -66,9 +72,23 @@ SELECT id FROM system.descriptor
 34
 35
 36
+37
+39
+40
 50
 51
 52
+
+# Verify we can read ID on its own (see #58614).
+query I
+SELECT id FROM system.descriptor WHERE id=1
+----
+1
+
+query I
+SELECT id FROM (VALUES(1)) AS v(a) INNER LOOKUP JOIN system.descriptor on id=a
+----
+1
 
 # Verify we can read "protobuf" columns.
 query I
@@ -135,11 +155,15 @@ lastUpdated  TIMESTAMP  false  NULL  ·  {}         false
 query TTBTTTB
 SHOW COLUMNS FROM system.jobs
 ----
-id        INT8       false  unique_rowid()     ·  {primary,jobs_status_created_idx}  false
-status    STRING     false  NULL               ·  {jobs_status_created_idx}          false
-created   TIMESTAMP  false  now():::TIMESTAMP  ·  {jobs_status_created_idx}          false
-payload   BYTES      false  NULL               ·  {}                                 false
-progress  BYTES      true   NULL               ·  {}                                 false
+id                 INT8       false  unique_rowid()     ·  {jobs_created_by_type_created_by_id_idx,jobs_status_created_idx,primary}  false
+status             STRING     false  NULL               ·  {jobs_created_by_type_created_by_id_idx,jobs_status_created_idx}          false
+created            TIMESTAMP  false  now():::TIMESTAMP  ·  {jobs_status_created_idx}                                                 false
+payload            BYTES      false  NULL               ·  {}                                                                        false
+progress           BYTES      true   NULL               ·  {}                                                                        false
+created_by_type    STRING     true   NULL               ·  {jobs_created_by_type_created_by_id_idx}                                  false
+created_by_id      INT8       true   NULL               ·  {jobs_created_by_type_created_by_id_idx}                                  false
+claim_session_id   BYTES      true   NULL               ·  {}                                                                        false
+claim_instance_id  INT8       true   NULL               ·  {}                                                                        false
 
 query TTBTTTB
 SHOW COLUMNS FROM system.settings
@@ -152,31 +176,19 @@ valueType    STRING     true   NULL               ·  {}         false
 query TTBTTTB
 SHOW COLUMNS FROM system.role_members
 ----
-role     STRING  false  NULL  ·  {primary,role_members_role_idx,role_members_member_idx}  false
-member   STRING  false  NULL  ·  {primary,role_members_role_idx,role_members_member_idx}  false
+role     STRING  false  NULL  ·  {primary,role_members_member_idx,role_members_role_idx}  false
+member   STRING  false  NULL  ·  {primary,role_members_member_idx,role_members_role_idx}  false
 isAdmin  BOOL    false  NULL  ·  {}                                                       false
 
 
 # Verify default privileges on system tables.
-query TTTT
+query TTT
 SHOW GRANTS ON DATABASE system
 ----
-system  crdb_internal       admin  GRANT
-system  crdb_internal       admin  SELECT
-system  crdb_internal       root   GRANT
-system  crdb_internal       root   SELECT
-system  information_schema  admin  GRANT
-system  information_schema  admin  SELECT
-system  information_schema  root   GRANT
-system  information_schema  root   SELECT
-system  pg_catalog          admin  GRANT
-system  pg_catalog          admin  SELECT
-system  pg_catalog          root   GRANT
-system  pg_catalog          root   SELECT
-system  public              admin  GRANT
-system  public              admin  SELECT
-system  public              root   GRANT
-system  public              root   SELECT
+system  admin  GRANT
+system  admin  SELECT
+system  root   GRANT
+system  root   SELECT
 
 query TTTTT
 SHOW GRANTS ON system.*
@@ -186,11 +198,7 @@ system  public  comments                         admin   GRANT
 system  public  comments                         admin   INSERT
 system  public  comments                         admin   SELECT
 system  public  comments                         admin   UPDATE
-system  public  comments                         public  DELETE
-system  public  comments                         public  GRANT
-system  public  comments                         public  INSERT
 system  public  comments                         public  SELECT
-system  public  comments                         public  UPDATE
 system  public  comments                         root    DELETE
 system  public  comments                         root    GRANT
 system  public  comments                         root    INSERT
@@ -240,14 +248,24 @@ system  public  locations                        root    GRANT
 system  public  locations                        root    INSERT
 system  public  locations                        root    SELECT
 system  public  locations                        root    UPDATE
+system  public  migrations                       admin   DELETE
+system  public  migrations                       admin   GRANT
+system  public  migrations                       admin   INSERT
+system  public  migrations                       admin   SELECT
+system  public  migrations                       admin   UPDATE
+system  public  migrations                       root    DELETE
+system  public  migrations                       root    GRANT
+system  public  migrations                       root    INSERT
+system  public  migrations                       root    SELECT
+system  public  migrations                       root    UPDATE
 system  public  namespace                        admin   GRANT
 system  public  namespace                        admin   SELECT
 system  public  namespace                        root    GRANT
 system  public  namespace                        root    SELECT
-system  public  namespace_deprecated             admin   GRANT
-system  public  namespace_deprecated             admin   SELECT
-system  public  namespace_deprecated             root    GRANT
-system  public  namespace_deprecated             root    SELECT
+system  public  namespace2                       admin   GRANT
+system  public  namespace2                       admin   SELECT
+system  public  namespace2                       root    GRANT
+system  public  namespace2                       root    SELECT
 system  public  protected_ts_meta                admin   GRANT
 system  public  protected_ts_meta                admin   SELECT
 system  public  protected_ts_meta                root    GRANT
@@ -326,6 +344,16 @@ system  public  role_options                     root    GRANT
 system  public  role_options                     root    INSERT
 system  public  role_options                     root    SELECT
 system  public  role_options                     root    UPDATE
+system  public  scheduled_jobs                   admin   DELETE
+system  public  scheduled_jobs                   admin   GRANT
+system  public  scheduled_jobs                   admin   INSERT
+system  public  scheduled_jobs                   admin   SELECT
+system  public  scheduled_jobs                   admin   UPDATE
+system  public  scheduled_jobs                   root    DELETE
+system  public  scheduled_jobs                   root    GRANT
+system  public  scheduled_jobs                   root    INSERT
+system  public  scheduled_jobs                   root    SELECT
+system  public  scheduled_jobs                   root    UPDATE
 system  public  settings                         admin   DELETE
 system  public  settings                         admin   GRANT
 system  public  settings                         admin   INSERT
@@ -336,6 +364,16 @@ system  public  settings                         root    GRANT
 system  public  settings                         root    INSERT
 system  public  settings                         root    SELECT
 system  public  settings                         root    UPDATE
+system  public  sqlliveness                      admin   DELETE
+system  public  sqlliveness                      admin   GRANT
+system  public  sqlliveness                      admin   INSERT
+system  public  sqlliveness                      admin   SELECT
+system  public  sqlliveness                      admin   UPDATE
+system  public  sqlliveness                      root    DELETE
+system  public  sqlliveness                      root    GRANT
+system  public  sqlliveness                      root    INSERT
+system  public  sqlliveness                      root    SELECT
+system  public  sqlliveness                      root    UPDATE
 system  public  statement_bundle_chunks          admin   DELETE
 system  public  statement_bundle_chunks          admin   GRANT
 system  public  statement_bundle_chunks          admin   INSERT
@@ -376,6 +414,10 @@ system  public  table_statistics                 root    GRANT
 system  public  table_statistics                 root    INSERT
 system  public  table_statistics                 root    SELECT
 system  public  table_statistics                 root    UPDATE
+system  public  tenants                          admin   GRANT
+system  public  tenants                          admin   SELECT
+system  public  tenants                          root    GRANT
+system  public  tenants                          root    SELECT
 system  public  ui                               admin   DELETE
 system  public  ui                               admin   GRANT
 system  public  ui                               admin   INSERT
@@ -423,20 +465,22 @@ ALTER DATABASE system RENAME TO not_system
 statement error user root does not have DROP privilege on database system
 DROP DATABASE system
 
-# Users cannot exceed allowed privileges on system objects.
-statement error user testuser must not have ALL privileges on system object with ID=.*
+statement error user root does not have DROP privilege on relation users
+DROP TABLE system.users
+
+statement error user root does not have ALL privilege on database system
 GRANT ALL ON DATABASE system TO testuser
 
-statement error user testuser must not have INSERT privileges on system object with ID=.*
+statement error user root does not have INSERT privilege on database system
 GRANT GRANT, SELECT, INSERT ON DATABASE system TO testuser
 
 statement ok
 GRANT GRANT, SELECT ON DATABASE system TO testuser
 
-statement error user testuser must not have ALL privileges on system object with ID=.*
+statement error user root does not have ALL privilege on relation namespace
 GRANT ALL ON system.namespace TO testuser
 
-statement error user testuser must not have INSERT privileges on system object with ID=.*
+statement error user root does not have INSERT privilege on relation namespace
 GRANT GRANT, SELECT, INSERT ON system.namespace TO testuser
 
 statement ok
@@ -446,76 +490,88 @@ statement ok
 GRANT SELECT ON system.descriptor TO testuser
 
 # Superusers must have exactly the allowed privileges.
-statement error user root must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root does not have ALL privilege on database system
 GRANT ALL ON DATABASE system TO root
 
-statement error user root must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root does not have DELETE privilege on database system
 GRANT DELETE, INSERT ON DATABASE system TO root
 
-statement error user root must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root does not have ALL privilege on relation namespace
 GRANT ALL ON system.namespace TO root
 
-statement error user root must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root does not have DELETE privilege on relation descriptor
 GRANT DELETE, INSERT ON system.descriptor TO root
 
-statement error user root must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root does not have ALL privilege on relation descriptor
 GRANT ALL ON system.descriptor TO root
 
-statement error user root must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root must have exactly GRANT, SELECT privileges on system database with ID=.*
 REVOKE GRANT ON DATABASE system FROM root
 
-statement error user root must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root must have exactly GRANT, SELECT privileges on system table with ID=.*
 REVOKE GRANT ON system.namespace FROM root
 
-statement error user root does not have privileges
+statement error user root does not have ALL privilege on relation namespace
 REVOKE ALL ON system.namespace FROM root
 
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root does not have privileges over system table with ID=.*
+REVOKE GRANT,SELECT ON system.namespace FROM root
+
+statement error user root does not have ALL privilege on database system
 GRANT ALL ON DATABASE system TO admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root does not have DELETE privilege on database system
 GRANT DELETE, INSERT ON DATABASE system TO admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
-GRANT ALL ON system.namespace TO admin
-
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
-GRANT DELETE, INSERT ON system.descriptor TO admin
-
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
-GRANT ALL ON system.descriptor TO admin
-
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user admin must have exactly GRANT, SELECT privileges on system database with ID=.*
 REVOKE GRANT ON DATABASE system FROM admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system object with ID=.*
+statement error user root does not have ALL privilege on relation namespace
+GRANT ALL ON system.namespace TO admin
+
+statement error user root does not have DELETE privilege on relation descriptor
+GRANT DELETE, INSERT ON system.descriptor TO admin
+
+statement error user root does not have ALL privilege on relation descriptor
+GRANT ALL ON system.descriptor TO admin
+
+statement error user admin must have exactly GRANT, SELECT privileges on system table with ID=.*
+REVOKE GRANT ON system.descriptor FROM admin
+
+statement error user admin must have exactly GRANT, SELECT privileges on system database with ID=.*
+REVOKE GRANT ON DATABASE system FROM admin
+
+statement error user admin must have exactly GRANT, SELECT privileges on system table with ID=.*
 REVOKE GRANT ON system.namespace FROM admin
 
-statement error user admin does not have privileges
+statement error user root does not have ALL privilege on relation namespace
 REVOKE ALL ON system.namespace FROM admin
+
+statement error user admin does not have privileges over system table with ID=.*
+REVOKE GRANT,SELECT ON system.namespace FROM admin
 
 # Some tables (we test system.lease here) used to allow multiple privilege sets for
 # backwards compatibility, and superusers were allowed very wide privileges.
 # We make sure this is no longer the case.
-statement error user testuser must not have ALL privileges on system object with ID=.*
+statement error user root does not have ALL privilege on relation lease
 GRANT ALL ON system.lease TO testuser
 
-statement error user root must have exactly GRANT, SELECT, INSERT, DELETE, UPDATE privileges on system object with ID=.*
+statement error user root does not have CREATE privilege on relation lease
 GRANT CREATE on system.lease to root
 
-statement error user admin must have exactly GRANT, SELECT, INSERT, DELETE, UPDATE privileges on system object with ID=.*
+statement error user root does not have CREATE privilege on relation lease
 GRANT CREATE on system.lease to admin
 
-statement error user testuser must not have CREATE privileges on system object with ID=.*
+statement error user root does not have CREATE privilege on relation lease
 GRANT CREATE on system.lease to testuser
 
-statement error user root must have exactly GRANT, SELECT, INSERT, DELETE, UPDATE privileges on system object with ID=.*
+statement error user root does not have ALL privilege on relation lease
 GRANT ALL ON system.lease TO root
 
-statement error user admin must have exactly GRANT, SELECT, INSERT, DELETE, UPDATE privileges on system object with ID=.*
+statement error user root does not have ALL privilege on relation lease
 GRANT ALL ON system.lease TO admin
 
-statement error user testuser must not have ALL privileges on system object with ID=.*
+statement error user root does not have ALL privilege on relation lease
 GRANT ALL ON system.lease TO testuser
 
 # NB: the "order by" is necessary or this test is flaky under DistSQL.
@@ -526,11 +582,14 @@ FROM system.settings
 WHERE name != 'sql.defaults.distsql'
 AND name != 'sql.stats.automatic_collection.enabled'
 AND name NOT LIKE '%sql.defaults.vectorize%'
+AND name NOT LIKE '%sql.testing%'
+AND name NOT LIKE '%sql.defaults.experimental_distsql_planning%'
 ORDER BY name
 ----
 cluster.secret
 diagnostics.reporting.enabled
 kv.range_merge.queue_enabled
+sql.defaults.interleaved_tables.enabled
 sql.stats.automatic_collection.min_stale_rows
 version
 
@@ -542,12 +601,14 @@ SELECT name, value
 FROM system.settings
 WHERE name NOT IN ('version', 'sql.defaults.distsql', 'cluster.secret',
   'sql.stats.automatic_collection.enabled', 'sql.defaults.vectorize',
-  'sql.defaults.vectorize_row_count_threshold')
+  'sql.defaults.vectorize_row_count_threshold',
+  'sql.defaults.experimental_distsql_planning')
 ORDER BY name
 ----
 diagnostics.reporting.enabled                  true
 kv.range_merge.queue_enabled                   false
 somesetting                                    somevalue
+sql.defaults.interleaved_tables.enabled        true
 sql.stats.automatic_collection.min_stale_rows  5
 
 user testuser
@@ -564,3 +625,18 @@ query TTB
 SELECT * from system.role_members
 ----
 admin  root  true
+
+statement ok
+SET DATABASE = "";
+
+query T
+SELECT username FROM system.users WHERE username = 'root'
+----
+root
+
+statement ok
+SET DATABASE = test
+
+# system is a database, not a schema.
+query error relation ".system.users" does not exist
+SELECT username FROM "".system.users WHERE username = 'root'

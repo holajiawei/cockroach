@@ -12,49 +12,53 @@ package colflow
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow/colrpc"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 )
 
 type callbackRemoteComponentCreator struct {
-	newOutboxFn func(*colexec.Allocator, colexec.Operator, []coltypes.T, []execinfrapb.MetadataSource) (*colrpc.Outbox, error)
-	newInboxFn  func(allocator *colexec.Allocator, typs []coltypes.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error)
+	newOutboxFn func(*colmem.Allocator, colexecbase.Operator, []*types.T, []execinfrapb.MetadataSource) (*colrpc.Outbox, error)
+	newInboxFn  func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error)
 }
 
 func (c callbackRemoteComponentCreator) newOutbox(
-	allocator *colexec.Allocator,
-	input colexec.Operator,
-	typs []coltypes.T,
+	allocator *colmem.Allocator,
+	input colexecbase.Operator,
+	typs []*types.T,
 	metadataSources []execinfrapb.MetadataSource,
+	toClose []colexecbase.Closer,
 ) (*colrpc.Outbox, error) {
 	return c.newOutboxFn(allocator, input, typs, metadataSources)
 }
 
 func (c callbackRemoteComponentCreator) newInbox(
-	allocator *colexec.Allocator, typs []coltypes.T, streamID execinfrapb.StreamID,
+	ctx context.Context, allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID,
 ) (*colrpc.Inbox, error) {
 	return c.newInboxFn(allocator, typs, streamID)
 }
 
-func intCols(numCols int) []types.T {
-	cols := make([]types.T, numCols)
+func intCols(numCols int) []*types.T {
+	cols := make([]*types.T, numCols)
 	for i := range cols {
-		cols[i] = *types.Int
+		cols[i] = types.Int
 	}
 	return cols
 }
@@ -134,6 +138,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 					},
 				},
 			},
+			ResultTypes: intCols(numInputTypesToMaterializer),
 		},
 		// This is the root of the flow. The noop operator that will read from i1
 		// and the materializer.
@@ -152,6 +157,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 					Streams: []execinfrapb.StreamEndpointSpec{{Type: execinfrapb.StreamEndpointSpec_SYNC_RESPONSE}},
 				},
 			},
+			ResultTypes: intCols(numInputTypesToMaterializer),
 		},
 		{
 			// Because creating a table reader is too complex (you need to create a
@@ -175,16 +181,17 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 					Streams: []execinfrapb.StreamEndpointSpec{{Type: execinfrapb.StreamEndpointSpec_REMOTE}},
 				},
 			},
+			ResultTypes: intCols(numInputTypesToOutbox),
 		},
 	}
 
-	inboxToNumInputTypes := make(map[*colrpc.Inbox][]coltypes.T)
+	inboxToNumInputTypes := make(map[*colrpc.Inbox][]*types.T)
 	outboxCreated := false
 	componentCreator := callbackRemoteComponentCreator{
 		newOutboxFn: func(
-			allocator *colexec.Allocator,
-			op colexec.Operator,
-			typs []coltypes.T,
+			allocator *colmem.Allocator,
+			op colexecbase.Operator,
+			typs []*types.T,
 			sources []execinfrapb.MetadataSource,
 		) (*colrpc.Outbox, error) {
 			require.False(t, outboxCreated)
@@ -195,10 +202,10 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 			// expect from the input DAG.
 			require.Len(t, sources, 1)
 			require.Len(t, inboxToNumInputTypes[sources[0].(*colrpc.Inbox)], numInputTypesToOutbox)
-			return colrpc.NewOutbox(allocator, op, typs, sources)
+			return colrpc.NewOutbox(allocator, op, typs, sources, nil /* toClose */)
 		},
-		newInboxFn: func(allocator *colexec.Allocator, typs []coltypes.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error) {
-			inbox, err := colrpc.NewInbox(allocator, typs, streamID)
+		newInboxFn: func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error) {
+			inbox, err := colrpc.NewInbox(context.Background(), allocator, typs, streamID)
 			inboxToNumInputTypes[inbox] = typs
 			return inbox, err
 		},
@@ -208,16 +215,20 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 	evalCtx := tree.MakeTestingEvalContext(st)
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
-	f := &flowinfra.FlowBase{FlowCtx: execinfra.FlowCtx{EvalCtx: &evalCtx, NodeID: roachpb.NodeID(1)}}
+	f := &flowinfra.FlowBase{
+		FlowCtx: execinfra.FlowCtx{EvalCtx: &evalCtx,
+			NodeID: base.TestingIDContainer,
+		},
+	}
 	var wg sync.WaitGroup
-	vfc := newVectorizedFlowCreator(&vectorizedFlowCreatorHelper{f: f}, componentCreator, false, &wg, &execinfra.RowChannel{}, nil, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{}, nil)
+	vfc := newVectorizedFlowCreator(
+		&vectorizedFlowCreatorHelper{f: f}, componentCreator, false, false, &wg, &execinfra.RowChannel{},
+		nil /* nodeDialer */, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
+		nil /* fdSemaphore */, descs.DistSQLTypeResolver{},
+	)
 
-	_, err := vfc.setupFlow(ctx, &f.FlowCtx, procs, flowinfra.FuseNormally)
-	defer func() {
-		for _, memAcc := range vfc.streamingMemAccounts {
-			memAcc.Close(ctx)
-		}
-	}()
+	_, err := vfc.setupFlow(ctx, &f.FlowCtx, procs, nil /* localProcessors */, flowinfra.FuseNormally)
+	defer vfc.cleanup(ctx)
 	require.NoError(t, err)
 
 	// Verify that an outbox was actually created.
@@ -235,11 +246,13 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
 
-	const baseDirName = "base"
-
-	ngn := engine.NewDefaultInMem()
+	// We use an on-disk engine for this test since we're testing FS interactions
+	// and want to get the same behavior as a non-testing environment.
+	tempPath, dirCleanup := testutils.TempDir(t)
+	ngn, err := storage.NewDefaultEngine(0 /* cacheSize */, base.StorageConfig{Dir: tempPath})
+	require.NoError(t, err)
 	defer ngn.Close()
-	require.NoError(t, ngn.CreateDir(baseDirName))
+	defer dirCleanup()
 
 	newVectorizedFlow := func() *vectorizedFlow {
 		return NewVectorizedFlow(
@@ -247,22 +260,26 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 				FlowCtx: execinfra.FlowCtx{
 					Cfg: &execinfra.ServerConfig{
 						TempFS:          ngn,
-						TempStoragePath: baseDirName,
-						VecFDSemaphore:  &colexec.TestingSemaphore{},
+						TempStoragePath: tempPath,
+						VecFDSemaphore:  &colexecbase.TestingSemaphore{},
 						Metrics:         &execinfra.DistSQLMetrics{},
 					},
 					EvalCtx: &evalCtx,
-					NodeID:  roachpb.NodeID(1),
+					NodeID:  base.TestingIDContainer,
 				},
 			},
 		).(*vectorizedFlow)
 	}
 
-	checkDirs := func(t *testing.T, numDirs int) {
+	dirs, err := ngn.List(tempPath)
+	require.NoError(t, err)
+	numDirsTheTestStartedWith := len(dirs)
+	checkDirs := func(t *testing.T, numExtraDirs int) {
 		t.Helper()
-		dirs, err := ngn.ListDir(baseDirName)
+		dirs, err := ngn.List(tempPath)
 		require.NoError(t, err)
-		require.Equal(t, numDirs, len(dirs), "expected %d directories but found %d: %s", numDirs, len(dirs), dirs)
+		expectedNumDirs := numDirsTheTestStartedWith + numExtraDirs
+		require.Equal(t, expectedNumDirs, len(dirs), "expected %d directories but found %d: %s", expectedNumDirs, len(dirs), dirs)
 	}
 
 	// LazilyCreated asserts that a directory is not created during flow Setup
@@ -286,14 +303,14 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 
 		// Now simulate an operator spilling to disk. The flow should have set this
 		// up to create its directory.
-		creator.diskQueueCfg.OnNewDiskQueueCb()
+		creator.diskQueueCfg.GetPather.GetPath(ctx)
 
 		// We should now have one directory, the flow's temporary storage directory.
 		checkDirs(t, 1)
 
-		// Another operator calling OnNewDiskQueueCb again should not create a new
-		// directory
-		creator.diskQueueCfg.OnNewDiskQueueCb()
+		// Another operator calling GetPath again should not create a new
+		// directory.
+		creator.diskQueueCfg.GetPather.GetPath(ctx)
 		checkDirs(t, 1)
 
 		// When the flow is Cleaned up, this directory should be removed.
@@ -301,44 +318,28 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 		checkDirs(t, 0)
 	})
 
-	// This subtest verifies that two local flows with the same ID create
-	// different directories. This case happens regularly with local flows, since
-	// they have an unset ID.
-	t.Run("DirCreationHandlesUnsetIDCollisions", func(t *testing.T) {
-		flowID := execinfrapb.FlowID{}
-		vf1 := newVectorizedFlow()
-		var creator1 *vectorizedFlowCreator
-		vf1.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
-			creator1 = c
+	t.Run("DirCreationRace", func(t *testing.T) {
+		vf := newVectorizedFlow()
+		var creator *vectorizedFlowCreator
+		vf.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
+			creator = c
 		}
-		// Explicitly set an empty ID.
-		vf1.ID = flowID
-		_, err := vf1.Setup(ctx, &execinfrapb.FlowSpec{}, flowinfra.FuseNormally)
+
+		_, err := vf.Setup(ctx, &execinfrapb.FlowSpec{}, flowinfra.FuseNormally)
 		require.NoError(t, err)
 
-		checkDirs(t, 0)
-		creator1.diskQueueCfg.OnNewDiskQueueCb()
-		checkDirs(t, 1)
-
-		// Now a new flow with the same ID gets set up.
-		vf2 := newVectorizedFlow()
-		var creator2 *vectorizedFlowCreator
-		vf2.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
-			creator2 = c
-		}
-		vf2.ID = flowID
-		_, err = vf2.Setup(ctx, &execinfrapb.FlowSpec{}, flowinfra.FuseNormally)
-		require.NoError(t, err)
-
-		// Still only 1 directory.
-		checkDirs(t, 1)
-		creator2.diskQueueCfg.OnNewDiskQueueCb()
-		// A new directory should have been created for this flow.
-		checkDirs(t, 2)
-
-		vf1.Cleanup(ctx)
-		checkDirs(t, 1)
-		vf2.Cleanup(ctx)
+		createTempDir := creator.diskQueueCfg.GetPather.GetPath
+		errCh := make(chan error)
+		go func() {
+			createTempDir(ctx)
+			errCh <- ngn.MkdirAll(filepath.Join(vf.GetPath(ctx), "async"))
+		}()
+		createTempDir(ctx)
+		// Both goroutines should be able to create their subdirectories within the
+		// flow's temporary directory.
+		require.NoError(t, ngn.MkdirAll(filepath.Join(vf.GetPath(ctx), "main_goroutine")))
+		require.NoError(t, <-errCh)
+		vf.Cleanup(ctx)
 		checkDirs(t, 0)
 	})
 }

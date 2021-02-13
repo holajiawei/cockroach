@@ -12,13 +12,15 @@ package colexec
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 // NewSortChunks returns a new sort chunks operator, which sorts its input on
@@ -26,19 +28,23 @@ import (
 // the columns in the input operator. The input tuples must be sorted on first
 // matchLen columns.
 func NewSortChunks(
-	allocator *Allocator,
-	input Operator,
-	inputTypes []coltypes.T,
+	allocator *colmem.Allocator,
+	input colexecbase.Operator,
+	inputTypes []*types.T,
 	orderingCols []execinfrapb.Ordering_Column,
 	matchLen int,
-) (Operator, error) {
+) (colexecbase.Operator, error) {
 	if matchLen < 1 || matchLen == len(orderingCols) {
-		execerror.VectorizedInternalPanic(fmt.Sprintf(
+		colexecerror.InternalError(errors.AssertionFailedf(
 			"sort chunks should only be used when the input is "+
 				"already ordered on at least one column but not fully ordered; "+
 				"num ordering cols = %d, matchLen = %d", len(orderingCols), matchLen))
 	}
-	chunker, err := newChunker(allocator, input, inputTypes, orderingCols[:matchLen])
+	alreadySortedCols := make([]uint32, matchLen)
+	for i := range alreadySortedCols {
+		alreadySortedCols[i] = orderingCols[i].ColIdx
+	}
+	chunker, err := newChunker(allocator, input, inputTypes, alreadySortedCols)
 	if err != nil {
 		return nil, err
 	}
@@ -50,30 +56,30 @@ func NewSortChunks(
 }
 
 type sortChunksOp struct {
-	allocator *Allocator
+	allocator *colmem.Allocator
 	input     *chunker
-	sorter    resettableOperator
+	sorter    ResettableOperator
 
 	exportedFromBuffer int
 	exportedFromBatch  int
 	windowedBatch      coldata.Batch
 }
 
+var _ colexecbase.Operator = &sortChunksOp{}
+var _ colexecbase.BufferingInMemoryOperator = &sortChunksOp{}
+
 func (c *sortChunksOp) ChildCount(verbose bool) int {
-	return 0
+	return 1
 }
 
 func (c *sortChunksOp) Child(nth int, verbose bool) execinfra.OpNode {
 	if nth == 0 {
 		return c.input
 	}
-	execerror.VectorizedInternalPanic(fmt.Sprintf("invalid index %d", nth))
+	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }
-
-var _ Operator = &sortChunksOp{}
-var _ bufferingInMemoryOperator = &sortChunksOp{}
 
 func (c *sortChunksOp) Init() {
 	c.input.init()
@@ -97,14 +103,14 @@ func (c *sortChunksOp) Next(ctx context.Context) coldata.Batch {
 			// the full reset of the chunker because we're in the middle of
 			// processing of the input to sortChunksOp.
 			c.input.emptyBuffer()
-			c.sorter.reset()
+			c.sorter.reset(ctx)
 		} else {
 			return batch
 		}
 	}
 }
 
-func (c *sortChunksOp) ExportBuffered(Operator) coldata.Batch {
+func (c *sortChunksOp) ExportBuffered(context.Context, colexecbase.Operator) coldata.Batch {
 	// First, we check whether chunker has buffered up any tuples, and if so,
 	// whether we have exported them all.
 	if c.input.bufferedTuples.Length() > 0 {
@@ -113,8 +119,8 @@ func (c *sortChunksOp) ExportBuffered(Operator) coldata.Batch {
 			if newExportedFromBuffer > c.input.bufferedTuples.Length() {
 				newExportedFromBuffer = c.input.bufferedTuples.Length()
 			}
-			for i, t := range c.input.inputTypes {
-				window := c.input.bufferedTuples.ColVec(i).Window(t, c.exportedFromBuffer, newExportedFromBuffer)
+			for i := range c.input.inputTypes {
+				window := c.input.bufferedTuples.ColVec(i).Window(c.exportedFromBuffer, newExportedFromBuffer)
 				c.windowedBatch.ReplaceCol(window, i)
 			}
 			c.windowedBatch.SetLength(newExportedFromBuffer - c.exportedFromBuffer)
@@ -174,9 +180,9 @@ const (
 	// last read batch directly. Only tuples that are fully contained within the
 	// last read batch are "emitted".
 	chunkerReadFromBatch
-	// inputDone indicates that the input has been fully consumed and there are
-	// no more tuples to read from the chunker.
-	inputDone
+	// chunkerDone indicates that the input has been fully consumed and all
+	// tuples have already been emitted.
+	chunkerDone
 )
 
 // chunker is a spooler that produces chunks from its input when the tuples
@@ -195,14 +201,14 @@ type chunker struct {
 	OneInputNode
 	NonExplainable
 
-	allocator *Allocator
+	allocator *colmem.Allocator
 	// inputTypes contains the types of all of the columns from input.
-	inputTypes []coltypes.T
+	inputTypes []*types.T
 	// inputDone indicates whether input has been fully consumed.
 	inputDone bool
 	// alreadySortedCols indicates the columns on which the input is already
 	// ordered.
-	alreadySortedCols []execinfrapb.Ordering_Column
+	alreadySortedCols []uint32
 
 	// batch is the last read batch from input.
 	batch coldata.Batch
@@ -228,7 +234,7 @@ type chunker struct {
 	// bufferedTuples is a buffer to store tuples when a chunk is bigger than
 	// coldata.BatchSize() or when the chunk is the last in the last read batch
 	// (we don't know yet where the end of such chunk is).
-	bufferedTuples coldata.Batch
+	bufferedTuples *appendOnlyBufferedBatch
 
 	readFrom chunkerReadingState
 	state    chunkerState
@@ -246,15 +252,15 @@ type chunker struct {
 var _ spooler = &chunker{}
 
 func newChunker(
-	allocator *Allocator,
-	input Operator,
-	inputTypes []coltypes.T,
-	alreadySortedCols []execinfrapb.Ordering_Column,
+	allocator *colmem.Allocator,
+	input colexecbase.Operator,
+	inputTypes []*types.T,
+	alreadySortedCols []uint32,
 ) (*chunker, error) {
 	var err error
 	partitioners := make([]partitioner, len(alreadySortedCols))
 	for i, col := range alreadySortedCols {
-		partitioners[i], err = newPartitioner(inputTypes[col.ColIdx])
+		partitioners[i], err = newPartitioner(inputTypes[col])
 		if err != nil {
 			return nil, err
 		}
@@ -272,14 +278,14 @@ func newChunker(
 
 func (s *chunker) init() {
 	s.input.Init()
-	s.bufferedTuples = s.allocator.NewMemBatchWithSize(s.inputTypes, 0 /* size */)
+	s.bufferedTuples = newAppendOnlyBufferedBatch(s.allocator, s.inputTypes, nil /* colsToStore */)
 	s.partitionCol = make([]bool, coldata.BatchSize())
 	s.chunks = make([]int, 0, 16)
 }
 
 // done indicates whether the chunker has fully consumed its input.
 func (s *chunker) done() bool {
-	return s.readFrom == inputDone
+	return s.readFrom == chunkerDone
 }
 
 // prepareNextChunks prepares the chunks for the chunker spooler.
@@ -305,14 +311,14 @@ func (s *chunker) prepareNextChunks(ctx context.Context) chunkerReadingState {
 			if s.batch.Selection() != nil {
 				// We assume that the input has been deselected, so the batch should
 				// never have a selection vector set.
-				execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected: batch with non-nil selection vector"))
+				colexecerror.InternalError(errors.AssertionFailedf("unexpected: batch with non-nil selection vector"))
 			}
 
 			// First, run the partitioners on our pre-sorted columns to determine the
 			// boundaries of the chunks (stored in s.chunks) to sort further.
 			copy(s.partitionCol, zeroBoolColumn)
 			for i, orderedCol := range s.alreadySortedCols {
-				s.partitioners[i].partition(s.batch.ColVec(int(orderedCol.ColIdx)), s.partitionCol,
+				s.partitioners[i].partition(s.batch.ColVec(int(orderedCol)), s.partitionCol,
 					s.batch.Length())
 			}
 			s.chunks = boolVecToSel64(s.partitionCol, s.chunks[:0])
@@ -336,17 +342,15 @@ func (s *chunker) prepareNextChunks(ctx context.Context) chunkerReadingState {
 				// There are some buffered tuples, so we need to check whether the
 				// first tuple of s.batch belongs to the chunk that is being buffered.
 				differ := false
-				for _, col := range s.alreadySortedCols {
-					if err := tuplesDiffer(
-						s.inputTypes[col.ColIdx],
-						s.bufferedTuples.ColVec(int(col.ColIdx)),
-						0, /*aTupleIdx */
-						s.batch.ColVec(int(col.ColIdx)),
-						0, /* bTupleIdx */
-						&differ,
-					); err != nil {
-						execerror.VectorizedInternalPanic(err)
-					}
+				i := 0
+				for !differ && i < len(s.alreadySortedCols) {
+					differ = valuesDiffer(
+						s.bufferedTuples.ColVec(int(s.alreadySortedCols[i])),
+						0, /*aValueIdx */
+						s.batch.ColVec(int(s.alreadySortedCols[i])),
+						0, /* bValueIdx */
+					)
+					i++
 				}
 				if differ {
 					// Buffered tuples comprise a full chunk, so we proceed to emitting
@@ -377,7 +381,7 @@ func (s *chunker) prepareNextChunks(ctx context.Context) chunkerReadingState {
 			s.state = chunkerEmittingFromBatch
 			return chunkerReadFromBuffer
 		case chunkerEmittingFromBatch:
-			if s.chunksProcessedIdx+1 < len(s.chunks) {
+			if s.chunksProcessedIdx < len(s.chunks)-1 {
 				// There is at least one chunk that is fully contained within s.batch.
 				// We don't know yet whether the tuples from the next batch belong to
 				// the last chunk of the current batch, so we will buffer those and can
@@ -398,13 +402,13 @@ func (s *chunker) prepareNextChunks(ctx context.Context) chunkerReadingState {
 			} else {
 				// All tuples in s.batch have been emitted.
 				if s.inputDone {
-					return inputDone
+					return chunkerDone
 				}
-				execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected: chunkerEmittingFromBatch state" +
+				colexecerror.InternalError(errors.AssertionFailedf("unexpected: chunkerEmittingFromBatch state" +
 					"when s.chunks is fully processed and input is not done"))
 			}
 		default:
-			execerror.VectorizedInternalPanic(fmt.Sprintf("invalid chunker spooler state %v", s.state))
+			colexecerror.InternalError(errors.AssertionFailedf("invalid chunker spooler state %v", s.state))
 		}
 	}
 }
@@ -417,18 +421,7 @@ func (s *chunker) buffer(start int, end int) {
 	}
 	s.allocator.PerformOperation(s.bufferedTuples.ColVecs(), func() {
 		s.exportState.numProcessedTuplesFromBatch = end
-		for i, colVec := range s.bufferedTuples.ColVecs() {
-			colVec.Append(
-				coldata.SliceArgs{
-					ColType:     s.inputTypes[i],
-					Src:         s.batch.ColVec(i),
-					DestIdx:     s.bufferedTuples.Length(),
-					SrcStartIdx: start,
-					SrcEndIdx:   end,
-				},
-			)
-		}
-		s.bufferedTuples.SetLength(s.bufferedTuples.Length() + end - start)
+		s.bufferedTuples.append(s.batch, start, end)
 	})
 }
 
@@ -439,11 +432,11 @@ func (s *chunker) spool(ctx context.Context) {
 func (s *chunker) getValues(i int) coldata.Vec {
 	switch s.readFrom {
 	case chunkerReadFromBuffer:
-		return s.bufferedTuples.ColVec(i).Window(s.inputTypes[i], 0 /* start */, s.bufferedTuples.Length())
+		return s.bufferedTuples.ColVec(i).Window(0 /* start */, s.bufferedTuples.Length())
 	case chunkerReadFromBatch:
-		return s.batch.ColVec(i).Window(s.inputTypes[i], s.chunks[s.chunksStartIdx], s.chunks[len(s.chunks)-1])
+		return s.batch.ColVec(i).Window(s.chunks[s.chunksStartIdx], s.chunks[len(s.chunks)-1])
 	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected chunkerReadingState in getValues: %v", s.state))
+		colexecerror.InternalError(errors.AssertionFailedf("unexpected chunkerReadingState in getValues: %v", s.state))
 		// This code is unreachable, but the compiler cannot infer that.
 		return nil
 	}
@@ -455,10 +448,10 @@ func (s *chunker) getNumTuples() int {
 		return s.bufferedTuples.Length()
 	case chunkerReadFromBatch:
 		return s.chunks[len(s.chunks)-1] - s.chunks[s.chunksStartIdx]
-	case inputDone:
+	case chunkerDone:
 		return 0
 	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected chunkerReadingState in getNumTuples: %v", s.state))
+		colexecerror.InternalError(errors.AssertionFailedf("unexpected chunkerReadingState in getNumTuples: %v", s.state))
 		// This code is unreachable, but the compiler cannot infer that.
 		return 0
 	}
@@ -483,15 +476,17 @@ func (s *chunker) getPartitionsCol() []bool {
 			s.partitionCol[s.chunks[i]-s.chunks[s.chunksStartIdx]] = true
 		}
 		return s.partitionCol
+	case chunkerDone:
+		return nil
 	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected chunkerReadingState in getPartitionsCol: %v", s.state))
+		colexecerror.InternalError(errors.AssertionFailedf("unexpected chunkerReadingState in getPartitionsCol: %v", s.state))
 		// This code is unreachable, but the compiler cannot infer that.
 		return nil
 	}
 }
 
 func (s *chunker) getWindowedBatch(startIdx, endIdx int) coldata.Batch {
-	execerror.VectorizedInternalPanic("getWindowedBatch is not implemented on chunker spooler")
+	colexecerror.InternalError(errors.AssertionFailedf("getWindowedBatch is not implemented on chunker spooler"))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }

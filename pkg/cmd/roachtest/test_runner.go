@@ -35,9 +35,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/petermattis/goid"
-	"github.com/pkg/errors"
 )
 
 // testRunner runs tests.
@@ -269,7 +269,7 @@ func (r *testRunner) Run(
 	for i := 0; i < parallelism; i++ {
 		i := i // Copy for closure.
 		wg.Add(1)
-		stopper.RunWorker(ctx, func(ctx context.Context) {
+		if err := stopper.RunAsyncTask(ctx, "worker", func(ctx context.Context) {
 			defer wg.Done()
 
 			if err := r.runWorker(
@@ -281,18 +281,25 @@ func (r *testRunner) Run(
 				l,
 			); err != nil {
 				// A worker returned an error. Let's shut down.
-				msg := fmt.Sprintf("Worker %d returned with error. Quiescing. Error: %s", i, err)
+				msg := fmt.Sprintf("Worker %d returned with error. Quiescing. Error: %+v", i, err)
 				shout(ctx, l, lopt.stdout, msg)
 				errs.AddErr(err)
-				// Quiesce the stopper. This will cause all workers to not pick up more
-				// tests after finishing the currently running one.
-				stopper.Quiesce(ctx)
+				// Stop the stopper. This will cause all workers to not pick up more
+				// tests after finishing the currently running one. We add one to the
+				// WaitGroup so that wg.Wait() will also wait for the stopper.
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					stopper.Stop(ctx)
+				}()
 				// Interrupt everybody waiting for resources.
 				if qp != nil {
 					qp.Close(msg)
 				}
 			}
-		})
+		}); err != nil {
+			wg.Done()
+		}
 	}
 
 	// Wait for all the workers to finish.
@@ -370,6 +377,7 @@ func (r *testRunner) runWorker(
 		wStatus.SetCluster(nil)
 
 		if c == nil {
+			l.PrintfCtx(ctx, "Worker exiting; no cluster to destroy.")
 			return
 		}
 		doDestroy := ctx.Err() == nil
@@ -399,7 +407,7 @@ func (r *testRunner) runWorker(
 			if _, ok := c.spec.ReusePolicy.(reusePolicyNone); ok {
 				wStatus.SetStatus("destroying cluster")
 				// We use a context that can't be canceled for the Destroy().
-				c.Destroy(ctx, closeLogger, l)
+				c.Destroy(context.Background(), closeLogger, l)
 				c = nil
 			}
 		}
@@ -479,7 +487,7 @@ func (r *testRunner) runWorker(
 		if err != nil || t.Failed() {
 			failureMsg := fmt.Sprintf("%s (%d) - ", testToRun.spec.Name, testToRun.runNum)
 			if err != nil {
-				failureMsg += err.Error()
+				failureMsg += fmt.Sprintf("%+v", err)
 			} else {
 				failureMsg += t.FailureMsg()
 			}
@@ -494,7 +502,7 @@ func (r *testRunner) runWorker(
 				// On any test failure or error, we destroy the cluster. We could be
 				// more selective, but this sounds safer.
 				l.PrintfCtx(ctx, "destroying cluster %s because: %s", c, failureMsg)
-				c.Destroy(ctx, closeLogger, l)
+				c.Destroy(context.Background(), closeLogger, l)
 				c = nil
 			}
 
@@ -548,6 +556,12 @@ fi'`
 	}
 }
 
+func allStacks() []byte {
+	// Collect up to 5mb worth of stacks.
+	b := make([]byte, 5*(1<<20))
+	return b[:runtime.Stack(b, true /* all */)]
+}
+
 // An error is returned if the test is still running (on another goroutine) when
 // this returns. This happens when the test doesn't respond to cancellation.
 // Returns true if the test is considered to have passed, false otherwise.
@@ -587,7 +601,9 @@ func (r *testRunner) runTest(
 	defer func() {
 		t.end = timeutil.Now()
 
-		if err := recover(); err != nil {
+		// We only have to record panics if the panic'd value is not the sentinel
+		// produced by t.Fatal*().
+		if err := recover(); err != nil && err != errTestFatal {
 			t.mu.Lock()
 			t.mu.failed = true
 			t.mu.output = append(t.mu.output, t.decorate(0 /* skip */, fmt.Sprint(err))...)
@@ -602,7 +618,6 @@ func (r *testRunner) runTest(
 		if t.Failed() {
 			t.mu.Lock()
 			output := fmt.Sprintf("test artifacts and logs in: %s\n", t.ArtifactsDir()) + string(t.mu.output)
-			failLoc := t.mu.failLoc
 			t.mu.Unlock()
 
 			if teamCity {
@@ -621,7 +636,11 @@ func (r *testRunner) runTest(
 			shout(ctx, l, stdout, "--- FAIL: %s (%s)\n%s", t.Name(), durationStr, output)
 			// NB: check NodeCount > 0 to avoid posting issues from this pkg's unit tests.
 			if issues.CanPost() && t.spec.Run != nil && t.spec.Cluster.NodeCount > 0 {
-				authorEmail := getAuthorEmail(t.spec.Tags, failLoc.file, failLoc.line)
+				projectColumnID := 0
+				if info, ok := roachtestOwners[t.spec.Owner]; ok {
+					projectColumnID = info.TriageColumnID
+				}
+
 				branch := "<unknown branch>"
 				if b := os.Getenv("TC_BUILD_BRANCH"); b != "" {
 					branch = b
@@ -630,20 +649,25 @@ func (r *testRunner) runTest(
 					branch, cloud, output)
 				artifacts := fmt.Sprintf("/%s", t.Name())
 
+				// Issues posted from roachtest are identifiable as such and
+				// they are also release blockers (this label may be removed
+				// by a human upon closer investigation).
+				labels := []string{"O-roachtest"}
+				if !t.spec.NonReleaseBlocker {
+					labels = append(labels, "release-blocker")
+				}
+
 				req := issues.PostRequest{
 					// TODO(tbg): actually use this as a template.
 					TitleTemplate: fmt.Sprintf("roachtest: %s failed", t.Name()),
 					// TODO(tbg): make a template better adapted to roachtest.
-					BodyTemplate: issues.UnitTestFailureBody,
-					PackageName:  "roachtest",
-					TestName:     t.Name(),
-					Message:      msg,
-					Artifacts:    artifacts,
-					AuthorEmail:  authorEmail,
-					// Issues posted from roachtest are identifiable as such and
-					// they are also release blockers (this label may be removed
-					// by a human upon closer investigation).
-					ExtraLabels: []string{"O-roachtest", "release-blocker"},
+					BodyTemplate:    issues.UnitTestFailureBody,
+					PackageName:     "roachtest",
+					TestName:        t.Name(),
+					Message:         msg,
+					Artifacts:       artifacts,
+					ExtraLabels:     labels,
+					ProjectColumnID: projectColumnID,
 				}
 				if err := issues.Post(
 					context.Background(),
@@ -732,7 +756,9 @@ func (r *testRunner) runTest(
 
 		// This is the call to actually run the test.
 		defer func() {
-			if r := recover(); r != nil {
+			// We only have to record panics if the panic'd value is not the sentinel
+			// produced by t.Fatal*().
+			if r := recover(); r != nil && r != errTestFatal {
 				// TODO(andreimatei): prevent the cluster from being reused.
 				t.Fatalf("test panicked: %v", r)
 			}
@@ -741,18 +767,62 @@ func (r *testRunner) runTest(
 		t.spec.Run(runCtx, t, c)
 	}()
 
+	teardownL, err := c.l.ChildLogger("teardown", quietStderr, quietStdout)
+	if err != nil {
+		return false, err
+	}
 	select {
 	case <-done:
+		s := "success"
+		if t.Failed() {
+			s = "failure"
+		}
+		c.l.Printf("tearing down after %s; see teardown.log", s)
+		l, c.l, t.l = teardownL, teardownL, teardownL
 	case <-time.After(timeout):
-		// We hit a timeout. We're going to mark the test as failed (which will also
-		// cancel its context). Then we'll wait up to 5 minutes in the hope
-		// that the test reacts either to the ctx cancelation or to the fact that it
-		// was marked as failed. If that happens, great - we return normally and so
-		// the cluster can be reused. It the test does not react to anything, then
-		// we return an error, which will cause the caller to stop everything and
-		// destroy this cluster (as well as all the others). The cluster
-		// cannot be reused since we have a runaway test goroutine that's presumably
-		// going to continue using the cluster.
+		c.l.Printf("tearing down after timeout; see teardown.log")
+		l, c.l, t.l = teardownL, teardownL, teardownL
+		// Timeouts are often opaque. Improve our changes by dumping the stack
+		// so that at least we can piece together what the test is trying to
+		// do at this very moment.
+		// In large roachtest runs, this will dump everyone else's stack as well,
+		// but this is just hard to avoid. Moving to a worker model in which
+		// each roachtest is spawned off as a separate process would address
+		// this at the expense of ease of communication between the runner and
+		// the test.
+		//
+		// Do this before we cancel the context, which might (hopefully) unblock
+		// the test. We want to see where it got stuck.
+		const stacksFile = "__stacks"
+		if cl, err := t.l.ChildLogger(stacksFile, quietStderr, quietStdout); err == nil {
+			cl.PrintfCtx(ctx, "all stacks:\n\n%s\n", allStacks())
+			t.l.PrintfCtx(ctx, "dumped stacks to %s", stacksFile)
+		}
+		// Now kill anything going on in this cluster while collecting stacks
+		// to the logs, to get the server side of the hang.
+		//
+		// TODO(tbg): send --sig=3 followed by a hard kill after we've fixed
+		// https://github.com/cockroachdb/cockroach/issues/45875.
+		// Signal 11 will dump stacks, but it might be confusing to folks
+		// who debug from the artifacts only.
+		//
+		// Don't use surrounding context, which are likely already canceled.
+		if nodes := c.All(); len(nodes) > 0 { // avoid tests
+			innerCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = c.StopE(innerCtx, c.All(), stopArgs("--sig=11"))
+			cancel()
+		}
+
+		// Mark the test as failed (which will also cancel its context). Then
+		// we'll wait up to 5 minutes in the hope that the test reacts either to
+		// the ctx cancelation or to the fact that it was marked as failed (and
+		// all processes nuked out from under it).
+		// If that happens, great - we return normally and so the cluster can be
+		// reused. It the test does not react to anything, then we return an
+		// error, which will cause the caller to stop everything and destroy
+		// this cluster (as well as all the others). The cluster cannot be
+		// reused since we have a runaway test goroutine that's presumably going
+		// to continue using the cluster.
 		t.printfAndFail(0 /* skip */, "test timed out (%s)", timeout)
 		select {
 		case <-done:
@@ -760,22 +830,37 @@ func (r *testRunner) runTest(
 				panic("expected success=false after a timeout")
 			}
 		case <-time.After(5 * time.Minute):
-			msg := "test timed out and afterwards failed to respond to cancelation"
+			// We really shouldn't get here unless the test code somehow managed
+			// to deadlock without blocking on anything remote - since we killed
+			// everything.
+			const msg = "test timed out and afterwards failed to respond to cancelation"
 			t.l.PrintfCtx(ctx, msg)
 			r.collectClusterLogs(ctx, c, t.l)
 			// We return an error here because the test goroutine is still running, so
 			// we want to alert the caller of this unusual situation.
-			return false, fmt.Errorf(msg)
+			return false, errors.New(msg)
 		}
 	}
 
-	// Detect replica divergence (i.e. ranges in which replicas have arrived
-	// at the same log position with different states).
-	c.FailOnReplicaDivergence(ctx, t)
 	// Detect dead nodes in an inner defer. Note that this will call
 	// t.printfAndFail() when appropriate, which will cause the code below to
 	// enter the t.Failed() branch.
 	c.FailOnDeadNodes(ctx, t)
+
+	if !t.Failed() {
+		// Detect replica divergence (i.e. ranges in which replicas have arrived
+		// at the same log position with different states).
+		//
+		// We avoid trying to do this when t.Failed() (and in particular when there
+		// are dead nodes) because for reasons @tbg does not understand this gets
+		// stuck occasionally, which really ruins the roachtest run. The method
+		// below already uses a ctx timeout and SQL statement_timeout, but it does
+		// not seem to be enough.
+		//
+		// TODO(testinfra): figure out why this can still get stuck despite the
+		// above.
+		c.FailOnReplicaDivergence(ctx, t)
+	}
 
 	if t.Failed() {
 		r.collectClusterLogs(ctx, c, t.l)
@@ -808,6 +893,9 @@ func (r *testRunner) collectClusterLogs(ctx context.Context, c *cluster, l *logg
 	}
 	if err := c.CopyRoachprodState(ctx); err != nil {
 		l.Printf("failed to copy roachprod state: %s", err)
+	}
+	if err := c.FetchDiskUsage(ctx); err != nil {
+		l.Printf("failed to fetch disk uage summary: %s", err)
 	}
 	if err := c.FetchDebugZip(ctx); err != nil {
 		l.Printf("failed to collect zip: %s", err)
@@ -1089,9 +1177,16 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 
 	buildVersionMajorMinor := fmt.Sprintf("%d.%d", buildVersion.Major(), buildVersion.Minor())
 
+	// NB: you can update the values in this map to point at newer patch
+	// releases. You will need to run acceptance/version-upgrade with the
+	// checkpoint option enabled to create the missing store directory fixture
+	// (see runVersionUpgrade). The same is true for adding a new key to this
+	// map.
 	verMap := map[string]string{
-		"20.1": "19.2.1",
-		"19.2": "19.1.5",
+		"21.1": "20.2.4",
+		"20.2": "20.1.10",
+		"20.1": "19.2.11",
+		"19.2": "19.1.11",
 		"19.1": "2.1.9",
 		"2.2":  "2.1.9",
 		"2.1":  "2.0.7",

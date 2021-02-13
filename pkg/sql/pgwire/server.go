@@ -15,30 +15,37 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 )
 
 // ATTENTION: After changing this value in a unit test, you probably want to
@@ -47,7 +54,7 @@ import (
 //
 // The "results_buffer_size" connection parameter can be used to override this
 // default for an individual connection.
-var connResultsBufferSize = settings.RegisterPublicByteSizeSetting(
+var connResultsBufferSize = settings.RegisterByteSizeSetting(
 	"sql.defaults.results_buffer.size",
 	"default size of the buffer that accumulates results for a statement or a batch "+
 		"of statements before they are sent to the client. This can be overridden on "+
@@ -59,7 +66,17 @@ var connResultsBufferSize = settings.RegisterPublicByteSizeSetting(
 		"Updating the setting only affects new connections. "+
 		"Setting to 0 disables any buffering.",
 	16<<10, // 16 KiB
-)
+).WithPublic()
+
+var logConnAuth = settings.RegisterBoolSetting(
+	sql.ConnAuditingClusterSettingName,
+	"if set, log SQL client connect and disconnect events (note: may hinder performance on loaded nodes)",
+	false).WithPublic()
+
+var logSessionAuth = settings.RegisterBoolSetting(
+	sql.AuthAuditingClusterSettingName,
+	"if set, log SQL session login/disconnection events (note: may hinder performance on loaded nodes)",
+	false).WithPublic()
 
 const (
 	// ErrSSLRequired is returned when a client attempts to connect to a
@@ -164,10 +181,33 @@ type Server struct {
 		conf *hba.Conf
 	}
 
-	sqlMemoryPool mon.BytesMonitor
-	connMonitor   mon.BytesMonitor
+	sqlMemoryPool *mon.BytesMonitor
+	connMonitor   *mon.BytesMonitor
 
-	stopper *stop.Stopper
+	// testing{Conn,Auth}LogEnabled is used in unit tests in this
+	// package to force-enable conn/auth logging without dancing around
+	// the asynchronicity of cluster settings.
+	testingConnLogEnabled int32
+	testingAuthLogEnabled int32
+
+	// trustClientProvidedRemoteAddr indicates whether the server should honor
+	// a `crdb:remote_addr` status parameter provided by the client during
+	// session authentication. This status parameter can be set by SQL proxies
+	// to feed the "real" client address, where otherwise the CockroachDB SQL
+	// server would only see the address of the proxy.
+	//
+	// This setting is security-sensitive and should not be enabled
+	// without a SQL proxy that carefully scrubs any client-provided
+	// `crdb:remote_addr` field. In particular, this setting should never
+	// be set when there is no SQL proxy at all. Otherwise, a malicious
+	// client could use this field to pretend being from another address
+	// than its own and defeat the HBA rules.
+	//
+	// TODO(knz,ben): It would be good to have something more specific
+	// than a boolean, i.e. to accept the provided address only from
+	// certain peer IPs, or with certain certificates. (could it be a
+	// special hba.conf directive?)
+	trustClientProvidedRemoteAddr syncutil.AtomicBool
 }
 
 // ServerMetrics is the set of metrics for the pgwire server.
@@ -176,7 +216,7 @@ type ServerMetrics struct {
 	BytesOutCount  *metric.Counter
 	Conns          *metric.Gauge
 	NewConns       *metric.Counter
-	ConnMemMetrics sql.MemoryMetrics
+	ConnMemMetrics sql.BaseMemoryMetrics
 	SQLMemMetrics  sql.MemoryMetrics
 }
 
@@ -188,7 +228,7 @@ func makeServerMetrics(
 		BytesOutCount:  metric.NewCounter(MetaBytesOut),
 		Conns:          metric.NewGauge(MetaConns),
 		NewConns:       metric.NewCounter(MetaNewConns),
-		ConnMemMetrics: sql.MakeMemMetrics("conns", histogramWindow),
+		ConnMemMetrics: sql.MakeBaseMemMetrics("conns", histogramWindow),
 		SQLMemMetrics:  sqlMemMetrics,
 	}
 }
@@ -221,20 +261,29 @@ func MakeServer(
 		execCfg:    executorConfig,
 		metrics:    makeServerMetrics(sqlMemMetrics, histogramWindow),
 	}
-	server.sqlMemoryPool = mon.MakeMonitor("sql",
+	server.sqlMemoryPool = mon.NewMonitor("sql",
 		mon.MemoryResource,
-		server.metrics.SQLMemMetrics.CurBytesCount,
-		server.metrics.SQLMemMetrics.MaxBytesHist,
+		// Note that we don't report metrics on this monitor. The reason for this is
+		// that we report metrics on the sum of all the child monitors of this pool.
+		// This monitor is the "main sql" monitor. It's a child of the root memory
+		// monitor. Its children are the sql monitors for each new connection. The
+		// sum of those children, plus the extra memory in the "conn" monitor below,
+		// is more than enough metrics information about the monitors.
+		nil, /* curCount */
+		nil, /* maxHist */
 		0, noteworthySQLMemoryUsageBytes, st)
 	server.sqlMemoryPool.Start(context.Background(), parentMemoryMonitor, mon.BoundAccount{})
-	server.SQLServer = sql.NewServer(executorConfig, &server.sqlMemoryPool)
+	server.SQLServer = sql.NewServer(executorConfig, server.sqlMemoryPool)
 
-	server.connMonitor = mon.MakeMonitor("conn",
+	// TODO(knz,ben): Use a cluster setting for this.
+	server.trustClientProvidedRemoteAddr.Set(trustClientProvidedRemoteAddrOverride)
+
+	server.connMonitor = mon.NewMonitor("conn",
 		mon.MemoryResource,
 		server.metrics.ConnMemMetrics.CurBytesCount,
 		server.metrics.ConnMemMetrics.MaxBytesHist,
 		int64(connReservationBatchSize)*baseSQLMemoryBudget, noteworthyConnMemoryUsageBytes, st)
-	server.connMonitor.Start(context.Background(), &server.sqlMemoryPool, mon.BoundAccount{})
+	server.connMonitor.Start(context.Background(), server.sqlMemoryPool, mon.BoundAccount{})
 
 	server.mu.Lock()
 	server.mu.connCancelMap = make(cancelChanMap)
@@ -249,9 +298,23 @@ func MakeServer(
 	return server
 }
 
+// AnnotateCtxForIncomingConn annotates the provided context with a
+// tag that reports the peer's address. In the common case, the
+// context is annotated with a "client" tag. When the server is
+// configured to recognize client-specified remote addresses, it is
+// annotated with a "peer" tag and the "client" tag is added later
+// when the session is set up.
+func (s *Server) AnnotateCtxForIncomingConn(ctx context.Context, conn net.Conn) context.Context {
+	tag := "client"
+	if s.trustClientProvidedRemoteAddr.Get() {
+		tag = "peer"
+	}
+	return logtags.AddTag(ctx, tag, conn.RemoteAddr().String())
+}
+
 // Match returns true if rd appears to be a Postgres connection.
 func Match(rd io.Reader) bool {
-	var buf pgwirebase.ReadBuffer
+	buf := pgwirebase.MakeReadBuffer()
 	_, err := buf.ReadUntypedMsg(rd)
 	if err != nil {
 		return false
@@ -265,7 +328,6 @@ func Match(rd io.Reader) bool {
 
 // Start makes the Server ready for serving connections.
 func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
-	s.stopper = stopper
 	s.SQLServer.Start(ctx, stopper)
 }
 
@@ -299,8 +361,13 @@ func (s *Server) Metrics() (res []interface{}) {
 // The RFC on drain modes has more information regarding the specifics of
 // what will happen to connections in different states:
 // https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20160425_drain_modes.md
-func (s *Server) Drain(drainWait time.Duration) error {
-	return s.drainImpl(drainWait, cancelMaxWait)
+//
+// The reporter callback, if non-nil, is called on a best effort basis
+// to report work that needed to be done and which may or may not have
+// been done by the time this call returns. See the explanation in
+// pkg/server/drain.go for details.
+func (s *Server) Drain(drainWait time.Duration, reporter func(int, redact.SafeString)) error {
+	return s.drainImpl(drainWait, cancelMaxWait, reporter)
 }
 
 // Undrain switches the server back to the normal mode of operation in which
@@ -321,7 +388,21 @@ func (s *Server) setDrainingLocked(drain bool) bool {
 	return true
 }
 
-func (s *Server) drainImpl(drainWait time.Duration, cancelWait time.Duration) error {
+// drainImpl drains the SQL clients.
+//
+// The drainWait duration is used to wait on clients to
+// self-disconnect after their session has been canceled. The
+// cancelWait is used to wait after the drainWait timer has expired
+// and there are still clients connected, and their context.Context is
+// canceled.
+//
+// The reporter callback, if non-nil, is called on a best effort basis
+// to report work that needed to be done and which may or may not have
+// been done by the time this call returns. See the explanation in
+// pkg/server/drain.go for details.
+func (s *Server) drainImpl(
+	drainWait time.Duration, cancelWait time.Duration, reporter func(int, redact.SafeString),
+) error {
 	// This anonymous function returns a copy of s.mu.connCancelMap if there are
 	// any active connections to cancel. We will only attempt to cancel
 	// connections that were active at the moment the draining switch happened.
@@ -347,6 +428,10 @@ func (s *Server) drainImpl(drainWait time.Duration, cancelWait time.Duration) er
 	}()
 	if len(connCancelMap) == 0 {
 		return nil
+	}
+	if reporter != nil {
+		// Report progress to the Drain RPC.
+		reporter(len(connCancelMap), "SQL clients")
 	}
 
 	// Spin off a goroutine that waits for all connections to signal that they
@@ -421,6 +506,20 @@ func (s SocketType) asConnType() (hba.ConnType, error) {
 	}
 }
 
+func (s *Server) connLogEnabled() bool {
+	return atomic.LoadInt32(&s.testingConnLogEnabled) != 0 || logConnAuth.Get(&s.execCfg.Settings.SV)
+}
+
+// TestingEnableConnLogging is exported for use in tests.
+func (s *Server) TestingEnableConnLogging() {
+	atomic.StoreInt32(&s.testingConnLogEnabled, 1)
+}
+
+// TestingEnableAuthLogging is exported for use in tests.
+func (s *Server) TestingEnableAuthLogging() {
+	atomic.StoreInt32(&s.testingAuthLogEnabled, 1)
+}
+
 // ServeConn serves a single connection, driving the handshake process and
 // delegating to the appropriate connection type.
 //
@@ -436,6 +535,38 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	ctx, draining, onCloseFn := s.registerConn(ctx)
 	defer onCloseFn()
 
+	connDetails := eventpb.CommonConnectionDetails{
+		InstanceID:    int32(s.execCfg.NodeID.SQLInstanceID()),
+		Network:       conn.RemoteAddr().Network(),
+		RemoteAddress: conn.RemoteAddr().String(),
+	}
+
+	// Some bookkeeping, for security-minded administrators.
+	// This registers the connection to the authentication log.
+	connStart := timeutil.Now()
+	if s.connLogEnabled() {
+		ev := &eventpb.ClientConnectionStart{
+			CommonEventDetails:      eventpb.CommonEventDetails{Timestamp: connStart.UnixNano()},
+			CommonConnectionDetails: connDetails,
+		}
+		log.StructuredEvent(ctx, ev)
+	}
+	defer func() {
+		// The duration of the session is logged at the end so that the
+		// reader of the log file can know how much to look back in time
+		// to find when the connection was opened. This is important
+		// because the log files may have been rotated since.
+		if s.connLogEnabled() {
+			endTime := timeutil.Now()
+			ev := &eventpb.ClientConnectionEnd{
+				CommonEventDetails:      eventpb.CommonEventDetails{Timestamp: endTime.UnixNano()},
+				CommonConnectionDetails: connDetails,
+				Duration:                endTime.Sub(connStart).Nanoseconds(),
+			}
+			log.StructuredEvent(ctx, ev)
+		}
+	}()
+
 	// In any case, first check the command in the start-up message.
 	//
 	// We're assuming that a client is not willing/able to receive error
@@ -443,6 +574,12 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	version, buf, err := s.readVersion(conn)
 	if err != nil {
 		return err
+	}
+
+	if version == versionCancel {
+		// The cancel message is rather peculiar: it is sent without
+		// authentication, always over an unencrypted channel.
+		return handleCancel(conn)
 	}
 
 	// If the server is shutting down, terminate the connection early.
@@ -465,19 +602,20 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	if clientErr != nil {
 		return s.sendErr(ctx, conn, clientErr)
 	}
+	ctx = logtags.AddTag(ctx, connType.String(), nil)
 
 	// What does the client want to do?
 	switch version {
-	case versionCancel:
-		// If the client is really issuing a cancel request, close the door
-		// in their face (we don't support it yet). Make a note of that use
-		// in telemetry.
-		telemetry.Inc(sqltelemetry.CancelRequestCounter)
-		_ = conn.Close()
-		return nil
-
 	case version30:
 		// Normal SQL connection. Proceed normally below.
+
+	case versionCancel:
+		// The PostgreSQL protocol definition says that cancel payloads
+		// must be sent *prior to upgrading the connection to use TLS*.
+		// Yet, we've found clients in the wild that send the cancel
+		// after the TLS handshake, for example at
+		// https://github.com/cockroachlabs/support/issues/600.
+		return handleCancel(conn)
 
 	default:
 		// We don't know this protocol.
@@ -497,9 +635,17 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 
 	// Load the client-provided session parameters.
 	var sArgs sql.SessionArgs
-	if sArgs, err = parseClientProvidedSessionParameters(ctx, &s.execCfg.Settings.SV, &buf); err != nil {
+	if sArgs, err = parseClientProvidedSessionParameters(ctx, &s.execCfg.Settings.SV, &buf,
+		conn.RemoteAddr(), s.trustClientProvidedRemoteAddr.Get()); err != nil {
 		return s.sendErr(ctx, conn, err)
 	}
+
+	// Populate the client address field in the context tags and the
+	// shared struct for structured logging.
+	// Only know do we know the remote client address for sure (it may have
+	// been overridden by a status parameter).
+	connDetails.RemoteAddress = sArgs.RemoteAddr.String()
+	ctx = logtags.AddTag(ctx, "client", connDetails.RemoteAddress)
 
 	// If a test is hooking in some authentication option, load it.
 	var testingAuthHook func(context.Context) error
@@ -509,28 +655,40 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 
 	// Defer the rest of the processing to the connection handler.
 	// This includes authentication.
-	serveConn(
+	s.serveConn(
 		ctx, conn, sArgs,
-		&s.metrics, reserved, s.SQLServer,
-		s.IsDraining,
+		reserved,
 		authOptions{
 			connType:        connType,
+			connDetails:     connDetails,
 			insecure:        s.cfg.Insecure,
 			ie:              s.execCfg.InternalExecutor,
 			auth:            s.GetAuthenticationConfiguration(),
 			testingAuthHook: testingAuthHook,
-		},
-		s.stopper)
+		})
+	return nil
+}
+
+func handleCancel(conn net.Conn) error {
+	// Since we don't support this, close the door in the client's
+	// face. Make a note of that use in telemetry.
+	telemetry.Inc(sqltelemetry.CancelRequestCounter)
+	_ = conn.Close()
 	return nil
 }
 
 // parseClientProvidedSessionParameters reads the incoming k/v pairs
 // in the startup message into a sql.SessionArgs struct.
 func parseClientProvidedSessionParameters(
-	ctx context.Context, sv *settings.Values, buf *pgwirebase.ReadBuffer,
+	ctx context.Context,
+	sv *settings.Values,
+	buf *pgwirebase.ReadBuffer,
+	origRemoteAddr net.Addr,
+	trustClientProvidedRemoteAddr bool,
 ) (sql.SessionArgs, error) {
 	args := sql.SessionArgs{
 		SessionDefaults: make(map[string]string),
+		RemoteAddr:      origRemoteAddr,
 	}
 	foundBufferSize := false
 
@@ -557,8 +715,11 @@ func parseClientProvidedSessionParameters(
 		// Load the parameter.
 		switch key {
 		case "user":
-			// Unicode-normalize and case-fold the username.
-			args.User = tree.Name(value).Normalize()
+			// In CockroachDB SQL, unlike in PostgreSQL, usernames are
+			// case-insensitive. Therefore we need to normalize the username
+			// here, so that further lookups for authentication have the correct
+			// identifier.
+			args.User, _ = security.MakeSQLUsernameFromUserInput(value, security.UsernameValidation)
 
 		case "results_buffer_size":
 			if args.ConnResultsBufferSize, err = humanizeutil.ParseBytes(value); err != nil {
@@ -572,23 +733,44 @@ func parseClientProvidedSessionParameters(
 			}
 			foundBufferSize = true
 
-		default:
-			exists, configurable := sql.IsSessionVariableConfigurable(key)
+		case "crdb:remote_addr":
+			if !trustClientProvidedRemoteAddr {
+				return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+					"server not configured to accept remote address override (requested: %q)", value)
+			}
 
-			switch {
-			case exists && configurable:
-				args.SessionDefaults[key] = value
+			hostS, portS, err := net.SplitHostPort(value)
+			if err != nil {
+				return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+					"invalid address format: %v", err)
+			}
+			port, err := strconv.Atoi(portS)
+			if err != nil {
+				return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+					"remote port is not numeric: %v", err)
+			}
+			ip := net.ParseIP(hostS)
+			if ip == nil {
+				return sql.SessionArgs{}, pgerror.New(pgcode.ProtocolViolation,
+					"remote address is not numeric")
+			}
+			args.RemoteAddr = &net.TCPAddr{IP: ip, Port: port}
 
-			case !exists:
-				if _, ok := sql.UnsupportedVars[key]; ok {
-					counter := sqltelemetry.UnimplementedClientStatusParameterCounter(key)
-					telemetry.Inc(counter)
+		case "options":
+			opts, err := parseOptions(value)
+			if err != nil {
+				return sql.SessionArgs{}, err
+			}
+			for _, opt := range opts {
+				err = loadParameter(ctx, opt.key, opt.value, &args)
+				if err != nil {
+					return sql.SessionArgs{}, pgerror.Wrapf(err, pgerror.GetPGCode(err), "options")
 				}
-				log.Warningf(ctx, "unknown configuration parameter: %q", key)
-
-			case !configurable:
-				return sql.SessionArgs{}, pgerror.Newf(pgcode.CantChangeRuntimeParam,
-					"parameter %q cannot be changed", key)
+			}
+		default:
+			err = loadParameter(ctx, key, value, &args)
+			if err != nil {
+				return sql.SessionArgs{}, err
 			}
 		}
 	}
@@ -598,13 +780,156 @@ func parseClientProvidedSessionParameters(
 		args.ConnResultsBufferSize = connResultsBufferSize.Get(sv)
 	}
 
+	// TODO(richardjcai): When connecting to the database, we'll want to
+	// check for CONNECT privilege on the database. #59875.
 	if _, ok := args.SessionDefaults["database"]; !ok {
 		// CockroachDB-specific behavior: if no database is specified,
 		// default to "defaultdb". In PostgreSQL this would be "postgres".
-		args.SessionDefaults["database"] = sessiondata.DefaultDatabaseName
+		args.SessionDefaults["database"] = catalogkeys.DefaultDatabaseName
 	}
 
 	return args, nil
+}
+
+func loadParameter(ctx context.Context, key, value string, args *sql.SessionArgs) error {
+	exists, configurable := sql.IsSessionVariableConfigurable(key)
+
+	switch {
+	case exists && configurable:
+		args.SessionDefaults[key] = value
+
+	case !exists:
+		if _, ok := sql.UnsupportedVars[key]; ok {
+			counter := sqltelemetry.UnimplementedClientStatusParameterCounter(key)
+			telemetry.Inc(counter)
+		}
+		log.Warningf(ctx, "unknown configuration parameter: %q", key)
+
+	case !configurable:
+		return pgerror.Newf(pgcode.CantChangeRuntimeParam,
+			"parameter %q cannot be changed", key)
+	}
+	return nil
+}
+
+// option represents an option argument passed in the connection URL.
+type option struct {
+	key   string
+	value string
+}
+
+// parseOptions parses the given string into the options. The options must be
+// separated by space and have one of the following patterns:
+// '-c key=value', '-ckey=value', '--key=value'
+func parseOptions(optionsString string) ([]option, error) {
+	var res []option
+	optionsRaw, err := url.QueryUnescape(optionsString)
+	if err != nil {
+		return nil, pgerror.Newf(pgcode.ProtocolViolation, "failed to unescape options %q", optionsString)
+	}
+
+	lastWasDashC := false
+	opts := splitOptions(optionsRaw)
+
+	for i := 0; i < len(opts); i++ {
+		prefix := ""
+		if len(opts[i]) > 1 {
+			prefix = opts[i][:2]
+		}
+
+		switch {
+		case opts[i] == "-c":
+			lastWasDashC = true
+			continue
+		case lastWasDashC:
+			lastWasDashC = false
+			// if the last option was '-c' parse current option with no regard to
+			// the prefix
+			prefix = ""
+		case prefix == "--" || prefix == "-c":
+			lastWasDashC = false
+		default:
+			return nil, pgerror.Newf(pgcode.ProtocolViolation,
+				"option %q is invalid, must have prefix '-c' or '--'", opts[i])
+		}
+
+		opt, err := splitOption(opts[i], prefix)
+		if err != nil {
+			return nil, err
+		}
+		res = append(res, opt)
+	}
+	return res, nil
+}
+
+// splitOptions slices the given string into substrings separated by space
+// unless the space is escaped using backslashes '\\'. It also skips multiple
+// subsequent spaces.
+func splitOptions(options string) []string {
+	var res []string
+	var sb strings.Builder
+	i := 0
+	for i < len(options) {
+		sb.Reset()
+		// skip leading space
+		for i < len(options) && options[i] == ' ' {
+			i++
+		}
+		if i == len(options) {
+			break
+		}
+
+		lastWasEscape := false
+
+		for i < len(options) {
+			if options[i] == ' ' && !lastWasEscape {
+				break
+			}
+			if !lastWasEscape && options[i] == '\\' {
+				lastWasEscape = true
+			} else {
+				lastWasEscape = false
+				sb.WriteByte(options[i])
+			}
+			i++
+		}
+
+		res = append(res, sb.String())
+	}
+
+	return res
+}
+
+// splitOption splits the given opt argument into substrings separated by '='.
+// It returns an error if the given option does not comply with the pattern
+// "key=value" and the number of elements in the result is not two.
+// splitOption removes the prefix from the key and replaces '-' with '_' so
+// "--option-name=value" becomes [option_name, value].
+func splitOption(opt, prefix string) (option, error) {
+	kv := strings.Split(opt, "=")
+
+	if len(kv) != 2 {
+		return option{}, pgerror.Newf(pgcode.ProtocolViolation,
+			"option %q is invalid, check '='", opt)
+	}
+
+	kv[0] = strings.TrimPrefix(kv[0], prefix)
+
+	return option{key: strings.ReplaceAll(kv[0], "-", "_"), value: kv[1]}, nil
+}
+
+// Note: Usage of an env var here makes it possible to unconditionally
+// enable this feature when cluster settings do not work reliably,
+// e.g. in multi-tenant setups in v20.2. This override mechanism can
+// be removed after all of CC is moved to use v21.1 or a version which
+// supports cluster settings.
+var trustClientProvidedRemoteAddrOverride = envutil.EnvOrDefaultBool("COCKROACH_TRUST_CLIENT_PROVIDED_SQL_REMOTE_ADDR", false)
+
+// TestingSetTrustClientProvidedRemoteAddr is used in tests.
+func (s *Server) TestingSetTrustClientProvidedRemoteAddr(b bool) func() {
+	prev := s.trustClientProvidedRemoteAddr.Get()
+	s.trustClientProvidedRemoteAddr.Set(b)
+	return func() { s.trustClientProvidedRemoteAddr.Set(prev) }
 }
 
 // maybeUpgradeToSecureConn upgrades the connection to TLS/SSL if
@@ -625,17 +950,18 @@ func (s *Server) maybeUpgradeToSecureConn(
 	if version != versionSSL {
 		// The client did not require a SSL connection.
 
-		if !s.cfg.Insecure && connType != hba.ConnLocal {
-			// Currently non-SSL connections are not allowed in secure
-			// mode. Ideally, we want to allow this and subject it to HBA
-			// rules ('hostssl' vs 'hostnossl').
-			//
-			// TODO(knz): revisit this when needed.
-			clientErr = pgerror.New(pgcode.ProtocolViolation, ErrSSLRequired)
+		// Insecure mode: nothing to say, nothing to do.
+		// TODO(knz): Remove this condition - see
+		// https://github.com/cockroachdb/cockroach/issues/53404
+		if s.cfg.Insecure {
 			return
 		}
 
-		// Non-SSL in non-secure mode, all is well: no-op.
+		// Secure mode: disallow if TCP and the user did not opt into
+		// non-TLS SQL conns.
+		if !s.cfg.AcceptSQLWithoutTLS && connType != hba.ConnLocal {
+			clientErr = pgerror.New(pgcode.ProtocolViolation, ErrSSLRequired)
+		}
 		return
 	}
 
@@ -654,7 +980,7 @@ func (s *Server) maybeUpgradeToSecureConn(
 	// connection to use TLS/SSL.
 
 	// Do we have a TLS configuration?
-	tlsConfig, serverErr := s.cfg.GetServerTLSConfig()
+	tlsConfig, serverErr := s.execCfg.RPCContext.GetServerTLSConfig()
 	if serverErr != nil {
 		return
 	}
@@ -730,6 +1056,9 @@ func (s *Server) readVersion(
 	conn io.Reader,
 ) (version uint32, buf pgwirebase.ReadBuffer, err error) {
 	var n int
+	buf = pgwirebase.MakeReadBuffer(
+		pgwirebase.ReadBufferOptionWithClusterSettings(&s.execCfg.Settings.SV),
+	)
 	n, err = buf.ReadUntypedMsg(conn)
 	if err != nil {
 		return
@@ -757,5 +1086,5 @@ func (s *Server) sendErr(ctx context.Context, conn net.Conn, err error) error {
 }
 
 func newAdminShutdownErr(msg string) error {
-	return pgerror.Newf(pgcode.AdminShutdown, msg)
+	return pgerror.New(pgcode.AdminShutdown, msg)
 }

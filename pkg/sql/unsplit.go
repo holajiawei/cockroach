@@ -14,16 +14,19 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
 )
 
 type unsplitNode struct {
 	optColumnsSlot
 
-	tableDesc *sqlbase.TableDescriptor
-	index     *sqlbase.IndexDescriptor
+	tableDesc catalog.TableDescriptor
+	index     *descpb.IndexDescriptor
 	run       unsplitRun
 	rows      planNode
 }
@@ -43,7 +46,7 @@ func (n *unsplitNode) Next(params runParams) (bool, error) {
 	}
 
 	row := n.rows.Values()
-	rowKey, err := getRowKey(n.tableDesc, n.index, row)
+	rowKey, err := getRowKey(params.ExecCfg().Codec, n.tableDesc, n.index, row)
 	if err != nil {
 		return false, err
 	}
@@ -73,8 +76,8 @@ func (n *unsplitNode) Close(ctx context.Context) {
 type unsplitAllNode struct {
 	optColumnsSlot
 
-	tableDesc *sqlbase.TableDescriptor
-	index     *sqlbase.IndexDescriptor
+	tableDesc catalog.TableDescriptor
+	index     *descpb.IndexDescriptor
 	run       unsplitAllRun
 }
 
@@ -94,19 +97,21 @@ func (n *unsplitAllNode) startExec(params runParams) error {
 		WHERE
 			database_name=$1 AND table_name=$2 AND index_name=$3 AND split_enforced_until IS NOT NULL
 	`
-	dbDesc, err := sqlbase.GetDatabaseDescFromID(params.ctx, params.p.txn, n.tableDesc.ParentID)
+	dbDesc, err := catalogkv.MustGetDatabaseDescByID(
+		params.ctx, params.p.txn, params.ExecCfg().Codec, n.tableDesc.GetParentID(),
+	)
 	if err != nil {
 		return err
 	}
 	indexName := ""
-	if n.index.ID != n.tableDesc.PrimaryIndex.ID {
+	if n.index.ID != n.tableDesc.GetPrimaryIndexID() {
 		indexName = n.index.Name
 	}
 	ranges, err := params.p.ExtendedEvalContext().InternalExecutor.(*InternalExecutor).QueryEx(
-		params.ctx, "split points query", params.p.txn, sqlbase.InternalExecutorSessionDataOverride{},
+		params.ctx, "split points query", params.p.txn, sessiondata.InternalExecutorOverride{},
 		statement,
-		dbDesc.Name,
-		n.tableDesc.Name,
+		dbDesc.GetName(),
+		n.tableDesc.GetName(),
 		indexName,
 	)
 	if err != nil {

@@ -28,15 +28,13 @@
   height 100%
   display flex
   flex-direction column
-  overflow hidden
+  overflow auto
 
 .cluster-overview
   .cluster-summary
     background-color white
     padding 24px
     margin-top 0
-    margin-left 24px
-    margin-right 24px
     border 1px solid $table-border-color
     font-family $font-family--base
 
@@ -61,7 +59,7 @@
 
     .capacity-usage
       &.cluster-summary__title
-        color $colors--title
+        color $colors--neutral-7
         grid-area cap-t
 
       &.cluster-summary__chart
@@ -93,7 +91,7 @@
 
     .node-liveness
       &.cluster-summary__title
-        color $colors--title
+        color $colors--neutral-7
         grid-area live-t
 
       &.cluster-summary__metric.live-nodes
@@ -116,7 +114,7 @@
 
     .replication-status
       &.cluster-summary__title
-        color $colors--title
+        color $colors--neutral-7
         grid-area rep-t
 
       &.cluster-summary__metric.total-ranges
@@ -176,8 +174,11 @@
       &.alert
         color $alert-color
 
+      &.disabled
+        color $colors--neutral-5
+
       &.storage-used, &.storage-usable
-        color $colors--link
+        color $colors--neutral-7
         @media screen and (min-width: 960px) and (max-width: 1400px)
           font-size 14px
           line-height 16px
@@ -195,7 +196,7 @@
       font-weight 500
       line-height 18px
       text-transform uppercase
-      color $tooltip-color
+      color $colors--neutral-5
       letter-spacing 2px
 
       @media screen and (max-width: 960px)
@@ -253,6 +254,6 @@
 
 .cluster-overview--fixed
   flex-grow 1
+  max-width $max-window-width
   position relative
-  margin $spacing-small $spacing-medium
-  overflow hidden
+  padding $spacing-smaller $spacing-medium

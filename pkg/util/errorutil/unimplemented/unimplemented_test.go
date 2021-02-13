@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/errors"
 )
 
@@ -31,7 +32,6 @@ func TestUnimplemented(t *testing.T) {
 		{NewWithDepthf(1, "woo", "hello %s", "world"), "unimplemented: hello world", "woo", "", 0},
 		{NewWithIssue(123, "waa"), "unimplemented: waa", "", "", 123},
 		{NewWithIssuef(123, "hello %s", "world"), "unimplemented: hello world", "", "", 123},
-		{NewWithIssueHint(123, "waa", "woo"), "unimplemented: waa", "", "woo", 123},
 		{NewWithIssueDetail(123, "waa", "woo"), "unimplemented: woo", "waa", "", 123},
 		{NewWithIssueDetailf(123, "waa", "hello %s", "world"), "unimplemented: hello world", "waa", "", 123},
 	}
@@ -50,7 +50,7 @@ func TestUnimplemented(t *testing.T) {
 				}
 				if test.expIssue != 0 {
 					ref := fmt.Sprintf("%s\nSee: %s",
-						errors.UnimplementedErrorHint, makeURL(test.expIssue))
+						errors.UnimplementedErrorHint, build.MakeIssueURL(test.expIssue))
 					if hint == ref {
 						found |= 2
 					}
@@ -79,7 +79,7 @@ func TestUnimplemented(t *testing.T) {
 				}
 
 				if test.expIssue != 0 {
-					url := makeURL(test.expIssue)
+					url := build.MakeIssueURL(test.expIssue)
 					if links[0].IssueURL != url {
 						t.Errorf("expected link url %q, got %q", url, links[0].IssueURL)
 					}

@@ -16,10 +16,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/fs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -58,8 +58,8 @@ func (f *fdCountingFS) assertOpenFDs(
 	require.Equal(t, expectedReadFDs, f.readFDs)
 }
 
-func (f *fdCountingFS) CreateFile(name string) (fs.File, error) {
-	file, err := f.FS.CreateFile(name)
+func (f *fdCountingFS) Create(name string) (fs.File, error) {
+	file, err := f.FS.Create(name)
 	if err != nil {
 		return nil, err
 	}
@@ -67,8 +67,8 @@ func (f *fdCountingFS) CreateFile(name string) (fs.File, error) {
 	return &fdCountingFSFile{File: file, onCloseCb: func() { f.writeFDs-- }}, nil
 }
 
-func (f *fdCountingFS) CreateFileWithSync(name string, bytesPerSync int) (fs.File, error) {
-	file, err := f.FS.CreateFileWithSync(name, bytesPerSync)
+func (f *fdCountingFS) CreateWithSync(name string, bytesPerSync int) (fs.File, error) {
+	file, err := f.FS.CreateWithSync(name, bytesPerSync)
 	if err != nil {
 		return nil, err
 	}
@@ -76,8 +76,8 @@ func (f *fdCountingFS) CreateFileWithSync(name string, bytesPerSync int) (fs.Fil
 	return &fdCountingFSFile{File: file, onCloseCb: func() { f.writeFDs-- }}, nil
 }
 
-func (f *fdCountingFS) OpenFile(name string) (fs.File, error) {
-	file, err := f.FS.OpenFile(name)
+func (f *fdCountingFS) Open(name string) (fs.File, error) {
+	file, err := f.FS.Open(name)
 	if err != nil {
 		return nil, err
 	}
@@ -93,9 +93,9 @@ func TestPartitionedDiskQueue(t *testing.T) {
 
 	var (
 		ctx   = context.Background()
-		typs  = []coltypes.T{coltypes.Int64}
-		batch = testAllocator.NewMemBatch(typs)
-		sem   = &colexec.TestingSemaphore{}
+		typs  = []*types.T{types.Int}
+		batch = testAllocator.NewMemBatchWithMaxCapacity(typs)
+		sem   = &colexecbase.TestingSemaphore{}
 	)
 	batch.SetLength(coldata.BatchSize())
 
@@ -106,7 +106,7 @@ func TestPartitionedDiskQueue(t *testing.T) {
 	queueCfg.FS = countingFS
 
 	t.Run("ReopenReadPartition", func(t *testing.T) {
-		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault)
+		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault, testDiskAcc)
 
 		countingFS.assertOpenFDs(t, sem, 0, 0)
 		require.NoError(t, p.Enqueue(ctx, 0, batch))
@@ -133,7 +133,7 @@ func TestPartitionedDiskQueue(t *testing.T) {
 		// And the file descriptor should be automatically closed.
 		countingFS.assertOpenFDs(t, sem, 0, 0)
 
-		require.NoError(t, p.Close())
+		require.NoError(t, p.Close(ctx))
 		countingFS.assertOpenFDs(t, sem, 0, 0)
 	})
 
@@ -144,8 +144,8 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 
 	var (
 		ctx    = context.Background()
-		typs   = []coltypes.T{coltypes.Int64}
-		batch  = testAllocator.NewMemBatch(typs)
+		typs   = []*types.T{types.Int}
+		batch  = testAllocator.NewMemBatchWithMaxCapacity(typs)
 		rng, _ = randutil.NewPseudoRand()
 		// maxPartitions is in [1, 10]. The maximum partitions on a single level.
 		maxPartitions = 1 + rng.Intn(10)
@@ -170,8 +170,8 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 		// maxPartitions+1 are created. The +1 is the file descriptor of the
 		// new partition being written to when closedForWrites from maxPartitions
 		// and writing the merged result to a single new partition.
-		sem := colexec.NewTestingSemaphore(maxPartitions + 1)
-		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyCloseOnNewPartition)
+		sem := colexecbase.NewTestingSemaphore(maxPartitions + 1)
+		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyCloseOnNewPartition, testDiskAcc)
 
 		// Define sortRepartition to be able to call this helper function
 		// recursively.
@@ -200,7 +200,7 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 			require.NoError(t, p.CloseAllOpenReadFileDescriptors())
 			countingFS.assertOpenFDs(t, sem, 1, 0)
 			// Closing all write descriptors will close all descriptors.
-			require.NoError(t, p.CloseAllOpenWriteFileDescriptors())
+			require.NoError(t, p.CloseAllOpenWriteFileDescriptors(ctx))
 			countingFS.assertOpenFDs(t, sem, 0, 0)
 
 			// Now, we simulate a repartition. Open all partitions for reads.
@@ -225,7 +225,7 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 			// next iteration (if any, otherwise p.Close should close it) of this loop.
 			countingFS.assertOpenFDs(t, sem, 1, 0)
 			// Call CloseInactiveReadPartitions to reclaim space.
-			require.NoError(t, p.CloseInactiveReadPartitions())
+			require.NoError(t, p.CloseInactiveReadPartitions(ctx))
 			// Try to enqueue to a partition that was just closed.
 			require.Error(t, p.Enqueue(ctx, firstPartitionIdx, batch))
 			countingFS.assertOpenFDs(t, sem, 1, 0)
@@ -235,7 +235,7 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 		}
 
 		sortRepartition(0, numRepartitions)
-		require.NoError(t, p.Close())
+		require.NoError(t, p.Close(ctx))
 		countingFS.assertOpenFDs(t, sem, 0, 0)
 	})
 
@@ -250,8 +250,8 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 		// The limit for a hash join is maxPartitions + 2. maxPartitions is the
 		// number of partitions partitioned to and 2 represents the file descriptors
 		// for the left and right side in the case of a repartition.
-		sem := colexec.NewTestingSemaphore(maxPartitions + 2)
-		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault)
+		sem := colexecbase.NewTestingSemaphore(maxPartitions + 2)
+		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault, testDiskAcc)
 
 		// joinRepartition will perform the partitioning that happens during a hash
 		// join. expectedRepartitionReadFDs are the read file descriptors that are
@@ -282,11 +282,11 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 			}
 
 			// The input has been partitioned. All file descriptors should be closed.
-			require.NoError(t, p.CloseAllOpenWriteFileDescriptors())
+			require.NoError(t, p.CloseAllOpenWriteFileDescriptors(ctx))
 			countingFS.assertOpenFDs(t, sem, 0, expectedRepartitionReadFDs)
 			require.NoError(t, p.CloseAllOpenReadFileDescriptors())
 			countingFS.assertOpenFDs(t, sem, 0, 0)
-			require.NoError(t, p.CloseInactiveReadPartitions())
+			require.NoError(t, p.CloseInactiveReadPartitions(ctx))
 			countingFS.assertOpenFDs(t, sem, 0, 0)
 			// Now that we closed (read: deleted) the partitions read to repartition,
 			// it should be illegal to enqueue to that index.

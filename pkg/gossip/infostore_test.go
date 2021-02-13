@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/gogo/protobuf/proto"
 )
 
 var emptyAddr = util.MakeUnresolvedAddr("test", "<test-addr>")
@@ -37,7 +36,7 @@ var emptyAddr = util.MakeUnresolvedAddr("test", "<test-addr>")
 func newTestInfoStore() (*infoStore, *stop.Stopper) {
 	stopper := stop.NewStopper()
 	nc := &base.NodeIDContainer{}
-	nc.Set(context.TODO(), 1)
+	nc.Set(context.Background(), 1)
 	is := newInfoStore(log.AmbientContext{Tracer: tracing.NewTracer()}, nc, emptyAddr, stopper)
 	return is, stopper
 }
@@ -47,7 +46,7 @@ func newTestInfoStore() (*infoStore, *stop.Stopper) {
 func TestZeroDuration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	info := is.newInfo(nil, 0)
 	if info.TTLStamp != math.MaxInt64 {
 		t.Errorf("expected zero duration to get max TTLStamp: %d", info.TTLStamp)
@@ -58,7 +57,7 @@ func TestZeroDuration(t *testing.T) {
 func TestNewInfo(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	info1 := is.newInfo(nil, time.Second)
 	info2 := is.newInfo(nil, time.Second)
 	if err := is.addInfo("a", info1); err != nil {
@@ -77,7 +76,7 @@ func TestNewInfo(t *testing.T) {
 func TestInfoStoreGetInfo(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	i := is.newInfo(nil, time.Second)
 	i.NodeID = 1
 	if err := is.addInfo("a", i); err != nil {
@@ -101,7 +100,7 @@ func TestInfoStoreGetInfo(t *testing.T) {
 func TestInfoStoreGetInfoTTL(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	i := is.newInfo(nil, time.Nanosecond)
 	if err := is.addInfo("a", i); err != nil {
 		t.Error(err)
@@ -117,7 +116,7 @@ func TestInfoStoreGetInfoTTL(t *testing.T) {
 func TestAddInfoSameKeyLessThanEqualTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	info1 := is.newInfo(nil, time.Second)
 	if err := is.addInfo("a", info1); err != nil {
 		t.Error(err)
@@ -141,7 +140,7 @@ func TestAddInfoSameKeyLessThanEqualTimestamp(t *testing.T) {
 func TestAddInfoSameKeyGreaterTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	info1 := is.newInfo(nil, time.Second)
 	info2 := is.newInfo(nil, time.Second)
 	if err1, err2 := is.addInfo("a", info1), is.addInfo("a", info2); err1 != nil || err2 != nil {
@@ -154,7 +153,7 @@ func TestAddInfoSameKeyGreaterTimestamp(t *testing.T) {
 func TestAddInfoSameKeyDifferentHops(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	info1 := is.newInfo(nil, time.Second)
 	info1.Hops = 1
 	info2 := is.newInfo(nil, time.Second)
@@ -168,7 +167,7 @@ func TestAddInfoSameKeyDifferentHops(t *testing.T) {
 	}
 
 	i := is.getInfo("a")
-	if i.Hops != info1.Hops || !proto.Equal(i, info1) {
+	if i.Hops != info1.Hops || !reflect.DeepEqual(i, info1) {
 		t.Error("failed to properly combine hops and value", i)
 	}
 
@@ -178,7 +177,7 @@ func TestAddInfoSameKeyDifferentHops(t *testing.T) {
 		t.Error(err)
 	}
 	i = is.getInfo("a")
-	if i.Hops != info3.Hops || !proto.Equal(i, info3) {
+	if i.Hops != info3.Hops || !reflect.DeepEqual(i, info3) {
 		t.Error("failed to properly combine hops and value", i)
 	}
 }
@@ -240,7 +239,7 @@ func TestCombineInfosRatchetMonotonic(t *testing.T) {
 // Helper method creates an infostore with 10 infos.
 func createTestInfoStore(t *testing.T) *infoStore {
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	for i := 0; i < 10; i++ {
 		infoA := is.newInfo(nil, time.Second)
@@ -316,7 +315,7 @@ func TestInfoStoreMostDistant(t *testing.T) {
 		roachpb.NodeID(3),
 	}
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	// Start with one very distant info that shouldn't affect mostDistant
 	// calculations because it isn't a node ID key.
@@ -376,7 +375,7 @@ func TestLeastUseful(t *testing.T) {
 		roachpb.NodeID(2),
 	}
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	set := makeNodeSet(3, metric.NewGauge(metric.Metadata{Name: ""}))
 	if is.leastUseful(set) != 0 {
@@ -446,7 +445,7 @@ func (cr *callbackRecord) Keys() []string {
 func TestCallbacks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	wg := &sync.WaitGroup{}
 	cb1 := callbackRecord{wg: wg}
 	cb2 := callbackRecord{wg: wg}
@@ -555,7 +554,7 @@ func TestCallbacks(t *testing.T) {
 func TestRegisterCallback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	wg := &sync.WaitGroup{}
 	cb := callbackRecord{wg: wg}
 

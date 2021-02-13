@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -25,13 +25,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
-	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 )
 
 var noRewindExpected = CmdPos(-1)
@@ -39,18 +40,18 @@ var noRewindExpected = CmdPos(-1)
 type testContext struct {
 	manualClock *hlc.ManualClock
 	clock       *hlc.Clock
-	mockDB      *client.DB
-	mon         mon.BytesMonitor
-	tracer      opentracing.Tracer
+	mockDB      *kv.DB
+	mon         *mon.BytesMonitor
+	tracer      *tracing.Tracer
 	// ctx is mimicking the spirit of a client connection's context
 	ctx      context.Context
 	settings *cluster.Settings
 }
 
-func makeTestContext() testContext {
+func makeTestContext(stopper *stop.Stopper) testContext {
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
-	factory := client.MakeMockTxnSenderFactory(
+	factory := kv.MakeMockTxnSenderFactory(
 		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
 		) (*roachpb.BatchResponse, *roachpb.Error) {
 			return nil, nil
@@ -61,8 +62,8 @@ func makeTestContext() testContext {
 	return testContext{
 		manualClock: manual,
 		clock:       clock,
-		mockDB:      client.NewDB(ambient, factory, clock),
-		mon: mon.MakeMonitor(
+		mockDB:      kv.NewDB(ambient, factory, clock, stopper),
+		mon: mon.NewMonitor(
 			"test root mon",
 			mon.MemoryResource,
 			nil,  /* curCount */
@@ -72,7 +73,7 @@ func makeTestContext() testContext {
 			settings,
 		),
 		tracer:   ambient.Tracer,
-		ctx:      context.TODO(),
+		ctx:      context.Background(),
 		settings: settings,
 	}
 }
@@ -80,10 +81,10 @@ func makeTestContext() testContext {
 // createOpenState returns a txnState initialized with an open txn.
 func (tc *testContext) createOpenState(typ txnType) (fsm.State, *txnState) {
 	sp := tc.tracer.StartSpan("createOpenState")
-	ctx := opentracing.ContextWithSpan(tc.ctx, sp)
+	ctx := tracing.ContextWithSpan(tc.ctx, sp)
 	ctx, cancel := context.WithCancel(ctx)
 
-	txnStateMon := mon.MakeMonitor("test mon",
+	txnStateMon := mon.NewMonitor("test mon",
 		mon.MemoryResource,
 		nil,  /* curCount */
 		nil,  /* maxHist */
@@ -91,7 +92,7 @@ func (tc *testContext) createOpenState(typ txnType) (fsm.State, *txnState) {
 		1000, /* noteworthy */
 		cluster.MakeTestingClusterSettings(),
 	)
-	txnStateMon.Start(tc.ctx, &tc.mon, mon.BoundAccount{})
+	txnStateMon.Start(tc.ctx, tc.mon, mon.BoundAccount{})
 
 	ts := txnState{
 		Ctx:           ctx,
@@ -100,10 +101,10 @@ func (tc *testContext) createOpenState(typ txnType) (fsm.State, *txnState) {
 		cancel:        cancel,
 		sqlTimestamp:  timeutil.Now(),
 		priority:      roachpb.NormalUserPriority,
-		mon:           &txnStateMon,
+		mon:           txnStateMon,
 		txnAbortCount: metric.NewCounter(MetaTxnAbort),
 	}
-	ts.mu.txn = client.NewTxn(ctx, tc.mockDB, roachpb.NodeID(1) /* gatewayNodeID */)
+	ts.mu.txn = kv.NewTxn(ctx, tc.mockDB, roachpb.NodeID(1) /* gatewayNodeID */)
 
 	state := stateOpen{
 		ImplicitTxn: fsm.FromBool(typ == implicitTxn),
@@ -114,14 +115,7 @@ func (tc *testContext) createOpenState(typ txnType) (fsm.State, *txnState) {
 // createAbortedState returns a txnState initialized with an aborted txn.
 func (tc *testContext) createAbortedState() (fsm.State, *txnState) {
 	_, ts := tc.createOpenState(explicitTxn)
-	ts.mu.txn.CleanupOnError(ts.Ctx, errors.Errorf("dummy error"))
 	return stateAborted{}, ts
-}
-
-func (tc *testContext) createRestartWaitState() (fsm.State, *txnState) {
-	_, ts := tc.createOpenState(explicitTxn)
-	s := stateRestartWait{}
-	return s, ts
 }
 
 func (tc *testContext) createCommitWaitState() (fsm.State, *txnState, error) {
@@ -135,7 +129,7 @@ func (tc *testContext) createCommitWaitState() (fsm.State, *txnState, error) {
 }
 
 func (tc *testContext) createNoTxnState() (fsm.State, *txnState) {
-	txnStateMon := mon.MakeMonitor("test mon",
+	txnStateMon := mon.NewMonitor("test mon",
 		mon.MemoryResource,
 		nil,  /* curCount */
 		nil,  /* maxHist */
@@ -143,7 +137,7 @@ func (tc *testContext) createNoTxnState() (fsm.State, *txnState) {
 		1000, /* noteworthy */
 		cluster.MakeTestingClusterSettings(),
 	)
-	ts := txnState{mon: &txnStateMon, connCtx: tc.ctx}
+	ts := txnState{mon: txnStateMon, connCtx: tc.ctx}
 	return stateNoTxn{}, &ts
 }
 
@@ -176,12 +170,12 @@ type expKVTxn struct {
 	userPriority *roachpb.UserPriority
 	// For the timestamps we just check the physical part. The logical part is
 	// incremented every time the clock is read and so it's unpredictable.
-	tsNanos     *int64
-	origTSNanos *int64
-	maxTSNanos  *int64
+	writeTSNanos          *int64
+	readTSNanos           *int64
+	uncertaintyLimitNanos *int64
 }
 
-func checkTxn(txn *client.Txn, exp expKVTxn) error {
+func checkTxn(txn *kv.Txn, exp expKVTxn) error {
 	if txn == nil {
 		return errors.Errorf("expected a KV txn but found an uninitialized txn")
 	}
@@ -194,34 +188,37 @@ func checkTxn(txn *client.Txn, exp expKVTxn) error {
 			*exp.userPriority, txn.UserPriority())
 	}
 	proto := txn.TestingCloneTxn()
-	if exp.tsNanos != nil && *exp.tsNanos != proto.WriteTimestamp.WallTime {
+	if exp.writeTSNanos != nil && *exp.writeTSNanos != proto.WriteTimestamp.WallTime {
 		return errors.Errorf("expected Timestamp: %d, but got: %s",
-			*exp.tsNanos, proto.WriteTimestamp)
+			*exp.writeTSNanos, proto.WriteTimestamp)
 	}
-	if origTimestamp := txn.ReadTimestamp(); exp.origTSNanos != nil &&
-		*exp.origTSNanos != origTimestamp.WallTime {
-		return errors.Errorf("expected DeprecatedOrigTimestamp: %d, but got: %s",
-			*exp.origTSNanos, origTimestamp)
+	if readTimestamp := txn.ReadTimestamp(); exp.readTSNanos != nil &&
+		*exp.readTSNanos != readTimestamp.WallTime {
+		return errors.Errorf("expected ReadTimestamp: %d, but got: %s",
+			*exp.readTSNanos, readTimestamp)
 	}
-	if exp.maxTSNanos != nil && *exp.maxTSNanos != proto.MaxTimestamp.WallTime {
-		return errors.Errorf("expected MaxTimestamp: %d, but got: %s",
-			*exp.maxTSNanos, proto.MaxTimestamp)
+	if exp.uncertaintyLimitNanos != nil && *exp.uncertaintyLimitNanos != proto.GlobalUncertaintyLimit.WallTime {
+		return errors.Errorf("expected GlobalUncertaintyLimit: %d, but got: %s",
+			*exp.uncertaintyLimitNanos, proto.GlobalUncertaintyLimit)
 	}
 	return nil
 }
 
 func TestTransitions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	ctx := context.TODO()
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
 	dummyRewCap := rewindCapability{rewindPos: CmdPos(12)}
-	testCon := makeTestContext()
+	testCon := makeTestContext(stopper)
 	tranCtx := transitionCtx{
 		db:             testCon.mockDB,
-		nodeID:         roachpb.NodeID(5),
+		nodeIDOrZero:   roachpb.NodeID(5),
 		clock:          testCon.clock,
 		tracer:         tracing.NewTracer(),
-		connMon:        &testCon.mon,
+		connMon:        testCon.mon,
 		sessionTracing: &SessionTracing{},
 		settings:       testCon.settings,
 	}
@@ -234,7 +231,7 @@ func TestTransitions(t *testing.T) {
 	txnName := sqlTxnName
 	now := testCon.clock.Now()
 	pri := roachpb.NormalUserPriority
-	maxTS := testCon.clock.Now().Add(testCon.clock.MaxOffset().Nanoseconds(), 0 /* logical */)
+	uncertaintyLimit := testCon.clock.Now().Add(testCon.clock.MaxOffset().Nanoseconds(), 0 /* logical */)
 	type test struct {
 		name string
 
@@ -283,11 +280,11 @@ func TestTransitions(t *testing.T) {
 				expEv:   txnStart,
 			},
 			expTxn: &expKVTxn{
-				debugName:    &txnName,
-				userPriority: &pri,
-				tsNanos:      &now.WallTime,
-				origTSNanos:  &now.WallTime,
-				maxTSNanos:   &maxTS.WallTime,
+				debugName:             &txnName,
+				userPriority:          &pri,
+				writeTSNanos:          &now.WallTime,
+				readTSNanos:           &now.WallTime,
+				uncertaintyLimitNanos: &uncertaintyLimit.WallTime,
 			},
 		},
 		{
@@ -306,11 +303,11 @@ func TestTransitions(t *testing.T) {
 				expEv:   txnStart,
 			},
 			expTxn: &expKVTxn{
-				debugName:    &txnName,
-				userPriority: &pri,
-				tsNanos:      &now.WallTime,
-				origTSNanos:  &now.WallTime,
-				maxTSNanos:   &maxTS.WallTime,
+				debugName:             &txnName,
+				userPriority:          &pri,
+				writeTSNanos:          &now.WallTime,
+				readTSNanos:           &now.WallTime,
+				uncertaintyLimitNanos: &uncertaintyLimit.WallTime,
 			},
 		},
 		//
@@ -328,8 +325,8 @@ func TestTransitions(t *testing.T) {
 				}
 				return s, ts, nil
 			},
-			ev:        eventTxnFinish{},
-			evPayload: eventTxnFinishPayload{commit: true},
+			ev:        eventTxnFinishCommitted{},
+			evPayload: nil,
 			expState:  stateNoTxn{},
 			expAdv: expAdvance{
 				expCode: advanceOne,
@@ -349,8 +346,8 @@ func TestTransitions(t *testing.T) {
 				}
 				return s, ts, nil
 			},
-			ev:        eventTxnFinish{},
-			evPayload: eventTxnFinishPayload{commit: true},
+			ev:        eventTxnFinishCommitted{},
+			evPayload: nil,
 			expState:  stateNoTxn{},
 			expAdv: expAdvance{
 				expCode: advanceOne,
@@ -419,7 +416,7 @@ func TestTransitions(t *testing.T) {
 				}
 				return eventRetriableErr{CanAutoRetry: fsm.False, IsCommit: fsm.False}, b
 			},
-			expState: stateRestartWait{},
+			expState: stateAborted{},
 			expAdv: expAdvance{
 				expCode: skipBatch,
 				expEv:   noEvent,
@@ -554,9 +551,8 @@ func TestTransitions(t *testing.T) {
 				s, ts := testCon.createAbortedState()
 				return s, ts, nil
 			},
-			ev:        eventTxnFinish{},
-			evPayload: eventTxnFinishPayload{commit: false},
-			expState:  stateNoTxn{},
+			ev:       eventTxnFinishAborted{},
+			expState: stateNoTxn{},
 			expAdv: expAdvance{
 				expCode: advanceOne,
 				expEv:   txnRollback,
@@ -564,21 +560,39 @@ func TestTransitions(t *testing.T) {
 			expTxn: nil,
 		},
 		{
-			// The txn is starting again (e.g. ROLLBACK TO SAVEPOINT while in Aborted).
-			name: "Aborted->Starting",
+			// The txn is starting again (ROLLBACK TO SAVEPOINT <not cockroach_restart> while in Aborted).
+			name: "Aborted->Open",
 			init: func() (fsm.State, *txnState, error) {
 				s, ts := testCon.createAbortedState()
 				return s, ts, nil
 			},
-			ev: eventTxnStart{ImplicitTxn: fsm.False},
-			evPayload: makeEventTxnStartPayload(pri, tree.ReadWrite, timeutil.Now(),
-				nil /* historicalTimestamp */, tranCtx),
+			ev:       eventSavepointRollback{},
+			expState: stateOpen{ImplicitTxn: fsm.False},
+			expAdv: expAdvance{
+				expCode: advanceOne,
+				expEv:   noEvent,
+			},
+			expTxn: &expKVTxn{},
+		},
+		{
+			// The txn is starting again (ROLLBACK TO SAVEPOINT cockroach_restart while in Aborted).
+			name: "Aborted->Restart",
+			init: func() (fsm.State, *txnState, error) {
+				s, ts := testCon.createAbortedState()
+				return s, ts, nil
+			},
+			ev:       eventTxnRestart{},
 			expState: stateOpen{ImplicitTxn: fsm.False},
 			expAdv: expAdvance{
 				expCode: advanceOne,
 				expEv:   txnRestart,
 			},
-			expTxn: &expKVTxn{},
+			expTxn: &expKVTxn{
+				userPriority:          &pri,
+				writeTSNanos:          &now.WallTime,
+				readTSNanos:           &now.WallTime,
+				uncertaintyLimitNanos: &uncertaintyLimit.WallTime,
+			},
 		},
 		{
 			// The txn is starting again (e.g. ROLLBACK TO SAVEPOINT while in Aborted).
@@ -589,67 +603,15 @@ func TestTransitions(t *testing.T) {
 				s, ts := testCon.createAbortedState()
 				return s, ts, nil
 			},
-			ev: eventTxnStart{ImplicitTxn: fsm.False},
-			evPayload: makeEventTxnStartPayload(pri, tree.ReadOnly, now.GoTime(),
-				&now, tranCtx),
-			expState: stateOpen{ImplicitTxn: fsm.False},
-			expAdv: expAdvance{
-				expCode: advanceOne,
-				expEv:   txnRestart,
-			},
-			expTxn: &expKVTxn{
-				tsNanos: proto.Int64(now.WallTime),
-			},
-		},
-		//
-		// Tests starting from the RestartWait state.
-		//
-		{
-			// The txn got finished, such as after a ROLLBACK.
-			name: "RestartWait->NoTxn",
-			init: func() (fsm.State, *txnState, error) {
-				s, ts := testCon.createRestartWaitState()
-				err := ts.mu.txn.Rollback(ts.Ctx)
-				return s, ts, err
-			},
-			ev:        eventTxnFinish{},
-			evPayload: eventTxnFinishPayload{commit: false},
-			expState:  stateNoTxn{},
-			expAdv: expAdvance{
-				expCode: advanceOne,
-				expEv:   txnRollback,
-			},
-			expTxn: nil,
-		},
-		{
-			// The txn got restarted, through a ROLLBACK TO SAVEPOINT.
-			name: "RestartWait->Open",
-			init: func() (fsm.State, *txnState, error) {
-				s, ts := testCon.createRestartWaitState()
-				return s, ts, nil
-			},
 			ev:       eventTxnRestart{},
 			expState: stateOpen{ImplicitTxn: fsm.False},
 			expAdv: expAdvance{
 				expCode: advanceOne,
 				expEv:   txnRestart,
 			},
-			expTxn: &expKVTxn{},
-		},
-		{
-			name: "RestartWait->Aborted",
-			init: func() (fsm.State, *txnState, error) {
-				s, ts := testCon.createRestartWaitState()
-				return s, ts, nil
+			expTxn: &expKVTxn{
+				writeTSNanos: proto.Int64(now.WallTime),
 			},
-			ev:        eventNonRetriableErr{IsCommit: fsm.False},
-			evPayload: eventNonRetriableErrPayload{err: fmt.Errorf("test non-retriable err")},
-			expState:  stateAborted{},
-			expAdv: expAdvance{
-				expCode: skipBatch,
-				expEv:   noEvent,
-			},
-			expTxn: &expKVTxn{},
 		},
 		//
 		// Tests starting from the CommitWait state.
@@ -659,12 +621,11 @@ func TestTransitions(t *testing.T) {
 			init: func() (fsm.State, *txnState, error) {
 				return testCon.createCommitWaitState()
 			},
-			ev:        eventTxnFinish{},
-			evPayload: eventTxnFinishPayload{commit: true},
-			expState:  stateNoTxn{},
+			ev:       eventTxnFinishCommitted{},
+			expState: stateNoTxn{},
 			expAdv: expAdvance{
 				expCode: advanceOne,
-				expEv:   txnCommit,
+				expEv:   noEvent,
 			},
 			expTxn: nil,
 		},

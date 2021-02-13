@@ -23,6 +23,7 @@ package leaktest
 import (
 	"fmt"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -30,6 +31,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/petermattis/goid"
 )
 
@@ -53,8 +55,8 @@ func interestingGoroutines() map[int64]string {
 			// Ignore HTTP keep alives
 			strings.Contains(stack, ").readLoop(") ||
 			strings.Contains(stack, ").writeLoop(") ||
-			// Ignore the raven client, which is created lazily on first use.
-			strings.Contains(stack, "raven-go.(*Client).Capture") ||
+			// Ignore the Sentry client, which is created lazily on first use.
+			strings.Contains(stack, "sentry-go.(*HTTPTransport).worker") ||
 			// Seems to be gccgo specific.
 			(runtime.Compiler == "gccgo" && strings.Contains(stack, "testing.T.Parallel")) ||
 			// Below are the stacks ignored by the upstream leaktest code.
@@ -84,18 +86,33 @@ func interestingGoroutines() map[int64]string {
 // mis-attributed as leaked by the currently-running test.
 var leakDetectorDisabled uint32
 
+// PrintLeakedStoppers is injected from `pkg/util/stop` to avoid a dependency
+// cycle.
+var PrintLeakedStoppers = func(t testing.TB) {}
+
 // AfterTest snapshots the currently-running goroutines and returns a
 // function to be run at the end of tests to see whether any
 // goroutines leaked.
 func AfterTest(t testing.TB) func() {
-	if atomic.LoadUint32(&leakDetectorDisabled) != 0 {
-		return func() {}
-	}
+	// Try a best effort GC to help the race tests move along.
+	runtime.GC()
 	orig := interestingGoroutines()
 	return func() {
+		t.Helper()
 		// If there was a panic, "leaked" goroutines are expected.
 		if r := recover(); r != nil {
-			panic(r)
+			atomic.StoreUint32(&leakDetectorDisabled, 1)
+			// NB: we don't want to re-panic here, for the Go test
+			// harness will not recover that for us. Instead, it will
+			// stop running the tests, but we are deciding here to fail
+			// only that one test but keep going otherwise.
+			// We need to explicitly print the stack trace though.
+			t.Fatalf("%v\n%s", r, debug.Stack())
+			return
+		}
+
+		if atomic.LoadUint32(&leakDetectorDisabled) != 0 {
+			return
 		}
 
 		// If the test already failed, we don't pile on any more errors but we check
@@ -106,6 +123,8 @@ func AfterTest(t testing.TB) func() {
 			}
 			return
 		}
+
+		PrintLeakedStoppers(t)
 
 		// Loop, waiting for goroutines to shut down.
 		// Wait up to 5 seconds, but finish as quickly as possible.
@@ -142,5 +161,5 @@ func diffGoroutines(base map[int64]string) error {
 	for _, g := range leaked {
 		b.WriteString(fmt.Sprintf("Leaked goroutine: %v\n\n", g))
 	}
-	return fmt.Errorf(b.String())
+	return errors.Newf("%s", b.String())
 }

@@ -15,11 +15,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/errors"
 )
 
 // CreateTestTableDescriptor converts a SQL string to a table for test purposes.
@@ -27,33 +29,57 @@ import (
 // other tables.
 func CreateTestTableDescriptor(
 	ctx context.Context,
-	parentID, id sqlbase.ID,
+	parentID, id descpb.ID,
 	schema string,
-	privileges *sqlbase.PrivilegeDescriptor,
-) (sqlbase.TableDescriptor, error) {
+	privileges *descpb.PrivilegeDescriptor,
+) (*tabledesc.Mutable, error) {
 	st := cluster.MakeTestingClusterSettings()
 	stmt, err := parser.ParseOne(schema)
 	if err != nil {
-		return sqlbase.TableDescriptor{}, err
+		return nil, err
 	}
 	semaCtx := tree.MakeSemaContext()
 	evalCtx := tree.MakeTestingEvalContext(st)
-	desc, err := MakeTableDesc(
-		ctx,
-		nil, /* txn */
-		nil, /* vt */
-		st,
-		stmt.AST.(*tree.CreateTable),
-		parentID, keys.PublicSchemaID, id,
-		hlc.Timestamp{}, /* creationTime */
-		privileges,
-		nil, /* affected */
-		&semaCtx,
-		&evalCtx,
-		&sessiondata.SessionData{}, /* sessionData */
-		false,                      /* temporary */
-	)
-	return desc.TableDescriptor, err
+	switch n := stmt.AST.(type) {
+	case *tree.CreateTable:
+		desc, err := NewTableDesc(
+			ctx,
+			nil, /* txn */
+			nil, /* vs */
+			st,
+			n,
+			parentID,
+			keys.PublicSchemaID,
+			id,
+			descpb.InvalidID,
+			hlc.Timestamp{}, /* creationTime */
+			privileges,
+			nil, /* affected */
+			&semaCtx,
+			&evalCtx,
+			&sessiondata.SessionData{
+				LocalOnlySessionData: sessiondata.LocalOnlySessionData{
+					EnableUniqueWithoutIndexConstraints: true,
+				},
+			}, /* sessionData */
+			tree.PersistencePermanent,
+		)
+		return desc, err
+	case *tree.CreateSequence:
+		desc, err := NewSequenceTableDesc(
+			ctx,
+			n.Name.Table(),
+			n.Options,
+			parentID, keys.PublicSchemaID, id,
+			hlc.Timestamp{}, /* creationTime */
+			privileges,
+			tree.PersistencePermanent,
+			nil, /* params */
+		)
+		return desc, err
+	default:
+		return nil, errors.Errorf("unexpected AST %T", stmt.AST)
+	}
 }
 
 // StmtBufReader is an exported interface for reading a StmtBuf.
@@ -95,7 +121,7 @@ func (dsp *DistSQLPlanner) Exec(
 		return err
 	}
 	p := localPlanner.(*planner)
-	p.stmt = &Statement{Statement: stmt}
+	p.stmt = makeStatement(stmt, ClusterWideID{} /* queryID */)
 	if err := p.makeOptimizerPlan(ctx); err != nil {
 		return err
 	}
@@ -108,21 +134,17 @@ func (dsp *DistSQLPlanner) Exec(
 		rw,
 		stmt.AST.StatementType(),
 		execCfg.RangeDescriptorCache,
-		execCfg.LeaseHolderCache,
 		p.txn,
-		func(ts hlc.Timestamp) {
-			_ = execCfg.Clock.Update(ts)
-		},
+		execCfg.Clock,
 		p.ExtendedEvalContext().Tracing,
+		execCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 
 	evalCtx := p.ExtendedEvalContext()
-	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p.txn)
-	planCtx.isLocal = !distribute
-	planCtx.planner = p
+	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p, p.txn, distribute)
 	planCtx.stmtType = recv.stmtType
 
-	dsp.PlanAndRun(ctx, evalCtx, planCtx, p.txn, p.curPlan.plan, recv)()
+	dsp.PlanAndRun(ctx, evalCtx, planCtx, p.txn, p.curPlan.main, recv)()
 	return rw.Err()
 }

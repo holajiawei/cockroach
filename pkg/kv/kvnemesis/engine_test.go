@@ -15,17 +15,20 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEngine(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	k := func(s string, ts hlc.Timestamp) engine.MVCCKey {
-		return engine.MVCCKey{Key: []byte(s), Timestamp: ts}
+	k := func(s string, ts hlc.Timestamp) storage.MVCCKey {
+		return storage.MVCCKey{Key: []byte(s), Timestamp: ts}
 	}
 	var missing roachpb.Value
 	v := func(s string, ts hlc.Timestamp) roachpb.Value {
@@ -37,7 +40,9 @@ func TestEngine(t *testing.T) {
 		return hlc.Timestamp{WallTime: int64(i)}
 	}
 
-	e := MakeEngine()
+	e, err := MakeEngine()
+	require.NoError(t, err)
+	defer e.Close()
 	assert.Equal(t, missing, e.Get(roachpb.Key(`a`), ts(1)))
 	e.Put(k(`a`, ts(1)), roachpb.MakeValueFromString(`a-1`).RawBytes)
 	e.Put(k(`a`, ts(2)), roachpb.MakeValueFromString(`a-2`).RawBytes)

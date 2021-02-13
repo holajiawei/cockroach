@@ -14,54 +14,67 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/cockroachdb/errors/oserror"
+	"github.com/cockroachdb/logtags"
 )
 
 const defaultLeniencySetting = 60 * time.Second
 
 var (
-	nodeLivenessLogLimiter = log.Every(5 * time.Second)
-	// LeniencySetting is the amount of time to defer any attempts to
-	// reschedule a job.  Visible for testing.
-	LeniencySetting = settings.RegisterDurationSetting(
-		"jobs.registry.leniency",
-		"the amount of time to defer any attempts to reschedule a job",
-		defaultLeniencySetting)
 	gcSetting = settings.RegisterDurationSetting(
 		"jobs.retention_time",
 		"the amount of time to retain records for completed jobs before",
-		time.Hour*24*14)
+		time.Hour*24*14,
+	).WithPublic()
 )
 
-// NodeLiveness is the subset of storage.NodeLiveness's interface needed
-// by Registry.
-type NodeLiveness interface {
-	Self() (storagepb.Liveness, error)
-	GetLivenesses() []storagepb.Liveness
+// adoptedJobs represents a the epoch and cancelation of a job id being run
+// by the registry.
+type adoptedJob struct {
+	sid sqlliveness.SessionID
+	// Calling the func will cancel the context the job was resumed with.
+	cancel context.CancelFunc
 }
+
+// adoptionNotice is used by Run to notify the registry to resumeClaimedJobs
+// and by TestingNudgeAdoptionQueue to claimAndResumeClaimedJobs.
+type adoptionNotice bool
+
+const (
+	resumeClaimedJobs         adoptionNotice = false
+	claimAndResumeClaimedJobs adoptionNotice = true
+)
 
 // Registry creates Jobs and manages their leases and cancelation.
 //
@@ -89,16 +102,43 @@ type NodeLiveness interface {
 // node simply behaves as though its leniency period is 0. Epoch-based
 // nodes will see time-based nodes delay the act of stealing a job.
 type Registry struct {
-	ac         log.AmbientContext
-	stopper    *stop.Stopper
-	db         *client.DB
-	ex         sqlutil.InternalExecutor
-	clock      *hlc.Clock
-	nodeID     *base.NodeIDContainer
-	settings   *cluster.Settings
-	planFn     planHookMaker
-	metrics    Metrics
-	adoptionCh chan struct{}
+	ac       log.AmbientContext
+	stopper  *stop.Stopper
+	nl       optionalnodeliveness.Container
+	db       *kv.DB
+	ex       sqlutil.InternalExecutor
+	clock    *hlc.Clock
+	nodeID   *base.SQLIDContainer
+	settings *cluster.Settings
+	execCtx  jobExecCtxMaker
+	metrics  Metrics
+	knobs    TestingKnobs
+
+	// adoptionChan is used to nudge the registry to resume claimed jobs and
+	// potentially attempt to claim jobs.
+	adoptionCh  chan adoptionNotice
+	sqlInstance sqlliveness.Instance
+
+	// sessionBoundInternalExecutorFactory provides a way for jobs to create
+	// internal executors. This is rarely needed, and usually job resumers should
+	// use the internal executor from the JobExecCtx. The intended user of this
+	// interface is the schema change job resumer, which needs to set the
+	// tableCollectionModifier on the internal executor to different values in
+	// multiple concurrent queries. This situation is an exception to the internal
+	// executor generally being a stateless wrapper, and makes it impossible to
+	// reuse the same internal executor across all the queries (without
+	// refactoring to get rid of the tableCollectionModifier field, which we
+	// should do eventually).
+	//
+	// Note that, while this API is not ideal, internal executors are basically
+	// lightweight wrappers requiring no additional teardown. There's not much
+	// cost incurred in creating these.
+	//
+	// TODO (lucy): We should refactor and get rid of the tableCollectionModifier
+	// field. Modifying the TableCollection is basically a per-query operation
+	// and should be a per-query setting. #34304 is the issue for creating/
+	// improving this API.
+	sessionBoundInternalExecutorFactory sqlutil.SessionBoundInternalExecutorFactory
 
 	// if non-empty, indicates path to file that prevents any job adoptions.
 	preventAdoptionFile string
@@ -108,7 +148,7 @@ type Registry struct {
 		// epoch is present to support older nodes that are not using
 		// the timestamp-based approach to determine when to steal jobs.
 		// TODO: Remove this and deprecate Lease.Epoch proto field
-		epoch int64
+		deprecatedEpoch int64
 		// jobs holds a map from job id to its context cancel func. This should
 		// be populated with jobs that are currently being run (and owned) by
 		// this registry. Calling the func will cancel the context the job was
@@ -117,61 +157,91 @@ type Registry struct {
 		// are normally canceled on any node by the CANCEL JOB statement, which is
 		// propagated to jobs via the .Progressed call. This function should not be
 		// used to cancel a job in that way.
-		jobs map[int64]context.CancelFunc
+		// TODO(spaskob): add deprecated notice.
+		deprecatedJobs map[int64]context.CancelFunc
+
+		// adoptedJobs holds a map from job id to its context cancel func and epoch.
+		// It contains the that are adopted and rpobably being run. One exception is
+		// jobs scheduled inside a transaction, they will show in this map but will
+		// only be run when the transaction commits.
+		adoptedJobs map[int64]*adoptedJob
 	}
 
 	TestingResumerCreationKnobs map[jobspb.Type]func(Resumer) Resumer
 }
 
-// planHookMaker is a wrapper around sql.NewInternalPlanner. It returns an
+// jobExecCtxMaker is a wrapper around sql.NewInternalPlanner. It returns an
 // *sql.planner as an interface{} due to package dependency cycles. It should
 // be cast to that type in the sql package when it is used. Returns a cleanup
 // function that must be called once the caller is done with the planner.
 //
 // TODO(mjibson): Can we do something to avoid passing an interface{} here
 // that must be type casted in a Resumer? It cannot be done here because
-// PlanHookState lives in the sql package, which would create a dependency
-// cycle if listed here. Furthermore, moving PlanHookState into a common
+// JobExecContext lives in the sql package, which would create a dependency
+// cycle if listed here. Furthermore, moving JobExecContext into a common
 // subpackage like sqlbase is difficult because of the amount of sql-only
-// stuff that PlanHookState exports. One other choice is to merge this package
+// stuff that JobExecContext exports. One other choice is to merge this package
 // back into the sql package. There's maybe a better way that I'm unaware of.
-type planHookMaker func(opName, user string) (interface{}, func())
+type jobExecCtxMaker func(opName string, user security.SQLUsername) (interface{}, func())
 
 // PreventAdoptionFile is the name of the file which, if present in the first
 // on-disk store, will prevent the adoption of background jobs by that node.
 const PreventAdoptionFile = "DISABLE_STARTING_BACKGROUND_JOBS"
 
 // MakeRegistry creates a new Registry. planFn is a wrapper around
-// sql.newInternalPlanner. It returns a sql.PlanHookState, but must be
+// sql.newInternalPlanner. It returns a sql.JobExecCtx, but must be
 // coerced into that in the Resumer functions.
 func MakeRegistry(
 	ac log.AmbientContext,
 	stopper *stop.Stopper,
 	clock *hlc.Clock,
-	db *client.DB,
+	nl optionalnodeliveness.Container,
+	db *kv.DB,
 	ex sqlutil.InternalExecutor,
-	nodeID *base.NodeIDContainer,
+	nodeID *base.SQLIDContainer,
+	sqlInstance sqlliveness.Instance,
 	settings *cluster.Settings,
 	histogramWindowInterval time.Duration,
-	planFn planHookMaker,
+	execCtxFn jobExecCtxMaker,
 	preventAdoptionFile string,
+	knobs *TestingKnobs,
 ) *Registry {
 	r := &Registry{
 		ac:                  ac,
 		stopper:             stopper,
 		clock:               clock,
+		nl:                  nl,
 		db:                  db,
 		ex:                  ex,
 		nodeID:              nodeID,
+		sqlInstance:         sqlInstance,
 		settings:            settings,
-		planFn:              planFn,
+		execCtx:             execCtxFn,
 		preventAdoptionFile: preventAdoptionFile,
-		adoptionCh:          make(chan struct{}),
+		adoptionCh:          make(chan adoptionNotice),
 	}
-	r.mu.epoch = 1
-	r.mu.jobs = make(map[int64]context.CancelFunc)
-	r.metrics.InitHooks(histogramWindowInterval)
+	if knobs != nil {
+		r.knobs = *knobs
+	}
+	r.mu.deprecatedEpoch = 1
+	r.mu.deprecatedJobs = make(map[int64]context.CancelFunc)
+	r.mu.adoptedJobs = make(map[int64]*adoptedJob)
+	r.metrics.init(histogramWindowInterval)
 	return r
+}
+
+func (r *Registry) startUsingSQLLivenessAdoption(ctx context.Context) bool {
+	return sqlliveness.IsActive(ctx, r.settings)
+}
+
+// SetSessionBoundInternalExecutorFactory sets the
+// SessionBoundInternalExecutorFactory that will be used by the job registry
+// executor. We expose this separately from the constructor to avoid a circular
+// dependency.
+func (r *Registry) SetSessionBoundInternalExecutorFactory(
+	factory sqlutil.SessionBoundInternalExecutorFactory,
+) {
+	r.sessionBoundInternalExecutorFactory = factory
 }
 
 // MetricsStruct returns the metrics for production monitoring of each job type.
@@ -185,28 +255,24 @@ func (r *Registry) MetricsStruct() *Metrics {
 func (r *Registry) CurrentlyRunningJobs() []int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	jobs := make([]int64, len(r.mu.jobs))
+	jobs := make([]int64, len(r.mu.deprecatedJobs)+len(r.mu.adoptedJobs))
 	i := 0
-	for jID := range r.mu.jobs {
+	// The following are maps keyed by job id.
+	for jID := range r.mu.deprecatedJobs {
+		jobs[i] = jID
+		i++
+	}
+	for jID := range r.mu.adoptedJobs {
 		jobs[i] = jID
 		i++
 	}
 	return jobs
 }
 
-// lenientNow returns the timestamp after which we should attempt
-// to steal a job from a node whose liveness is failing.  This allows
-// jobs coordinated by a node which is temporarily saturated to continue.
-func (r *Registry) lenientNow() time.Time {
-	// We see this in tests.
-	var offset time.Duration
-	if r.settings == cluster.NoSettings {
-		offset = defaultLeniencySetting
-	} else {
-		offset = LeniencySetting.Get(&r.settings.SV)
-	}
-
-	return r.clock.Now().GoTime().Add(-offset)
+// ID returns a unique during the lifetume of the registry id that is
+// used for keying sqlliveness claims held by the registry.
+func (r *Registry) ID() base.SQLInstanceID {
+	return r.nodeID.SQLInstanceID()
 }
 
 // makeCtx returns a new context from r's ambient context and an associated
@@ -216,7 +282,7 @@ func (r *Registry) makeCtx() (context.Context, func()) {
 }
 
 func (r *Registry) makeJobID() int64 {
-	return int64(builtins.GenerateUniqueInt(r.nodeID.Get()))
+	return int64(builtins.GenerateUniqueInt(r.nodeID.SQLInstanceID()))
 }
 
 // CreateAndStartJob creates and asynchronously starts a job from record. An
@@ -225,19 +291,19 @@ func (r *Registry) makeJobID() int64 {
 // job will be started with (canceling ctx will not cause the job to cancel).
 func (r *Registry) CreateAndStartJob(
 	ctx context.Context, resultsCh chan<- tree.Datums, record Record,
-) (*Job, <-chan error, error) {
+) (*StartableJob, error) {
 	var rj *StartableJob
-	if err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) (err error) {
-		rj, err = r.CreateStartableJobWithTxn(ctx, record, txn, resultsCh)
+	if err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+		rj, err = r.CreateStartableJobWithTxn(ctx, record, txn)
 		return err
 	}); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	errCh, err := rj.Start(ctx)
+	err := rj.Start(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return rj.Job, errCh, nil
+	return rj, nil
 }
 
 // Run starts previously unstarted jobs from a list of scheduled
@@ -248,33 +314,77 @@ func (r *Registry) Run(ctx context.Context, ex sqlutil.InternalExecutor, jobs []
 	}
 	log.Infof(ctx, "scheduled jobs %+v", jobs)
 	buf := bytes.Buffer{}
+	usingSQLLiveness := r.startUsingSQLLivenessAdoption(ctx)
 	for i, id := range jobs {
-		select {
-		case r.adoptionCh <- struct{}{}:
-		case <-ctx.Done():
-			return ctx.Err()
+		// In the pre-20.2 and mixed-version state, the adoption loop needs to be
+		// notified once per job (in the worst case) in order to ensure that all
+		// newly created jobs get adopted in a timely manner. In the sqlliveness
+		// world of 20.2 and later, we only need to notify the loop once as the
+		// newly created jobs are already claimed. The adoption loop will merely
+		// start all previously claimed jobs.
+		if !usingSQLLiveness || i == 0 {
+			select {
+			case r.adoptionCh <- resumeClaimedJobs:
+			case <-r.stopper.ShouldQuiesce():
+				return stop.ErrUnavailable
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
-
 		if i > 0 {
 			buf.WriteString(",")
 		}
-		buf.WriteString(fmt.Sprintf(" (%d)", id))
+		buf.WriteString(fmt.Sprintf(" %d", id))
 	}
-	if _, err := ex.Exec(
-		ctx,
-		"wait-for-jobs",
-		nil, /* txn */
-		fmt.Sprintf("SHOW JOBS WHEN COMPLETE VALUES %s", buf.String()),
-	); err != nil {
-		return errors.New("could not finish waiting for queued jobs to complete")
+	// Manually retry instead of using SHOW JOBS WHEN COMPLETE so we have greater
+	// control over retries. Also, avoiding SHOW JOBS prevents us from having to
+	// populate the crdb_internal.jobs vtable.
+	query := fmt.Sprintf(
+		`SELECT count(*) FROM system.jobs WHERE id IN (%s)
+       AND (status != 'succeeded' AND status != 'failed' AND status != 'canceled')`,
+		buf.String())
+	for r := retry.StartWithCtx(ctx, retry.Options{
+		InitialBackoff: 5 * time.Millisecond,
+		MaxBackoff:     1 * time.Second,
+		Multiplier:     1.5,
+	}); r.Next(); {
+		// We poll the number of queued jobs that aren't finished. As with SHOW JOBS
+		// WHEN COMPLETE, if one of the jobs is missing from the jobs table for
+		// whatever reason, we'll fail later when we try to load the job.
+		row, err := ex.QueryRowEx(
+			ctx,
+			"poll-show-jobs",
+			nil, /* txn */
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			query,
+		)
+		if err != nil {
+			return errors.Wrap(err, "polling for queued jobs to complete")
+		}
+		if row == nil {
+			return errors.New("polling for queued jobs failed")
+		}
+		count := int64(tree.MustBeDInt(row[0]))
+		if log.V(3) {
+			log.Infof(ctx, "waiting for %d queued jobs to complete", count)
+		}
+		if count == 0 {
+			break
+		}
 	}
 	for i, id := range jobs {
 		j, err := r.LoadJob(ctx, id)
 		if err != nil {
-			return errors.Wrapf(err, "Job %d could not be loaded. The job may not have succeeded", jobs[i])
+			return errors.WithHint(
+				errors.Wrapf(err, "job %d could not be loaded", jobs[i]),
+				"The job may not have succeeded.")
+		}
+		if j.Payload().FinalResumeError != nil {
+			decodedErr := errors.DecodeError(ctx, *j.Payload().FinalResumeError)
+			return decodedErr
 		}
 		if j.Payload().Error != "" {
-			return errors.New(fmt.Sprintf("Job %d failed with error %s", jobs[i], j.Payload().Error))
+			return errors.Newf("job %d failed with error: %s", jobs[i], j.Payload().Error)
 		}
 	}
 	return nil
@@ -283,12 +393,13 @@ func (r *Registry) Run(ctx context.Context, ex sqlutil.InternalExecutor, jobs []
 // NewJob creates a new Job.
 func (r *Registry) NewJob(record Record) *Job {
 	job := &Job{
-		registry: r,
+		registry:  r,
+		createdBy: record.CreatedBy,
 	}
 	job.mu.payload = jobspb.Payload{
 		Description:   record.Description,
 		Statement:     record.Statement,
-		Username:      record.Username,
+		UsernameProto: record.Username.EncodeProto(),
 		DescriptorIDs: record.DescriptorIDs,
 		Details:       jobspb.WrapPayloadDetails(record.Details),
 		Noncancelable: record.NonCancelable,
@@ -300,14 +411,75 @@ func (r *Registry) NewJob(record Record) *Job {
 	return job
 }
 
-// CreateJobWithTxn creates a job to be started later with StartJob.
-// It stores the job in the jobs table, marks it pending and gives the
-// current node a lease.
-func (r *Registry) CreateJobWithTxn(
-	ctx context.Context, record Record, txn *client.Txn,
+// CreateJobWithTxn creates a job to be started later with StartJob. It stores
+// the job in the jobs table, marks it pending and gives the current node a
+// lease.
+func (r *Registry) CreateJobWithTxn(ctx context.Context, record Record, txn *kv.Txn) (*Job, error) {
+	j := r.NewJob(record)
+
+	s, err := r.sqlInstance.Session(ctx)
+	if errors.Is(err, sqlliveness.NotStartedError) {
+		if r.startUsingSQLLivenessAdoption(ctx) {
+			err = errors.WithAssertionFailure(err)
+		} else {
+			err = nil
+		}
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "error getting live session")
+	}
+	if !r.startUsingSQLLivenessAdoption(ctx) {
+		// TODO(spaskob): remove in 20.2 as this code path is only needed while
+		// migrating to 20.2 cluster.
+		if err := j.WithTxn(txn).deprecatedInsert(
+			ctx, r.makeJobID(), r.deprecatedNewLease(), s,
+		); err != nil {
+			return nil, err
+		}
+		return j, nil
+	}
+	j.sessionID = s.ID()
+	jobID := r.makeJobID()
+	start := timeutil.Now()
+	if txn != nil {
+		start = txn.ReadTimestamp().GoTime()
+	}
+	j.mu.progress.ModifiedMicros = timeutil.ToUnixMicros(start)
+	payloadBytes, err := protoutil.Marshal(&j.mu.payload)
+	if err != nil {
+		return nil, err
+	}
+	progressBytes, err := protoutil.Marshal(&j.mu.progress)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = j.registry.ex.Exec(ctx, "job-row-insert", txn, `
+INSERT INTO system.jobs (id, status, payload, progress, claim_session_id, claim_instance_id)
+VALUES ($1, $2, $3, $4, $5, $6)`, jobID, StatusRunning, payloadBytes, progressBytes, s.ID().UnsafeBytes(), r.ID(),
+	); err != nil {
+		return nil, err
+	}
+
+	j.id = &jobID
+	return j, nil
+}
+
+const invalidNodeID = 0
+
+// CreateAdoptableJobWithTxn creates a job which will be adopted for execution
+// at a later time by some node in the cluster.
+func (r *Registry) CreateAdoptableJobWithTxn(
+	ctx context.Context, record Record, txn *kv.Txn,
 ) (*Job, error) {
 	j := r.NewJob(record)
-	if err := j.WithTxn(txn).insert(ctx, r.makeJobID(), r.newLease()); err != nil {
+
+	// We create a job record with an invalid lease to force the registry (on some node
+	// in the cluster) to adopt this job at a later time.
+	lease := &jobspb.Lease{NodeID: invalidNodeID}
+
+	if err := j.WithTxn(txn).deprecatedInsert(
+		ctx, r.makeJobID(), lease, nil,
+	); err != nil {
 		return nil, err
 	}
 	return j, nil
@@ -327,7 +499,7 @@ func (r *Registry) CreateJobWithTxn(
 // back then the caller must call CleanupOnRollback to unregister the job from
 // the Registry.
 func (r *Registry) CreateStartableJobWithTxn(
-	ctx context.Context, record Record, txn *client.Txn, resultsCh chan<- tree.Datums,
+	ctx context.Context, record Record, txn *kv.Txn,
 ) (*StartableJob, error) {
 	j, err := r.CreateJobWithTxn(ctx, record, txn)
 	if err != nil {
@@ -342,17 +514,39 @@ func (r *Registry) CreateStartableJobWithTxn(
 	if err != nil {
 		return nil, err
 	}
+	// Construct a context which contains a tracing span that follows from the
+	// span in the parent context. We don't directly use the parent span because
+	// we want independent lifetimes and cancellation. For the same reason, we
+	// don't use the Context returned by ForkSpan.
 	resumerCtx, cancel := r.makeCtx()
-	if err := r.register(*j.ID(), cancel); err != nil {
-		return nil, err
+	_, span := tracing.ForkSpan(ctx, "job")
+	if span != nil {
+		resumerCtx = tracing.ContextWithSpan(resumerCtx, span)
 	}
+
+	if r.startUsingSQLLivenessAdoption(ctx) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if _, alreadyRegistered := r.mu.adoptedJobs[*j.ID()]; alreadyRegistered {
+			log.Fatalf(ctx, "job %d: was just created but found in registered adopted jobs", *j.ID())
+		}
+		r.mu.adoptedJobs[*j.ID()] = &adoptedJob{sid: j.sessionID, cancel: cancel}
+	} else {
+		// TODO(spaskob): remove in 20.2 as this code path is only needed while
+		// migrating to 20.2 cluster.
+		if err := r.deprecatedRegister(*j.ID(), cancel); err != nil {
+			return nil, err
+		}
+	}
+
 	return &StartableJob{
 		Job:        j,
 		txn:        txn,
 		resumer:    resumer,
 		resumerCtx: resumerCtx,
 		cancel:     cancel,
-		resultsCh:  resultsCh,
+		span:       span,
+		execDone:   make(chan struct{}),
 	}, nil
 }
 
@@ -365,7 +559,7 @@ func (r *Registry) LoadJob(ctx context.Context, jobID int64) (*Job, error) {
 // LoadJobWithTxn does the same as above, but using the transaction passed in
 // the txn argument. Passing a nil transaction is equivalent to calling LoadJob
 // in that a transaction will be automatically created.
-func (r *Registry) LoadJobWithTxn(ctx context.Context, jobID int64, txn *client.Txn) (*Job, error) {
+func (r *Registry) LoadJobWithTxn(ctx context.Context, jobID int64, txn *kv.Txn) (*Job, error) {
 	j := &Job{
 		id:       &jobID,
 		registry: r,
@@ -376,9 +570,22 @@ func (r *Registry) LoadJobWithTxn(ctx context.Context, jobID int64, txn *client.
 	return j, nil
 }
 
+// UpdateJobWithTxn calls the Update method on an existing job with jobID, using
+// a transaction passed in the txn argument. Passing a nil transaction means
+// that a txn will be automatically created.
+func (r *Registry) UpdateJobWithTxn(
+	ctx context.Context, jobID int64, txn *kv.Txn, updateFunc UpdateFn,
+) error {
+	j := &Job{
+		id:       &jobID,
+		registry: r,
+	}
+	return j.WithTxn(txn).Update(ctx, updateFunc)
+}
+
 // DefaultCancelInterval is a reasonable interval at which to poll this node
 // for liveness failures and cancel running jobs.
-var DefaultCancelInterval = base.DefaultTxnHeartbeatInterval
+var DefaultCancelInterval = 10 * time.Second
 
 // DefaultAdoptInterval is a reasonable interval at which to poll system.jobs
 // for jobs with expired leases.
@@ -387,101 +594,254 @@ var DefaultCancelInterval = base.DefaultTxnHeartbeatInterval
 // Registry.Start has been called will not have any effect.
 var DefaultAdoptInterval = 30 * time.Second
 
-// gcInterval is how often we check for and delete job records older than the
-// retention limit.
-const gcInterval = 1 * time.Hour
+// TestingSetAdoptAndCancelIntervals can be used to accelerate job adoption and
+// state changes.
+func TestingSetAdoptAndCancelIntervals(adopt, cancel time.Duration) (cleanup func()) {
+	prevAdopt := DefaultAdoptInterval
+	prevCancel := DefaultCancelInterval
+	DefaultAdoptInterval = adopt
+	DefaultCancelInterval = cancel
+	return func() {
+		DefaultAdoptInterval = prevAdopt
+		DefaultCancelInterval = prevCancel
+	}
+}
+
+var maxAdoptionsPerLoop = envutil.EnvOrDefaultInt(`COCKROACH_JOB_ADOPTIONS_PER_PERIOD`, 10)
+
+// maxGCInterval is the maximum duration for how often we check for and delete job
+// records older than the retention limit.
+const maxGCInterval = 1 * time.Hour
 
 // Start polls the current node for liveness failures and cancels all registered
 // jobs if it observes a failure. Otherwise it starts all the main daemons of
 // registry that poll the jobs table and start/cancel/gc jobs.
 func (r *Registry) Start(
-	ctx context.Context,
-	stopper *stop.Stopper,
-	nl NodeLiveness,
-	cancelInterval, adoptInterval time.Duration,
+	ctx context.Context, stopper *stop.Stopper, cancelInterval, adoptInterval time.Duration,
 ) error {
-	// Calling maybeCancelJobs once at the start ensures we have an up-to-date
-	// liveness epoch before we wait out the first cancelInterval.
-	r.maybeCancelJobs(ctx, nl)
 
-	stopper.RunWorker(context.Background(), func(ctx context.Context) {
-		for {
-			select {
-			case <-stopper.ShouldStop():
+	every := log.Every(time.Second)
+	withSession := func(
+		f func(ctx context.Context, s sqlliveness.Session),
+	) func(ctx context.Context) {
+		return func(ctx context.Context) {
+			if !r.startUsingSQLLivenessAdoption(ctx) {
 				return
-			case <-time.After(cancelInterval):
-				r.maybeCancelJobs(ctx, nl)
 			}
-		}
-	})
-
-	stopper.RunWorker(context.Background(), func(ctx context.Context) {
-		for {
-			select {
-			case <-stopper.ShouldStop():
-				return
-			case <-time.After(gcInterval):
-				old := timeutil.Now().Add(-1 * gcSetting.Get(&r.settings.SV))
-				if err := r.cleanupOldJobs(ctx, old); err != nil {
-					log.Warningf(ctx, "error cleaning up old job records: %v", err)
+			s, err := r.sqlInstance.Session(ctx)
+			if err != nil {
+				if log.ExpensiveLogEnabled(ctx, 2) || (ctx.Err() == nil && every.ShouldLog()) {
+					log.Errorf(ctx, "error getting live session: %s", err)
 				}
+				return
 			}
+
+			log.VEventf(ctx, 1, "registry live claim (instance_id: %s, sid: %s)", r.ID(), s.ID())
+			f(ctx, s)
+		}
+	}
+
+	removeClaimsFromDeadSessions := func(ctx context.Context, s sqlliveness.Session) {
+		if _, err := r.ex.QueryRowEx(
+			ctx, "expire-sessions", nil,
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()}, `
+UPDATE system.jobs
+   SET claim_session_id = NULL
+ WHERE claim_session_id <> $1
+   AND status IN `+claimableStatusTupleString+`
+   AND NOT crdb_internal.sql_liveness_is_alive(claim_session_id)`,
+			s.ID().UnsafeBytes(),
+		); err != nil {
+			log.Errorf(ctx, "error expiring job sessions: %s", err)
+		}
+	}
+	servePauseAndCancelRequests := func(ctx context.Context, s sqlliveness.Session) {
+		if err := r.servePauseAndCancelRequests(ctx, s); err != nil {
+			log.Errorf(ctx, "failed to serve pause and cancel requests: %v", err)
+		}
+	}
+	cancelLoopTask := withSession(func(ctx context.Context, s sqlliveness.Session) {
+		removeClaimsFromDeadSessions(ctx, s)
+		r.maybeCancelJobs(ctx, s)
+		servePauseAndCancelRequests(ctx, s)
+	})
+	claimJobs := withSession(func(ctx context.Context, s sqlliveness.Session) {
+		if err := r.claimJobs(ctx, s); err != nil {
+			log.Errorf(ctx, "error claiming jobs: %s", err)
 		}
 	})
-
-	maybeAdoptJobs := func(ctx context.Context) {
+	processClaimedJobs := withSession(func(ctx context.Context, s sqlliveness.Session) {
 		if r.adoptionDisabled(ctx) {
-			r.cancelAll(ctx)
+			log.Warningf(ctx, "canceling all adopted jobs due to liveness failure")
+			r.cancelAllAdoptedJobs()
 			return
 		}
-		if err := r.maybeAdoptJob(ctx, nl); err != nil {
+		if err := r.processClaimedJobs(ctx, s); err != nil {
+			log.Errorf(ctx, "error processing claimed jobs: %s", err)
+		}
+	})
+	maybeAdoptJobsDeprecated := func(ctx context.Context, randomizeJobOrder bool) {
+		if r.adoptionDisabled(ctx) {
+			r.deprecatedCancelAll(ctx)
+			return
+		}
+		if err := r.deprecatedMaybeAdoptJob(ctx, r.nl, randomizeJobOrder); err != nil {
 			log.Errorf(ctx, "error while adopting jobs: %s", err)
 		}
 	}
 
-	stopper.RunWorker(context.Background(), func(ctx context.Context) {
+	if err := stopper.RunAsyncTask(context.Background(), "jobs/cancel", func(ctx context.Context) {
+		// Calling maybeCancelJobs once at the start ensures we have an up-to-date
+		// liveness epoch before we wait out the first cancelInterval.
+		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		defer cancel()
+		r.maybeCancelJobsDeprecated(ctx, r.nl)
+		cancelLoopTask(ctx)
 		for {
 			select {
-			case <-stopper.ShouldStop():
+			case <-r.stopper.ShouldQuiesce():
+				log.Warningf(ctx, "canceling all adopted jobs due to stopper quiescing")
+				r.deprecatedCancelAll(ctx)
+				r.cancelAllAdoptedJobs()
 				return
-			case <-r.adoptionCh:
-				maybeAdoptJobs(ctx)
-			case <-time.After(adoptInterval):
-				maybeAdoptJobs(ctx)
+			case <-time.After(cancelInterval):
+				r.maybeCancelJobsDeprecated(ctx, r.nl)
+				cancelLoopTask(ctx)
+			}
+		}
+	}); err != nil {
+		return err
+	}
+	if err := stopper.RunAsyncTask(context.Background(), "jobs/gc", func(ctx context.Context) {
+		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		settingChanged := make(chan struct{}, 1)
+		gcSetting.SetOnChange(&r.settings.SV, func() {
+			select {
+			case settingChanged <- struct{}{}:
+			default:
+			}
+		})
+		gcInterval := func() time.Duration {
+			if setting := gcSetting.Get(&r.settings.SV); setting < maxGCInterval {
+				return setting
+			}
+			return maxGCInterval
+		}
+		timer := timeutil.NewTimer()
+		lastGC := timeutil.Now()
+		// We'll jitter the first cleanup run to avoid contention in case multiple
+		// nodes restart at once.
+
+		const jitter = 1 / 6
+		jitterFraction := 1 + (2*rand.Float64()-1)*jitter // 1 + [-1/6, +1/6)
+		jitterredDuration := float64(gcInterval()) * jitterFraction
+		timer.Reset(time.Duration(jitterredDuration))
+		defer cancel()
+		for {
+			select {
+			case <-settingChanged:
+				timer.Reset(timeutil.Until(lastGC.Add(gcInterval())))
+			case <-stopper.ShouldQuiesce():
+				return
+			case <-timer.C:
+				timer.Read = true
+				old := timeutil.Now().Add(-1 * gcSetting.Get(&r.settings.SV))
+				if err := r.cleanupOldJobs(ctx, old); err != nil {
+					log.Warningf(ctx, "error cleaning up old job records: %v", err)
+				}
+				lastGC = timeutil.Now()
+				timer.Reset(gcInterval())
+			}
+		}
+	}); err != nil {
+		return err
+	}
+	return stopper.RunAsyncTask(context.Background(), "jobs/adopt", func(ctx context.Context) {
+		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		defer cancel()
+		timer := timeutil.NewTimer()
+		defer timer.Stop()
+		timer.Reset(adoptInterval)
+		for {
+			select {
+			case <-stopper.ShouldQuiesce():
+				return
+			case shouldClaim := <-r.adoptionCh:
+				// Try to adopt the most recently created job.
+				if r.startUsingSQLLivenessAdoption(ctx) {
+					if shouldClaim {
+						claimJobs(ctx)
+					}
+					processClaimedJobs(ctx)
+				} else {
+					// TODO(spaskob): remove in 20.2 as this code path is only needed while
+					// migrating to 20.2 cluster.
+					maybeAdoptJobsDeprecated(ctx, false /* randomizeJobOrder */)
+				}
+			case <-timer.C:
+				timer.Read = true
+				if r.startUsingSQLLivenessAdoption(ctx) {
+					claimJobs(ctx)
+					processClaimedJobs(ctx)
+				} else {
+					// TODO(spaskob): remove in 20.2 as this code path is only needed while
+					// migrating to 20.2 cluster.
+					maybeAdoptJobsDeprecated(ctx, true /* randomizeJobOrder */)
+				}
+				timer.Reset(adoptInterval)
 			}
 		}
 	})
-	return nil
 }
 
-func (r *Registry) maybeCancelJobs(ctx context.Context, nl NodeLiveness) {
-	liveness, err := nl.Self()
-	if err != nil {
+func (r *Registry) maybeCancelJobs(ctx context.Context, s sqlliveness.Session) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// If the cluster is finalized, kill any remaining legacy jobs. They will be
+	// re-adopted with the new epoch based leasing.
+	r.deprecatedCancelAllLocked(ctx)
+
+	for id, aj := range r.mu.adoptedJobs {
+		if aj.sid != s.ID() {
+			log.Warningf(ctx, "job %d: running without having a live claim; killed.", id)
+			aj.cancel()
+			delete(r.mu.adoptedJobs, id)
+		}
+	}
+}
+
+// TODO(spaskob): remove in 20.2 as this code path is only needed while
+// migrating to 20.2 cluster.
+func (r *Registry) maybeCancelJobsDeprecated(
+	ctx context.Context, nlw optionalnodeliveness.Container,
+) {
+	nl, ok := nlw.Optional(54251)
+	if !ok {
+		// At most one container is running on behalf of a SQL tenant, so it must be
+		// this one, and there's no point canceling anything.
+		//
+		// TODO(ajwerner): don't rely on this. Instead fix this issue:
+		// https://github.com/cockroachdb/cockroach/issues/47892
+		return
+	}
+	liveness, ok := nl.Self()
+	if !ok {
 		if nodeLivenessLogLimiter.ShouldLog() {
-			log.Warningf(ctx, "unable to get node liveness: %s", err)
+			log.Warning(ctx, "own liveness record not found")
 		}
 		// Conservatively assume our lease has expired. Abort all jobs.
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		r.cancelAll(ctx)
+		r.deprecatedCancelAll(ctx)
 		return
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	// If we haven't persisted a liveness record within the leniency
 	// interval, we'll cancel all of our jobs.
 	if !liveness.IsLive(r.lenientNow()) {
-		r.cancelAll(ctx)
-		r.mu.epoch = liveness.Epoch
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.deprecatedCancelAllLocked(ctx)
+		r.mu.deprecatedEpoch = liveness.Epoch
 		return
-	}
-
-	// Finally, we cancel all jobs if the stopper is quiescing.
-	select {
-	case <-r.stopper.ShouldQuiesce():
-		r.cancelAll(ctx)
-	default:
 	}
 }
 
@@ -494,17 +854,17 @@ func (r *Registry) isOrphaned(ctx context.Context, payload *jobspb.Payload) (boo
 	}
 	for _, id := range payload.DescriptorIDs {
 		pendingMutations := false
-		if err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-			td, err := sqlbase.GetTableDescFromID(ctx, txn, id)
+		if err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			td, err := catalogkv.MustGetTableDescByID(ctx, txn, keys.TODOSQLCodec, id)
 			if err != nil {
 				return err
 			}
 			hasAnyMutations := len(td.GetMutations()) != 0 || len(td.GetGCMutations()) != 0
-			hasDropJob := td.DropJobID != 0
+			hasDropJob := td.TableDesc().DropJobID != 0
 			pendingMutations = hasAnyMutations || hasDropJob
 			return nil
 		}); err != nil {
-			if errors.Is(err, sqlbase.ErrDescriptorNotFound) {
+			if errors.Is(err, catalog.ErrDescriptorNotFound) {
 				// Treat missing table descriptors as no longer relevant for the
 				// job payload. See
 				// https://github.com/cockroachdb/cockroach/45399.
@@ -519,28 +879,60 @@ func (r *Registry) isOrphaned(ctx context.Context, payload *jobspb.Payload) (boo
 	return true, nil
 }
 
-func (r *Registry) cleanupOldJobs(ctx context.Context, olderThan time.Time) error {
-	const stmt = `SELECT id, payload, status, created FROM system.jobs WHERE created < $1
-		      ORDER BY created LIMIT 1000`
-	rows, err := r.ex.Query(ctx, "gc-jobs", nil /* txn */, stmt, olderThan)
-	if err != nil {
-		return err
-	}
+const cleanupPageSize = 100
 
+func (r *Registry) cleanupOldJobs(ctx context.Context, olderThan time.Time) error {
+	var maxID int64
+	for {
+		var done bool
+		var err error
+		done, maxID, err = r.cleanupOldJobsPage(ctx, olderThan, maxID, cleanupPageSize)
+		if err != nil || done {
+			return err
+		}
+	}
+}
+
+// cleanupOldJobsPage deletes up to cleanupPageSize job rows with ID > minID.
+// minID is supposed to be the maximum ID returned by the previous page (0 if no
+// previous page).
+func (r *Registry) cleanupOldJobsPage(
+	ctx context.Context, olderThan time.Time, minID int64, pageSize int,
+) (done bool, maxID int64, retErr error) {
+	const stmt = "SELECT id, payload, status, created FROM system.jobs " +
+		"WHERE created < $1 AND id > $2 " +
+		"ORDER BY id " + // the ordering is important as we keep track of the maximum ID we've seen
+		"LIMIT $3"
+	it, err := r.ex.QueryIterator(ctx, "gc-jobs", nil /* txn */, stmt, olderThan, minID, pageSize)
+	if err != nil {
+		return false, 0, err
+	}
+	// We have to make sure to close the iterator since we might return from the
+	// for loop early (before Next() returns false).
+	defer func() {
+		closeErr := it.Close()
+		if retErr == nil {
+			retErr = closeErr
+		}
+	}()
 	toDelete := tree.NewDArray(types.Int)
-	toDelete.Array = make(tree.Datums, 0, len(rows))
 	oldMicros := timeutil.ToUnixMicros(olderThan)
-	for _, row := range rows {
+
+	var ok bool
+	var numRows int
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+		numRows++
+		row := it.Cur()
 		payload, err := UnmarshalPayload(row[1])
 		if err != nil {
-			return err
+			return false, 0, err
 		}
 		remove := false
 		switch Status(*row[2].(*tree.DString)) {
 		case StatusRunning, StatusPending:
 			done, err := r.isOrphaned(ctx, payload)
 			if err != nil {
-				return err
+				return false, 0, err
 			}
 			remove = done && row[3].(*tree.DTimestamp).Time.Before(olderThan)
 		case StatusSucceeded, StatusCanceled, StatusFailed:
@@ -550,26 +942,40 @@ func (r *Registry) cleanupOldJobs(ctx context.Context, olderThan time.Time) erro
 			toDelete.Array = append(toDelete.Array, row[0])
 		}
 	}
+	if err != nil {
+		return false, 0, err
+	}
+	if numRows == 0 {
+		return true, 0, nil
+	}
+
+	log.VEventf(ctx, 2, "read potentially expired jobs: %d", numRows)
 	if len(toDelete.Array) > 0 {
-		log.Infof(ctx, "cleaning up %d expired job records", len(toDelete.Array))
+		log.Infof(ctx, "cleaning up expired job records: %d", len(toDelete.Array))
 		const stmt = `DELETE FROM system.jobs WHERE id = ANY($1)`
 		var nDeleted int
 		if nDeleted, err = r.ex.Exec(
 			ctx, "gc-jobs", nil /* txn */, stmt, toDelete,
 		); err != nil {
-			return errors.Wrap(err, "deleting old jobs")
+			return false, 0, errors.Wrap(err, "deleting old jobs")
 		}
 		if nDeleted != len(toDelete.Array) {
-			return errors.Errorf("asked to delete %d rows but %d were actually deleted",
+			return false, 0, errors.AssertionFailedf("asked to delete %d rows but %d were actually deleted",
 				len(toDelete.Array), nDeleted)
 		}
 	}
-	return nil
+	// If we got as many rows as we asked for, there might be more.
+	morePages := numRows == pageSize
+	// Track the highest ID we encounter, so it can serve as the bottom of the
+	// next page.
+	lastRow := it.Cur()
+	maxID = int64(*(lastRow[0].(*tree.DInt)))
+	return !morePages, maxID, nil
 }
 
 // getJobFn attempts to get a resumer from the given job id. If the job id
 // does not have a resumer then it returns an error message suitable for users.
-func (r *Registry) getJobFn(ctx context.Context, txn *client.Txn, id int64) (*Job, Resumer, error) {
+func (r *Registry) getJobFn(ctx context.Context, txn *kv.Txn, id int64) (*Job, Resumer, error) {
 	job, err := r.LoadJobWithTxn(ctx, id, txn)
 	if err != nil {
 		return nil, nil, err
@@ -582,7 +988,7 @@ func (r *Registry) getJobFn(ctx context.Context, txn *client.Txn, id int64) (*Jo
 }
 
 // CancelRequested marks the job as cancel-requested using the specified txn (may be nil).
-func (r *Registry) CancelRequested(ctx context.Context, txn *client.Txn, id int64) error {
+func (r *Registry) CancelRequested(ctx context.Context, txn *kv.Txn, id int64) error {
 	job, _, err := r.getJobFn(ctx, txn, id)
 	if err != nil {
 		// Special case schema change jobs to mark the job as canceled.
@@ -607,21 +1013,44 @@ func (r *Registry) CancelRequested(ctx context.Context, txn *client.Txn, id int6
 }
 
 // PauseRequested marks the job with id as paused-requested using the specified txn (may be nil).
-func (r *Registry) PauseRequested(ctx context.Context, txn *client.Txn, id int64) error {
-	job, _, err := r.getJobFn(ctx, txn, id)
+func (r *Registry) PauseRequested(ctx context.Context, txn *kv.Txn, id int64) error {
+	job, resumer, err := r.getJobFn(ctx, txn, id)
 	if err != nil {
 		return err
 	}
-	return job.WithTxn(txn).pauseRequested(ctx, nil)
+	var onPauseRequested onPauseRequestFunc
+	if pr, ok := resumer.(PauseRequester); ok {
+		onPauseRequested = pr.OnPauseRequest
+	}
+	return job.WithTxn(txn).pauseRequested(ctx, onPauseRequested)
 }
 
-// Resume resumes the paused job with id using the specified txn (may be nil).
-func (r *Registry) Resume(ctx context.Context, txn *client.Txn, id int64) error {
+// Succeeded marks the job with id as succeeded.
+func (r *Registry) Succeeded(ctx context.Context, txn *kv.Txn, id int64) error {
 	job, _, err := r.getJobFn(ctx, txn, id)
 	if err != nil {
 		return err
 	}
-	return job.WithTxn(txn).resumed(ctx)
+	return job.WithTxn(txn).succeeded(ctx, nil)
+}
+
+// Failed marks the job with id as failed.
+func (r *Registry) Failed(ctx context.Context, txn *kv.Txn, id int64, causingError error) error {
+	job, _, err := r.getJobFn(ctx, txn, id)
+	if err != nil {
+		return err
+	}
+	return job.WithTxn(txn).failed(ctx, causingError, nil)
+}
+
+// Unpause changes the paused job with id to running or reverting using the
+// specified txn (may be nil).
+func (r *Registry) Unpause(ctx context.Context, txn *kv.Txn, id int64) error {
+	job, _, err := r.getJobFn(ctx, txn, id)
+	if err != nil {
+		return err
+	}
+	return job.WithTxn(txn).unpaused(ctx)
 }
 
 // Resumer is a resumable job, and is associated with a Job object. Jobs can be
@@ -632,26 +1061,8 @@ func (r *Registry) Resume(ctx context.Context, txn *client.Txn, id int64) error 
 // Resumers are created through registered Constructor functions.
 //
 type Resumer interface {
-	// Resume is called when a job is started or resumed. Sending results on the
-	// chan will return them to a user, if a user's session is connected. phs
-	// is a sql.PlanHookState.
-	Resume(ctx context.Context, phs interface{}, resultsCh chan<- tree.Datums) error
-
-	// OnSuccess is called when a job has completed successfully, and is called
-	// with the same txn that will mark the job as successful. The txn will
-	// only be committed if this doesn't return an error and the job state was
-	// successfully changed to successful. If OnSuccess returns an error, the
-	// job will be marked as failed.
-	//
-	// Any work this function does must still be correct if the txn is aborted at
-	// a later time.
-	OnSuccess(ctx context.Context, txn *client.Txn) error
-
-	// OnTerminal is called after a job has successfully been marked as
-	// terminal. It should be used to perform optional cleanup and return final
-	// results to the user. There is no guarantee that this function is ever run
-	// (for example, if a node died immediately after Success commits).
-	OnTerminal(ctx context.Context, status Status, resultsCh chan<- tree.Datums)
+	// Resume is called when a job is started or resumed. execCtx is a sql.JobExecCtx.
+	Resume(ctx context.Context, execCtx interface{}) error
 
 	// OnFailOrCancel is called when a job fails or is cancel-requested.
 	//
@@ -659,7 +1070,27 @@ type Resumer interface {
 	// which is not guaranteed to run on the node where the job is running. So it
 	// cannot assume that any other methods have been called on this Resumer
 	// object.
-	OnFailOrCancel(ctx context.Context, phs interface{}) error
+	OnFailOrCancel(ctx context.Context, execCtx interface{}) error
+}
+
+// PauseRequester is an extension of Resumer which allows job implementers to inject
+// logic during the transaction which moves a job to PauseRequested.
+type PauseRequester interface {
+	Resumer
+
+	// OnPauseRequest is called in the transaction that moves a job to PauseRequested.
+	// If an error is returned, the pause request will fail. execCtx is a
+	// sql.JobExecCtx.
+	OnPauseRequest(ctx context.Context, execCtx interface{}, txn *kv.Txn, details *jobspb.Progress) error
+}
+
+// JobResultsReporter is an interface for reporting the results of the job execution.
+// Resumer implementations may also implement this interface if they wish to return
+// data to the user upon successful completion.
+type JobResultsReporter interface {
+	// ReportResults sends job results on the specified channel.
+	// This method will only be called if Resume() ran successfully to completion.
+	ReportResults(ctx context.Context, resultsCh chan<- tree.Datums) error
 }
 
 // Constructor creates a resumable job of a certain type. The Resumer is
@@ -689,11 +1120,17 @@ func (r *Registry) createResumer(job *Job, settings *cluster.Settings) (Resumer,
 
 type retryJobError string
 
+// retryJobErrorSentinel exists so the errors returned from NewRetryJobError can
+// be marked with it, allowing more robust detection of retry errors even if
+// they are wrapped, etc. This was originally introduced to deal with injected
+// retry errors from testing knobs.
+var retryJobErrorSentinel = retryJobError("")
+
 // NewRetryJobError creates a new error that, if returned by a Resumer,
 // indicates to the jobs registry that the job should be restarted in the
 // background.
 func NewRetryJobError(s string) error {
-	return retryJobError(s)
+	return errors.Mark(retryJobError(s), retryJobErrorSentinel)
 }
 
 func (r retryJobError) Error() string {
@@ -706,175 +1143,152 @@ func (r retryJobError) Error() string {
 // be closed by the caller after errCh sends a value. errCh returns an error if
 // the job was not completed with success. status is the current job status.
 func (r *Registry) stepThroughStateMachine(
-	ctx context.Context,
-	phs interface{},
-	resumer Resumer,
-	resultsCh chan<- tree.Datums,
-	job *Job,
-	status Status,
-	jobErr error,
+	ctx context.Context, execCtx interface{}, resumer Resumer, job *Job, status Status, jobErr error,
 ) error {
-	log.Infof(ctx, "job %d: stepping through state %s with error %v", *job.ID(), status, jobErr)
+	payload := job.Payload()
+	jobType := payload.Type()
+	log.Infof(ctx, "%s job %d: stepping through state %s with error: %+v", jobType, *job.ID(), status, jobErr)
+	jm := r.metrics.JobMetrics[jobType]
 	switch status {
 	case StatusRunning:
 		if jobErr != nil {
-			errorMsg := fmt.Sprintf("job %d: resuming with non-nil error: %v", *job.ID(), jobErr)
-			return errors.NewAssertionErrorWithWrappedErrf(jobErr, errorMsg)
+			return errors.NewAssertionErrorWithWrappedErrf(jobErr,
+				"job %d: resuming with non-nil error", *job.ID())
 		}
-		err := resumer.Resume(ctx, phs, resultsCh)
+		resumeCtx := logtags.AddTag(ctx, "job", *job.ID())
+		if payload.StartedMicros == 0 {
+			if err := job.started(ctx); err != nil {
+				return err
+			}
+		}
+		var err error
+		func() {
+			jm.CurrentlyRunning.Inc(1)
+			defer jm.CurrentlyRunning.Dec(1)
+			err = resumer.Resume(resumeCtx, execCtx)
+		}()
 		if err == nil {
-			return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, StatusSucceeded, nil)
+			jm.ResumeCompleted.Inc(1)
+			return r.stepThroughStateMachine(ctx, execCtx, resumer, job, StatusSucceeded, nil)
 		}
-		if ctx.Err() != nil {
+		if resumeCtx.Err() != nil {
 			// The context was canceled. Tell the user, but don't attempt to
 			// mark the job as failed because it can be resumed by another node.
+			//
+			// TODO(ajwerner): We'll also end up here if the job was canceled or
+			// paused. We should make this error clearer.
+			jm.ResumeRetryError.Inc(1)
 			return errors.Errorf("job %d: node liveness error: restarting in background", *job.ID())
 		}
 		// TODO(spaskob): enforce a limit on retries.
-		if e, ok := err.(retryJobError); ok {
-			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), e)
+		// TODO(spaskob,lucy): Add metrics on job retries. Consider having a backoff
+		// mechanism (possibly combined with a retry limit).
+		if errors.Is(err, retryJobErrorSentinel) {
+			jm.ResumeRetryError.Inc(1)
+			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), err)
 		}
-		if err, ok := errors.Cause(err).(*InvalidStatusError); ok {
-			if err.status != StatusCancelRequested && err.status != StatusPauseRequested {
-				errorMsg := fmt.Sprintf("job %d: unexpected status %s provided for a running job", *job.ID(), err.status)
-				return errors.NewAssertionErrorWithWrappedErrf(jobErr, errorMsg)
+		jm.ResumeFailed.Inc(1)
+		if sErr := (*InvalidStatusError)(nil); errors.As(err, &sErr) {
+			if sErr.status != StatusCancelRequested && sErr.status != StatusPauseRequested {
+				return errors.NewAssertionErrorWithWrappedErrf(jobErr,
+					"job %d: unexpected status %s provided for a running job", *job.ID(), sErr.status)
 			}
-			return err
+			return sErr
 		}
-		return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, StatusReverting, err)
+		return r.stepThroughStateMachine(ctx, execCtx, resumer, job, StatusReverting, err)
 	case StatusPauseRequested:
 		return errors.Errorf("job %s", status)
 	case StatusCancelRequested:
 		return errors.Errorf("job %s", status)
 	case StatusPaused:
-		errorMsg := fmt.Sprintf("job %d: unexpected status %s provided to state machine", *job.ID(), status)
-		return errors.NewAssertionErrorWithWrappedErrf(jobErr, errorMsg)
+		return errors.NewAssertionErrorWithWrappedErrf(jobErr,
+			"job %d: unexpected status %s provided to state machine", *job.ID(), status)
 	case StatusCanceled:
 		if err := job.canceled(ctx, nil); err != nil {
 			// If we can't transactionally mark the job as canceled then it will be
 			// restarted during the next adopt loop and reverting will be retried.
-			return errors.Wrapf(err, "job %d: could not mark as canceled: %s", *job.ID(), jobErr)
+			return errors.Wrapf(err, "job %d: could not mark as canceled: %v", *job.ID(), jobErr)
 		}
-		resumer.OnTerminal(ctx, status, resultsCh)
-		return errors.Errorf("job %s", status)
+		return errors.WithSecondaryError(errors.Errorf("job %s", status), jobErr)
 	case StatusSucceeded:
 		if jobErr != nil {
-			errorMsg := fmt.Sprintf("job %d: successful bu unexpected error provided", *job.ID())
-			return errors.NewAssertionErrorWithWrappedErrf(jobErr, errorMsg)
+			return errors.NewAssertionErrorWithWrappedErrf(jobErr,
+				"job %d: successful bu unexpected error provided", *job.ID())
 		}
-		if err := job.Succeeded(ctx, resumer.OnSuccess); err != nil {
+		if err := job.succeeded(ctx, nil); err != nil {
 			// If it didn't succeed, we consider the job as failed and need to go
 			// through reverting state first.
 			// TODO(spaskob): this is silly, we should remove the OnSuccess hooks and
 			// execute them in resume so that the client can handle these errors
 			// better.
-			return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, StatusReverting, errors.Wrapf(err, "could not mark job %d as succeeded", *job.ID()))
+			return r.stepThroughStateMachine(ctx, execCtx, resumer, job, StatusReverting, errors.Wrapf(err, "could not mark job %d as succeeded", *job.ID()))
 		}
-		resumer.OnTerminal(ctx, status, resultsCh)
 		return nil
 	case StatusReverting:
-		if err := job.Reverted(ctx, jobErr, nil); err != nil {
+		if err := job.reverted(ctx, jobErr, nil); err != nil {
 			// If we can't transactionally mark the job as reverting then it will be
 			// restarted during the next adopt loop and it will be retried.
 			return errors.Wrapf(err, "job %d: could not mark as reverting: %s", *job.ID(), jobErr)
 		}
-		err := resumer.OnFailOrCancel(ctx, phs)
+		onFailOrCancelCtx := logtags.AddTag(ctx, "job", *job.ID())
+		var err error
+		func() {
+			jm.CurrentlyRunning.Inc(1)
+			defer jm.CurrentlyRunning.Dec(1)
+			err = resumer.OnFailOrCancel(onFailOrCancelCtx, execCtx)
+		}()
 		if successOnFailOrCancel := err == nil; successOnFailOrCancel {
+			jm.FailOrCancelCompleted.Inc(1)
 			// If the job has failed with any error different than canceled we
 			// mark it as Failed.
 			nextStatus := StatusFailed
-			if errors.Is(errJobCanceled, jobErr) {
+			if HasErrJobCanceled(jobErr) {
 				nextStatus = StatusCanceled
 			}
-			return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, nextStatus, jobErr)
+			return r.stepThroughStateMachine(ctx, execCtx, resumer, job, nextStatus, jobErr)
 		}
-		if ctx.Err() != nil {
+		if onFailOrCancelCtx.Err() != nil {
+			jm.FailOrCancelRetryError.Inc(1)
 			// The context was canceled. Tell the user, but don't attempt to
 			// mark the job as failed because it can be resumed by another node.
 			return errors.Errorf("job %d: node liveness error: restarting in background", *job.ID())
 		}
-		if e, ok := err.(retryJobError); ok {
-			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), e)
+		if errors.Is(err, retryJobErrorSentinel) {
+			jm.FailOrCancelRetryError.Inc(1)
+			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), err)
 		}
-		if err, ok := errors.Cause(err).(*InvalidStatusError); ok {
-			if err.status != StatusPauseRequested {
-				errorMsg := fmt.Sprintf("job %d: unexpected status %s provided for a reverting job", job.ID(), err.status)
-				return errors.NewAssertionErrorWithWrappedErrf(jobErr, errorMsg)
+		jm.FailOrCancelFailed.Inc(1)
+		if sErr := (*InvalidStatusError)(nil); errors.As(err, &sErr) {
+			if sErr.status != StatusPauseRequested {
+				return errors.NewAssertionErrorWithWrappedErrf(jobErr,
+					"job %d: unexpected status %s provided for a reverting job", *job.ID(), sErr.status)
 			}
-			return err
+			return sErr
 		}
-		return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, StatusFailed, errors.Wrapf(err, "job %d: cannot be reverted, manual cleanup may be required", *job.ID()))
+		return r.stepThroughStateMachine(ctx, execCtx, resumer, job, StatusFailed,
+			errors.Wrapf(err, "job %d: cannot be reverted, manual cleanup may be required", *job.ID()))
 	case StatusFailed:
 		if jobErr == nil {
-			errorMsg := fmt.Sprintf("job %d: has StatusFailed but no error was provided", *job.ID())
-			return errors.NewAssertionErrorWithWrappedErrf(jobErr, errorMsg)
+			return errors.NewAssertionErrorWithWrappedErrf(jobErr,
+				"job %d: has StatusFailed but no error was provided", *job.ID())
 		}
-		if err := job.Failed(ctx, jobErr, nil); err != nil {
+		if err := job.failed(ctx, jobErr, nil); err != nil {
 			// If we can't transactionally mark the job as failed then it will be
 			// restarted during the next adopt loop and reverting will be retried.
 			return errors.Wrapf(err, "job %d: could not mark as failed: %s", *job.ID(), jobErr)
 		}
-		resumer.OnTerminal(ctx, status, resultsCh)
 		return jobErr
 	default:
-		return errors.AssertionFailedf("job %d: has unsupported status %s", *job.ID(), status)
+		return errors.NewAssertionErrorWithWrappedErrf(jobErr,
+			"job %d: has unsupported status %s", *job.ID(), status)
 	}
-}
-
-// resume starts or resumes a job. If no error is returned then the job was
-// asynchronously executed. The job is executed with the ctx, so ctx must
-// only by canceled if the job should also be canceled. resultsCh is passed
-// to the resumable func and should be closed by the caller after errCh sends
-// a value.
-func (r *Registry) resume(
-	ctx context.Context, resumer Resumer, resultsCh chan<- tree.Datums, job *Job,
-) (<-chan error, error) {
-	errCh := make(chan error, 1)
-	taskName := fmt.Sprintf(`job-%d`, *job.ID())
-	if err := r.stopper.RunAsyncTask(ctx, taskName, func(ctx context.Context) {
-		// Bookkeeping.
-		payload := job.Payload()
-		phs, cleanup := r.planFn("resume-"+taskName, payload.Username)
-		defer cleanup()
-		spanName := fmt.Sprintf(`%s-%d`, payload.Type(), *job.ID())
-		var span opentracing.Span
-		ctx, span = r.ac.AnnotateCtxWithSpan(ctx, spanName)
-		defer span.Finish()
-
-		// Run the actual job.
-		status, err := job.CurrentStatus(ctx)
-		if err == nil {
-			var finalResumeError error
-			if job.Payload().FinalResumeError != nil {
-				finalResumeError = errors.DecodeError(ctx, *job.Payload().FinalResumeError)
-			}
-			err = r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, status, finalResumeError)
-			if err != nil {
-				if errors.HasAssertionFailure(err) {
-					log.ReportOrPanic(ctx, nil, err.Error())
-				}
-				log.Errorf(ctx, "job %d: adoption completed with error %v", *job.ID(), err)
-			}
-			status, err := job.CurrentStatus(ctx)
-			if err != nil {
-				log.Errorf(ctx, "job %d: failed querying status: %v", *job.ID(), err)
-			} else {
-				log.Infof(ctx, "job %d: status %s after adoption finished", *job.ID(), status)
-			}
-		}
-		r.unregister(*job.ID())
-		errCh <- err
-	}); err != nil {
-		return nil, err
-	}
-	return errCh, nil
 }
 
 func (r *Registry) adoptionDisabled(ctx context.Context) bool {
 	if r.preventAdoptionFile != "" {
 		if _, err := os.Stat(r.preventAdoptionFile); err != nil {
-			if !os.IsNotExist(err) {
-				log.Warning(ctx, "error checking if job adoption is currently disabled", err)
+			if !oserror.IsNotExist(err) {
+				log.Warningf(ctx, "error checking if job adoption is currently disabled: %v", err)
 			}
 			return false
 		}
@@ -884,252 +1298,39 @@ func (r *Registry) adoptionDisabled(ctx context.Context) bool {
 	return false
 }
 
-func (r *Registry) maybeAdoptJob(ctx context.Context, nl NodeLiveness) error {
-	const stmt = `
-SELECT id, payload, progress IS NULL, status
-FROM system.jobs
-WHERE status IN ($1, $2, $3, $4, $5) ORDER BY created DESC`
-	rows, err := r.ex.Query(
-		ctx, "adopt-job", nil /* txn */, stmt,
-		StatusPending, StatusRunning, StatusCancelRequested, StatusPauseRequested, StatusReverting,
-	)
-	if err != nil {
-		return errors.Wrap(err, "failed querying for jobs")
-	}
-
-	type nodeStatus struct {
-		isLive bool
-	}
-	nodeStatusMap := map[roachpb.NodeID]*nodeStatus{
-		// 0 is not a valid node ID, but we treat it as an always-dead node so that
-		// the empty lease (Lease{}) is always considered expired.
-		0: {isLive: false},
-	}
-	{
-		// We subtract the leniency interval here to artificially
-		// widen the range of times over which the job registry will
-		// consider the node to be alive.  We rely on the fact that
-		// only a live node updates its own expiration.  Thus, the
-		// expiration time can be used as a reasonable measure of
-		// when the node was last seen.
-		now := r.lenientNow()
-		for _, liveness := range nl.GetLivenesses() {
-			nodeStatusMap[liveness.NodeID] = &nodeStatus{
-				isLive: liveness.IsLive(now),
-			}
-
-			// Don't try to start any more jobs unless we're really live,
-			// otherwise we'd just immediately cancel them.
-			if liveness.NodeID == r.nodeID.Get() {
-				if !liveness.IsLive(r.clock.Now().GoTime()) {
-					return errors.Errorf(
-						"trying to adopt jobs on node %d which is not live", r.nodeID.Get())
-				}
-			}
-		}
-	}
-
-	if log.V(3) {
-		log.Infof(ctx, "evaluating %d jobs for adoption", len(rows))
-	}
-	for _, row := range rows {
-		id := (*int64)(row[0].(*tree.DInt))
-
-		payload, err := UnmarshalPayload(row[1])
-		if err != nil {
-			return err
-		}
-
-		status := Status(tree.MustBeDString(row[3]))
-		if log.V(3) {
-			log.Infof(ctx, "job %d: evaluating for adoption with status `%s` and lease %v",
-				*id, status, payload.Lease)
-		}
-
-		if payload.Lease == nil {
-			// If the lease is missing, it simply means the job does not yet support
-			// resumability.
-			if log.V(2) {
-				log.Infof(ctx, "job %d: skipping: nil lease", *id)
-			}
-			continue
-		}
-
-		// If the job has no progress it is from a 2.0 cluster. If the entire cluster
-		// has been upgraded to 2.1 then we know nothing is running the job and it
-		// can be safely failed.
-		if nullProgress, ok := row[2].(*tree.DBool); ok && bool(*nullProgress) {
-			log.Warningf(ctx, "job %d predates cluster upgrade and must be re-run", id)
-			versionErr := errors.New("job predates cluster upgrade and must be re-run")
-			payload.Error = versionErr.Error()
-			payloadBytes, err := protoutil.Marshal(payload)
-			if err != nil {
-				return err
-			}
-
-			// We can't use job.update here because it fails while attempting to unmarshal
-			// the progress. Setting the status to failed is idempotent so we don't care
-			// if multiple nodes execute this.
-			const updateStmt = `UPDATE system.jobs SET status = $1, payload = $2 WHERE id = $3`
-			updateArgs := []interface{}{StatusFailed, payloadBytes, *id}
-			err = r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-				_, err := r.ex.Exec(ctx, "job-update", txn, updateStmt, updateArgs...)
-				return err
-			})
-			if err != nil {
-				log.Warningf(ctx, "job %d: has no progress but unable to mark failed: %s", id, err)
-			}
-			continue
-		}
-
-		r.mu.Lock()
-		_, runningOnNode := r.mu.jobs[*id]
-		r.mu.Unlock()
-
-		if notLeaseHolder := payload.Lease.NodeID != r.nodeID.Get(); notLeaseHolder {
-			// Another node holds the lease on the job, see if we should steal it.
-			if runningOnNode {
-				// If we are currently running a job that another node has the lease on,
-				// stop running it.
-				log.Warningf(ctx, "job %d: node %d owns lease; canceling", *id, payload.Lease.NodeID)
-				r.unregister(*id)
-				continue
-			}
-			nodeStatus, ok := nodeStatusMap[payload.Lease.NodeID]
-			if !ok {
-				// This case should never happen.
-				log.ReportOrPanic(ctx, nil, "job %d: skipping: no liveness record for the job's node %d",
-					log.Safe(*id), payload.Lease.NodeID)
-				continue
-			}
-			if nodeStatus.isLive {
-				if log.V(2) {
-					log.Infof(ctx, "job %d: skipping: another node is live and holds the lease", *id)
-				}
-				continue
-			}
-		}
-		// Below we know that this node holds the lease on the job.
-		job := &Job{id: id, registry: r}
-		resumeCtx, cancel := r.makeCtx()
-
-		if pauseRequested := status == StatusPauseRequested; pauseRequested {
-			if err := job.Paused(ctx, func(context.Context, *client.Txn) error {
-				r.unregister(*id)
-				return nil
-			}); err != nil {
-				log.Errorf(ctx, "job %d: could not set to paused: %v", *id, err)
-				continue
-			}
-			log.Infof(ctx, "job %d: paused", *id)
-			continue
-		}
-
-		if cancelRequested := status == StatusCancelRequested; cancelRequested {
-			if err := job.Reverted(ctx, errJobCanceled, func(context.Context, *client.Txn) error {
-				// Unregister the job in case it is running on the node.
-				// Unregister is a no-op for jobs that are not running.
-				r.unregister(*id)
-				return nil
-			}); err != nil {
-				log.Errorf(ctx, "job %d: could not set to reverting: %v", *id, err)
-				continue
-			}
-			log.Infof(ctx, "job %d: canceled: the job is now reverting", *id)
-		} else if currentlyRunning := r.register(*id, cancel) != nil; currentlyRunning {
-			if log.V(3) {
-				log.Infof(ctx, "job %d: skipping: the job is already running/reverting on this node", *id)
-			}
-			continue
-		}
-
-		// Check if job status has changed in the meanwhile.
-		currentStatus, err := job.CurrentStatus(ctx)
-		if err != nil {
-			return err
-		}
-		if status != currentStatus {
-			continue
-		}
-		// Adopt job and resume/revert it.
-		if err := job.adopt(ctx, payload.Lease); err != nil {
-			r.unregister(*id)
-			return errors.Wrap(err, "unable to acquire lease")
-		}
-
-		resultsCh := make(chan tree.Datums)
-		resumer, err := r.createResumer(job, r.settings)
-		if err != nil {
-			r.unregister(*id)
-			return err
-		}
-		log.Infof(ctx, "job %d: resuming execution", *id)
-		errCh, err := r.resume(resumeCtx, resumer, resultsCh, job)
-		if err != nil {
-			r.unregister(*id)
-			return err
-		}
-		go func() {
-			// Drain and ignore results.
-			for range resultsCh {
-			}
-		}()
-		go func() {
-			// Wait for the job to finish. No need to print the error because if there
-			// was one it's been set in the job status already.
-			<-errCh
-			close(resultsCh)
-		}()
-
-		// Only adopt one job per turn to allow other nodes their fair share.
-		break
-	}
-
-	return nil
-}
-
-func (r *Registry) newLease() *jobspb.Lease {
-	nodeID := r.nodeID.Get()
-	if nodeID == 0 {
-		panic("jobs.Registry has empty node ID")
-	}
+func (r *Registry) cancelAllAdoptedJobs() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return &jobspb.Lease{NodeID: nodeID, Epoch: r.mu.epoch}
-}
-
-func (r *Registry) cancelAll(ctx context.Context) {
-	r.mu.AssertHeld()
-	for jobID, cancel := range r.mu.jobs {
-		log.Warningf(ctx, "job %d: canceling due to liveness failure", jobID)
-		cancel()
+	for _, aj := range r.mu.adoptedJobs {
+		aj.cancel()
 	}
-	r.mu.jobs = make(map[int64]context.CancelFunc)
-}
-
-// register registers an about to be resumed job in memory so that it can be
-// killed and that no one else tries to resume it. This essentially works as a
-// barrier that only one function can cross and try to resume the job.
-func (r *Registry) register(jobID int64, cancel func()) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	// We need to prevent different routines trying to adopt and resume the job.
-	if _, alreadyRegistered := r.mu.jobs[jobID]; alreadyRegistered {
-		return errors.Errorf("job %d: already registered", jobID)
-	}
-	r.mu.jobs[jobID] = cancel
-	return nil
+	r.mu.adoptedJobs = make(map[int64]*adoptedJob)
 }
 
 func (r *Registry) unregister(jobID int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	cancel, ok := r.mu.jobs[jobID]
+	cancel, ok := r.mu.deprecatedJobs[jobID]
 	// It is possible for a job to be double unregistered. unregister is always
-	// called at the end of resume. But it can also be called during cancelAll
+	// called at the end of resume. But it can also be called during deprecatedCancelAll
 	// and in the adopt loop under certain circumstances.
 	if ok {
 		cancel()
-		delete(r.mu.jobs, jobID)
+		delete(r.mu.deprecatedJobs, jobID)
+		return
 	}
+	aj, ok := r.mu.adoptedJobs[jobID]
+	// It is possible for a job to be double unregistered. unregister is always
+	// called at the end of resume. But it can also be called during deprecatedCancelAll
+	// and in the adopt loop under certain circumstances.
+	if ok {
+		aj.cancel()
+		delete(r.mu.adoptedJobs, jobID)
+	}
+}
+
+// TestingNudgeAdoptionQueue is used by tests to tell the registry that there is
+// a job to be adopted.
+func (r *Registry) TestingNudgeAdoptionQueue() {
+	r.adoptionCh <- claimAndResumeClaimedJobs
 }

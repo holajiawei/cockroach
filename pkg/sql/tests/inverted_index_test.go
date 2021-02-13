@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -31,9 +32,10 @@ const jsonComplexity = 25
 
 func TestInvertedIndex(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	db := sqlutils.MakeSQLRunner(tc.Conns[0])
 
@@ -63,7 +65,7 @@ func TestInvertedIndex(t *testing.T) {
 
 	t.Run("ensure we're using the inverted index", func(t *testing.T) {
 		// Just to make sure we're using the inverted index.
-		explain := db.Query(t, `SELECT count(*) FROM [EXPLAIN SELECT * FROM test.jsons WHERE j @> '{"a": 1}'] WHERE description = 'jsons@jsons_j_idx'`)
+		explain := db.Query(t, `SELECT count(*) FROM [EXPLAIN SELECT * FROM test.jsons WHERE j @> '{"a": 1}'] WHERE info LIKE '%jsons@jsons_j_idx%'`)
 		explain.Next()
 		var c int
 		if err := explain.Scan(&c); err != nil {

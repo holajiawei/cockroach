@@ -65,17 +65,20 @@ func TestParseDate(t *testing.T) {
 			err: "date is out of range",
 		},
 		{
-			s:   "0000-01-01",
-			err: "year value 0 is out of range",
+			s:   "0000-01-01 AD",
+			err: "only positive years are permitted in AD/BC notation",
 		},
 	} {
 		t.Run(tc.s, func(t *testing.T) {
-			d, err := ParseDate(time.Time{}, ParseModeYMD, tc.s)
+			d, depOnCtx, err := ParseDate(time.Time{}, ParseModeYMD, tc.s)
 			if tc.err != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.err) {
 					t.Fatalf("got %v, expected %v", err, tc.err)
 				}
 				return
+			}
+			if depOnCtx {
+				t.Fatalf("should not depend on context")
 			}
 			pg := d.PGEpochDays()
 			if pg != tc.pgdays {

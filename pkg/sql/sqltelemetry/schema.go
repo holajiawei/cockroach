@@ -31,6 +31,10 @@ func SchemaNewTypeCounter(t string) telemetry.Counter {
 }
 
 var (
+	// CreateInterleavedTableCounter is to be incremented every time an
+	// interleaved table is being created.
+	CreateInterleavedTableCounter = telemetry.GetCounterOnce("sql.schema.create_interleaved_table")
+
 	// CreateTempTableCounter is to be incremented every time a TEMP TABLE
 	// has been created.
 	CreateTempTableCounter = telemetry.GetCounterOnce("sql.schema.create_temp_table")
@@ -44,42 +48,101 @@ var (
 	CreateTempViewCounter = telemetry.GetCounterOnce("sql.schema.create_temp_view")
 )
 
-// SchemaChangeCreate is to be incremented every time a CREATE
+var (
+	// HashShardedIndexCounter is to be incremented every time a hash
+	// sharded index is created.
+	HashShardedIndexCounter = telemetry.GetCounterOnce("sql.schema.hash_sharded_index")
+
+	// InvertedIndexCounter is to be incremented every time an inverted
+	// index is created.
+	InvertedIndexCounter = telemetry.GetCounterOnce("sql.schema.inverted_index")
+
+	// GeographyInvertedIndexCounter is to be incremented every time a
+	// geography inverted index is created. These are a subset of the
+	// indexes counted in InvertedIndexCounter.
+	GeographyInvertedIndexCounter = telemetry.GetCounterOnce("sql.schema.geography_inverted_index")
+
+	// GeometryInvertedIndexCounter is to be incremented every time a
+	// geometry inverted index is created. These are a subset of the
+	// indexes counted in InvertedIndexCounter.
+	GeometryInvertedIndexCounter = telemetry.GetCounterOnce("sql.schema.geometry_inverted_index")
+
+	// PartialIndexCounter is to be incremented every time a partial index is
+	// created.
+	PartialIndexCounter = telemetry.GetCounterOnce("sql.schema.partial_index")
+)
+
+var (
+	// TempObjectCleanerDeletionCounter is to be incremented every time a temporary schema
+	// has been deleted by the temporary object cleaner.
+	TempObjectCleanerDeletionCounter = telemetry.GetCounterOnce("sql.schema.temp_object_cleaner.num_cleaned")
+)
+
+// SchemaNewColumnTypeQualificationCounter is to be incremented every time
+// a new qualification is used for a newly created column.
+func SchemaNewColumnTypeQualificationCounter(qual string) telemetry.Counter {
+	return telemetry.GetCounter("sql.schema.new_column.qualification." + qual)
+}
+
+// SchemaChangeCreateCounter is to be incremented every time a CREATE
 // schema change was made.
-func SchemaChangeCreate(typ string) telemetry.Counter {
+func SchemaChangeCreateCounter(typ string) telemetry.Counter {
 	return telemetry.GetCounter("sql.schema.create_" + typ)
 }
 
-// SchemaChangeDrop is to be incremented every time a DROP
+// SchemaChangeDropCounter is to be incremented every time a DROP
 // schema change was made.
-func SchemaChangeDrop(typ string) telemetry.Counter {
+func SchemaChangeDropCounter(typ string) telemetry.Counter {
 	return telemetry.GetCounter("sql.schema.drop_" + typ)
 }
 
-// SchemaSetZoneConfig is to be incremented every time a ZoneConfig
+// SchemaSetZoneConfigCounter is to be incremented every time a ZoneConfig
 // argument is parsed.
-func SchemaSetZoneConfig(configName, keyChange string) telemetry.Counter {
+func SchemaSetZoneConfigCounter(configName, keyChange string) telemetry.Counter {
 	return telemetry.GetCounter(
 		fmt.Sprintf("sql.schema.zone_config.%s.%s", configName, keyChange),
 	)
 }
 
-// SchemaChangeAlter behaves the same as SchemaChangeAlterWithExtra
+// SchemaChangeAlterCounter behaves the same as SchemaChangeAlterCounterWithExtra
 // but with no extra metadata.
-func SchemaChangeAlter(typ string) telemetry.Counter {
-	return SchemaChangeAlterWithExtra(typ, "")
+func SchemaChangeAlterCounter(typ string) telemetry.Counter {
+	return SchemaChangeAlterCounterWithExtra(typ, "")
 }
 
-// SchemaChangeAlterWithExtra is to be incremented for ALTER schema changes.
+// SchemaChangeAlterCounterWithExtra is to be incremented for ALTER schema changes.
 // `typ` is for declaring which type was altered, e.g. TABLE, DATABASE.
 // `extra` can be used for extra trailing useful metadata.
-func SchemaChangeAlterWithExtra(typ string, extra string) telemetry.Counter {
+func SchemaChangeAlterCounterWithExtra(typ string, extra string) telemetry.Counter {
 	if extra != "" {
 		extra = "." + extra
 	}
 	return telemetry.GetCounter(fmt.Sprintf("sql.schema.alter_%s%s", typ, extra))
 }
 
+// SchemaSetAuditModeCounter is to be incremented every time an audit mode is set.
+func SchemaSetAuditModeCounter(mode string) telemetry.Counter {
+	return telemetry.GetCounter("sql.schema.set_audit_mode." + mode)
+}
+
+// SchemaJobControlCounter is to be incremented every time a job control action
+// is taken.
+func SchemaJobControlCounter(desiredStatus string) telemetry.Counter {
+	return telemetry.GetCounter("sql.schema.job.control." + desiredStatus)
+}
+
+// SchemaChangeInExplicitTxnCounter is to be incremented every time a schema change
+// is scheduled using an explicit transaction.
+var SchemaChangeInExplicitTxnCounter = telemetry.GetCounterOnce("sql.schema.change_in_explicit_txn")
+
 // SecondaryIndexColumnFamiliesCounter is a counter that is incremented every time
 // a secondary index that is separated into different column families is created.
 var SecondaryIndexColumnFamiliesCounter = telemetry.GetCounterOnce("sql.schema.secondary_index_column_families")
+
+// CreateUnloggedTableCounter is a counter that is incremented every time an unlogged
+// table is created.
+var CreateUnloggedTableCounter = telemetry.GetCounterOnce("sql.schema.create_unlogged_table")
+
+// SchemaRefreshMaterializedView is to be incremented every time a materialized
+// view is refreshed.
+var SchemaRefreshMaterializedView = telemetry.GetCounterOnce("sql.schema.refresh_materialized_view")

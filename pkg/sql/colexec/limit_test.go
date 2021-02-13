@@ -13,13 +13,16 @@ package colexec
 import (
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestLimit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	tcs := []struct {
-		limit    int
+		limit    uint64
 		tuples   []tuple
 		expected []tuple
 	}{
@@ -63,7 +66,7 @@ func TestLimit(t *testing.T) {
 	for _, tc := range tcs {
 		// The tuples consisting of all nulls still count as separate rows, so if
 		// we replace all values with nulls, we should get the same output.
-		runTestsWithoutAllNullsInjection(t, []tuples{tc.tuples}, nil /* typs */, tc.expected, orderedVerifier, func(input []Operator) (Operator, error) {
+		runTestsWithoutAllNullsInjection(t, []tuples{tc.tuples}, nil /* typs */, tc.expected, orderedVerifier, func(input []colexecbase.Operator) (colexecbase.Operator, error) {
 			return NewLimitOp(input[0], tc.limit), nil
 		})
 	}

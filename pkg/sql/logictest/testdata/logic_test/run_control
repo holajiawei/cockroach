@@ -100,11 +100,25 @@ CANCEL QUERY 'aaa'::NAME
 
 user testuser
 
-query error only users with the admin role are allowed to CANCEL JOBS
+query error pq: user testuser does not have CONTROLJOB privilege
 CANCEL JOB 1
 
-query error only users with the admin role are allowed to PAUSE JOBS
+query error pq: user testuser does not have CONTROLJOB privilege
 PAUSE JOB 1
 
-query error only users with the admin role are allowed to RESUME JOBS
+query error pq: user testuser does not have CONTROLJOB privilege
 RESUME JOB 1
+
+user root
+
+query T rowsort
+SELECT feature_name FROM crdb_internal.feature_usage
+WHERE feature_name IN (
+  'sql.schema.job.control.pause',
+  'sql.schema.job.control.resume',
+  'sql.schema.job.control.cancel'
+)
+----
+sql.schema.job.control.pause
+sql.schema.job.control.cancel
+sql.schema.job.control.resume

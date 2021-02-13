@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -53,6 +53,12 @@ func (l InsertsDataLoader) InitialDataLoad(
 	var hooks workload.Hooks
 	if h, ok := gen.(workload.Hookser); ok {
 		hooks = h.Hooks()
+	}
+
+	if hooks.PreCreate != nil {
+		if err := hooks.PreCreate(db); err != nil {
+			return 0, errors.Wrapf(err, "Could not precreate")
+		}
 	}
 
 	for _, table := range tables {

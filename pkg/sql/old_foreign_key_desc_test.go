@@ -15,11 +15,16 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // The goal of this test is to validate a case that could happen in a
@@ -31,46 +36,51 @@ import (
 // old version descriptor and ensures that everything is OK.
 func TestOldForeignKeyRepresentationGetsUpgraded(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
-CREATE TABLE t.t1 (x INT);
+CREATE TABLE t.t1 (x INT, INDEX i (x));
 CREATE TABLE t.t2 (x INT, UNIQUE INDEX (x));
 ALTER TABLE t.t1 ADD CONSTRAINT fk1 FOREIGN KEY (x) REFERENCES t.t2 (x);
 CREATE INDEX ON t.t1 (x);
 `); err != nil {
 		t.Fatal(err)
 	}
-	desc := sqlbase.GetTableDescriptor(kvDB, "t", "t1")
-	desc = sqlbase.GetTableDescriptor(kvDB, "t", "t2")
+	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t1")
+	desc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t2")
 	// Remember the old foreign keys.
-	oldInboundFKs := append([]sqlbase.ForeignKeyConstraint{}, desc.InboundFKs...)
+	oldInboundFKs := append([]descpb.ForeignKeyConstraint{}, desc.GetInboundFKs()...)
 	// downgradeForeignKey downgrades a table descriptor's foreign key representation
 	// to the pre-19.2 table descriptor format where foreign key information
 	// is stored on the index.
-	downgradeForeignKey := func(tbl *sqlbase.TableDescriptor) *sqlbase.TableDescriptor {
+	downgradeForeignKey := func(tbl catalog.TableDescriptor) catalog.TableDescriptor {
 		// Downgrade the outbound foreign keys.
-		for i := range tbl.OutboundFKs {
-			fk := &tbl.OutboundFKs[i]
-			idx, err := sqlbase.FindFKOriginIndex(tbl, fk.OriginColumnIDs)
+		for i := range tbl.GetOutboundFKs() {
+			fk := &tbl.GetOutboundFKs()[i]
+			idx, err := tabledesc.FindFKOriginIndex(tbl, fk.OriginColumnIDs)
 			if err != nil {
 				t.Fatal(err)
 			}
-			referencedTbl, err := sqlbase.GetTableDescFromID(ctx, kvDB, fk.ReferencedTableID)
+			var referencedTbl catalog.TableDescriptor
+			err = kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+				referencedTbl, err = catalogkv.MustGetTableDescByID(ctx, txn, keys.SystemSQLCodec, fk.ReferencedTableID)
+				return err
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			refIdx, err := sqlbase.FindFKReferencedIndex(referencedTbl, fk.ReferencedColumnIDs)
+			refIdx, err := tabledesc.FindFKReferencedUniqueConstraint(referencedTbl, fk.ReferencedColumnIDs)
 			if err != nil {
 				t.Fatal(err)
 			}
-			idx.ForeignKey = sqlbase.ForeignKeyReference{
+			idx.ForeignKey = descpb.ForeignKeyReference{
 				Name:            fk.Name,
 				Table:           fk.ReferencedTableID,
-				Index:           refIdx.ID,
+				Index:           refIdx.(*descpb.IndexDescriptor).ID,
 				Validity:        fk.Validity,
 				SharedPrefixLen: int32(len(fk.OriginColumnIDs)),
 				OnDelete:        fk.OnDelete,
@@ -78,36 +88,40 @@ CREATE INDEX ON t.t1 (x);
 				Match:           fk.Match,
 			}
 		}
-		tbl.OutboundFKs = nil
+		tbl.TableDesc().OutboundFKs = nil
 		// Downgrade the inbound foreign keys.
-		for i := range tbl.InboundFKs {
-			fk := &tbl.InboundFKs[i]
-			idx, err := sqlbase.FindFKReferencedIndex(desc, fk.ReferencedColumnIDs)
+		for i := range tbl.GetInboundFKs() {
+			fk := &tbl.GetInboundFKs()[i]
+			refIdx, err := tabledesc.FindFKReferencedUniqueConstraint(desc, fk.ReferencedColumnIDs)
 			if err != nil {
 				t.Fatal(err)
 			}
-			originTbl, err := sqlbase.GetTableDescFromID(ctx, kvDB, fk.OriginTableID)
-			if err != nil {
+			var originTbl catalog.TableDescriptor
+			if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+				originTbl, err = catalogkv.MustGetTableDescByID(ctx, txn, keys.SystemSQLCodec, fk.OriginTableID)
+				return err
+			}); err != nil {
 				t.Fatal(err)
 			}
-			originIdx, err := sqlbase.FindFKOriginIndex(originTbl, fk.OriginColumnIDs)
+			originIdx, err := tabledesc.FindFKOriginIndex(originTbl, fk.OriginColumnIDs)
 			if err != nil {
 				t.Fatal(err)
 			}
 			// Back references only contain the table and index IDs in old format versions.
-			fkRef := sqlbase.ForeignKeyReference{
+			fkRef := descpb.ForeignKeyReference{
 				Table: fk.OriginTableID,
 				Index: originIdx.ID,
 			}
+			idx := refIdx.(*descpb.IndexDescriptor)
 			idx.ReferencedBy = append(idx.ReferencedBy, fkRef)
 		}
-		tbl.InboundFKs = nil
+		tbl.TableDesc().InboundFKs = nil
 		return tbl
 	}
-	err := kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		b := txn.NewBatch()
 		newDesc := downgradeForeignKey(desc)
-		if err := writeDescToBatch(ctx, false, s.ClusterSettings(), b, desc.ID, newDesc); err != nil {
+		if err := catalogkv.WriteDescToBatch(ctx, false, s.ClusterSettings(), b, keys.SystemSQLCodec, desc.GetID(), newDesc); err != nil {
 			return err
 		}
 		return txn.Run(ctx, b)
@@ -116,19 +130,19 @@ CREATE INDEX ON t.t1 (x);
 		t.Fatal(err)
 	}
 	// Run a DROP INDEX statement and ensure that the downgraded descriptor gets upgraded successfully.
-	if _, err := sqlDB.Exec(`DROP INDEX t.t1@t1_auto_index_fk1`); err != nil {
+	if _, err := sqlDB.Exec(`DROP INDEX t.t1@i`); err != nil {
 		t.Fatal(err)
 	}
-	desc = sqlbase.GetTableDescriptor(kvDB, "t", "t2")
+	desc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t2")
 	// Remove the validity field on all the descriptors for comparison, since
 	// foreign keys on the referenced side's validity is not always updated correctly.
-	for i := range desc.InboundFKs {
-		desc.InboundFKs[i].Validity = sqlbase.ConstraintValidity_Validated
+	for i := range desc.TableDesc().InboundFKs {
+		desc.TableDesc().InboundFKs[i].Validity = descpb.ConstraintValidity_Validated
 	}
 	for i := range oldInboundFKs {
-		oldInboundFKs[i].Validity = sqlbase.ConstraintValidity_Validated
+		oldInboundFKs[i].Validity = descpb.ConstraintValidity_Validated
 	}
-	if !reflect.DeepEqual(desc.InboundFKs, oldInboundFKs) {
-		t.Error("expected fks", oldInboundFKs, "but found", desc.InboundFKs)
+	if !reflect.DeepEqual(desc.GetInboundFKs(), oldInboundFKs) {
+		t.Error("expected fks", oldInboundFKs, "but found", desc.GetInboundFKs())
 	}
 }

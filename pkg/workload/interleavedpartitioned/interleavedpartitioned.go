@@ -20,14 +20,14 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -430,7 +430,7 @@ func (w *interleavedPartitioned) Tables() []workload.Table {
 
 // Ops implements the Opser interface.
 func (w *interleavedPartitioned) Ops(
-	urls []string, reg *histogram.Registry,
+	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(w, ``, urls)
 	if err != nil {
@@ -664,12 +664,12 @@ func (w *interleavedPartitioned) fetchSessionID(
 	start := timeutil.Now()
 	baseSessionID := randomSessionID(rng, locality, localPercent)
 	var sessionID string
-	if err := w.findSessionIDStatement1.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && err != gosql.ErrNoRows {
+	if err := w.findSessionIDStatement1.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && !errors.Is(err, gosql.ErrNoRows) {
 		return "", err
 	}
 	// Didn't find a next session ID, let's try the other way.
 	if len(sessionID) == 0 {
-		if err := w.findSessionIDStatement2.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && err != gosql.ErrNoRows {
+		if err := w.findSessionIDStatement2.QueryRowContext(ctx, baseSessionID).Scan(&sessionID); err != nil && !errors.Is(err, gosql.ErrNoRows) {
 			return "", err
 		}
 	}
@@ -741,12 +741,19 @@ func (w *interleavedPartitioned) updateFunc(
 // Hooks implements the Hookser interface.
 func (w *interleavedPartitioned) Hooks() workload.Hooks {
 	return workload.Hooks{
+		PreCreate: func(db *gosql.DB) error {
+			if _, err := db.Exec(`SET CLUSTER SETTING sql.defaults.interleaved_tables.enabled = true`); err != nil {
+				return err
+			}
+			return nil
+		},
 		PreLoad: func(db *gosql.DB) error {
 			if _, err := db.Exec(
 				zoneLocationsStmt, w.eastZoneName, w.westZoneName, w.centralZoneName,
 			); err != nil {
 				return err
 			}
+
 			if _, err := db.Exec(
 				fmt.Sprintf(
 					"ALTER PARTITION west OF TABLE sessions CONFIGURE ZONE USING"+
@@ -814,12 +821,12 @@ func (w *interleavedPartitioned) sessionsInitialRow(rowIdx int) []interface{} {
 	}
 }
 
-var childColTypes = []coltypes.T{
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
+var childTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
 }
 
 func (w *interleavedPartitioned) childInitialRowBatchFunc(
@@ -831,7 +838,7 @@ func (w *interleavedPartitioned) childInitialRowBatchFunc(
 		nowString := timeutil.Now().UTC().Format(time.RFC3339)
 		rng := rand.New(rand.NewSource(int64(sessionRowIdx) + rngFactor))
 
-		cb.Reset(childColTypes, nPerBatch)
+		cb.Reset(childTypes, nPerBatch, coldata.StandardColumnFactory)
 		sessionIDCol := cb.ColVec(0).Bytes()
 		idCol := cb.ColVec(1).Bytes()
 		valueCol := cb.ColVec(2).Bytes()
@@ -847,17 +854,17 @@ func (w *interleavedPartitioned) childInitialRowBatchFunc(
 	}
 }
 
-var deviceColTypes = []coltypes.T{
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
+var deviceTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
 }
 
 func (w *interleavedPartitioned) deviceInitialRowBatch(
@@ -868,7 +875,7 @@ func (w *interleavedPartitioned) deviceInitialRowBatch(
 	sessionID := randomSessionID(sessionRNG, `east`, w.initEastPercent)
 	nowString := timeutil.Now().UTC().Format(time.RFC3339)
 
-	cb.Reset(deviceColTypes, w.devicesPerSession)
+	cb.Reset(deviceTypes, w.devicesPerSession, coldata.StandardColumnFactory)
 	sessionIDCol := cb.ColVec(0).Bytes()
 	idCol := cb.ColVec(1).Bytes()
 	deviceIDCol := cb.ColVec(2).Bytes()
@@ -893,11 +900,11 @@ func (w *interleavedPartitioned) deviceInitialRowBatch(
 	}
 }
 
-var queryColTypes = []coltypes.T{
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
-	coltypes.Bytes,
+var queryTypes = []*types.T{
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
+	types.Bytes,
 }
 
 func (w *interleavedPartitioned) queryInitialRowBatch(
@@ -908,7 +915,7 @@ func (w *interleavedPartitioned) queryInitialRowBatch(
 	sessionID := randomSessionID(sessionRNG, `east`, w.initEastPercent)
 	nowString := timeutil.Now().UTC().Format(time.RFC3339)
 
-	cb.Reset(queryColTypes, w.queriesPerSession)
+	cb.Reset(queryTypes, w.queriesPerSession, coldata.StandardColumnFactory)
 	sessionIDCol := cb.ColVec(0).Bytes()
 	idCol := cb.ColVec(1).Bytes()
 	createdCol := cb.ColVec(2).Bytes()

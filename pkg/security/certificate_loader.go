@@ -22,7 +22,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 )
 
 func init() {
@@ -55,6 +56,11 @@ var defaultAssetLoader = AssetLoader{
 // assetLoaderImpl is used to list/read/stat security assets.
 var assetLoaderImpl = defaultAssetLoader
 
+// GetAssetLoader returns the active asset loader.
+func GetAssetLoader() AssetLoader {
+	return assetLoaderImpl
+}
+
 // SetAssetLoader overrides the asset loader with the passed-in one.
 func SetAssetLoader(al AssetLoader) {
 	assetLoaderImpl = al
@@ -72,6 +78,9 @@ const (
 	_ PemUsage = iota
 	// CAPem describes the main CA certificate.
 	CAPem
+	// TenantClientCAPem describes the CA certificate used to broker authN/Z for SQL
+	// tenants wishing to access the KV layer.
+	TenantClientCAPem
 	// ClientCAPem describes the CA certificate used to verify client certificates.
 	ClientCAPem
 	// UICAPem describes the CA certificate used to verify the Admin UI server certificate.
@@ -83,6 +92,8 @@ const (
 	UIPem
 	// ClientPem describes a client certificate.
 	ClientPem
+	// TenantClientPem describes a SQL tenant client certificate.
+	TenantClientPem
 
 	// Maximum allowable permissions.
 	maxKeyPermissions os.FileMode = 0700
@@ -94,7 +105,7 @@ const (
 )
 
 func isCA(usage PemUsage) bool {
-	return usage == CAPem || usage == ClientCAPem || usage == UICAPem
+	return usage == CAPem || usage == ClientCAPem || usage == TenantClientCAPem || usage == UICAPem
 }
 
 func (p PemUsage) String() string {
@@ -103,6 +114,8 @@ func (p PemUsage) String() string {
 		return "CA"
 	case ClientCAPem:
 		return "Client CA"
+	case TenantClientCAPem:
+		return "Tenant Client CA"
 	case UICAPem:
 		return "UI CA"
 	case NodePem:
@@ -111,6 +124,8 @@ func (p PemUsage) String() string {
 		return "UI"
 	case ClientPem:
 		return "Client"
+	case TenantClientPem:
+		return "Tenant Client"
 	default:
 		return "unknown"
 	}
@@ -185,6 +200,11 @@ func CertInfoFromFilename(filename string) (*CertInfo, error) {
 		if numParts != 2 {
 			return nil, errors.Errorf("client CA certificate filename should match ca-client%s", certExtension)
 		}
+	case `ca-client-tenant`:
+		fileUsage = TenantClientCAPem
+		if numParts != 2 {
+			return nil, errors.Errorf("tenant CA certificate filename should match ca%s", certExtension)
+		}
 	case `ca-ui`:
 		fileUsage = UICAPem
 		if numParts != 2 {
@@ -202,10 +222,17 @@ func CertInfoFromFilename(filename string) (*CertInfo, error) {
 		}
 	case `client`:
 		fileUsage = ClientPem
-		// strip prefix and suffix and re-join middle parts.
+		// Strip prefix and suffix and re-join middle parts.
 		name = strings.Join(parts[1:numParts-1], `.`)
 		if len(name) == 0 {
 			return nil, errors.Errorf("client certificate filename should match client.<user>%s", certExtension)
+		}
+	case `client-tenant`:
+		fileUsage = TenantClientPem
+		// Strip prefix and suffix and re-join middle parts.
+		name = strings.Join(parts[1:numParts-1], `.`)
+		if len(name) == 0 {
+			return nil, errors.Errorf("tenant certificate filename should match client-tenant.<tenantid>%s", certExtension)
 		}
 	default:
 		return nil, errors.Errorf("unknown prefix %q", prefix)
@@ -250,7 +277,7 @@ func (cl *CertificateLoader) MaybeCreateCertsDir() error {
 		return nil
 	}
 
-	if !os.IsNotExist(err) {
+	if !oserror.IsNotExist(err) {
 		return makeErrorf(err, "could not stat certs directory %s", cl.certsDir)
 	}
 
@@ -272,7 +299,7 @@ func (cl *CertificateLoader) TestDisablePermissionChecks() {
 func (cl *CertificateLoader) Load() error {
 	fileInfos, err := assetLoaderImpl.ReadDir(cl.certsDir)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if oserror.IsNotExist(err) {
 			// Directory does not exist.
 			if log.V(3) {
 				log.Infof(context.Background(), "missing certs directory %s", cl.certsDir)
@@ -445,10 +472,10 @@ func validateDualPurposeNodeCert(ci *CertInfo) error {
 
 	// The first certificate is used in client auth.
 	cert := ci.ParsedCertificates[0]
-
-	// Check Subject Common Name.
-	if a, e := cert.Subject.CommonName, NodeUser; a != e {
-		return errors.Errorf("client/server node certificate has Subject \"CN=%s\", expected \"CN=%s\"", a, e)
+	principals := getCertificatePrincipals(cert)
+	if !Contains(principals, NodeUser) {
+		return errors.Errorf("client/server node certificate has principals %q, expected %q",
+			principals, NodeUser)
 	}
 
 	return nil
@@ -464,8 +491,10 @@ func validateCockroachCertificate(ci *CertInfo, cert *x509.Certificate) error {
 		// This is done in validateDualPurposeNodeCert.
 	case ClientPem:
 		// Check that CommonName matches the username extracted from the filename.
-		if a, e := cert.Subject.CommonName, ci.Name; a != e {
-			return errors.Errorf("client certificate has Subject \"CN=%s\", expected \"CN=%s\" (must match filename)", a, e)
+		principals := getCertificatePrincipals(cert)
+		if !Contains(principals, ci.Name) {
+			return errors.Errorf("client certificate has principals %q, expected %q",
+				principals, ci.Name)
 		}
 	}
 	return nil

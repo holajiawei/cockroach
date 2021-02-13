@@ -12,73 +12,51 @@ package main
 
 import (
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-type aggOverloads struct {
-	Agg       execinfrapb.AggregatorSpec_Func
-	Overloads []*overload
-}
+const minMaxAggTmpl = "pkg/sql/colexec/colexecagg/min_max_agg_tmpl.go"
 
-// AggNameLower returns the aggregation name in lower case, e.g. "min".
-func (a aggOverloads) AggNameLower() string {
-	return strings.ToLower(a.Agg.String())
-}
+func genMinMaxAgg(inputFileContents string, wr io.Writer) error {
+	r := strings.NewReplacer(
+		"_AGG", "{{$agg}}",
+		"_GOTYPESLICE", "{{.GoTypeSliceName}}",
+		"_GOTYPE", "{{.GoType}}",
+		"_TYPE", "{{.VecMethod}}",
+		"TemplateType", "{{.VecMethod}}",
+	)
+	s := r.Replace(inputFileContents)
 
-// AggNameTitle returns the aggregation name in title case, e.g. "Min".
-func (a aggOverloads) AggNameTitle() string {
-	return strings.Title(a.AggNameLower())
-}
+	assignCmpRe := makeFunctionRegex("_ASSIGN_CMP", 6)
+	s = assignCmpRe.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 6))
 
-// Avoid unused warning for functions which are only used in templates.
-var _ = aggOverloads{}.AggNameLower()
-var _ = aggOverloads{}.AggNameTitle()
+	accumulateMinMax := makeFunctionRegex("_ACCUMULATE_MINMAX", 5)
+	s = accumulateMinMax.ReplaceAllString(s, `{{template "accumulateMinMax" buildDict "Global" . "HasNulls" $4 "HasSel" $5}}`)
 
-func genMinMaxAgg(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/min_max_agg_tmpl.go")
-	if err != nil {
-		return err
-	}
-
-	s := string(t)
-	s = strings.Replace(s, "_AGG_TITLE", "{{.AggNameTitle}}", -1)
-	s = strings.Replace(s, "_AGG", "{{$agg}}", -1)
-	s = strings.Replace(s, "_GOTYPESLICE", "{{.LTyp.GoTypeSliceName}}", -1)
-	s = strings.Replace(s, "_GOTYPE", "{{.LTyp.GoTypeName}}", -1)
-	s = strings.Replace(s, "_TYPES_T", "coltypes.{{.LTyp}}", -1)
-	s = strings.Replace(s, "_TYPE", "{{.LTyp}}", -1)
-
-	assignCmpRe := makeFunctionRegex("_ASSIGN_CMP", 3)
-	s = assignCmpRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.Assign", 3))
-
-	accumulateMinMax := makeFunctionRegex("_ACCUMULATE_MINMAX", 4)
-	s = accumulateMinMax.ReplaceAllString(s, `{{template "accumulateMinMax" buildDict "Global" . "LTyp" .LTyp "HasNulls" $4}}`)
-
-	s = replaceManipulationFuncs(".LTyp", s)
+	s = replaceManipulationFuncs(s)
 
 	tmpl, err := template.New("min_max_agg").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
-
 	if err != nil {
 		return err
 	}
-	data := []aggOverloads{
+	return tmpl.Execute(wr, []struct {
+		Agg       string
+		Overloads []*oneArgOverload
+	}{
 		{
-			Agg:       execinfrapb.AggregatorSpec_MIN,
+			Agg:       "min",
 			Overloads: sameTypeComparisonOpToOverloads[tree.LT],
 		},
 		{
-			Agg:       execinfrapb.AggregatorSpec_MAX,
+			Agg:       "max",
 			Overloads: sameTypeComparisonOpToOverloads[tree.GT],
 		},
-	}
-	return tmpl.Execute(wr, data)
+	})
 }
 
 func init() {
-	registerGenerator(genMinMaxAgg, "min_max_agg.eg.go")
+	registerAggGenerator(genMinMaxAgg, "min_max_agg.eg.go", minMaxAggTmpl)
 }

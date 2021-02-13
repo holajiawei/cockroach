@@ -8,170 +8,100 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-// {{/*
 // +build execgen_template
-//
-// This file is the execgen template for hash_aggregator.eg.go. It's formatted
-// in a special way, so it's both valid Go and a valid text/template input. This
-// permits editing this file with editor support.
-//
-// */}}
 
 package colexec
 
-import (
-	"bytes"
-	"fmt"
-	"math"
+import "github.com/cockroachdb/cockroach/pkg/col/coldata"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-)
-
-// {{/*
-
-// Declarations to make the template compile properly.
-
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "tree" package.
-var _ tree.Operator
-
-// Dummy import to pull in "math" package.
-var _ int = math.MaxInt16
-
-// _ASSIGN_NE is the template function for assigning the result of comparing
-// the second input to the third input into the first input.
-func _ASSIGN_NE(_, _, _ interface{}) int {
-	execerror.VectorizedInternalPanic("")
+// populateEqChains populates op.scratch.eqChains with indices of tuples from b
+// that belong to the same groups. It returns the number of equality chains.
+// Passed-in sel is updated to include tuples that are "heads" of the
+// corresponding equality chains and op.ht.probeScratch.hashBuffer is adjusted
+// accordingly. headToEqChainsID is a scratch space that must contain all
+// zeroes and be of at least batchLength length.
+// execgen:template<useSel>
+func populateEqChains(
+	op *hashAggregator, batchLength int, sel []int, headToEqChainsID []int, useSel bool,
+) int {
+	eqChainsCount := 0
+	// Capture the slices in order for BCE to occur.
+	headIDs := op.ht.probeScratch.headID
+	hashBuffer := op.ht.probeScratch.hashBuffer
+	_ = headIDs[batchLength-1]
+	_ = hashBuffer[batchLength-1]
+	if useSel {
+		_ = sel[batchLength-1]
+	}
+	for i := 0; i < batchLength; i++ {
+		// Since we're essentially probing the batch against itself, headID
+		// cannot be 0, so we don't need to check that. What we have here is
+		// the tuple at position i belongs to the same equality chain as the
+		// tuple at position headID-1.
+		// We will use a similar to keyID encoding for eqChains slot - all
+		// tuples that should be included in eqChains[i] chain will have
+		// eqChainsID = i + 1. headToEqChainsID is a mapping from headID to
+		// eqChainsID that we're currently building in which eqChainsID
+		// indicates that the current tuple is the head of its equality chain.
+		//gcassert:bce
+		headID := headIDs[i]
+		if eqChainsID := headToEqChainsID[headID-1]; eqChainsID == 0 {
+			// This tuple is the head of the new equality chain, so we include
+			// it in updated selection vector. We also compact the hash buffer
+			// accordingly.
+			//gcassert:bce
+			h := hashBuffer[i]
+			hashBuffer[eqChainsCount] = h
+			if useSel {
+				//gcassert:bce
+				s := sel[i]
+				sel[eqChainsCount] = s
+				op.scratch.eqChains[eqChainsCount] = append(op.scratch.eqChains[eqChainsCount], s)
+			} else {
+				sel[eqChainsCount] = i
+				op.scratch.eqChains[eqChainsCount] = append(op.scratch.eqChains[eqChainsCount], i)
+			}
+			eqChainsCount++
+			headToEqChainsID[headID-1] = eqChainsCount
+		} else {
+			// This tuple is not the head of its equality chain, so we append
+			// it to already existing chain.
+			if useSel {
+				//gcassert:bce
+				s := sel[i]
+				op.scratch.eqChains[eqChainsID-1] = append(op.scratch.eqChains[eqChainsID-1], s)
+			} else {
+				op.scratch.eqChains[eqChainsID-1] = append(op.scratch.eqChains[eqChainsID-1], i)
+			}
+		}
+	}
+	return eqChainsCount
 }
 
-// */}}
-
-// {{/*
-func _MATCH_LOOP(
-	sel []int,
-	lhs coldata.Vec,
-	rhs coldata.Vec,
-	aggKeyIdx int,
-	lhsNull bool,
-	diff []bool,
-	_LHS_MAYBE_HAS_NULLS bool,
-	_RHS_MAYBE_HAS_NULLS bool,
-) { // */}}
-	// {{define "matchLoop" -}}
-
-	lhsVal := execgen.UNSAFEGET(lhsCol, aggKeyIdx)
-
-	for selIdx, rowIdx := range sel {
-		// {{if .LhsMaybeHasNulls}}
-		// {{if .RhsMaybeHasNulls}}
-		diffNull := (lhsNull != rhs.Nulls().NullAt(rowIdx))
-		if diffNull {
-			diff[selIdx] = true
-			continue
-		}
-		// {{else}}
-		if lhsNull {
-			diff[selIdx] = true
-			continue
-		}
-		// {{end}}
-		// {{end}}
-
-		rhsVal := execgen.UNSAFEGET(rhsCol, rowIdx)
-
-		var cmp bool
-		_ASSIGN_NE(cmp, lhsVal, rhsVal)
-		diff[selIdx] = diff[selIdx] || cmp
-	}
-
-	// {{end}}
-	// {{/*
-} // */}}
-
-// match takes a selection vector and compares it against the values of the key
-// of its aggregation function. It returns a selection vector representing the
-// unmatched tuples and a boolean to indicate whether or not there are any
-// matching tuples. It directly writes the result of matched tuples into the
-// selection vector of 'b' and sets the length of the batch to the number of
-// matching tuples. match also takes a diff boolean slice for internal use.
-// This slice need to be allocated to be at at least as big as sel and set to
-// all false. diff will be reset to all false when match returns. This is to
-// avoid additional slice allocation.
-// NOTE: the return vector will reuse the memory allocated for the selection
-//       vector.
-func (v hashAggFuncs) match(
-	sel []int,
+// populateEqChains populates op.scratch.eqChains with indices of tuples from b
+// that belong to the same groups. It returns the number of equality chains as
+// well as a selection vector that contains "heads" of each of the chains. The
+// method assumes that op.ht.probeScratch.headID has been populated with keyIDs
+// of all tuples.
+// NOTE: selection vector of b is modified to include only heads of each of the
+// equality chains.
+// NOTE: op.ht.probeScratch.headID and op.ht.probeScratch.differs are reset.
+func (op *hashAggregator) populateEqChains(
 	b coldata.Batch,
-	keyCols []uint32,
-	keyTypes []coltypes.T,
-	keyMapping coldata.Batch,
-	diff []bool,
-) (bool, []int) {
-	// We want to directly write to the selection vector to avoid extra
-	// allocation.
-	b.SetSelection(true)
-	matched := b.Selection()
-	matched = matched[:0]
-
-	aggKeyIdx := v.keyIdx
-
-	for keyIdx, colIdx := range keyCols {
-		lhs := keyMapping.ColVec(keyIdx)
-		lhsHasNull := lhs.MaybeHasNulls()
-		lhsNull := lhs.Nulls().NullAt(v.keyIdx)
-
-		rhs := b.ColVec(int(colIdx))
-		rhsHasNull := rhs.MaybeHasNulls()
-
-		keyTyp := keyTypes[keyIdx]
-
-		switch keyTyp {
-		// {{range .}}
-		case _TYPES_T:
-			lhsCol := lhs._TemplateType()
-			rhsCol := rhs._TemplateType()
-			if lhsHasNull && rhsHasNull {
-				_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, true, true)
-			} else if lhsHasNull && !rhsHasNull {
-				_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, true, false)
-			} else if !lhsHasNull && rhsHasNull {
-				_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, false, true)
-			} else {
-				_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, false, false)
-			}
-		// {{end}}
-		default:
-			execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", keyTyp))
-		}
+) (eqChainsCount int, eqChainsHeadsSel []int) {
+	batchLength := b.Length()
+	if batchLength == 0 {
+		return
 	}
-
-	remaining := sel[:0]
-	anyMatched := false
-
-	for selIdx, isDiff := range diff {
-		if isDiff {
-			remaining = append(remaining, sel[selIdx])
-		} else {
-			matched = append(matched, sel[selIdx])
-		}
+	headIDToEqChainsID := op.scratch.intSlice[:batchLength]
+	copy(headIDToEqChainsID, zeroIntColumn)
+	sel := b.Selection()
+	if sel != nil {
+		eqChainsCount = populateEqChains(op, batchLength, sel, headIDToEqChainsID, true)
+	} else {
+		b.SetSelection(true)
+		sel = b.Selection()
+		eqChainsCount = populateEqChains(op, batchLength, sel, headIDToEqChainsID, false)
 	}
-
-	if len(matched) > 0 {
-		b.SetLength(len(matched))
-		anyMatched = true
-	}
-
-	// Reset diff slice back to all false.
-	for n := 0; n < len(diff); n += copy(diff, zeroBoolColumn) {
-	}
-
-	return anyMatched, remaining
+	return eqChainsCount, sel
 }

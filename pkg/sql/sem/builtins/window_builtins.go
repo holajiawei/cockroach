@@ -12,12 +12,12 @@ package builtins
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 func initWindowBuiltins() {
@@ -27,16 +27,13 @@ func initWindowBuiltins() {
 			panic("duplicate builtin: " + k)
 		}
 
-		if !v.props.Impure {
-			panic(fmt.Sprintf("%s: window functions should all be impure, found %v", k, v))
-		}
 		if v.props.Class != tree.WindowClass {
-			panic(fmt.Sprintf("%s: window functions should be marked with the tree.WindowClass "+
+			panic(errors.AssertionFailedf("%s: window functions should be marked with the tree.WindowClass "+
 				"function class, found %v", k, v))
 		}
 		for _, w := range v.overloads {
 			if w.WindowFunc == nil {
-				panic(fmt.Sprintf("%s: window functions should have tree.WindowFunc constructors, "+
+				panic(errors.AssertionFailedf("%s: window functions should have tree.WindowFunc constructors, "+
 					"found %v", k, w))
 			}
 		}
@@ -46,8 +43,7 @@ func initWindowBuiltins() {
 
 func winProps() tree.FunctionProperties {
 	return tree.FunctionProperties{
-		Impure: true,
-		Class:  tree.WindowClass,
+		Class: tree.WindowClass,
 	}
 }
 
@@ -56,94 +52,170 @@ func winProps() tree.FunctionProperties {
 // See `windowFuncHolder` in the sql package.
 var windows = map[string]builtinDefinition{
 	"row_number": makeBuiltin(winProps(),
-		makeWindowOverload(tree.ArgTypes{}, types.Int, newRowNumberWindow,
-			"Calculates the number of the current row within its partition, counting from 1."),
+		makeWindowOverload(
+			tree.ArgTypes{},
+			types.Int,
+			newRowNumberWindow,
+			"Calculates the number of the current row within its partition, counting from 1.",
+			tree.VolatilityImmutable,
+		),
 	),
 	"rank": makeBuiltin(winProps(),
-		makeWindowOverload(tree.ArgTypes{}, types.Int, newRankWindow,
-			"Calculates the rank of the current row with gaps; same as row_number of its first peer."),
+		makeWindowOverload(
+			tree.ArgTypes{},
+			types.Int,
+			newRankWindow,
+			"Calculates the rank of the current row with gaps; same as row_number of its first peer.",
+			tree.VolatilityImmutable,
+		),
 	),
 	"dense_rank": makeBuiltin(winProps(),
-		makeWindowOverload(tree.ArgTypes{}, types.Int, newDenseRankWindow,
-			"Calculates the rank of the current row without gaps; this function counts peer groups."),
+		makeWindowOverload(
+			tree.ArgTypes{},
+			types.Int,
+			newDenseRankWindow,
+			"Calculates the rank of the current row without gaps; this function counts peer groups.",
+			tree.VolatilityImmutable,
+		),
 	),
 	"percent_rank": makeBuiltin(winProps(),
-		makeWindowOverload(tree.ArgTypes{}, types.Float, newPercentRankWindow,
-			"Calculates the relative rank of the current row: (rank - 1) / (total rows - 1)."),
+		makeWindowOverload(
+			tree.ArgTypes{},
+			types.Float,
+			newPercentRankWindow,
+			"Calculates the relative rank of the current row: (rank - 1) / (total rows - 1).",
+			tree.VolatilityImmutable,
+		),
 	),
 	"cume_dist": makeBuiltin(winProps(),
-		makeWindowOverload(tree.ArgTypes{}, types.Float, newCumulativeDistWindow,
+		makeWindowOverload(
+			tree.ArgTypes{},
+			types.Float,
+			newCumulativeDistWindow,
 			"Calculates the relative rank of the current row: "+
-				"(number of rows preceding or peer with current row) / (total rows)."),
+				"(number of rows preceding or peer with current row) / (total rows).",
+			tree.VolatilityImmutable,
+		),
 	),
 	"ntile": makeBuiltin(winProps(),
-		makeWindowOverload(tree.ArgTypes{{"n", types.Int}}, types.Int, newNtileWindow,
-			"Calculates an integer ranging from 1 to `n`, dividing the partition as equally as possible."),
+		makeWindowOverload(
+			tree.ArgTypes{{"n", types.Int}},
+			types.Int,
+			newNtileWindow,
+			"Calculates an integer ranging from 1 to `n`, dividing the partition as equally as possible.",
+			tree.VolatilityImmutable,
+		),
 	),
 	"lag": collectOverloads(
 		winProps(),
 		types.Scalar,
 		func(t *types.T) tree.Overload {
-			return makeWindowOverload(tree.ArgTypes{{"val", t}}, t,
+			return makeWindowOverload(
+				tree.ArgTypes{{"val", t}},
+				t,
 				makeLeadLagWindowConstructor(false, false, false),
 				"Returns `val` evaluated at the previous row within current row's partition; "+
-					"if there is no such row, instead returns null.")
+					"if there is no such row, instead returns null.",
+				tree.VolatilityImmutable,
+			)
 		},
 		func(t *types.T) tree.Overload {
-			return makeWindowOverload(tree.ArgTypes{{"val", t}, {"n", types.Int}}, t,
+			return makeWindowOverload(
+				tree.ArgTypes{{"val", t}, {"n", types.Int}},
+				t,
 				makeLeadLagWindowConstructor(false, true, false),
 				"Returns `val` evaluated at the row that is `n` rows before the current row within its partition; "+
-					"if there is no such row, instead returns null. `n` is evaluated with respect to the current row.")
+					"if there is no such row, instead returns null. `n` is evaluated with respect to the current row.",
+				tree.VolatilityImmutable,
+			)
 		},
 		// TODO(nvanbenschoten): We still have no good way to represent two parameters that
 		// can be any types but must be the same (eg. lag(T, Int, T)).
 		func(t *types.T) tree.Overload {
-			return makeWindowOverload(tree.ArgTypes{
-				{"val", t}, {"n", types.Int}, {"default", t},
-			}, t, makeLeadLagWindowConstructor(false, true, true),
+			return makeWindowOverload(
+				tree.ArgTypes{
+					{"val", t}, {"n", types.Int}, {"default", t},
+				},
+				t,
+				makeLeadLagWindowConstructor(false, true, true),
 				"Returns `val` evaluated at the row that is `n` rows before the current row within its partition; "+
 					"if there is no such, row, instead returns `default` (which must be of the same type as `val`). "+
-					"Both `n` and `default` are evaluated with respect to the current row.")
+					"Both `n` and `default` are evaluated with respect to the current row.",
+				tree.VolatilityImmutable,
+			)
 		},
 	),
 	"lead": collectOverloads(winProps(), types.Scalar,
 		func(t *types.T) tree.Overload {
-			return makeWindowOverload(tree.ArgTypes{{"val", t}}, t,
+			return makeWindowOverload(
+				tree.ArgTypes{{"val", t}},
+				t,
 				makeLeadLagWindowConstructor(true, false, false),
 				"Returns `val` evaluated at the following row within current row's partition; "+""+
-					"if there is no such row, instead returns null.")
+					"if there is no such row, instead returns null.",
+				tree.VolatilityImmutable,
+			)
 		},
 		func(t *types.T) tree.Overload {
-			return makeWindowOverload(tree.ArgTypes{{"val", t}, {"n", types.Int}}, t,
+			return makeWindowOverload(
+				tree.ArgTypes{{"val", t}, {"n", types.Int}},
+				t,
 				makeLeadLagWindowConstructor(true, true, false),
 				"Returns `val` evaluated at the row that is `n` rows after the current row within its partition; "+
-					"if there is no such row, instead returns null. `n` is evaluated with respect to the current row.")
+					"if there is no such row, instead returns null. `n` is evaluated with respect to the current row.",
+				tree.VolatilityImmutable,
+			)
 		},
 		func(t *types.T) tree.Overload {
-			return makeWindowOverload(tree.ArgTypes{
-				{"val", t}, {"n", types.Int}, {"default", t},
-			}, t, makeLeadLagWindowConstructor(true, true, true),
+			return makeWindowOverload(
+				tree.ArgTypes{
+					{"val", t}, {"n", types.Int}, {"default", t},
+				},
+				t,
+				makeLeadLagWindowConstructor(true, true, true),
 				"Returns `val` evaluated at the row that is `n` rows after the current row within its partition; "+
 					"if there is no such, row, instead returns `default` (which must be of the same type as `val`). "+
-					"Both `n` and `default` are evaluated with respect to the current row.")
+					"Both `n` and `default` are evaluated with respect to the current row.",
+				tree.VolatilityImmutable,
+			)
 		},
 	),
-	"first_value": collectOverloads(winProps(), types.Scalar,
+	"first_value": collectOverloads(
+		winProps(),
+		types.Scalar,
 		func(t *types.T) tree.Overload {
-			return makeWindowOverload(tree.ArgTypes{{"val", t}}, t, newFirstValueWindow,
-				"Returns `val` evaluated at the row that is the first row of the window frame.")
+			return makeWindowOverload(
+				tree.ArgTypes{{"val", t}},
+				t,
+				newFirstValueWindow,
+				"Returns `val` evaluated at the row that is the first row of the window frame.",
+				tree.VolatilityImmutable,
+			)
 		}),
-	"last_value": collectOverloads(winProps(), types.Scalar,
+	"last_value": collectOverloads(
+		winProps(),
+		types.Scalar,
 		func(t *types.T) tree.Overload {
-			return makeWindowOverload(tree.ArgTypes{{"val", t}}, t, newLastValueWindow,
-				"Returns `val` evaluated at the row that is the last row of the window frame.")
+			return makeWindowOverload(
+				tree.ArgTypes{{"val", t}},
+				t,
+				newLastValueWindow,
+				"Returns `val` evaluated at the row that is the last row of the window frame.",
+				tree.VolatilityImmutable,
+			)
 		}),
 	"nth_value": collectOverloads(winProps(), types.Scalar,
 		func(t *types.T) tree.Overload {
-			return makeWindowOverload(tree.ArgTypes{
-				{"val", t}, {"n", types.Int}}, t, newNthValueWindow,
+			return makeWindowOverload(
+				tree.ArgTypes{
+					{"val", t}, {"n", types.Int},
+				},
+				t,
+				newNthValueWindow,
 				"Returns `val` evaluated at the row that is the `n`th row of the window frame (counting from 1); "+
-					"null if no such row.")
+					"null if no such row.",
+				tree.VolatilityImmutable,
+			)
 		}),
 }
 
@@ -152,12 +224,14 @@ func makeWindowOverload(
 	ret *types.T,
 	f func([]*types.T, *tree.EvalContext) tree.WindowFunc,
 	info string,
+	volatility tree.Volatility,
 ) tree.Overload {
 	return tree.Overload{
 		Types:      in,
 		ReturnType: tree.FixedReturnType(ret),
 		WindowFunc: f,
 		Info:       info,
+		Volatility: volatility,
 	}
 }
 
@@ -174,7 +248,7 @@ var _ tree.WindowFunc = &firstValueWindow{}
 var _ tree.WindowFunc = &lastValueWindow{}
 var _ tree.WindowFunc = &nthValueWindow{}
 
-// aggregateWindowFunc aggregates over the the current row's window frame, using
+// aggregateWindowFunc aggregates over the current row's window frame, using
 // the internal tree.AggregateFunc to perform the aggregation.
 type aggregateWindowFunc struct {
 	agg     tree.AggregateFunc
@@ -197,7 +271,7 @@ func NewAggregateWindowFunc(
 func (w *aggregateWindowFunc) Compute(
 	ctx context.Context, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun,
 ) (tree.Datum, error) {
-	if !wfr.FirstInPeerGroup() && wfr.DefaultFrameExclusion() {
+	if !wfr.FirstInPeerGroup() && wfr.Frame.DefaultFrameExclusion() {
 		return w.peerRes, nil
 	}
 
@@ -268,9 +342,16 @@ type framableAggregateWindowFunc struct {
 func newFramableAggregateWindow(
 	agg tree.AggregateFunc, aggConstructor func(*tree.EvalContext, tree.Datums) tree.AggregateFunc,
 ) tree.WindowFunc {
+	// jsonObjectAggregate is a special aggregate function because its
+	// implementation assumes that once Result is called, the returned
+	// object is immutable and calls to Add will result in a panic. To go
+	// around this limitation, we make sure that the function is reset for
+	// each row regardless of the window frame.
+	_, shouldReset := agg.(*jsonObjectAggregate)
 	return &framableAggregateWindowFunc{
 		agg:            &aggregateWindowFunc{agg: agg, peerRes: tree.DNull},
 		aggConstructor: aggConstructor,
+		shouldReset:    shouldReset,
 	}
 }
 
@@ -294,7 +375,7 @@ func (w *framableAggregateWindowFunc) Compute(
 	if err != nil {
 		return nil, err
 	}
-	if !wfr.FirstInPeerGroup() && wfr.DefaultFrameExclusion() {
+	if !wfr.FirstInPeerGroup() && wfr.Frame.DefaultFrameExclusion() {
 		// The concept of window framing takes precedence over the concept of
 		// peers - although we calculated the result for one of the peers of the
 		// current row, it is possible for that peer to have a different window
@@ -758,7 +839,7 @@ func (nthValueWindow) Compute(
 	var idx int
 	// Note that we do not need to check whether a filter is present because
 	// filters are only supported for aggregate functions.
-	if wfr.DefaultFrameExclusion() {
+	if wfr.Frame.DefaultFrameExclusion() {
 		// We subtract 1 because nth is counting from 1.
 		idx = frameStartIdx + nth - 1
 	} else {

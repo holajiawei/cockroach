@@ -15,13 +15,17 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -31,18 +35,10 @@ var insertFastPathNodePool = sync.Pool{
 	},
 }
 
-// Check that exec.InsertFastPathMaxRows does not exceed the default
-// maxInsertBatchSize.
-func init() {
-	if maxInsertBatchSize < exec.InsertFastPathMaxRows {
-		panic("decrease exec.InsertFastPathMaxRows")
-	}
-}
-
 // insertFastPathNode is a faster implementation of inserting values in a table
 // and performing FK checks. It is used when all the foreign key checks can be
 // performed via a direct lookup in an index, and when the input is VALUES of
-// limited size (at most exec.InsertFastPathMaxRows).
+// limited size (at most mutations.MaxBatchSize).
 type insertFastPathNode struct {
 	// input values, similar to a valuesNode.
 	input [][]tree.TypedExpr
@@ -50,7 +46,7 @@ type insertFastPathNode struct {
 	// columns is set if this INSERT is returning any rows, to be
 	// consumed by a renderNode upstream. This occurs when there is a
 	// RETURNING clause with some scalar expressions.
-	columns sqlbase.ResultColumns
+	columns colinfo.ResultColumns
 
 	run insertFastPathRun
 }
@@ -90,35 +86,36 @@ type insertFastPathFKSpanInfo struct {
 type insertFastPathFKCheck struct {
 	exec.InsertFastPathFKCheck
 
-	tabDesc     *sqlbase.ImmutableTableDescriptor
-	idxDesc     *sqlbase.IndexDescriptor
+	tabDesc     catalog.TableDescriptor
+	idxDesc     *descpb.IndexDescriptor
 	keyPrefix   []byte
-	colMap      map[sqlbase.ColumnID]int
+	colMap      catalog.TableColMap
 	spanBuilder *span.Builder
 }
 
-func (c *insertFastPathFKCheck) init() error {
+func (c *insertFastPathFKCheck) init(params runParams) error {
 	idx := c.ReferencedIndex.(*optIndex)
 	c.tabDesc = c.ReferencedTable.(*optTable).desc
 	c.idxDesc = idx.desc
-	c.keyPrefix = sqlbase.MakeIndexKeyPrefix(&c.tabDesc.TableDescriptor, c.idxDesc.ID)
-	c.spanBuilder = span.MakeBuilder(c.tabDesc.TableDesc(), c.idxDesc)
+
+	codec := params.ExecCfg().Codec
+	c.keyPrefix = rowenc.MakeIndexKeyPrefix(codec, c.tabDesc, c.idxDesc.ID)
+	c.spanBuilder = span.MakeBuilder(params.EvalContext(), codec, c.tabDesc, c.idxDesc)
 
 	if len(c.InsertCols) > idx.numLaxKeyCols {
 		return errors.AssertionFailedf(
 			"%d FK cols, only %d cols in index", len(c.InsertCols), idx.numLaxKeyCols,
 		)
 	}
-	c.colMap = make(map[sqlbase.ColumnID]int, len(c.InsertCols))
 	for i, ord := range c.InsertCols {
-		var colID sqlbase.ColumnID
+		var colID descpb.ColumnID
 		if i < len(c.idxDesc.ColumnIDs) {
 			colID = c.idxDesc.ColumnIDs[i]
 		} else {
 			colID = c.idxDesc.ExtraColumnIDs[i-len(c.idxDesc.ColumnIDs)]
 		}
 
-		c.colMap[colID] = int(ord)
+		c.colMap.Set(colID, int(ord))
 	}
 	return nil
 }
@@ -224,14 +221,10 @@ func (n *insertFastPathNode) runFKChecks(params runParams) error {
 }
 
 func (n *insertFastPathNode) startExec(params runParams) error {
-	if err := params.p.maybeSetSystemConfig(n.run.ti.tableDesc().GetID()); err != nil {
-		return err
-	}
-
 	// Cache traceKV during execution, to avoid re-evaluating it for every row.
 	n.run.traceKV = params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 
-	n.run.initRowContainer(params, n.columns, 0 /* rowCapacity */)
+	n.run.initRowContainer(params, n.columns)
 
 	n.run.numInputCols = len(n.input[0])
 	n.run.inputBuf = make(tree.Datums, len(n.input)*n.run.numInputCols)
@@ -242,7 +235,7 @@ func (n *insertFastPathNode) startExec(params runParams) error {
 
 	if len(n.run.fkChecks) > 0 {
 		for i := range n.run.fkChecks {
-			if err := n.run.fkChecks[i].init(); err != nil {
+			if err := n.run.fkChecks[i].init(params); err != nil {
 				return err
 			}
 		}
@@ -273,8 +266,6 @@ func (n *insertFastPathNode) BatchedNext(params runParams) (bool, error) {
 		return false, nil
 	}
 
-	tracing.AnnotateTrace()
-
 	// The fast path node does everything in one batch.
 
 	for rowIdx, tupleRow := range n.input {
@@ -286,6 +277,7 @@ func (n *insertFastPathNode) BatchedNext(params runParams) (bool, error) {
 			var err error
 			inputRow[col], err = typedExpr.Eval(params.EvalContext())
 			if err != nil {
+				err = interceptAlterColumnTypeParseError(n.run.insertCols, col, err)
 				return false, err
 			}
 		}
@@ -310,18 +302,14 @@ func (n *insertFastPathNode) BatchedNext(params runParams) (bool, error) {
 		return false, err
 	}
 
-	if err := n.run.ti.atBatchEnd(params.ctx, n.run.traceKV); err != nil {
-		return false, err
-	}
-
-	if _, err := n.run.ti.finalize(params.ctx, n.run.traceKV); err != nil {
+	if err := n.run.ti.finalize(params.ctx); err != nil {
 		return false, err
 	}
 	// Remember we're done for the next call to BatchedNext().
 	n.run.done = true
 
 	// Possibly initiate a run of CREATE STATISTICS.
-	params.ExecCfg().StatsRefresher.NotifyMutation(n.run.ti.tableDesc().ID, len(n.input))
+	params.ExecCfg().StatsRefresher.NotifyMutation(n.run.ti.ri.Helper.TableDesc.GetID(), len(n.input))
 
 	return true, nil
 }
@@ -330,13 +318,10 @@ func (n *insertFastPathNode) BatchedNext(params runParams) (bool, error) {
 func (n *insertFastPathNode) BatchedCount() int { return len(n.input) }
 
 // BatchedCount implements the batchedPlanNode interface.
-func (n *insertFastPathNode) BatchedValues(rowIdx int) tree.Datums { return n.run.rows.At(rowIdx) }
+func (n *insertFastPathNode) BatchedValues(rowIdx int) tree.Datums { return n.run.ti.rows.At(rowIdx) }
 
 func (n *insertFastPathNode) Close(ctx context.Context) {
 	n.run.ti.close(ctx)
-	if n.run.rows != nil {
-		n.run.rows.Close(ctx)
-	}
 	*n = insertFastPathNode{}
 	insertFastPathNodePool.Put(n)
 }
@@ -344,4 +329,67 @@ func (n *insertFastPathNode) Close(ctx context.Context) {
 // See planner.autoCommit.
 func (n *insertFastPathNode) enableAutoCommit() {
 	n.run.ti.enableAutoCommit()
+}
+
+// interceptAlterColumnTypeParseError wraps a type parsing error with a warning
+// about the column undergoing an ALTER COLUMN TYPE schema change.
+// If colNum is not -1, only the colNum'th column in insertCols will be checked
+// for AlterColumnTypeInProgress, otherwise every column in insertCols will
+// be checked.
+func interceptAlterColumnTypeParseError(
+	insertCols []descpb.ColumnDescriptor, colNum int, err error,
+) error {
+	// Only intercept the error if the column being inserted into
+	// is an actual column. This is to avoid checking on values that don't
+	// correspond to an actual column, for example a check constraint.
+	if colNum >= len(insertCols) {
+		return err
+	}
+	var insertCol descpb.ColumnDescriptor
+
+	// wrapParseError is a helper function that checks if an insertCol has the
+	// AlterColumnTypeInProgress flag and wraps the parse error msg stating
+	// that the error may be because the column is being altered.
+	// Returns if the error msg has been wrapped and the wrapped error msg.
+	wrapParseError := func(insertCol descpb.ColumnDescriptor, colNum int, err error) (bool, error) {
+		if insertCol.AlterColumnTypeInProgress {
+			code := pgerror.GetPGCode(err)
+			if code == pgcode.InvalidTextRepresentation {
+				if colNum != -1 {
+					// If a column is specified, we can ensure the parse error
+					// is happening because the column is undergoing an alter column type
+					// schema change.
+					return true, errors.Wrapf(err,
+						"This table is still undergoing the ALTER COLUMN TYPE schema change, "+
+							"this insert is not supported until the schema change is finalized")
+				}
+				// If no column is specified, the error message is slightly changed to say
+				// that the error MAY be because a column is undergoing an alter column type
+				// schema change.
+				return true, errors.Wrap(err,
+					"This table is still undergoing the ALTER COLUMN TYPE schema change, "+
+						"this insert may not be supported until the schema change is finalized")
+			}
+		}
+		return false, err
+	}
+
+	// If a colNum is specified, we just check the one column for
+	// AlterColumnTypeInProgress and return the error whether it's wrapped or not.
+	if colNum != -1 {
+		insertCol = insertCols[colNum]
+		_, err = wrapParseError(insertCol, colNum, err)
+		return err
+	}
+
+	// If the colNum is -1, we check every insertCol for AlterColumnTypeInProgress.
+	for _, insertCol = range insertCols {
+		var changed bool
+		changed, err = wrapParseError(insertCol, colNum, err)
+		if changed {
+			return err
+		}
+	}
+
+	return err
 }

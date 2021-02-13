@@ -13,8 +13,10 @@
 package execinfra
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -48,17 +50,32 @@ type FlowCtx struct {
 	// must be performed. Processors in the Flow will use this txn concurrently.
 	// This field is generally not nil, except for flows that don't run in a
 	// higher-level txn (like backfills).
-	Txn *client.Txn
+	Txn *kv.Txn
 
 	// nodeID is the ID of the node on which the processors using this FlowCtx
 	// run.
-	NodeID roachpb.NodeID
+	NodeID *base.SQLIDContainer
 
 	// TraceKV is true if KV tracing was requested by the session.
 	TraceKV bool
 
+	// CollectStats is true if execution stats collection was requested.
+	CollectStats bool
+
 	// Local is true if this flow is being run as part of a local-only query.
 	Local bool
+
+	// Gateway is true if this flow is being run on the gateway node.
+	Gateway bool
+
+	// TypeResolverFactory is used to construct transaction bound TypeResolvers
+	// to resolve type references during flow setup. It is not safe for concurrent
+	// use and is intended to be used only during flow setup and initialization.
+	// The TypeResolverFactory is initialized when the FlowContext is created
+	// on the gateway node using the planner's descs.Collection and is created
+	// on remote nodes with a new descs.Collection. After the flow is complete,
+	// all descriptors leased from the factory must be released.
+	TypeResolverFactory *descs.DistSQLTypeResolverFactory
 }
 
 // NewEvalCtx returns a modifiable copy of the FlowCtx's EvalContext.
@@ -69,7 +86,8 @@ type FlowCtx struct {
 // them at runtime to ensure expressions are evaluated with the correct indexed
 // var context.
 func (ctx *FlowCtx) NewEvalCtx() *tree.EvalContext {
-	return ctx.EvalCtx.Copy()
+	evalCopy := ctx.EvalCtx.Copy()
+	return evalCopy
 }
 
 // TestingKnobs returns the distsql testing knobs for this flow context.
@@ -80,4 +98,20 @@ func (ctx *FlowCtx) TestingKnobs() TestingKnobs {
 // Stopper returns the stopper for this flowCtx.
 func (ctx *FlowCtx) Stopper() *stop.Stopper {
 	return ctx.Cfg.Stopper
+}
+
+// Codec returns the SQL codec for this flowCtx.
+func (ctx *FlowCtx) Codec() keys.SQLCodec {
+	return ctx.EvalCtx.Codec
+}
+
+// ProcessorComponentID returns a ComponentID for the given processor in this
+// flow.
+func (ctx *FlowCtx) ProcessorComponentID(procID int32) execinfrapb.ComponentID {
+	return execinfrapb.ProcessorComponentID(ctx.ID, procID)
+}
+
+// StreamComponentID returns a ComponentID for the given stream in this flow.
+func (ctx *FlowCtx) StreamComponentID(streamID execinfrapb.StreamID) execinfrapb.ComponentID {
+	return execinfrapb.StreamComponentID(ctx.ID, streamID)
 }

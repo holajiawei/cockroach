@@ -30,7 +30,10 @@ interface LoginIndicatorState {
   isOpenMenu: boolean;
 }
 
-class LoginIndicator extends React.Component<LoginIndicatorProps, LoginIndicatorState> {
+class LoginIndicator extends React.Component<
+  LoginIndicatorProps,
+  LoginIndicatorState
+> {
   constructor(props: LoginIndicatorProps) {
     super(props);
     this.state = {
@@ -42,24 +45,26 @@ class LoginIndicator extends React.Component<LoginIndicatorProps, LoginIndicator
     this.setState({
       isOpenMenu: nextState,
     });
-  }
+  };
 
   render() {
     const { loginState, handleLogout } = this.props;
     const { isOpenMenu } = this.state;
-    if (!loginState.useLogin()) {
-      return null;
-    }
-
-    if (!loginState.loginEnabled()) {
+    if (!loginState.secureCluster()) {
       return (
         <div className="login-indicator login-indicator--insecure">
-          <div>Insecure mode</div>
-          <div className="image-container"
-               title="Insecure mode"
-               dangerouslySetInnerHTML={trustIcon(unlockedIcon)}/>
+          <div
+            className="image-container"
+            title="Insecure mode"
+            dangerouslySetInnerHTML={trustIcon(unlockedIcon)}
+          />
+          <div className="login-indicator__title">Insecure mode</div>
         </div>
       );
+    }
+
+    if (!loginState.displayUserMenu()) {
+      return null;
     }
 
     const user = loginState.loggedInUser();
@@ -75,9 +80,7 @@ class LoginIndicator extends React.Component<LoginIndicatorProps, LoginIndicator
           visible={isOpenMenu}
           onVisibleChange={this.onUserMenuToggle}
         >
-          <UserMenu
-            userName={user}
-            onLogoutClick={handleLogout}/>
+          <UserMenu userName={user} onLogoutClick={handleLogout} />
         </Popover>
       </div>
     );

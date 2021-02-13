@@ -81,6 +81,9 @@ func registerSQLSmith(r *testRegistry) {
 		c.l.Printf("seed: %d", seed)
 
 		c.Put(ctx, cockroach, "./cockroach")
+		if err := c.PutLibraries(ctx, "./lib"); err != nil {
+			t.Fatalf("could not initialize libraries: %v", err)
+		}
 		c.Start(ctx, t)
 
 		setupFunc, ok := setups[setupName]
@@ -104,13 +107,6 @@ func registerSQLSmith(r *testRegistry) {
 			logStmt(setup)
 		}
 
-		stmt := "SET experimental_enable_primary_key_changes = true;"
-		if _, err := conn.Exec(stmt); err != nil {
-			t.Fatal(err)
-		} else {
-			logStmt(stmt)
-		}
-
 		const timeout = time.Minute
 		setStmtTimeout := fmt.Sprintf("SET statement_timeout='%s';", timeout.String())
 		t.Status("setting statement_timeout")
@@ -123,6 +119,30 @@ func registerSQLSmith(r *testRegistry) {
 		smither, err := sqlsmith.NewSmither(conn, rng, setting.Options...)
 		if err != nil {
 			t.Fatal(err)
+		}
+
+		versionString, err := fetchCockroachVersion(ctx, c, c.Node(1)[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		crdbVersion, err := toCRDBVersion(versionString)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if crdbVersion >= crdbVersion21_1 {
+			// We will enable panic injection on this connection in the
+			// vectorized engine (and will ignore the injected errors) in order
+			// to test that the panic-catching mechanism of error propagation
+			// works as expected.
+			// Note: it is important to enable this testing knob only after all
+			// other setup queries have already completed, including the smither
+			// instantiation (otherwise, the setup might fail because of the
+			// injected panics).
+			injectPanicsStmt := "SET testing_vectorize_inject_panics=true;"
+			if _, err := conn.Exec(injectPanicsStmt); err != nil {
+				t.Fatal(err)
+			}
+			logStmt(injectPanicsStmt)
 		}
 
 		t.Status("smithing")
@@ -171,7 +191,9 @@ func registerSQLSmith(r *testRegistry) {
 			}()
 			if err != nil {
 				es := err.Error()
-				if strings.Contains(es, "internal error") {
+				// TODO(yuzefovich): we temporarily ignore internal errors that
+				// are because of #39433.
+				if strings.Contains(es, "internal error") && !strings.Contains(es, "internal error: invalid index") {
 					logStmt(stmt)
 					t.Fatalf("error: %s\nstmt:\n%s;", err, stmt)
 				} else if strings.Contains(es, "communication error") {
@@ -200,7 +222,7 @@ func registerSQLSmith(r *testRegistry) {
 			// NB: sqlsmith failures should never block a release.
 			Owner:      OwnerSQLExec,
 			Cluster:    makeClusterSpec(4),
-			MinVersion: "v20.1.0",
+			MinVersion: "v20.2.0",
 			Timeout:    time.Minute * 20,
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				runSQLSmith(ctx, t, c, setup, setting)

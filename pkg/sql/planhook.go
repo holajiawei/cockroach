@@ -13,10 +13,18 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/roleprivilege"
+	"github.com/cockroachdb/cockroach/pkg/migration"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -32,26 +40,18 @@ import (
 // plan execution.
 type planHookFn func(
 	context.Context, tree.Statement, PlanHookState,
-) (fn PlanHookRowFn, header sqlbase.ResultColumns, subplans []planNode, avoidBuffering bool, err error)
+) (fn PlanHookRowFn, header colinfo.ResultColumns, subplans []planNode, avoidBuffering bool, err error)
 
 // PlanHookRowFn describes the row-production for hook-created plans. The
 // channel argument is used to return results to the plan's runner. It's
 // a blocking channel, so implementors should be careful to only use blocking
 // sends on it when necessary. Any subplans returned by the hook when initially
-// called are passed back, planned and started, for the the RowFn's use.
+// called are passed back, planned and started, for the RowFn's use.
 //
 //TODO(dt): should this take runParams like a normal planNode.Next?
 type PlanHookRowFn func(context.Context, []planNode, chan<- tree.Datums) error
 
 var planHooks []planHookFn
-
-// wrappedPlanHookFn is similar to planHookFn but returns an existing plan type.
-// Additionally, it takes a context.
-type wrappedPlanHookFn func(
-	context.Context, tree.Statement, PlanHookState,
-) (planNode, error)
-
-var wrappedPlanHooks []wrappedPlanHookFn
 
 func (p *planner) RunParams(ctx context.Context) runParams {
 	return runParams{ctx, p.ExtendedEvalContext(), p}
@@ -68,40 +68,37 @@ func (p *planner) RunParams(ctx context.Context) runParams {
 // CCL statements to get access to a "planner" is through this PlanHookState
 // that gets passed back due to this inversion of roles.
 type PlanHookState interface {
-	SchemaResolver
+	resolver.SchemaResolver
 	RunParams(ctx context.Context) runParams
+	SemaCtx() *tree.SemaContext
 	ExtendedEvalContext() *extendedEvalContext
 	SessionData() *sessiondata.SessionData
 	ExecCfg() *ExecutorConfig
 	DistSQLPlanner() *DistSQLPlanner
-	LeaseMgr() *LeaseManager
-	TypeAsString(e tree.Expr, op string) (func() (string, error), error)
-	TypeAsStringArray(e tree.Exprs, op string) (func() ([]string, error), error)
+	LeaseMgr() *lease.Manager
+	TypeAsString(ctx context.Context, e tree.Expr, op string) (func() (string, error), error)
+	TypeAsStringArray(ctx context.Context, e tree.Exprs, op string) (func() ([]string, error), error)
 	TypeAsStringOpts(
-		opts tree.KVOptions, optsValidate map[string]KVStringOptValidate,
+		ctx context.Context, opts tree.KVOptions, optsValidate map[string]KVStringOptValidate,
 	) (func() (map[string]string, error), error)
-	User() string
+	User() security.SQLUsername
 	AuthorizationAccessor
 	// The role create/drop call into OSS code to reuse plan nodes.
 	// TODO(mberhault): it would be easier to just pass a planner to plan hooks.
-	CreateUserNode(
-		ctx context.Context, nameE, passwordE tree.Expr, ifNotExists bool, isRole bool, opName string,
-		rolePrivileges roleprivilege.List,
-	) (*CreateUserNode, error)
-	DropUserNode(
-		ctx context.Context, namesE tree.Exprs, ifExists bool, isRole bool, opName string,
-	) (*DropUserNode, error)
-	GetAllUsersAndRoles(ctx context.Context) (map[string]bool, error)
+	GetAllRoles(ctx context.Context) (map[security.SQLUsername]bool, error)
 	BumpRoleMembershipTableVersion(ctx context.Context) error
-	EvalAsOfTimestamp(asOf tree.AsOfClause) (hlc.Timestamp, error)
+	EvalAsOfTimestamp(ctx context.Context, asOf tree.AsOfClause) (hlc.Timestamp, error)
 	ResolveUncachedDatabaseByName(
-		ctx context.Context, dbName string, required bool) (*UncachedDatabaseDescriptor, error)
+		ctx context.Context, dbName string, required bool) (*dbdesc.Immutable, error)
 	ResolveMutableTableDescriptor(
-		ctx context.Context, tn *ObjectName, required bool, requiredType ResolveRequiredType,
-	) (table *MutableTableDescriptor, err error)
+		ctx context.Context, tn *tree.TableName, required bool, requiredType tree.RequiredTableKind,
+	) (table *tabledesc.Mutable, err error)
 	ShowCreate(
-		ctx context.Context, dbPrefix string, allDescs []sqlbase.Descriptor, desc *sqlbase.TableDescriptor, ignoreFKs shouldOmitFKClausesFromCreate,
+		ctx context.Context, dbPrefix string, allDescs []descpb.Descriptor, desc catalog.TableDescriptor, displayOptions ShowCreateDisplayOptions,
 	) (string, error)
+	CreateSchemaNamespaceEntry(ctx context.Context, schemaNameKey roachpb.Key,
+		schemaID descpb.ID) error
+	MigrationJobDeps() migration.JobDeps
 }
 
 // AddPlanHook adds a hook used to short-circuit creating a planNode from a
@@ -119,14 +116,6 @@ func ClearPlanHooks() {
 	planHooks = nil
 }
 
-// AddWrappedPlanHook adds a hook used to short-circuit creating a planNode from a
-// tree.Statement. If the returned plan is non-nil, it is used directly by the planner.
-//
-// See PlanHookState comments for information about why plan hooks are needed.
-func AddWrappedPlanHook(f wrappedPlanHookFn) {
-	wrappedPlanHooks = append(wrappedPlanHooks, f)
-}
-
 // hookFnNode is a planNode implemented in terms of a function. It begins the
 // provided function during Start and serves the results it returns over the
 // channel.
@@ -134,7 +123,7 @@ type hookFnNode struct {
 	optColumnsSlot
 
 	f        PlanHookRowFn
-	header   sqlbase.ResultColumns
+	header   colinfo.ResultColumns
 	subplans []planNode
 
 	run hookFnRun

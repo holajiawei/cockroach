@@ -11,12 +11,14 @@
 package sqlsmith
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/mutations"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 // Setup generates a SQL query that can be executed to initialize a database
@@ -62,14 +64,32 @@ func randTables(r *rand.Rand) string {
 	sb.WriteString(`
 		SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;
 		SET CLUSTER SETTING sql.stats.histogram_collection.enabled = false;
+		SET CLUSTER SETTING sql.defaults.interleaved_tables.enabled = true;
 	`)
 
-	stmts := sqlbase.RandCreateTables(r, "table", r.Intn(5)+1,
-		mutations.ForeignKeyMutator,
+	// Create the random tables.
+	stmts := rowenc.RandCreateTables(r, "table", r.Intn(5)+1,
 		mutations.StatisticsMutator,
+		// The PartialIndexMutator must be listed before the ForeignKeyMutator.
+		// A foreign key requires a unique index on the referenced column. These
+		// unique indexes are created by the ForeignKeyMutator. If the
+		// PartialIndexMutator is listed after the ForeignKeyMutator, it may
+		// mutate these unique indexes into partial unique indexes, which do not
+		// satisfy the requirements for creating the foreign key.
+		mutations.PartialIndexMutator,
+		mutations.ForeignKeyMutator,
 	)
 
 	for _, stmt := range stmts {
+		sb.WriteString(tree.SerializeForDisplay(stmt))
+		sb.WriteString(";\n")
+	}
+
+	// Create some random types as well.
+	numTypes := r.Intn(5) + 1
+	for i := 0; i < numTypes; i++ {
+		name := fmt.Sprintf("rand_typ_%d", i)
+		stmt := rowenc.RandCreateType(r, name, letters)
 		sb.WriteString(stmt.String())
 		sb.WriteString(";\n")
 	}
@@ -81,6 +101,7 @@ func randTables(r *rand.Rand) string {
 
 const (
 	seedTable = `
+CREATE TYPE greeting AS ENUM ('hello', 'howdy', 'hi', 'good day', 'morning');
 CREATE TABLE IF NOT EXISTS seed AS
 	SELECT
 		g::INT2 AS _int2,
@@ -98,7 +119,8 @@ CREATE TABLE IF NOT EXISTS seed AS
 		g::STRING::BYTES AS _bytes,
 		substring('00000000-0000-0000-0000-' || g::STRING || '00000000000', 1, 36)::UUID AS _uuid,
 		'0.0.0.0'::INET + g AS _inet,
-		g::STRING::JSONB AS _jsonb
+		g::STRING::JSONB AS _jsonb,
+		enum_range('hello'::greeting)[g] as _enum
 	FROM
 		generate_series(1, 5) AS g;
 

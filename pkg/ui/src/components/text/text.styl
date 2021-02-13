@@ -13,12 +13,6 @@
 .text
   letter-spacing $letter-spacing--compact
 
-.text > *,
-.text > *:hover,
-.text > *:active
-  color inherit
-  text-decoration inherit
-
 .text--heading-1
   @extend $text--heading-1
 
@@ -28,11 +22,17 @@
 .text--heading-3
   @extend $text--heading-3
 
+.text--heading-5
+  @extend $text--heading-5
+
 .text--body
   @extend $text--body
 
 .text--body-strong
   @extend $text--body-strong
+
+.text--code
+  @extend $text--code
 
 .text--disabled
   color $colors--disabled

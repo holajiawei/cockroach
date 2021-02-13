@@ -17,8 +17,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq"
-	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -42,7 +42,7 @@ func registerHotSpotSplits(r *testRegistry) {
 		m.Go(func() error {
 			t.l.Printf("starting load generator\n")
 
-			const blockSize = 1 << 19 // 512 KB
+			const blockSize = 1 << 18 // 256 KB
 			return c.RunE(ctx, appNode, fmt.Sprintf(
 				"./workload run kv --read-percent=0 --tolerate-errors --concurrency=%d "+
 					"--min-block-bytes=%d --max-block-bytes=%d --duration=%s {pgurl:1-3}",
@@ -50,7 +50,7 @@ func registerHotSpotSplits(r *testRegistry) {
 		})
 
 		m.Go(func() error {
-			t.Status(fmt.Sprintf("starting checks for range sizes"))
+			t.Status("starting checks for range sizes")
 			const sizeLimit = 3 * (1 << 29) // 3*512 MB (512 mb is default size)
 
 			db := c.Conn(ctx, 1)
@@ -89,9 +89,13 @@ func registerHotSpotSplits(r *testRegistry) {
 	concurrency := 128
 
 	r.Add(testSpec{
-		Name:    fmt.Sprintf("hotspotsplits/nodes=%d", numNodes),
-		Owner:   OwnerKV,
-		Cluster: makeClusterSpec(numNodes),
+		Name:  fmt.Sprintf("hotspotsplits/nodes=%d", numNodes),
+		Owner: OwnerKV,
+		// Test OOMs below this version because of scans over the large rows.
+		// No problem in 20.1 thanks to:
+		// https://github.com/cockroachdb/cockroach/pull/45323.
+		MinVersion: "v20.1.0",
+		Cluster:    makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			if local {
 				concurrency = 32

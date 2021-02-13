@@ -11,9 +11,9 @@
 package cli
 
 import (
-	"os"
-
+	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -28,25 +28,24 @@ func WorkloadCmd(userFacing bool) *cobra.Command {
 		rootCmd.AddCommand(subCmdFn(userFacing))
 	}
 	if userFacing {
-		whitelist := map[string]struct{}{
+		allowlist := map[string]struct{}{
 			`workload`: {},
 			`init`:     {},
 			`run`:      {},
 		}
 		for _, m := range workload.Registered() {
-			whitelist[m.Name] = struct{}{}
+			allowlist[m.Name] = struct{}{}
 		}
-		var addExperimental func(c *cobra.Command)
-		addExperimental = func(c *cobra.Command) {
-			c.Short = `[experimental] ` + c.Short
-			if _, ok := whitelist[c.Name()]; !ok {
+		var hideNonPublic func(c *cobra.Command)
+		hideNonPublic = func(c *cobra.Command) {
+			if _, ok := allowlist[c.Name()]; !ok {
 				c.Hidden = true
 			}
 			for _, sub := range c.Commands() {
-				addExperimental(sub)
+				hideNonPublic(sub)
 			}
 		}
-		addExperimental(rootCmd)
+		hideNonPublic(rootCmd)
 	}
 	return rootCmd
 }
@@ -73,8 +72,12 @@ func HandleErrs(
 	return func(cmd *cobra.Command, args []string) {
 		err := f(cmd, args)
 		if err != nil {
+			hint := errors.FlattenHints(err)
 			cmd.Println("Error:", err.Error())
-			os.Exit(1)
+			if hint != "" {
+				cmd.Println("Hint:", hint)
+			}
+			exit.WithCode(exit.UnspecifiedError())
 		}
 	}
 }

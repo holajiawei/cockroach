@@ -25,12 +25,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
 )
 
 func TestDetachMemo(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	catalog := testcat.New()
 	if _, err := catalog.ExecuteDDL("CREATE TABLE abc (a INT PRIMARY KEY, b INT, c STRING, INDEX (c))"); err != nil {
 		t.Fatal(err)
@@ -80,6 +83,7 @@ func TestDetachMemo(t *testing.T) {
 // new statistics.
 func TestDetachMemoRace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	catalog := testcat.New()
 
@@ -109,7 +113,7 @@ func TestDetachMemoRace(t *testing.T) {
 						memo.FiltersExpr{f.ConstructFiltersItem(
 							f.ConstructEq(
 								f.ConstructVariable(col),
-								f.ConstructConst(tree.NewDInt(10)),
+								f.ConstructConst(tree.NewDInt(10), types.Int),
 							),
 						)},
 					)
@@ -132,6 +136,7 @@ func TestDetachMemoRace(t *testing.T) {
 //   ...
 func TestCoster(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	runDataDrivenTest(
 		t, "testdata/coster/",
 		memo.ExprFmtHideRuleProps|memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|
@@ -145,6 +150,7 @@ func TestCoster(t *testing.T) {
 //   ...
 func TestPhysicalProps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	runDataDrivenTest(
 		t, "testdata/physprops/",
 		memo.ExprFmtHideConstraints|
@@ -162,15 +168,13 @@ func TestPhysicalProps(t *testing.T) {
 //   ...
 func TestRuleProps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	datadriven.Walk(t, "testdata/ruleprops", func(t *testing.T, path string) {
-		catalog := testcat.New()
-		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
-			tester := opttester.New(catalog, d.Input)
-			tester.Flags.ExprFormat = memo.ExprFmtHideStats | memo.ExprFmtHideCost |
-				memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes
-			return tester.RunCommand(t, d)
-		})
-	})
+	defer log.Scope(t).Close(t)
+	runDataDrivenTest(
+		t,
+		"testdata/ruleprops/",
+		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideQualifications|
+			memo.ExprFmtHideScalars|memo.ExprFmtHideTypes,
+	)
 }
 
 // TestRules files can be run separately like this:
@@ -179,6 +183,7 @@ func TestRuleProps(t *testing.T) {
 //   ...
 func TestRules(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	runDataDrivenTest(
 		t,
 		"testdata/rules/",
@@ -204,6 +209,7 @@ var externalTestData = flag.String(
 //
 func TestExternal(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	runDataDrivenTest(
 		t,
 		*externalTestData,

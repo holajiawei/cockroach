@@ -14,14 +14,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl/enginepbccl"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/gogo/protobuf/proto"
 )
@@ -95,7 +95,7 @@ func (m *StoreKeyManager) GetKey(id string) (*enginepbccl.SecretKey, error) {
 	if m.oldKey.Info.KeyId == id {
 		return m.oldKey, nil
 	}
-	return nil, fmt.Errorf("store key with id: %s was not found", id)
+	return nil, fmt.Errorf("store key ID %s was not found", id)
 }
 
 func loadKeyFromFile(fs vfs.FS, filename string) (*enginepbccl.SecretKey, error) {
@@ -178,7 +178,7 @@ func (m *DataKeyManager) Load(ctx context.Context) error {
 	_, err := m.fs.Stat(m.registryFilename)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if os.IsNotExist(err) {
+	if oserror.IsNotExist(err) {
 		// First run.
 		m.mu.keyRegistry = makeRegistryProto()
 		return nil
@@ -391,7 +391,7 @@ func (m *DataKeyManager) rotateDataKeyAndWrite(
 	if err != nil {
 		return
 	}
-	if err = engine.SafeWriteToFile(m.fs, m.dbDir, m.registryFilename, bytes); err != nil {
+	if err = storage.SafeWriteToFile(m.fs, m.dbDir, m.registryFilename, bytes); err != nil {
 		return
 	}
 	m.mu.keyRegistry = keyRegistry

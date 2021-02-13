@@ -14,7 +14,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // deselectorOp consumes the input operator, and if resulting batches have a
@@ -24,21 +26,23 @@ import (
 type deselectorOp struct {
 	OneInputNode
 	NonExplainable
-	allocator  *Allocator
-	inputTypes []coltypes.T
+	allocator  *colmem.Allocator
+	inputTypes []*types.T
 
 	output coldata.Batch
 }
 
-var _ Operator = &deselectorOp{}
+var _ colexecbase.Operator = &deselectorOp{}
 
 // NewDeselectorOp creates a new deselector operator on the given input
-// operator with the given column coltypes.
-func NewDeselectorOp(allocator *Allocator, input Operator, colTypes []coltypes.T) Operator {
+// operator with the given column types.
+func NewDeselectorOp(
+	allocator *colmem.Allocator, input colexecbase.Operator, typs []*types.T,
+) colexecbase.Operator {
 	return &deselectorOp{
 		OneInputNode: NewOneInputNode(input),
 		allocator:    allocator,
-		inputTypes:   colTypes,
+		inputTypes:   typs,
 	}
 }
 
@@ -47,21 +51,26 @@ func (p *deselectorOp) Init() {
 }
 
 func (p *deselectorOp) Next(ctx context.Context) coldata.Batch {
-	p.resetOutput()
+	// TODO(yuzefovich): this allocation is only needed in order to appease the
+	// tests of the external sorter with forced disk spilling (if we don't do
+	// this, an OOM error occurs during ResetMaybeReallocate call below at
+	// which point we have already received a batch from the input and it'll
+	// get lost because deselectorOp doesn't support fall-over to the
+	// disk-backed infrastructure).
+	p.output, _ = p.allocator.ResetMaybeReallocate(p.inputTypes, p.output, 1 /* minCapacity */)
 	batch := p.input.Next(ctx)
 	if batch.Selection() == nil {
 		return batch
 	}
-
+	p.output, _ = p.allocator.ResetMaybeReallocate(p.inputTypes, p.output, batch.Length())
 	sel := batch.Selection()
 	p.allocator.PerformOperation(p.output.ColVecs(), func() {
-		for i, t := range p.inputTypes {
+		for i := range p.inputTypes {
 			toCol := p.output.ColVec(i)
 			fromCol := batch.ColVec(i)
 			toCol.Copy(
 				coldata.CopySliceArgs{
 					SliceArgs: coldata.SliceArgs{
-						ColType:   t,
 						Src:       fromCol,
 						Sel:       sel,
 						SrcEndIdx: batch.Length(),
@@ -72,12 +81,4 @@ func (p *deselectorOp) Next(ctx context.Context) coldata.Batch {
 	})
 	p.output.SetLength(batch.Length())
 	return p.output
-}
-
-func (p *deselectorOp) resetOutput() {
-	if p.output == nil {
-		p.output = p.allocator.NewMemBatch(p.inputTypes)
-	} else {
-		p.output.ResetInternalBatch()
-	}
 }

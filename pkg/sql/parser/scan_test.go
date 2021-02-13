@@ -11,7 +11,6 @@
 package parser
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -20,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/errors"
 )
 
 func TestScanner(t *testing.T) {
@@ -65,6 +65,8 @@ func TestScanner(t *testing.T) {
 		{`&&`, []int{AND_AND}},
 		{`|`, []int{'|'}},
 		{`||`, []int{CONCAT}},
+		{`|/`, []int{SQRT}},
+		{`||/`, []int{CBRT}},
 		{`#`, []int{'#'}},
 		{`~`, []int{'~'}},
 		{`!~`, []int{NOT_REGMATCH}},
@@ -87,6 +89,8 @@ func TestScanner(t *testing.T) {
 		{`$a$1$$3$a$`, []int{SCONST}},
 		{`$a$1$3$a$`, []int{SCONST}},
 		{`$ab$1$a$ab$`, []int{SCONST}},
+		{`$ab1$ab$ab1$`, []int{SCONST}},
+		{`$ab1$ab12$ab1$`, []int{SCONST}},
 		{`$$~!@#$%^&*()_+:",./<>?;'$$`, []int{SCONST}},
 		{`$$hello
 world$$`, []int{SCONST}},
@@ -310,6 +314,8 @@ world`},
 		{`$a$1$$3$a$`, "1$$3"},
 		{`$a$1$3$a$`, "1$3"},
 		{`$ab$1$a$ab$`, "1$a"},
+		{`$ab1$ab$ab1$`, "ab"},
+		{`$ab1$ab12$ab1$`, "ab12"},
 		{`$$~!@#$%^&*()_+:",./<>?;'$$`, "~!@#$%^&*()_+:\",./<>?;'"},
 		{`$$hello
 world$$`, `hello
@@ -357,7 +363,7 @@ func TestScanError(t *testing.T) {
 		if lval.id != ERROR {
 			t.Errorf("%s: expected ERROR, but found %d", d.sql, lval.id)
 		}
-		if !testutils.IsError(errors.New(lval.str), d.err) {
+		if !testutils.IsError(errors.Newf("%s", lval.str), d.err) {
 			t.Errorf("%s: expected %s, but found %v", d.sql, d.err, lval.str)
 		}
 	}

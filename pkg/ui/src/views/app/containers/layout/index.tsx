@@ -17,7 +17,11 @@ import NavigationBar from "src/views/app/components/layoutSidebar";
 import TimeWindowManager from "src/views/app/containers/timewindow";
 import AlertBanner from "src/views/app/containers/alertBanner";
 import RequireLogin from "src/views/login/requireLogin";
-import { clusterIdSelector, clusterNameSelector, singleVersionSelector } from "src/redux/nodes";
+import {
+  clusterIdSelector,
+  clusterNameSelector,
+  singleVersionSelector,
+} from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import LoginIndicator from "src/views/app/components/loginIndicator";
 import {
@@ -47,6 +51,18 @@ export interface LayoutProps {
  * Individual pages provide their content via react-router.
  */
 class Layout extends React.Component<LayoutProps & RouteComponentProps> {
+  contentRef = React.createRef<HTMLDivElement>();
+
+  componentDidUpdate(prevProps: RouteComponentProps) {
+    // `react-router` doesn't handle scroll restoration (https://reactrouter.com/react-router/web/guides/scroll-restoration)
+    // and when location changed with react-router's Link it preserves scroll position whenever it is.
+    // AdminUI layout keeps left and top panels have fixed position on a screen and has internal scrolling for content div
+    // element which has to be scrolled back on top with navigation change.
+    if (this.props.location.pathname !== prevProps.location.pathname) {
+      this.contentRef.current.scrollTo(0, 0);
+    }
+  }
+
   render() {
     const { clusterName, clusterVersion, clusterId } = this.props;
     return (
@@ -55,8 +71,8 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
           titleTemplate="%s | Cockroach Console"
           defaultTitle="Cockroach Console"
         />
-        <TimeWindowManager/>
-        <AlertBanner/>
+        <TimeWindowManager />
+        <AlertBanner />
         <div className="layout-panel">
           <div className="layout-panel__header">
             <GlobalNavigation>
@@ -78,10 +94,10 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
           </div>
           <div className="layout-panel__body">
             <div className="layout-panel__sidebar">
-              <NavigationBar/>
+              <NavigationBar />
             </div>
-            <div className="layout-panel__content">
-              { this.props.children }
+            <div ref={this.contentRef} className="layout-panel__content">
+              {this.props.children}
             </div>
           </div>
         </div>

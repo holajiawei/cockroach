@@ -16,25 +16,27 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 var errNoInboundStreamConnection = errors.New("no inbound stream connection")
 
 // SettingFlowStreamTimeout is a cluster setting that sets the default flow
 // stream timeout.
-var SettingFlowStreamTimeout = settings.RegisterNonNegativeDurationSetting(
+var SettingFlowStreamTimeout = settings.RegisterDurationSetting(
 	"sql.distsql.flow_stream_timeout",
 	"amount of time incoming streams wait for a flow to be set up before erroring out",
 	10*time.Second,
+	settings.NonNegativeDuration,
 )
 
 // expectedConnectionTime is the expected time taken by a flow to connect to its
@@ -104,9 +106,6 @@ type flowEntry struct {
 type FlowRegistry struct {
 	syncutil.Mutex
 
-	// nodeID is the ID of the current node. Used for debugging.
-	nodeID roachpb.NodeID
-
 	// All fields in the flowEntry's are protected by the FlowRegistry mutex,
 	// except flow, whose methods can be called freely.
 	flows map[execinfrapb.FlowID]*flowEntry
@@ -126,13 +125,10 @@ type FlowRegistry struct {
 
 // NewFlowRegistry creates a new FlowRegistry.
 //
-// nodeID is the ID of the current node. Used for debugging; pass 0 if you don't
+// instID is the ID of the current node. Used for debugging; pass 0 if you don't
 // care.
-func NewFlowRegistry(nodeID roachpb.NodeID) *FlowRegistry {
-	fr := &FlowRegistry{
-		nodeID: nodeID,
-		flows:  make(map[execinfrapb.FlowID]*flowEntry),
-	}
+func NewFlowRegistry(instID base.SQLInstanceID) *FlowRegistry {
+	fr := &FlowRegistry{flows: make(map[execinfrapb.FlowID]*flowEntry)}
 	fr.flowDone = sync.NewCond(fr)
 	return fr
 }
@@ -158,11 +154,25 @@ func (fr *FlowRegistry) releaseEntryLocked(id execinfrapb.FlowID) {
 		entry.refCount--
 	} else {
 		if entry.refCount != 1 {
-			panic(fmt.Sprintf("invalid refCount: %d", entry.refCount))
+			panic(errors.AssertionFailedf("invalid refCount: %d", entry.refCount))
 		}
 		delete(fr.flows, id)
 		fr.flowDone.Signal()
 	}
+}
+
+type flowRetryableError struct {
+	cause error
+}
+
+func (e *flowRetryableError) Error() string {
+	return fmt.Sprintf("flow retryable error: %+v", e.cause)
+}
+
+// IsFlowRetryableError returns true if an error represents a retryable
+// flow error.
+func IsFlowRetryableError(e error) bool {
+	return errors.HasType(e, (*flowRetryableError)(nil))
 }
 
 // RegisterFlow makes a flow accessible to ConnectInboundStream. Any concurrent
@@ -194,19 +204,26 @@ func (fr *FlowRegistry) RegisterFlow(
 			}
 		}
 	}()
-	if fr.draining {
-		return errors.Errorf(
-			"could not register flowID %d on node %d because the registry is draining",
+
+	draining := fr.draining
+	if f.Cfg != nil {
+		if knobs, ok := f.Cfg.TestingKnobs.Flowinfra.(*TestingKnobs); ok && knobs != nil && knobs.FlowRegistryDraining != nil {
+			draining = knobs.FlowRegistryDraining()
+		}
+	}
+
+	if draining {
+		return &flowRetryableError{cause: errors.Errorf(
+			"could not register flowID %d because the registry is draining",
 			id,
-			fr.nodeID,
-		)
+		)}
 	}
 	entry := fr.getEntryLocked(id)
 	if entry.flow != nil {
 		return errors.Errorf(
-			"flow already registered: current node ID: %d flowID: %s.\n"+
+			"flow already registered: flowID: %s.\n"+
 				"Current flow: %+v\nExisting flow: %+v",
-			fr.nodeID, f.spec.FlowID, f.spec, entry.flow.spec)
+			f.spec.FlowID, f.spec, entry.flow.spec)
 	}
 	// Take a reference that will be removed by UnregisterFlow.
 	entry.refCount++
@@ -228,9 +245,9 @@ func (fr *FlowRegistry) RegisterFlow(
 			fr.Unlock()
 			if len(timedOutReceivers) != 0 {
 				// The span in the context might be finished by the time this runs. In
-				// principle, we could ForkCtxSpan() beforehand, but we don't want to
+				// principle, we could ForkSpan() beforehand, but we don't want to
 				// create the extra span every time.
-				timeoutCtx := opentracing.ContextWithSpan(ctx, nil)
+				timeoutCtx := tracing.ContextWithSpan(ctx, nil)
 				log.Errorf(
 					timeoutCtx,
 					"flow id:%s : %d inbound streams timed out after %s; propagated error throughout flow",
@@ -341,7 +358,16 @@ func (fr *FlowRegistry) waitForFlowLocked(
 // waited for. However, this is fine since there should be no local flows
 // running when the FlowRegistry drains as the draining logic starts with
 // draining all client connections to a node.
-func (fr *FlowRegistry) Drain(flowDrainWait time.Duration, minFlowDrainWait time.Duration) {
+//
+// The reporter callback, if non-nil, is called on a best effort basis
+// to report work that needed to be done and which may or may not have
+// been done by the time this call returns. See the explanation in
+// pkg/server/drain.go for details.
+func (fr *FlowRegistry) Drain(
+	flowDrainWait time.Duration,
+	minFlowDrainWait time.Duration,
+	reporter func(int, redact.SafeString),
+) {
 	allFlowsDone := make(chan struct{}, 1)
 	start := timeutil.Now()
 	stopWaiting := false
@@ -370,8 +396,6 @@ func (fr *FlowRegistry) Drain(flowDrainWait time.Duration, minFlowDrainWait time
 		fr.Unlock()
 	}()
 
-	// If the flow registry is empty, wait minFlowDrainWait for any incoming flows
-	// to register.
 	fr.Lock()
 	if len(fr.flows) == 0 {
 		fr.Unlock()
@@ -382,6 +406,10 @@ func (fr *FlowRegistry) Drain(flowDrainWait time.Duration, minFlowDrainWait time
 			fr.Unlock()
 			return
 		}
+	}
+	if reporter != nil {
+		// Report progress to the Drain RPC.
+		reporter(len(fr.flows), "distSQL execution flows")
 	}
 
 	go func() {

@@ -18,14 +18,19 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -39,7 +44,7 @@ const (
 // value.
 type encodeRow struct {
 	// datums is the new value of a changed table row.
-	datums sqlbase.EncDatumRow
+	datums rowenc.EncDatumRow
 	// updated is the mvcc timestamp corresponding to the latest update in
 	// `datums`.
 	updated hlc.Timestamp
@@ -48,15 +53,15 @@ type encodeRow struct {
 	deleted bool
 	// tableDesc is a TableDescriptor for the table containing `datums`.
 	// It's valid for interpreting the row at `updated`.
-	tableDesc *sqlbase.TableDescriptor
+	tableDesc catalog.TableDescriptor
 	// prevDatums is the old value of a changed table row. The field is set
 	// to nil if the before value for changes was not requested (OptDiff).
-	prevDatums sqlbase.EncDatumRow
+	prevDatums rowenc.EncDatumRow
 	// prevDeleted is true if prevDatums is missing or is a deletion.
 	prevDeleted bool
 	// prevTableDesc is a TableDescriptor for the table containing `prevDatums`.
 	// It's valid for interpreting the row at `updated.Prev()`.
-	prevTableDesc *sqlbase.TableDescriptor
+	prevTableDesc catalog.TableDescriptor
 }
 
 // Encoder turns a row into a serialized changefeed key, value, or resolved
@@ -78,12 +83,12 @@ type Encoder interface {
 	EncodeResolvedTimestamp(context.Context, string, hlc.Timestamp) ([]byte, error)
 }
 
-func getEncoder(opts map[string]string) (Encoder, error) {
+func getEncoder(opts map[string]string, targets jobspb.ChangefeedTargets) (Encoder, error) {
 	switch changefeedbase.FormatType(opts[changefeedbase.OptFormat]) {
 	case ``, changefeedbase.OptFormatJSON:
 		return makeJSONEncoder(opts)
 	case changefeedbase.OptFormatAvro:
-		return newConfluentAvroEncoder(opts)
+		return newConfluentAvroEncoder(opts, targets)
 	default:
 		return nil, errors.Errorf(`unknown %s: %s`, changefeedbase.OptFormat, opts[changefeedbase.OptFormat])
 	}
@@ -96,7 +101,7 @@ func getEncoder(opts map[string]string) (Encoder, error) {
 type jsonEncoder struct {
 	updatedField, beforeField, wrapped, keyOnly, keyInValue bool
 
-	alloc sqlbase.DatumAlloc
+	alloc rowenc.DatumAlloc
 	buf   bytes.Buffer
 }
 
@@ -137,15 +142,18 @@ func (e *jsonEncoder) EncodeKey(_ context.Context, row encodeRow) ([]byte, error
 }
 
 func (e *jsonEncoder) encodeKeyRaw(row encodeRow) ([]interface{}, error) {
-	colIdxByID := row.tableDesc.ColumnIdxMap()
-	jsonEntries := make([]interface{}, len(row.tableDesc.PrimaryIndex.ColumnIDs))
-	for i, colID := range row.tableDesc.PrimaryIndex.ColumnIDs {
-		idx, ok := colIdxByID[colID]
+	colIdxByID := catalog.ColumnIDToOrdinalMap(row.tableDesc.PublicColumns())
+	primaryIndex := row.tableDesc.GetPrimaryIndex()
+	jsonEntries := make([]interface{}, primaryIndex.NumColumns())
+	for i := 0; i < primaryIndex.NumColumns(); i++ {
+		colID := primaryIndex.GetColumnID(i)
+		idx, ok := colIdxByID.Get(colID)
 		if !ok {
 			return nil, errors.Errorf(`unknown column id: %d`, colID)
 		}
-		datum, col := row.datums[idx], &row.tableDesc.Columns[idx]
-		if err := datum.EnsureDecoded(&col.Type, &e.alloc); err != nil {
+		datum := row.datums[idx]
+		datum, col := row.datums[idx], row.tableDesc.PublicColumns()[idx]
+		if err := datum.EnsureDecoded(col.GetType(), &e.alloc); err != nil {
 			return nil, err
 		}
 		var err error
@@ -165,16 +173,15 @@ func (e *jsonEncoder) EncodeValue(_ context.Context, row encodeRow) ([]byte, err
 
 	var after map[string]interface{}
 	if !row.deleted {
-		columns := row.tableDesc.Columns
+		columns := row.tableDesc.PublicColumns()
 		after = make(map[string]interface{}, len(columns))
-		for i := range columns {
-			col := &columns[i]
+		for i, col := range columns {
 			datum := row.datums[i]
-			if err := datum.EnsureDecoded(&col.Type, &e.alloc); err != nil {
+			if err := datum.EnsureDecoded(col.GetType(), &e.alloc); err != nil {
 				return nil, err
 			}
 			var err error
-			after[col.Name], err = tree.AsJSON(datum.Datum, time.UTC)
+			after[col.GetName()], err = tree.AsJSON(datum.Datum, time.UTC)
 			if err != nil {
 				return nil, err
 			}
@@ -183,16 +190,15 @@ func (e *jsonEncoder) EncodeValue(_ context.Context, row encodeRow) ([]byte, err
 
 	var before map[string]interface{}
 	if row.prevDatums != nil && !row.prevDeleted {
-		columns := row.prevTableDesc.Columns
+		columns := row.prevTableDesc.PublicColumns()
 		before = make(map[string]interface{}, len(columns))
-		for i := range columns {
-			col := &columns[i]
+		for i, col := range columns {
 			datum := row.prevDatums[i]
-			if err := datum.EnsureDecoded(&col.Type, &e.alloc); err != nil {
+			if err := datum.EnsureDecoded(col.GetType(), &e.alloc); err != nil {
 				return nil, err
 			}
 			var err error
-			before[col.Name], err = tree.AsJSON(datum.Datum, time.UTC)
+			before[col.GetName()], err = tree.AsJSON(datum.Datum, time.UTC)
 			if err != nil {
 				return nil, err
 			}
@@ -249,7 +255,7 @@ func (e *jsonEncoder) EncodeResolvedTimestamp(
 	_ context.Context, _ string, resolved hlc.Timestamp,
 ) ([]byte, error) {
 	meta := map[string]interface{}{
-		`resolved`: tree.TimestampToDecimal(resolved).Decimal.String(),
+		`resolved`: tree.TimestampToDecimalDatum(resolved).Decimal.String(),
 	}
 	var jsonEntries interface{}
 	if e.wrapped {
@@ -267,7 +273,9 @@ func (e *jsonEncoder) EncodeResolvedTimestamp(
 // columns in a record.
 type confluentAvroEncoder struct {
 	registryURL                        string
+	schemaPrefix                       string
 	updatedField, beforeField, keyOnly bool
+	targets                            jobspb.ChangefeedTargets
 
 	keyCache      map[tableIDAndVersion]confluentRegisteredKeySchema
 	valueCache    map[tableIDAndVersionPair]confluentRegisteredEnvelopeSchema
@@ -277,7 +285,7 @@ type confluentAvroEncoder struct {
 type tableIDAndVersion uint64
 type tableIDAndVersionPair [2]tableIDAndVersion // [before, after]
 
-func makeTableIDAndVersion(id sqlbase.ID, version sqlbase.DescriptorVersion) tableIDAndVersion {
+func makeTableIDAndVersion(id descpb.ID, version descpb.DescriptorVersion) tableIDAndVersion {
 	return tableIDAndVersion(id)<<32 + tableIDAndVersion(version)
 }
 
@@ -293,8 +301,13 @@ type confluentRegisteredEnvelopeSchema struct {
 
 var _ Encoder = &confluentAvroEncoder{}
 
-func newConfluentAvroEncoder(opts map[string]string) (*confluentAvroEncoder, error) {
+func newConfluentAvroEncoder(
+	opts map[string]string, targets jobspb.ChangefeedTargets,
+) (*confluentAvroEncoder, error) {
 	e := &confluentAvroEncoder{registryURL: opts[changefeedbase.OptConfluentSchemaRegistry]}
+
+	e.schemaPrefix = opts[changefeedbase.OptAvroSchemaPrefix]
+	e.targets = targets
 
 	switch opts[changefeedbase.OptEnvelope] {
 	case string(changefeedbase.OptEnvelopeKeyOnly):
@@ -324,27 +337,34 @@ func newConfluentAvroEncoder(opts map[string]string) (*confluentAvroEncoder, err
 		return nil, errors.Errorf(`WITH option %s is required for %s=%s`,
 			changefeedbase.OptConfluentSchemaRegistry, changefeedbase.OptFormat, changefeedbase.OptFormatAvro)
 	}
-
 	e.keyCache = make(map[tableIDAndVersion]confluentRegisteredKeySchema)
 	e.valueCache = make(map[tableIDAndVersionPair]confluentRegisteredEnvelopeSchema)
 	e.resolvedCache = make(map[string]confluentRegisteredEnvelopeSchema)
 	return e, nil
 }
 
+// Get the raw SQL-formatted string for a table name
+// and apply full_table_name and avro_schema_prefix options
+func (e *confluentAvroEncoder) rawTableName(desc catalog.TableDescriptor) string {
+	return e.schemaPrefix + e.targets[desc.GetID()].StatementTimeName
+}
+
 // EncodeKey implements the Encoder interface.
 func (e *confluentAvroEncoder) EncodeKey(ctx context.Context, row encodeRow) ([]byte, error) {
-	cacheKey := makeTableIDAndVersion(row.tableDesc.ID, row.tableDesc.Version)
+	cacheKey := makeTableIDAndVersion(row.tableDesc.GetID(), row.tableDesc.GetVersion())
+
 	registered, ok := e.keyCache[cacheKey]
 	if !ok {
 		var err error
-		registered.schema, err = indexToAvroSchema(row.tableDesc, &row.tableDesc.PrimaryIndex)
+		tableName := e.rawTableName(row.tableDesc)
+		registered.schema, err = indexToAvroSchema(row.tableDesc, row.tableDesc.GetPrimaryIndex().IndexDesc(), tableName)
 		if err != nil {
 			return nil, err
 		}
 
 		// NB: This uses the kafka name escaper because it has to match the name
 		// of the kafka topic.
-		subject := SQLNameToKafkaName(row.tableDesc.Name) + confluentSubjectSuffixKey
+		subject := SQLNameToKafkaName(tableName) + confluentSubjectSuffixKey
 		registered.registryID, err = e.register(ctx, &registered.schema.avroRecord, subject)
 		if err != nil {
 			return nil, err
@@ -370,9 +390,9 @@ func (e *confluentAvroEncoder) EncodeValue(ctx context.Context, row encodeRow) (
 
 	var cacheKey tableIDAndVersionPair
 	if e.beforeField && row.prevTableDesc != nil {
-		cacheKey[0] = makeTableIDAndVersion(row.prevTableDesc.ID, row.prevTableDesc.Version)
+		cacheKey[0] = makeTableIDAndVersion(row.prevTableDesc.GetID(), row.prevTableDesc.GetVersion())
 	}
-	cacheKey[1] = makeTableIDAndVersion(row.tableDesc.ID, row.tableDesc.Version)
+	cacheKey[1] = makeTableIDAndVersion(row.tableDesc.GetID(), row.tableDesc.GetVersion())
 	registered, ok := e.valueCache[cacheKey]
 	if !ok {
 		var beforeDataSchema *avroDataRecord
@@ -390,14 +410,14 @@ func (e *confluentAvroEncoder) EncodeValue(ctx context.Context, row encodeRow) (
 		}
 
 		opts := avroEnvelopeOpts{afterField: true, beforeField: e.beforeField, updatedField: e.updatedField}
-		registered.schema, err = envelopeToAvroSchema(row.tableDesc.Name, opts, beforeDataSchema, afterDataSchema)
+		registered.schema, err = envelopeToAvroSchema(row.tableDesc.GetName(), opts, beforeDataSchema, afterDataSchema)
 		if err != nil {
 			return nil, err
 		}
 
 		// NB: This uses the kafka name escaper because it has to match the name
 		// of the kafka topic.
-		subject := SQLNameToKafkaName(row.tableDesc.Name) + confluentSubjectSuffixValue
+		subject := SQLNameToKafkaName(e.rawTableName(row.tableDesc)) + confluentSubjectSuffixValue
 		registered.registryID, err = e.register(ctx, &registered.schema.avroRecord, subject)
 		if err != nil {
 			return nil, err
@@ -411,7 +431,7 @@ func (e *confluentAvroEncoder) EncodeValue(ctx context.Context, row encodeRow) (
 			`updated`: row.updated,
 		}
 	}
-	var beforeDatums, afterDatums sqlbase.EncDatumRow
+	var beforeDatums, afterDatums rowenc.EncDatumRow
 	if row.prevDatums != nil && !row.prevDeleted {
 		beforeDatums = row.prevDatums
 	}
@@ -483,7 +503,7 @@ func (e *confluentAvroEncoder) register(
 
 	schemaStr := schema.codec.Schema()
 	if log.V(1) {
-		log.Infof(context.TODO(), "registering avro schema %s %s", url, schemaStr)
+		log.Infof(ctx, "registering avro schema %s %s", url, schemaStr)
 	}
 
 	req := confluentSchemaVersionRequest{Schema: schemaStr}
@@ -492,21 +512,39 @@ func (e *confluentAvroEncoder) register(
 		return 0, err
 	}
 
-	// TODO(someone): connect the context to the caller to obey
-	// cancellation.
-	resp, err := httputil.Post(ctx, url.String(), confluentSchemaContentType, &buf)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return 0, errors.Errorf(`registering schema to %s %s: %s`, url.String(), resp.Status, body)
-	}
-	var res confluentSchemaVersionResponse
-	if err := gojson.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return 0, err
+	var id int32
+
+	// Since network services are often a source of flakes, add a few retries here
+	// before we give up and return an error that will bubble up and tear down the
+	// entire changefeed, though that error is marked as retryable so that the job
+	// itself can attempt to start the changefeed again. TODO(dt): If the registry
+	// is down or constantly returning errors, we can't make progress. Continuing
+	// to indicate that we're "running" in this case can be misleading, as we
+	// really aren't anymore. Right now the MO in CDC is try and try again
+	// forever, so doing so here is consistent with the behavior elsewhere, but we
+	// should revisit this more broadly as this pattern can easily mask real,
+	// actionable issues in the operator's environment that which they might be
+	// able to resolve if we made them visible in a failure instead.
+	if err := retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), 3, func() error {
+		resp, err := httputil.Post(ctx, url.String(), confluentSchemaContentType, &buf)
+		if err != nil {
+			return errors.Wrap(err, "contacting confluent schema registry")
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := ioutil.ReadAll(resp.Body)
+			return errors.Errorf(`registering schema to %s %s: %s`, url.String(), resp.Status, body)
+		}
+		var res confluentSchemaVersionResponse
+		if err := gojson.NewDecoder(resp.Body).Decode(&res); err != nil {
+			return errors.Wrap(err, "decoding confluent schema registry reply")
+		}
+		id = res.ID
+		return nil
+	}); err != nil {
+		log.Warningf(ctx, "%+v", err)
+		return 0, MarkRetryableError(err)
 	}
 
-	return res.ID, nil
+	return id, nil
 }

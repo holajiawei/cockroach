@@ -13,32 +13,24 @@ package config
 import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
 // MakeZoneKeyPrefix returns the key prefix for id's row in the system.zones
 // table.
-func MakeZoneKeyPrefix(id uint32) roachpb.Key {
-	return keys.ZoneKeyPrefix(id)
+func MakeZoneKeyPrefix(id SystemTenantObjectID) roachpb.Key {
+	return keys.SystemSQLCodec.ZoneKeyPrefix(uint32(id))
 }
 
 // MakeZoneKey returns the key for id's entry in the system.zones table.
-func MakeZoneKey(id uint32) roachpb.Key {
-	return keys.ZoneKey(id)
+func MakeZoneKey(id SystemTenantObjectID) roachpb.Key {
+	return keys.SystemSQLCodec.ZoneKey(uint32(id))
 }
 
-// DecodeObjectID decodes the object ID from the front of key. It returns the
-// decoded object ID, the remainder of the key, and whether the result is valid
-// (i.e., whether the key was within the structured key space).
-func DecodeObjectID(key roachpb.RKey) (uint32, []byte, bool) {
-	if key.Equal(roachpb.RKeyMax) {
-		return 0, nil, false
-	}
-	if encoding.PeekType(key) != encoding.Int {
-		// TODO(marc): this should eventually return SystemDatabaseID.
-		return 0, nil, false
-	}
-	// Consume first encoded int.
-	rem, id64, err := encoding.DecodeUvarintAscending(key)
-	return uint32(id64), rem, err == nil
+// DecodeSystemTenantObjectID decodes the object ID for the system-tenant from
+// the front of key. It returns the decoded object ID, the remainder of the key,
+// and whether the result is valid (i.e., whether the key was within the system
+// tenant's structured key space).
+func DecodeSystemTenantObjectID(key roachpb.RKey) (SystemTenantObjectID, []byte, bool) {
+	rem, id, err := keys.SystemSQLCodec.DecodeTablePrefix(key.AsRawKey())
+	return SystemTenantObjectID(id), rem, err == nil
 }

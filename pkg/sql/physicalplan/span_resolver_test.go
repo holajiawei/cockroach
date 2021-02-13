@@ -15,21 +15,24 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan/replicaoracle"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -38,6 +41,7 @@ import (
 // state of caches.
 func TestSpanResolverUsesCaches(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	tc := testcluster.StartTestCluster(t, 4,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
@@ -45,7 +49,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 				UseDatabase: "t",
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	rowRanges, _ := setupRanges(
 		tc.Conns[0], tc.Servers[0], tc.Servers[0].DB(), t)
@@ -53,7 +57,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 	// Replicate the row ranges on all of the first 3 nodes. Save the 4th node in
 	// a pristine state, with empty caches.
 	for i := 0; i < 3; i++ {
-		rowRanges[i] = tc.AddReplicasOrFatal(
+		rowRanges[i] = tc.AddVotersOrFatal(
 			t, rowRanges[i].StartKey.AsRawKey(), tc.Target(1), tc.Target(2))
 	}
 
@@ -84,7 +88,9 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 
 	lr := physicalplan.NewSpanResolver(
 		s3.Cfg.Settings,
-		s3.DistSenderI().(*kv.DistSender), s3.Gossip(), s3.GetNode().Descriptor, nil,
+		s3.DistSenderI().(*kvcoord.DistSender),
+		s3.Gossip(),
+		s3.GetNode().Descriptor, nil,
 		replicaoracle.BinPackingChoice)
 
 	var spans []spanWithDir
@@ -96,13 +102,13 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 					Key:    rowRanges[i].StartKey.AsRawKey(),
 					EndKey: rowRanges[i].EndKey.AsRawKey(),
 				},
-				dir: kv.Ascending,
+				dir: kvcoord.Ascending,
 			})
 	}
 
-	// Resolve the spans. Since the LeaseHolderCache is empty, all the ranges
-	// should be grouped and "assigned" to replica 0.
-	replicas, err := resolveSpans(context.TODO(), lr.NewSpanResolverIterator(nil), spans...)
+	// Resolve the spans. Since the range descriptor cache doesn't have any
+	// leases, all the ranges should be grouped and "assigned" to replica 0.
+	replicas, err := resolveSpans(context.Background(), lr.NewSpanResolverIterator(nil), spans...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +135,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 	if err := populateCache(tc.Conns[3], 3 /* expectedNumRows */); err != nil {
 		t.Fatal(err)
 	}
-	replicas, err = resolveSpans(context.TODO(), lr.NewSpanResolverIterator(nil), spans...)
+	replicas, err = resolveSpans(context.Background(), lr.NewSpanResolverIterator(nil), spans...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,13 +167,13 @@ func populateCache(db *gosql.DB, expectedNumRows int) error {
 // `CREATE TABLE test (k INT PRIMARY KEY)` at row with value pk (the row will be
 // the first on the right of the split).
 func splitRangeAtVal(
-	ts *server.TestServer, tableDesc *sqlbase.TableDescriptor, pk int,
+	ts *server.TestServer, tableDesc catalog.TableDescriptor, pk int,
 ) (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
-	if len(tableDesc.Indexes) != 0 {
+	if len(tableDesc.PublicNonPrimaryIndexes()) != 0 {
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
 			errors.AssertionFailedf("expected table with just a PK, got: %+v", tableDesc)
 	}
-	pik, err := sqlbase.TestingMakePrimaryIndexKey(tableDesc, pk)
+	pik, err := rowenc.TestingMakePrimaryIndexKey(tableDesc, pk)
 	if err != nil {
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, err
 	}
@@ -182,15 +188,17 @@ func splitRangeAtVal(
 
 func TestSpanResolver(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	s, db, cdb := serverutils.StartServer(t, base.TestServerArgs{
 		UseDatabase: "t",
 	})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	rowRanges, tableDesc := setupRanges(db, s.(*server.TestServer), cdb, t)
 	lr := physicalplan.NewSpanResolver(
 		s.(*server.TestServer).Cfg.Settings,
-		s.DistSenderI().(*kv.DistSender), s.GossipI().(*gossip.Gossip),
+		s.DistSenderI().(*kvcoord.DistSender),
+		s.GossipI().(*gossip.Gossip),
 		s.(*server.TestServer).GetNode().Descriptor, nil,
 		replicaoracle.BinPackingChoice)
 
@@ -250,13 +258,13 @@ func TestSpanResolver(t *testing.T) {
 		},
 	}
 	for i, tc := range testCases {
-		for _, dir := range []kv.ScanDirection{kv.Ascending, kv.Descending} {
+		for _, dir := range []kvcoord.ScanDirection{kvcoord.Ascending, kvcoord.Descending} {
 			t.Run(fmt.Sprintf("%d-direction:%d", i, dir), func(t *testing.T) {
 				replicas, err := resolveSpans(ctx, it, orient(dir, tc.spans...)...)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if dir == kv.Descending {
+				if dir == kvcoord.Descending {
 					// When testing Descending resolving, reverse the expected results.
 					for i, j := 0, len(tc.expected)-1; i <= j; i, j = i+1, j-1 {
 						reverse(tc.expected[i])
@@ -276,15 +284,17 @@ func TestSpanResolver(t *testing.T) {
 
 func TestMixedDirections(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	s, db, cdb := serverutils.StartServer(t, base.TestServerArgs{
 		UseDatabase: "t",
 	})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	rowRanges, tableDesc := setupRanges(db, s.(*server.TestServer), cdb, t)
 	lr := physicalplan.NewSpanResolver(
 		s.(*server.TestServer).Cfg.Settings,
-		s.DistSenderI().(*kv.DistSender), s.GossipI().(*gossip.Gossip),
+		s.DistSenderI().(*kvcoord.DistSender),
+		s.GossipI().(*gossip.Gossip),
 		s.(*server.TestServer).GetNode().Descriptor,
 		nil,
 		replicaoracle.BinPackingChoice)
@@ -293,8 +303,8 @@ func TestMixedDirections(t *testing.T) {
 	it := lr.NewSpanResolverIterator(nil)
 
 	spans := []spanWithDir{
-		orient(kv.Ascending, makeSpan(tableDesc, 11, 15))[0],
-		orient(kv.Descending, makeSpan(tableDesc, 1, 14))[0],
+		orient(kvcoord.Ascending, makeSpan(tableDesc, 11, 15))[0],
+		orient(kvcoord.Descending, makeSpan(tableDesc, 1, 14))[0],
 	}
 	replicas, err := resolveSpans(ctx, it, spans...)
 	if err != nil {
@@ -310,8 +320,8 @@ func TestMixedDirections(t *testing.T) {
 }
 
 func setupRanges(
-	db *gosql.DB, s *server.TestServer, cdb *client.DB, t *testing.T,
-) ([]roachpb.RangeDescriptor, *sqlbase.TableDescriptor) {
+	db *gosql.DB, s *server.TestServer, cdb *kv.DB, t *testing.T,
+) ([]roachpb.RangeDescriptor, catalog.TableDescriptor) {
 	if _, err := db.Exec(`CREATE DATABASE t`); err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +337,7 @@ func setupRanges(
 		}
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(cdb, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(cdb, keys.SystemSQLCodec, "t", "test")
 	// Split every SQL row to its own range.
 	rowRanges := make([]roachpb.RangeDescriptor, len(values))
 	for i, val := range values {
@@ -342,11 +352,6 @@ func setupRanges(
 		}
 	}
 
-	// TODO(andrei): The sleep below serves to remove the noise that the
-	// RangeCache might encounter, clobbering descriptors with old versions.
-	// Remove once all the causes of such clobbering, listed in #10751, have been
-	// fixed.
-	time.Sleep(300 * time.Millisecond)
 	// Run a select across the whole table to populate the caches with all the
 	// ranges.
 	if _, err := db.Exec(`SELECT count(1) from test`); err != nil {
@@ -358,15 +363,15 @@ func setupRanges(
 
 type spanWithDir struct {
 	roachpb.Span
-	dir kv.ScanDirection
+	dir kvcoord.ScanDirection
 }
 
-func orient(dir kv.ScanDirection, spans ...roachpb.Span) []spanWithDir {
+func orient(dir kvcoord.ScanDirection, spans ...roachpb.Span) []spanWithDir {
 	res := make([]spanWithDir, 0, len(spans))
 	for _, span := range spans {
 		res = append(res, spanWithDir{span, dir})
 	}
-	if dir == kv.Descending {
+	if dir == kvcoord.Descending {
 		for i, j := 0, len(res)-1; i < j; i, j = i+1, j-1 {
 			res[i], res[j] = res[j], res[i]
 		}
@@ -394,7 +399,7 @@ func resolveSpans(
 				return nil, err
 			}
 			repls = append(repls, rngInfo{
-				ReplicaDescriptor: repl.ReplicaDescriptor,
+				ReplicaDescriptor: repl,
 				rngDesc:           it.Desc(),
 			})
 			if !it.NeedAnother() {
@@ -408,7 +413,7 @@ func resolveSpans(
 
 func onlyReplica(rng roachpb.RangeDescriptor) rngInfo {
 	if len(rng.InternalReplicas) != 1 {
-		panic(fmt.Sprintf("expected one replica in %+v", rng))
+		panic(errors.AssertionFailedf("expected one replica in %+v", rng))
 	}
 	return rngInfo{ReplicaDescriptor: rng.InternalReplicas[0], rngDesc: rng}
 }
@@ -419,7 +424,7 @@ func selectReplica(nodeID roachpb.NodeID, rng roachpb.RangeDescriptor) rngInfo {
 			return rngInfo{ReplicaDescriptor: rep, rngDesc: rng}
 		}
 	}
-	panic(fmt.Sprintf("no replica on node %d in: %s", nodeID, &rng))
+	panic(errors.AssertionFailedf("no replica on node %d in: %s", nodeID, &rng))
 }
 
 func expectResolved(actual [][]rngInfo, expected ...[]rngInfo) error {
@@ -446,9 +451,9 @@ func expectResolved(actual [][]rngInfo, expected ...[]rngInfo) error {
 	return nil
 }
 
-func makeSpan(tableDesc *sqlbase.TableDescriptor, i, j int) roachpb.Span {
+func makeSpan(tableDesc catalog.TableDescriptor, i, j int) roachpb.Span {
 	makeKey := func(val int) roachpb.Key {
-		key, err := sqlbase.TestingMakePrimaryIndexKey(tableDesc, val)
+		key, err := rowenc.TestingMakePrimaryIndexKey(tableDesc, val)
 		if err != nil {
 			panic(err)
 		}

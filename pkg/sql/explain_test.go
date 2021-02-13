@@ -18,14 +18,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestStatementReuses(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	initStmts := []string{
 		`CREATE DATABASE d`,
@@ -95,7 +97,6 @@ func TestStatementReuses(t *testing.T) {
 		`UPSERT INTO a VALUES (1)`,
 		`UPDATE a SET b = 1`,
 
-		`EXPLAIN ANALYZE (DISTSQL) SELECT 1`,
 		`EXPLAIN SELECT 1`,
 
 		// TODO(knz): backup/restore planning tests really should be

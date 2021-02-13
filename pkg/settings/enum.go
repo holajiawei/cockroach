@@ -17,7 +17,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // EnumSetting is a StringSetting that restricts the values to be one of the `enumValues`
@@ -59,6 +59,24 @@ func (e *EnumSetting) ParseEnum(raw string) (int64, bool) {
 	return v, ok
 }
 
+// GetAvailableValuesAsHint returns the possible enum settings as a string that
+// can be provided as an error hint to a user.
+func (e *EnumSetting) GetAvailableValuesAsHint() string {
+	// First stabilize output by sorting by key.
+	valIdxs := make([]int, 0, len(e.enumValues))
+	for i := range e.enumValues {
+		valIdxs = append(valIdxs, int(i))
+	}
+	sort.Ints(valIdxs)
+
+	// Now use those indices
+	vals := make([]string, 0, len(e.enumValues))
+	for _, enumIdx := range valIdxs {
+		vals = append(vals, fmt.Sprintf("%d: %s", enumIdx, e.enumValues[int64(enumIdx)]))
+	}
+	return "Available values: " + strings.Join(vals, ", ")
+}
+
 func (e *EnumSetting) set(sv *Values, k int64) error {
 	if _, ok := e.enumValues[k]; !ok {
 		return errors.Errorf("unrecognized value %d", k)
@@ -85,13 +103,10 @@ func enumValuesToDesc(enumValues map[int64]string) string {
 	return buffer.String()
 }
 
-// RegisterPublicEnumSetting defines a new setting with type int and makes it public.
-func RegisterPublicEnumSetting(
-	key, desc string, defaultValue string, enumValues map[int64]string,
-) *EnumSetting {
-	s := RegisterEnumSetting(key, desc, defaultValue, enumValues)
-	s.SetVisibility(Public)
-	return s
+// WithPublic sets public visibility and can be chained.
+func (e *EnumSetting) WithPublic() *EnumSetting {
+	e.SetVisibility(Public)
+	return e
 }
 
 // RegisterEnumSetting defines a new setting with type int.

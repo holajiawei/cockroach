@@ -17,19 +17,23 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 const (
@@ -39,6 +43,7 @@ const (
 
 // Catalog implements the cat.Catalog interface for testing purposes.
 type Catalog struct {
+	tree.TypeReferenceResolver
 	testSchema Schema
 	counter    int
 }
@@ -168,6 +173,11 @@ func (tc *Catalog) ResolveDataSourceByID(
 		"relation [%d] does not exist", id)
 }
 
+// ResolveTypeByOID is part of the cat.Catalog interface.
+func (tc *Catalog) ResolveTypeByOID(context.Context, oid.Oid) (*types.T, error) {
+	return nil, errors.Newf("test catalog cannot handle user defined types")
+}
+
 // CheckPrivilege is part of the cat.Catalog interface.
 func (tc *Catalog) CheckPrivilege(ctx context.Context, o cat.Object, priv privilege.Kind) error {
 	return tc.CheckAnyPrivilege(ctx, o)
@@ -206,6 +216,11 @@ func (tc *Catalog) HasAdminRole(ctx context.Context) (bool, error) {
 // RequireAdminRole is part of the cat.Catalog interface.
 func (tc *Catalog) RequireAdminRole(ctx context.Context, action string) error {
 	return nil
+}
+
+// HasRoleOption is part of the cat.Catalog interface.
+func (tc *Catalog) HasRoleOption(ctx context.Context, roleOption roleoption.Option) (bool, error) {
+	return true, nil
 }
 
 // FullyQualifiedName is part of the cat.Catalog interface.
@@ -256,6 +271,17 @@ func (tc *Catalog) Table(name *tree.TableName) *Table {
 	}
 	panic(pgerror.Newf(pgcode.WrongObjectType,
 		"\"%q\" is not a table", tree.ErrString(name)))
+}
+
+// Tables returns a list of all tables added to the test catalog.
+func (tc *Catalog) Tables() []*Table {
+	tables := make([]*Table, 0, len(tc.testSchema.dataSources))
+	for _, ds := range tc.testSchema.dataSources {
+		if tab, ok := ds.(*Table); ok {
+			tables = append(tables, tab)
+		}
+	}
+	return tables
 }
 
 // AddTable adds the given test table to the catalog.
@@ -322,6 +348,19 @@ func (tc *Catalog) ExecuteMultipleDDL(sql string) error {
 // ExecuteDDL parses the given DDL SQL statement and creates objects in the test
 // catalog. This is used to test without spinning up a cluster.
 func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
+	return tc.ExecuteDDLWithIndexVersion(sql, descpb.EmptyArraysInInvertedIndexesVersion)
+}
+
+// ExecuteDDLWithIndexVersion parses the given DDL SQL statement and creates
+// objects in the test catalog. This is used to test without spinning up a
+// cluster.
+//
+// Any indexes created with CREATE INDEX will have the provided index
+// descriptor version (the version is ignored for indexes created as part of
+// a CREATE TABLE statement).
+func (tc *Catalog) ExecuteDDLWithIndexVersion(
+	sql string, indexVersion descpb.IndexDescriptorVersion,
+) (string, error) {
 	stmt, err := parser.ParseOne(sql)
 	if err != nil {
 		return "", err
@@ -330,6 +369,10 @@ func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
 	switch stmt := stmt.AST.(type) {
 	case *tree.CreateTable:
 		tc.CreateTable(stmt)
+		return "", nil
+
+	case *tree.CreateIndex:
+		tc.CreateIndex(stmt, indexVersion)
 		return "", nil
 
 	case *tree.CreateView:
@@ -342,6 +385,10 @@ func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
 
 	case *tree.DropTable:
 		tc.DropTable(stmt)
+		return "", nil
+
+	case *tree.DropIndex:
+		tc.DropIndex(stmt)
 		return "", nil
 
 	case *tree.CreateSequence:
@@ -495,7 +542,7 @@ func (tv *View) Equals(other cat.Object) bool {
 
 // Name is part of the cat.DataSource interface.
 func (tv *View) Name() tree.Name {
-	return tv.ViewName.TableName
+	return tv.ViewName.ObjectName
 }
 
 // fqName is part of the dataSource interface.
@@ -528,7 +575,7 @@ type Table struct {
 	TabID      cat.StableID
 	TabVersion int
 	TabName    tree.TableName
-	Columns    []*Column
+	Columns    []cat.Column
 	Indexes    []*Index
 	Stats      TableStats
 	Checks     []cat.CheckConstraint
@@ -539,8 +586,6 @@ type Table struct {
 	// If Revoked is true, then the user has had privileges on the table revoked.
 	Revoked bool
 
-	writeOnlyColCount  int
-	deleteOnlyColCount int
 	writeOnlyIdxCount  int
 	deleteOnlyIdxCount int
 
@@ -550,6 +595,8 @@ type Table struct {
 
 	outboundFKs []ForeignKeyConstraint
 	inboundFKs  []ForeignKeyConstraint
+
+	uniqueConstraints []UniqueConstraint
 }
 
 var _ cat.Table = &Table{}
@@ -581,7 +628,7 @@ func (tt *Table) Equals(other cat.Object) bool {
 
 // Name is part of the cat.DataSource interface.
 func (tt *Table) Name() tree.Name {
-	return tt.TabName.TableName
+	return tt.TabName.ObjectName
 }
 
 // fqName is part of the dataSource interface.
@@ -594,29 +641,19 @@ func (tt *Table) IsVirtualTable() bool {
 	return tt.IsVirtual
 }
 
-// IsInterleaved is part of the cat.Table interface.
-func (tt *Table) IsInterleaved() bool {
+// IsMaterializedView is part of the cat.Table interface.
+func (tt *Table) IsMaterializedView() bool {
 	return false
 }
 
 // ColumnCount is part of the cat.Table interface.
 func (tt *Table) ColumnCount() int {
-	return len(tt.Columns) - tt.writeOnlyColCount - tt.deleteOnlyColCount
-}
-
-// WritableColumnCount is part of the cat.Table interface.
-func (tt *Table) WritableColumnCount() int {
-	return len(tt.Columns) - tt.deleteOnlyColCount
-}
-
-// DeletableColumnCount is part of the cat.Table interface.
-func (tt *Table) DeletableColumnCount() int {
 	return len(tt.Columns)
 }
 
 // Column is part of the cat.Table interface.
-func (tt *Table) Column(i int) cat.Column {
-	return tt.Columns[i]
+func (tt *Table) Column(i int) *cat.Column {
+	return &tt.Columns[i]
 }
 
 // IndexCount is part of the cat.Table interface.
@@ -689,10 +726,20 @@ func (tt *Table) InboundForeignKey(i int) cat.ForeignKeyConstraint {
 	return &tt.inboundFKs[i]
 }
 
+// UniqueCount is part of the cat.Table interface.
+func (tt *Table) UniqueCount() int {
+	return len(tt.uniqueConstraints)
+}
+
+// Unique is part of the cat.Table interface.
+func (tt *Table) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
+	return &tt.uniqueConstraints[i]
+}
+
 // FindOrdinal returns the ordinal of the column with the given name.
 func (tt *Table) FindOrdinal(name string) int {
 	for i, col := range tt.Columns {
-		if col.Name == name {
+		if col.ColName() == tree.Name(name) {
 			return i
 		}
 	}
@@ -737,6 +784,20 @@ type Index struct {
 	// partitionBy is the partitioning clause that corresponds to this index. Used
 	// to implement PartitionByListPrefixes.
 	partitionBy *tree.PartitionBy
+
+	// predicate is the partial index predicate expression, if it exists.
+	predicate string
+
+	// invertedOrd is the ordinal of the VirtualInverted column, if the index is
+	// an inverted index.
+	invertedOrd int
+
+	// geoConfig is the geospatial index configuration, if this is a geospatial
+	// inverted index. Otherwise geoConfig is nil.
+	geoConfig *geoindex.Config
+
+	// version is the index descriptor version of the index.
+	version descpb.IndexDescriptorVersion
 }
 
 // ID is part of the cat.Index interface.
@@ -784,9 +845,25 @@ func (ti *Index) LaxKeyColumnCount() int {
 	return ti.LaxKeyCount
 }
 
+// NonInvertedPrefixColumnCount is part of the cat.Index interface.
+func (ti *Index) NonInvertedPrefixColumnCount() int {
+	if !ti.IsInverted() {
+		panic("not supported for non-inverted indexes")
+	}
+	return ti.invertedOrd
+}
+
 // Column is part of the cat.Index interface.
 func (ti *Index) Column(i int) cat.IndexColumn {
 	return ti.Columns[i]
+}
+
+// VirtualInvertedColumn is part of the cat.Index interface.
+func (ti *Index) VirtualInvertedColumn() cat.IndexColumn {
+	if !ti.IsInverted() {
+		panic("non-inverted indexes do not have inverted virtual columns")
+	}
+	return ti.Column(ti.invertedOrd)
 }
 
 // Zone is part of the cat.Index interface.
@@ -799,8 +876,16 @@ func (ti *Index) Span() roachpb.Span {
 	panic("not implemented")
 }
 
+// Predicate is part of the cat.Index interface. It returns the predicate
+// expression and true if the index is a partial index. If the index is not
+// partial, the empty string and false is returned.
+func (ti *Index) Predicate() (string, bool) {
+	return ti.predicate, ti.predicate != ""
+}
+
 // PartitionByListPrefixes is part of the cat.Index interface.
 func (ti *Index) PartitionByListPrefixes() []tree.Datums {
+	ctx := context.Background()
 	p := ti.partitionBy
 	if p == nil {
 		return nil
@@ -839,7 +924,7 @@ func (ti *Index) PartitionByListPrefixes() []tree.Datums {
 			d := make(tree.Datums, len(vals))
 			for i := range vals {
 				c := tree.CastExpr{Expr: vals[i], Type: ti.Columns[i].DatumType()}
-				cTyped, err := c.TypeCheck(&semaCtx, nil)
+				cTyped, err := c.TypeCheck(ctx, &semaCtx, types.Any)
 				if err != nil {
 					panic(err)
 				}
@@ -859,90 +944,39 @@ func (ti *Index) PartitionByListPrefixes() []tree.Datums {
 	return res
 }
 
-// Column implements the cat.Column interface for testing purposes.
-type Column struct {
-	Ordinal      int
-	Hidden       bool
-	Nullable     bool
-	Name         string
-	Type         *types.T
-	ColType      types.T
-	DefaultExpr  *string
-	ComputedExpr *string
+// ImplicitPartitioningColumnCount is part of the cat.Index interface.
+func (ti *Index) ImplicitPartitioningColumnCount() int {
+	return 0
 }
 
-var _ cat.Column = &Column{}
-
-// ColID is part of the cat.Index interface.
-func (tc *Column) ColID() cat.StableID {
-	return 1 + cat.StableID(tc.Ordinal)
+// InterleaveAncestorCount is part of the cat.Index interface.
+func (ti *Index) InterleaveAncestorCount() int {
+	return 0
 }
 
-// IsNullable is part of the cat.Column interface.
-func (tc *Column) IsNullable() bool {
-	return tc.Nullable
+// InterleaveAncestor is part of the cat.Index interface.
+func (ti *Index) InterleaveAncestor(i int) (table, index cat.StableID, numKeyCols int) {
+	panic("no interleavings")
 }
 
-// ColName is part of the cat.Column interface.
-func (tc *Column) ColName() tree.Name {
-	return tree.Name(tc.Name)
+// InterleavedByCount is part of the cat.Index interface.
+func (ti *Index) InterleavedByCount() int {
+	return 0
 }
 
-// DatumType is part of the cat.Column interface.
-func (tc *Column) DatumType() *types.T {
-	return tc.Type
+// InterleavedBy is part of the cat.Index interface.
+func (ti *Index) InterleavedBy(i int) (table, index cat.StableID) {
+	panic("no interleavings")
 }
 
-// ColTypePrecision is part of the cat.Column interface.
-func (tc *Column) ColTypePrecision() int {
-	if tc.ColType.Family() == types.ArrayFamily {
-		if tc.ColType.ArrayContents().Family() == types.ArrayFamily {
-			panic(errors.AssertionFailedf("column type should never be a nested array"))
-		}
-		return int(tc.ColType.ArrayContents().Precision())
-	}
-	return int(tc.ColType.Precision())
+// GeoConfig is part of the cat.Index interface.
+func (ti *Index) GeoConfig() *geoindex.Config {
+	return ti.geoConfig
 }
 
-// ColTypeWidth is part of the cat.Column interface.
-func (tc *Column) ColTypeWidth() int {
-	if tc.ColType.Family() == types.ArrayFamily {
-		if tc.ColType.ArrayContents().Family() == types.ArrayFamily {
-			panic(errors.AssertionFailedf("column type should never be a nested array"))
-		}
-		return int(tc.ColType.ArrayContents().Width())
-	}
-	return int(tc.ColType.Width())
-}
-
-// ColTypeStr is part of the cat.Column interface.
-func (tc *Column) ColTypeStr() string {
-	return tc.ColType.SQLString()
-}
-
-// IsHidden is part of the cat.Column interface.
-func (tc *Column) IsHidden() bool {
-	return tc.Hidden
-}
-
-// HasDefault is part of the cat.Column interface.
-func (tc *Column) HasDefault() bool {
-	return tc.DefaultExpr != nil
-}
-
-// IsComputed is part of the cat.Column interface.
-func (tc *Column) IsComputed() bool {
-	return tc.ComputedExpr != nil
-}
-
-// DefaultExprStr is part of the cat.Column interface.
-func (tc *Column) DefaultExprStr() string {
-	return *tc.DefaultExpr
-}
-
-// ComputedExprStr is part of the cat.Column interface.
-func (tc *Column) ComputedExprStr() string {
-	return *tc.ComputedExpr
+// Version is part of the cat.Index interface.
+func (ti *Index) Version() descpb.IndexDescriptorVersion {
+	return ti.version
 }
 
 // TableStat implements the cat.TableStatistic interface for testing purposes.
@@ -955,7 +989,7 @@ var _ cat.TableStatistic = &TableStat{}
 
 // CreatedAt is part of the cat.TableStatistic interface.
 func (ts *TableStat) CreatedAt() time.Time {
-	d, err := tree.ParseDTimestamp(nil, ts.js.CreatedAt, time.Microsecond)
+	d, _, err := tree.ParseDTimestamp(nil, ts.js.CreatedAt, time.Microsecond)
 	if err != nil {
 		panic(err)
 	}
@@ -993,14 +1027,15 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 	if ts.js.HistogramColumnType == "" || ts.js.HistogramBuckets == nil {
 		return nil
 	}
-	colType, err := parser.ParseType(ts.js.HistogramColumnType)
+	colTypeRef, err := parser.GetTypeFromValidSQLSyntax(ts.js.HistogramColumnType)
 	if err != nil {
 		panic(err)
 	}
+	colType := tree.MustBeStaticallyKnownType(colTypeRef)
 	histogram := make([]cat.HistogramBucket, len(ts.js.HistogramBuckets))
 	for i := range histogram {
 		bucket := &ts.js.HistogramBuckets[i]
-		datum, err := sqlbase.ParseDatumStringAs(colType, bucket.UpperBound, &evalCtx)
+		datum, err := rowenc.ParseDatumStringAs(colType, bucket.UpperBound, &evalCtx)
 		if err != nil {
 			panic(err)
 		}
@@ -1112,6 +1147,60 @@ func (fk *ForeignKeyConstraint) UpdateReferenceAction() tree.ReferenceAction {
 	return fk.updateAction
 }
 
+// UniqueConstraint implements cat.UniqueConstraint. See that interface
+// for more information on the fields.
+type UniqueConstraint struct {
+	name           string
+	tabID          cat.StableID
+	columnOrdinals []int
+	predicate      string
+	withoutIndex   bool
+	validated      bool
+}
+
+var _ cat.UniqueConstraint = &UniqueConstraint{}
+
+// Name is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) Name() string {
+	return u.name
+}
+
+// TableID is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) TableID() cat.StableID {
+	return u.tabID
+}
+
+// ColumnCount is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) ColumnCount() int {
+	return len(u.columnOrdinals)
+}
+
+// ColumnOrdinal is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) ColumnOrdinal(tab cat.Table, i int) int {
+	if tab.ID() != u.tabID {
+		panic(errors.AssertionFailedf(
+			"invalid table %d passed to ColumnOrdinal (expected %d)",
+			tab.ID(), u.tabID,
+		))
+	}
+	return u.columnOrdinals[i]
+}
+
+// Predicate is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) Predicate() (string, bool) {
+	return u.predicate, u.predicate != ""
+}
+
+// WithoutIndex is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) WithoutIndex() bool {
+	return u.withoutIndex
+}
+
+// Validated is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) Validated() bool {
+	return u.validated
+}
+
 // Sequence implements the cat.Sequence interface for testing purposes.
 type Sequence struct {
 	SeqID      cat.StableID
@@ -1146,7 +1235,7 @@ func (ts *Sequence) Equals(other cat.Object) bool {
 
 // Name is part of the cat.DataSource interface.
 func (ts *Sequence) Name() tree.Name {
-	return ts.SeqName.TableName
+	return ts.SeqName.ObjectName
 }
 
 // fqName is part of the dataSource interface.

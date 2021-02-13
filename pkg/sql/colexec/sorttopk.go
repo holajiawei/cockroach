@@ -13,12 +13,14 @@ package colexec
 import (
 	"container/heap"
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -30,12 +32,12 @@ const (
 // columns given in orderingCols and returns the first K rows. The inputTypes
 // must correspond 1-1 with the columns in the input operator.
 func NewTopKSorter(
-	allocator *Allocator,
-	input Operator,
-	inputTypes []coltypes.T,
+	allocator *colmem.Allocator,
+	input colexecbase.Operator,
+	inputTypes []*types.T,
 	orderingCols []execinfrapb.Ordering_Column,
-	k uint16,
-) Operator {
+	k uint64,
+) colexecbase.Operator {
 	return &topKSorter{
 		allocator:    allocator,
 		OneInputNode: NewOneInputNode(input),
@@ -45,27 +47,30 @@ func NewTopKSorter(
 	}
 }
 
-var _ bufferingInMemoryOperator = &topKSorter{}
+var _ colexecbase.BufferingInMemoryOperator = &topKSorter{}
 
 // topKSortState represents the state of the sort operator.
 type topKSortState int
 
 const (
-	// sortSpooling is the initial state of the operator, where it spools its
-	// input.
+	// topKSortSpooling is the initial state of the operator, where it spools
+	// its input.
 	topKSortSpooling topKSortState = iota
-	// sortEmitting is the second state of the operator, indicating that each call
-	// to Next will return another batch of the sorted data.
+	// topKSortEmitting is the second state of the operator, indicating that
+	// each call to Next will return another batch of the sorted data.
 	topKSortEmitting
+	// topKSortDone is the final state of the operator, where it always returns
+	// a zero batch.
+	topKSortDone
 )
 
 type topKSorter struct {
 	OneInputNode
 
-	allocator    *Allocator
+	allocator    *colmem.Allocator
 	orderingCols []execinfrapb.Ordering_Column
-	inputTypes   []coltypes.T
-	k            uint16 // TODO(solon): support larger k values
+	inputTypes   []*types.T
+	k            uint64
 
 	// state is the current state of the sort.
 	state topKSortState
@@ -77,7 +82,7 @@ type topKSorter struct {
 	// comparators stores one comparator per ordering column.
 	comparators []vecComparator
 	// topK stores the top K rows. It is not sorted internally.
-	topK coldata.Batch
+	topK *appendOnlyBufferedBatch
 	// heap is a max heap which stores indices into topK.
 	heap []int
 	// sel is a selection vector which specifies an ordering on topK.
@@ -93,10 +98,9 @@ type topKSorter struct {
 
 func (t *topKSorter) Init() {
 	t.input.Init()
-	t.topK = t.allocator.NewMemBatchWithSize(t.inputTypes, 0 /* size */)
+	t.topK = newAppendOnlyBufferedBatch(t.allocator, t.inputTypes, nil /* colsToStore */)
 	t.comparators = make([]vecComparator, len(t.inputTypes))
-	for i := range t.inputTypes {
-		typ := t.inputTypes[i]
+	for i, typ := range t.inputTypes {
 		t.comparators[i] = GetVecComparator(typ, 2)
 	}
 	// TODO(yuzefovich): switch to calling this method on allocator. This will
@@ -106,17 +110,26 @@ func (t *topKSorter) Init() {
 }
 
 func (t *topKSorter) Next(ctx context.Context) coldata.Batch {
-	switch t.state {
-	case topKSortSpooling:
-		t.spool(ctx)
-		t.state = topKSortEmitting
-		fallthrough
-	case topKSortEmitting:
-		return t.emit()
+	for {
+		switch t.state {
+		case topKSortSpooling:
+			t.spool(ctx)
+			t.state = topKSortEmitting
+		case topKSortEmitting:
+			output := t.emit()
+			if output.Length() == 0 {
+				t.state = topKSortDone
+				continue
+			}
+			return output
+		case topKSortDone:
+			return coldata.ZeroBatch
+		default:
+			colexecerror.InternalError(errors.AssertionFailedf("invalid sort state %v", t.state))
+			// This code is unreachable, but the compiler cannot infer that.
+			return nil
+		}
 	}
-	execerror.VectorizedInternalPanic(fmt.Sprintf("invalid sort state %v", t.state))
-	// This code is unreachable, but the compiler cannot infer that.
-	return nil
 }
 
 // spool reads in the entire input, always storing the top K rows it has seen so
@@ -130,35 +143,18 @@ func (t *topKSorter) Next(ctx context.Context) coldata.Batch {
 func (t *topKSorter) spool(ctx context.Context) {
 	// Fill up t.topK by spooling up to K rows from the input.
 	t.inputBatch = t.input.Next(ctx)
-	spooledRows := 0
-	remainingRows := int(t.k)
+	remainingRows := t.k
 	for remainingRows > 0 && t.inputBatch.Length() > 0 {
-		toLength := spooledRows
 		fromLength := t.inputBatch.Length()
-		if remainingRows < t.inputBatch.Length() {
+		if remainingRows < uint64(t.inputBatch.Length()) {
 			// t.topK will be full after this batch.
-			fromLength = remainingRows
+			fromLength = int(remainingRows)
 		}
 		t.firstUnprocessedTupleIdx = fromLength
 		t.allocator.PerformOperation(t.topK.ColVecs(), func() {
-			for i := range t.inputTypes {
-				destVec := t.topK.ColVec(i)
-				vec := t.inputBatch.ColVec(i)
-				colType := t.inputTypes[i]
-				destVec.Append(
-					coldata.SliceArgs{
-						ColType:   colType,
-						Src:       vec,
-						Sel:       t.inputBatch.Selection(),
-						DestIdx:   toLength,
-						SrcEndIdx: fromLength,
-					},
-				)
-			}
-			spooledRows += fromLength
-			t.topK.SetLength(spooledRows)
+			t.topK.append(t.inputBatch, 0 /* startIdx */, fromLength)
 		})
-		remainingRows -= fromLength
+		remainingRows -= uint64(fromLength)
 		if fromLength == t.inputBatch.Length() {
 			t.inputBatch = t.input.Next(ctx)
 			t.firstUnprocessedTupleIdx = 0
@@ -211,16 +207,7 @@ func (t *topKSorter) spool(ctx context.Context) {
 	}
 }
 
-func (t *topKSorter) resetOutput() {
-	if t.output == nil {
-		t.output = t.allocator.NewMemBatchWithSize(t.inputTypes, coldata.BatchSize())
-	} else {
-		t.output.ResetInternalBatch()
-	}
-}
-
 func (t *topKSorter) emit() coldata.Batch {
-	t.resetOutput()
 	toEmit := t.topK.Length() - t.emitted
 	if toEmit == 0 {
 		// We're done.
@@ -229,6 +216,7 @@ func (t *topKSorter) emit() coldata.Batch {
 	if toEmit > coldata.BatchSize() {
 		toEmit = coldata.BatchSize()
 	}
+	t.output, _ = t.allocator.ResetMaybeReallocate(t.inputTypes, t.output, toEmit)
 	for i := range t.inputTypes {
 		vec := t.output.ColVec(i)
 		// At this point, we have already fully sorted the input. It is ok to do
@@ -239,7 +227,6 @@ func (t *topKSorter) emit() coldata.Batch {
 		vec.Copy(
 			coldata.CopySliceArgs{
 				SliceArgs: coldata.SliceArgs{
-					ColType:     t.inputTypes[i],
 					Src:         t.topK.ColVec(i),
 					Sel:         t.sel,
 					SrcStartIdx: t.emitted,
@@ -264,7 +251,7 @@ func (t *topKSorter) compareRow(vecIdx1, vecIdx2 int, rowIdx1, rowIdx2 int) int 
 			case execinfrapb.Ordering_Column_DESC:
 				return -res
 			default:
-				execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected direction value %d", d))
+				colexecerror.InternalError(errors.AssertionFailedf("unexpected direction value %d", d))
 			}
 		}
 	}
@@ -277,7 +264,7 @@ func (t *topKSorter) updateComparators(vecIdx int, batch coldata.Batch) {
 	}
 }
 
-func (t *topKSorter) ExportBuffered(Operator) coldata.Batch {
+func (t *topKSorter) ExportBuffered(context.Context, colexecbase.Operator) coldata.Batch {
 	topKLen := t.topK.Length()
 	// First, we check whether we have exported all tuples from the topK vector.
 	if t.exportedFromTopK < topKLen {
@@ -285,8 +272,8 @@ func (t *topKSorter) ExportBuffered(Operator) coldata.Batch {
 		if newExportedFromTopK > topKLen {
 			newExportedFromTopK = topKLen
 		}
-		for i, typ := range t.inputTypes {
-			window := t.topK.ColVec(i).Window(typ, t.exportedFromTopK, newExportedFromTopK)
+		for i := range t.inputTypes {
+			window := t.topK.ColVec(i).Window(t.exportedFromTopK, newExportedFromTopK)
 			t.windowedBatch.ReplaceCol(window, i)
 		}
 		t.windowedBatch.SetSelection(false)

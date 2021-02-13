@@ -14,20 +14,19 @@
 package log
 
 import (
-	"fmt"
-	"os"
+	"context"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/caller"
+	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 )
-
-// mainLog is the primary logger instance.
-var mainLog loggerT
 
 // logging is the global state of the logging setup.
 var logging loggingT
@@ -36,11 +35,12 @@ var logging loggingT
 //
 // TODO(knz): better separate global state and per-logger state.
 type loggingT struct {
-	// Level flag for output to stderr. Handled atomically.
-	stderrThreshold Severity
+	config
 
-	// pool for entry formatting buffers.
+	// allocation pool for entry formatting buffers.
 	bufPool sync.Pool
+	// allocation pool for slices of buffer pointers.
+	bufSlicePool sync.Pool
 
 	// interceptor is the configured InterceptorFn callback, if any.
 	interceptor atomic.Value
@@ -48,6 +48,33 @@ type loggingT struct {
 	// vmoduleConfig maintains the configuration for the log.V and vmodule
 	// facilities.
 	vmoduleConfig vmoduleConfig
+
+	// The common stderr sink.
+	stderrSink stderrSink
+	// The template for the stderr sink info. This is where the configuration
+	// parameters are applied in ApplyConfig().
+	// This template is copied to the heap for use as sinkInfo in the
+	// actual loggers, so that configuration updates do not race
+	// with logging operations.
+	stderrSinkInfoTemplate sinkInfo
+
+	// the mapping of channels to loggers.
+	//
+	// This is under a R/W lock because some tests leak goroutines
+	// asynchronously with TestLogScope.Close() calls. If/when that
+	// misdesign is corrected, this lock can be dropped.
+	rmu struct {
+		syncutil.RWMutex
+		channels map[Channel]*loggerT
+		// currentStderrSinkInfo is the currently active copy of
+		// stderrSinkInfoTemplate. This is used in tests and
+		// DescribeAppliedConfiguration().
+		currentStderrSinkInfo *sinkInfo
+	}
+
+	// testingFd2CaptureLogger remembers the logger that was last set up
+	// to capture fd2 writes. Used by unit tests in this package.
+	testingFd2CaptureLogger *loggerT
 
 	// mu protects the remaining elements of this structure and is
 	// used to synchronize logging.
@@ -61,59 +88,103 @@ type loggingT struct {
 
 		// exitOverride is used when shutting down logging.
 		exitOverride struct {
-			f         func(int, error) // overrides os.Exit when non-nil; testing only
-			hideStack bool             // hides stack trace; only in effect when f is not nil
+			f         func(exit.Code, error) // overrides exit.WithCode when non-nil; testing only
+			hideStack bool                   // hides stack trace; only in effect when f is not nil
 		}
-
-		// the Cluster ID is reported on every new log file so as to ease the correlation
-		// of panic reports with self-reported log files.
-		clusterID string
 
 		// fatalCh is closed on fatal errors.
 		fatalCh chan struct{}
+
+		// active indicates that at least one event has been logged
+		// to this logger already.
+		active        bool
+		firstUseStack string
+	}
+
+	idMu struct {
+		syncutil.RWMutex
+		idPayload
 	}
 }
 
-type loggerT struct {
-	// Directory prefix where to store this logger's files.
-	logDir DirName
-
-	// Name prefix for log files.
-	prefix string
-
-	// Level flag for output to files.
-	fileThreshold Severity
-
-	// noStderrRedirect, when set, disables redirecting this logger's
-	// log entries to stderr (even when the shared stderr threshold is
-	// matched).
-	noStderrRedirect bool
-
-	// notify GC daemon that a new log file was created
-	gcNotify chan struct{}
-
-	// mu protects the remaining elements of this structure and is
-	// used to synchronize logging.
-	mu struct {
-		syncutil.Mutex
-
-		// file holds the log file writer.
-		file flushSyncWriter
-
-		// syncWrites if true calls file.Flush and file.Sync on every log write.
-		syncWrites bool
-	}
+type idPayload struct {
+	// the Cluster ID is reported on every new log file so as to ease
+	// the correlation of panic reports with self-reported log files.
+	clusterID string
+	// the node ID is reported like the cluster ID, for the same reasons.
+	// We avoid using roahcpb.NodeID to avoid a circular reference.
+	nodeID int32
+	// ditto for the tenant ID.
+	tenantID string
+	// ditto for the SQL instance ID.
+	sqlInstanceID int32
 }
 
 func init() {
 	logging.bufPool.New = newBuffer
+	logging.bufSlicePool.New = newBufferSlice
 	logging.mu.fatalCh = make(chan struct{})
-	// Default stderrThreshold and fileThreshold to log everything.
-	// This will be the default in tests unless overridden; the CLI
-	// commands set their default separately in cli/flags.go.
-	logging.stderrThreshold = Severity_INFO
-	mainLog.prefix = program
-	mainLog.fileThreshold = Severity_INFO
+	logging.stderrSinkInfoTemplate.sink = &logging.stderrSink
+	si := logging.stderrSinkInfoTemplate
+	logging.setChannelLoggers(make(map[Channel]*loggerT), &si)
+}
+
+type sinkInfo struct {
+	// sink is where the log entries should be written.
+	sink logSink
+
+	// Level at or beyond which entries are output to this sink.
+	threshold Severity
+
+	// editor is the optional step that occurs prior to emitting the log
+	// entry.
+	editor redactEditor
+
+	// formatter for entries written via this sink.
+	formatter logFormatter
+
+	// msgCount supports the generation of a per-entry log entry
+	// counter. This is needed in audit logs to hinder malicious
+	// repudiation of log events by manually erasing log files or log
+	// entries.
+	msgCount uint64
+
+	// criticality indicates whether a failure to output some log
+	// entries should incur the process to terminate.
+	criticality bool
+
+	// redact and redactable memorize the input configuration
+	// that was used to create the editor above.
+	redact, redactable bool
+}
+
+// loggerT represents the logging source for a given log channel.
+type loggerT struct {
+	// sinkInfos stores the destinations for log entries.
+	sinkInfos []*sinkInfo
+
+	// outputMu is used to coordinate output to the sinks, to guarantee
+	// that the ordering of events the same on all sinks.
+	outputMu syncutil.Mutex
+}
+
+// getFileSinkIndex retrieves the index of the fileSink, if defined,
+// in the sinkInfos. Returns -1 if there is no file sink.
+func (l *loggerT) getFileSinkIndex() int {
+	for i, s := range l.sinkInfos {
+		if _, ok := s.sink.(*fileSink); ok {
+			return i
+		}
+	}
+	return -1
+}
+
+// getFileSink retrieves the file sink if defined.
+func (l *loggerT) getFileSink() *fileSink {
+	if i := l.getFileSinkIndex(); i != -1 {
+		return l.sinkInfos[i].sink.(*fileSink)
+	}
+	return nil
 }
 
 // FatalChan is closed when Fatal is called. This can be used to make
@@ -138,79 +209,82 @@ func (l *loggingT) signalFatalCh() {
 	}
 }
 
-// SetClusterID stores the Cluster ID for further reference.
-//
-// TODO(knz): This should not be configured per-logger.
-// See: https://github.com/cockroachdb/cockroach/issues/40983
-func SetClusterID(clusterID string) {
-	// Ensure that the clusterID is logged with the same format as for
+// SetNodeIDs stores the Node and Cluster ID for further reference.
+func SetNodeIDs(clusterID string, nodeID int32) {
+	// Ensure that the IDs are logged with the same format as for
 	// new log files, even on the first log file. This ensures that grep
 	// will always find it.
-	file, line, _ := caller.Lookup(1)
-	mainLog.outputLogEntry(Severity_INFO, file, line,
-		fmt.Sprintf("[config] clusterID: %s", clusterID))
+	ctx := logtags.AddTag(context.Background(), "config", nil)
+	logfDepth(ctx, 1, severity.INFO, channel.OPS, "clusterID: %s", clusterID)
+	if nodeID != 0 {
+		logfDepth(ctx, 1, severity.INFO, channel.OPS, "nodeID: n%d", nodeID)
+	}
 
 	// Perform the change proper.
-	logging.mu.Lock()
-	defer logging.mu.Unlock()
+	logging.idMu.Lock()
+	defer logging.idMu.Unlock()
 
-	if logging.mu.clusterID != "" {
+	if logging.idMu.clusterID != "" {
 		panic("clusterID already set")
 	}
 
-	logging.mu.clusterID = clusterID
+	logging.idMu.clusterID = clusterID
+	logging.idMu.nodeID = nodeID
 }
 
-// ensureFile ensures that l.file is set and valid.
-// Assumes that l.mu is held by the caller.
-func (l *loggerT) ensureFile() error {
-	if l.mu.file == nil {
-		return l.createFile()
-	}
-	return nil
-}
+// SetTenantIDs stores the tenant ID and instance ID for further reference.
+func SetTenantIDs(tenantID string, sqlInstanceID int32) {
+	// Ensure that the IDs are logged with the same format as for
+	// new log files, even on the first log file. This ensures that grep
+	// will always find it.
+	ctx := logtags.AddTag(context.Background(), "config", nil)
+	logfDepth(ctx, 1, severity.INFO, channel.OPS, "tenantID: %s", tenantID)
+	logfDepth(ctx, 1, severity.INFO, channel.OPS, "instanceID: %d", sqlInstanceID)
 
-// writeToFile writes to the file and applies the synchronization policy.
-// Assumes that l.mu is held by the caller.
-func (l *loggerT) writeToFile(data []byte) error {
-	if _, err := l.mu.file.Write(data); err != nil {
-		return err
+	// Perform the change proper.
+	logging.idMu.Lock()
+	defer logging.idMu.Unlock()
+
+	if logging.idMu.tenantID != "" {
+		panic("tenantID already set")
 	}
-	if l.mu.syncWrites {
-		_ = l.mu.file.Flush()
-		_ = l.mu.file.Sync()
-	}
-	return nil
+
+	logging.idMu.tenantID = tenantID
+	logging.idMu.sqlInstanceID = sqlInstanceID
 }
 
 // outputLogEntry marshals a log entry proto into bytes, and writes
 // the data to the log files. If a trace location is set, stack traces
 // are added to the entry before marshaling.
-func (l *loggerT) outputLogEntry(s Severity, file string, line int, msg string) {
-	// Set additional details in log entry.
-	now := timeutil.Now()
-	entry := MakeEntry(s, now.UnixNano(), file, line, msg)
-
+func (l *loggerT) outputLogEntry(entry logEntry) {
 	if f, ok := logging.interceptor.Load().(InterceptorFn); ok && f != nil {
-		f(entry)
+		f(entry.convertToLegacy())
 		return
 	}
 
-	// TODO(tschottdorf): this is a pretty horrible critical section.
-	l.mu.Lock()
-
-	var stacks []byte
+	// Mark the logger as active, so that further configuration changes
+	// are disabled. See IsActive() and its callers for details.
+	setActive()
 	var fatalTrigger chan struct{}
-	if s == Severity_FATAL {
+	extraFlush := false
+
+	if entry.sev == severity.FATAL {
+		extraFlush = true
 		logging.signalFatalCh()
 
 		switch traceback {
 		case tracebackSingle:
-			stacks = getStacks(false)
+			entry.stacks = getStacks(false)
 		case tracebackAll:
-			stacks = getStacks(true)
+			entry.stacks = getStacks(true)
 		}
-		stacks = append(stacks, []byte(fatalErrorPostamble)...)
+
+		for _, s := range l.sinkInfos {
+			entry.stacks = s.sink.attachHints(entry.stacks)
+		}
+
+		// Explain to the (human) user that we would like to hear from them.
+		entry.stacks = append(entry.stacks, []byte(fatalErrorPostamble)...)
 
 		// We don't want to hang forever writing our final log message. If
 		// things are broken (for example, if the disk fills up and there
@@ -225,11 +299,11 @@ func (l *loggerT) outputLogEntry(s Severity, file string, line int, msg string) 
 		//
 		// https://github.com/cockroachdb/cockroach/issues/23119
 		fatalTrigger = make(chan struct{})
-		exitFunc := func(x int, _ error) { os.Exit(x) }
+		exitFunc := func(x exit.Code, _ error) { exit.WithCode(x) }
 		logging.mu.Lock()
 		if logging.mu.exitOverride.f != nil {
 			if logging.mu.exitOverride.hideStack {
-				stacks = []byte("stack trace omitted via SetExitFunc()\n")
+				entry.stacks = []byte("stack trace omitted via SetExitFunc()\n")
 			}
 			exitFunc = logging.mu.exitOverride.f
 		}
@@ -246,85 +320,122 @@ func (l *loggerT) outputLogEntry(s Severity, file string, line int, msg string) 
 			case <-time.After(10 * time.Second):
 			case <-fatalTrigger:
 			}
-			exitFunc(255, nil) // C++ uses -1, which is silly because it's anded with 255 anyway.
+			exitFunc(exit.FatalError(), nil)
 			close(exitCalled)
 		}()
 	}
 
-	if s >= logging.stderrThreshold.get() || (s == Severity_FATAL && l.stderrRedirected()) {
-		// We force-copy FATAL messages to stderr, because the process is bound
-		// to terminate and the user will want to know why.
-		l.outputToStderr(entry, stacks)
-	}
-	if l.logDir.IsSet() && s >= l.fileThreshold.get() {
-		if err := l.ensureFile(); err != nil {
-			// Make sure the message appears somewhere.
-			l.outputToStderr(entry, stacks)
-			l.exitLocked(err)
-			l.mu.Unlock()
-			return
+	// The following buffers contain the formatted entry before it enters the sink.
+	// We need different buffers because the different sinks use different formats.
+	// For example, the fluent sink needs JSON, and the file sink does not use
+	// the terminal escape codes that the stderr sink uses.
+	bufs := getBufferSlice(len(l.sinkInfos))
+	defer putBufferSlice(bufs)
+
+	// The following code constructs / populates the formatted entries
+	// for each sink.
+	// We only do the work if the sink is active and the filtering does
+	// not eliminate the event.
+	someSinkActive := false
+	for i, s := range l.sinkInfos {
+		// Note: we need to use the .Get() method instead of reading the
+		// severity threshold directly, because some tests are unruly and
+		// let goroutines live and perform log calls beyond their
+		// Stopper's Stop() call (e.g. the pgwire async processing
+		// goroutine). These asynchronous log calls are concurrent with
+		// the stderrSinkInfo update in (*TestLogScope).Close().
+		if entry.sev < s.threshold.Get() || !s.sink.active() {
+			continue
 		}
+		editedEntry := entry
 
-		buf := logging.processForFile(entry, stacks)
-		data := buf.Bytes()
+		// Add a counter. This is important for e.g. the SQL audit logs.
+		// Note: whether the counter is displayed or not depends on
+		// the formatter.
+		editedEntry.counter = atomic.AddUint64(&s.msgCount, 1)
 
-		if err := l.writeToFile(data); err != nil {
-			l.exitLocked(err)
-			l.mu.Unlock()
-			putBuffer(buf)
-			return
-		}
+		// Process the redation spec.
+		editedEntry.payload = maybeRedactEntry(editedEntry.payload, s.editor)
 
-		putBuffer(buf)
+		// Format the entry for this sink.
+		bufs.b[i] = s.formatter.formatEntry(editedEntry)
+		someSinkActive = true
 	}
+
+	// If any of the sinks is active, it is now time to send it out.
+
+	if someSinkActive {
+		// The critical section here exists so that the output
+		// side effects from the same event (above) are emitted
+		// atomically. This ensures that the order of logging
+		// events is preserved across all sinks.
+		l.outputMu.Lock()
+		defer l.outputMu.Unlock()
+
+		var outputErr error
+		var outputErrExitCode exit.Code
+		for i, s := range l.sinkInfos {
+			if bufs.b[i] == nil {
+				// The sink was not accepting entries at this level. Nothing to do.
+				continue
+			}
+			if err := s.sink.output(extraFlush, bufs.b[i].Bytes()); err != nil {
+				if !s.criticality {
+					// An error on this sink is not critical. Just report
+					// the error and move on.
+					l.reportErrorEverywhereLocked(context.Background(), err)
+				} else {
+					// This error is critical. We'll have to terminate the
+					// process below.
+					if outputErr == nil {
+						outputErrExitCode = s.sink.exitCode()
+					}
+					outputErr = errors.CombineErrors(outputErr, err)
+				}
+			}
+		}
+		if outputErr != nil {
+			// Some sink was unavailable. However, the sink was active as
+			// per the threshold, so abandoning the write would be a
+			// contract violation.
+			//
+			// We definitely do not like to lose log entries, so we stop
+			// here. Note that exitLocked() shouts the error to all sinks,
+			// so even though this sink is not available any more, we'll
+			// keep a trace of the error in another sink.
+			l.exitLocked(outputErr, outputErrExitCode)
+			return // unreachable except in tests
+		}
+	}
+
 	// Flush and exit on fatal logging.
-	if s == Severity_FATAL {
-		l.flushAndSync(true /*doSync*/)
+	if entry.sev == severity.FATAL {
 		close(fatalTrigger)
 		// Note: although it seems like the function is allowed to return
-		// below when s == Severity_FATAL, this is not so, because the
+		// below when s == severity.FATAL, this is not so, because the
 		// anonymous function func() { <-exitCalled } is deferred
 		// above. That function ensures that outputLogEntry() will wait
 		// until the exit function has been called. If the exit function
-		// is os.Exit, it will never return, outputLogEntry()'s defer will
+		// is exit.WithCode, it will never return, outputLogEntry()'s defer will
 		// never complete and all is well. If the exit function was
 		// overridden, then the client that has overridden the exit
 		// function is expecting log.Fatal to return and all is well too.
 	}
-	l.mu.Unlock()
 }
 
-// printPanicToFile copies the panic details to the log file. This is
-// useful when the standard error is not redirected to the log file
-// (!stderrRedirected), as the go runtime will only print panics to
-// stderr.
-func (l *loggerT) printPanicToFile(r interface{}) {
-	if !l.logDir.IsSet() {
-		// There's no log file. Nothing to do.
-		return
-	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if err := l.ensureFile(); err != nil {
-		fmt.Fprintf(OrigStderr, "log: %v", err)
-		return
-	}
-
-	panicBytes := []byte(fmt.Sprintf("%v\n\n%s\n", r, debug.Stack()))
-	if err := l.writeToFile(panicBytes); err != nil {
-		fmt.Fprintf(OrigStderr, "log: %v", err)
-		return
-	}
+// DumpStacks produces a dump of the stack traces in the logging output.
+func DumpStacks(ctx context.Context) {
+	allStacks := getStacks(true)
+	// TODO(knz): This should really be a "debug" level, not "info".
+	Infof(ctx, "stack traces:\n%s", allStacks)
 }
 
-func (l *loggerT) outputToStderr(entry Entry, stacks []byte) {
-	buf := logging.processForStderr(entry, stacks)
-	_, err := OrigStderr.Write(buf.Bytes())
-	putBuffer(buf)
-	if err != nil {
-		l.exitLocked(err)
+func setActive() {
+	logging.mu.Lock()
+	defer logging.mu.Unlock()
+	if !logging.mu.active {
+		logging.mu.active = true
+		logging.mu.firstUseStack = string(debug.Stack())
 	}
 }
 

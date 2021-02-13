@@ -1,5 +1,4 @@
 statement ok
-SET experimental_enable_primary_key_changes = true;
 SET experimental_enable_hash_sharded_indexes = true
 
 statement ok
@@ -8,8 +7,10 @@ CREATE TABLE t (x INT PRIMARY KEY, y INT NOT NULL, z INT NOT NULL, w INT, INDEX 
 statement ok
 INSERT INTO t VALUES (1, 2, 3, 4), (5, 6, 7, 8)
 
-statement ok
+query T noticetrace
 ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y, z)
+----
+NOTICE: primary key changes are finalized asynchronously; further schema changes on this table may be restricted until the job completes
 
 query IIII rowsort
 SELECT * FROM t@primary
@@ -100,14 +101,14 @@ ALTER TABLE child ALTER PRIMARY KEY USING COLUMNS (x, y, z) INTERLEAVE IN PARENT
 query TT
 SHOW CREATE child
 ----
-child  CREATE TABLE child (
-           x INT8 NOT NULL,
-           y INT8 NOT NULL,
-           z INT8 NOT NULL,
-           CONSTRAINT "primary" PRIMARY KEY (x ASC, y ASC, z ASC),
-           UNIQUE INDEX child_x_key (x ASC),
-           FAMILY fam_0_x_y_z (x, y, z)
-       ) INTERLEAVE IN PARENT parent (x, y)
+child                                        CREATE TABLE public.child (
+                                             x INT8 NOT NULL,
+                                             y INT8 NOT NULL,
+                                             z INT8 NOT NULL,
+                                             CONSTRAINT "primary" PRIMARY KEY (x ASC, y ASC, z ASC),
+                                             UNIQUE INDEX child_x_key (x ASC),
+                                             FAMILY fam_0_x_y_z (x, y, z)
+) INTERLEAVE IN PARENT public.parent (x, y)
 
 
 query II rowsort
@@ -116,13 +117,17 @@ SELECT * FROM parent
 1 2
 4 5
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM child WHERE x >= 1 AND x < 5 AND y >= 2 AND y <= 6] OFFSET 2
 ----
-scan  ·            ·
-·     table        child@primary
-·     spans        /1/2/#/57/2-/4/6/#/57/3
-·     filter       (y >= 2) AND (y <= 6)
+·
+• filter
+│ filter: (y >= 2) AND (y <= 6)
+│
+└── • scan
+      missing stats
+      table: child@primary
+      spans: [/1/2 - /4/6]
 
 query III rowsort
 SELECT * FROM child WHERE x >= 1 AND x < 5 AND y >= 2 AND y <= 6
@@ -160,7 +165,7 @@ ALTER TABLE child ALTER PRIMARY KEY USING COLUMNS (y, z)
 query TT
 SHOW CREATE child
 ----
-child  CREATE TABLE child (
+child  CREATE TABLE public.child (
        x INT8 NOT NULL,
        y INT8 NOT NULL,
        z INT8 NOT NULL,
@@ -169,12 +174,14 @@ child  CREATE TABLE child (
        FAMILY fam_0_x_y_z (x, y, z)
 )
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM child WHERE y >=2 AND y <= 6] OFFSET 2
 ----
-scan  ·      ·
-·     table  child@primary
-·     spans  /2-/7
+·
+• scan
+  missing stats
+  table: child@primary
+  spans: [/2 - /6]
 
 query III rowsort
 SELECT * FROM child WHERE y >=2 AND y <= 6
@@ -203,25 +210,27 @@ ALTER TABLE child ALTER PRIMARY KEY USING COLUMNS (x, y, z) INTERLEAVE IN PARENT
 query TT
 SHOW CREATE child
 ----
-child  CREATE TABLE child (
-         x INT8 NOT NULL,
-         y INT8 NOT NULL,
-         z INT8 NOT NULL,
-         w INT8 NULL,
-         CONSTRAINT "primary" PRIMARY KEY (x ASC, y ASC, z ASC),
-         UNIQUE INDEX child_x_y_key (x ASC, y ASC),
-         INDEX i (x ASC, w ASC) INTERLEAVE IN PARENT parent (x),
-         FAMILY fam_0_x_y_z_w (x, y, z, w)
-       ) INTERLEAVE IN PARENT parent (x)
+child                                     CREATE TABLE public.child (
+                                          x INT8 NOT NULL,
+                                          y INT8 NOT NULL,
+                                          z INT8 NOT NULL,
+                                          w INT8 NULL,
+                                          CONSTRAINT "primary" PRIMARY KEY (x ASC, y ASC, z ASC),
+                                          UNIQUE INDEX child_x_y_key (x ASC, y ASC),
+                                          INDEX i (x ASC, w ASC) INTERLEAVE IN PARENT public.parent (x),
+                                          FAMILY fam_0_x_y_z_w (x, y, z, w)
+) INTERLEAVE IN PARENT public.parent (x)
 
 # If child@i was not properly rewritten, we wouldn't be able to select
 # all columns in child from it without an index join
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM child@i] OFFSET 2
 ----
-scan  ·      ·
-·     table  child@i
-·     spans  ALL
+·
+• scan
+  missing stats
+  table: child@i
+  spans: FULL SCAN
 
 query IIII
 SELECT * FROM child@i
@@ -307,7 +316,7 @@ ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y)
 query TT
 SHOW CREATE t
 ----
-t  CREATE TABLE t (
+t  CREATE TABLE public.t (
    rowid INT8 NOT NULL,
    y INT8 NOT NULL,
    CONSTRAINT "primary" PRIMARY KEY (y ASC),
@@ -340,12 +349,13 @@ ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y)
 query TT
 SHOW CREATE t
 ----
-t  CREATE TABLE t (
+t  CREATE TABLE public.t (
    x INT8 NOT NULL,
    y INT8 NOT NULL,
    z INT8 NOT NULL,
    w INT8 NULL,
    v JSONB NULL,
+   crdb_internal_z_shard_4 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(z AS STRING), '':::STRING)), 4:::INT8)) STORED,
    CONSTRAINT "primary" PRIMARY KEY (y ASC),
    UNIQUE INDEX i3 (z ASC) STORING (y),
    UNIQUE INDEX t_x_key (x ASC),
@@ -376,108 +386,107 @@ SELECT index_id, index_name FROM crdb_internal.table_indexes WHERE descriptor_na
 
 # Make sure that each index can index join against the new primary key;
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i1] OFFSET 2
 ----
-index-join  ·            ·
- │          table        t@primary
- │          key columns  y
- └── scan   ·            ·
-·           table        t@i1
-·           spans        ALL
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i1
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i1
 ----
 1 2 3 4 {}
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i2] OFFSET 2
 ----
-index-join  ·            ·
- │          table        t@primary
- │          key columns  y
- └── scan   ·            ·
-·           table        t@i2
-·           spans        ALL
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i2
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i2
 ----
 1 2 3 4 {}
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i3] OFFSET 2
 ----
-index-join  ·            ·
- │          table        t@primary
- │          key columns  y
- └── scan   ·            ·
-·           table        t@i3
-·           spans        ALL
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i3
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i3
 ----
 1 2 3 4 {}
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i4] OFFSET 2
 ----
-index-join  ·            ·
- │          table        t@primary
- │          key columns  y
- └── scan   ·            ·
-·           table        t@i4
-·           spans        ALL
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i4
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i4
 ----
 1 2 3 4 {}
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i5] OFFSET 2
 ----
-index-join  ·            ·
- │          table        t@primary
- │          key columns  y
- └── scan   ·            ·
-·           table        t@i5
-·           spans        ALL
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i5
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i5
 ----
 1 2 3 4 {}
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN SELECT * FROM t@i7] OFFSET 2
 ----
-index-join  ·            ·
- │          table        t@primary
- │          key columns  y
- └── scan   ·            ·
-·           table        t@i7
-·           spans        ALL
+·
+• index join
+│ table: t@primary
+│
+└── • scan
+      missing stats
+      table: t@i7
+      spans: FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i5
 ----
 1 2 3 4 {}
-
-# Regression test for #44782
-statement ok
-BEGIN
-
-statement ok
-CREATE TABLE t44782 (x INT PRIMARY KEY, y INT NOT NULL)
-
-statement error pq: cannot create table and change it's primary key in the same transaction
-ALTER TABLE t44782 ALTER PRIMARY KEY USING COLUMNS (y)
-
-statement ok
-ROLLBACK
 
 subtest hash_sharded
 
@@ -496,25 +505,26 @@ ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y) USING HASH WITH BUCKET_COUNT =
 query TT
 SHOW CREATE t
 ----
-t  CREATE TABLE t (
+t  CREATE TABLE public.t (
    x INT8 NOT NULL,
    y INT8 NOT NULL,
    z INT8 NULL,
+   crdb_internal_z_shard_5 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(z AS STRING), '':::STRING)), 5:::INT8)) STORED,
+   crdb_internal_y_shard_10 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(y AS STRING), '':::STRING)), 10:::INT8)) STORED,
    CONSTRAINT "primary" PRIMARY KEY (y ASC) USING HASH WITH BUCKET_COUNT = 10,
    UNIQUE INDEX t_x_key (x ASC),
    INDEX i1 (z ASC) USING HASH WITH BUCKET_COUNT = 5,
    FAMILY fam_0_x_y_z_crdb_internal_z_shard_5 (x, y, z, crdb_internal_z_shard_5, crdb_internal_y_shard_10)
 )
 
-query TTT
+query T
 SELECT * FROM [EXPLAIN INSERT INTO t VALUES (4, 5, 6)] OFFSET 2
 ----
-count                  ·            ·
- └── insert-fast-path  ·            ·
-·                      into         t(x, y, z, crdb_internal_z_shard_5, crdb_internal_y_shard_10)
-·                      strategy     inserter
-·                      auto commit  ·
-·                      size         7 columns, 1 row
+·
+• insert fast path
+  into: t(x, y, z, crdb_internal_z_shard_5, crdb_internal_y_shard_10)
+  auto commit
+  size: 7 columns, 1 row
 
 # Ensure that all of the indexes have been rewritten.
 query IT
@@ -560,18 +570,19 @@ ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y)
 query TT
 SHOW CREATE t
 ----
-t  CREATE TABLE t (
+t  CREATE TABLE public.t (
+   crdb_internal_x_shard_5 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(x AS STRING), '':::STRING)), 5:::INT8)) STORED,
    x INT8 NOT NULL,
    y INT8 NOT NULL,
    z INT8 NULL,
    CONSTRAINT "primary" PRIMARY KEY (y ASC),
-   UNIQUE INDEX t_crdb_internal_x_shard_5_x_key (x ASC) USING HASH WITH BUCKET_COUNT = 5,
+   UNIQUE INDEX t_x_key (x ASC) USING HASH WITH BUCKET_COUNT = 5,
    INDEX i (z ASC),
    FAMILY fam_0_x_y_z_crdb_internal_x_shard_5 (x, y, z, crdb_internal_x_shard_5)
 )
 
 query III
-SELECT * FROM t@t_crdb_internal_x_shard_5_x_key
+SELECT * FROM t@t_x_key
 ----
 1 2 3
 
@@ -588,8 +599,10 @@ CREATE TABLE t (rowid INT NOT NULL);
 query TT
 SHOW CREATE t
 ----
-t  CREATE TABLE t (
+t  CREATE TABLE public.t (
    rowid INT8 NOT NULL,
+   rowid_1 INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+   CONSTRAINT "primary" PRIMARY KEY (rowid_1 ASC),
    FAMILY "primary" (rowid, rowid_1)
 )
 
@@ -599,8 +612,9 @@ ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (rowid)
 query TT
 SHOW CREATE t
 ----
-t  CREATE TABLE t (
+t  CREATE TABLE public.t (
    rowid INT8 NOT NULL,
+   rowid_1 INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
    CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
    FAMILY "primary" (rowid, rowid_1)
 )
@@ -670,8 +684,9 @@ ALTER TABLE t ADD PRIMARY KEY (x)
 query TT
 SHOW CREATE t
 ----
-t  CREATE TABLE t (
+t  CREATE TABLE public.t (
    x INT8 NOT NULL,
+   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
    CONSTRAINT "primary" PRIMARY KEY (x ASC),
    FAMILY "primary" (x, rowid)
 )
@@ -685,12 +700,23 @@ ALTER TABLE t2 ADD PRIMARY KEY (x, y) INTERLEAVE IN PARENT t1 (x)
 query TT
 SHOW CREATE t2
 ----
-t2 CREATE TABLE t2 (
-     x INT8 NOT NULL,
-     y INT8 NOT NULL,
-     CONSTRAINT "primary" PRIMARY KEY (x ASC, y ASC),
-     FAMILY fam_0_x_y_rowid (x, y, rowid)
-) INTERLEAVE IN PARENT t1 (x)
+t2                                    CREATE TABLE public.t2 (
+                                      x INT8 NOT NULL,
+                                      y INT8 NOT NULL,
+                                      rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+                                      CONSTRAINT "primary" PRIMARY KEY (x ASC, y ASC),
+                                      FAMILY fam_0_x_y_rowid (x, y, rowid)
+) INTERLEAVE IN PARENT public.t1 (x)
+
+# Check that changing the primary key of a table removes interleave
+# backreferences from the parent. The final drop will succeed if
+# the backreferences have been removed.
+statement ok
+DROP TABLE IF EXISTS t1, t2 CASCADE;
+CREATE TABLE t1 (x INT PRIMARY KEY);
+CREATE TABLE t2 (x INT, y INT, PRIMARY KEY (x, y), FAMILY (x, y)) INTERLEAVE IN PARENT t1 (x);
+ALTER TABLE t2 ALTER PRIMARY KEY USING COLUMNS (x, y);
+DROP TABLE t1
 
 statement ok
 DROP TABLE IF EXISTS t;
@@ -700,8 +726,10 @@ ALTER TABLE t ADD PRIMARY KEY (x) USING HASH WITH BUCKET_COUNT=4
 query TT
 SHOW CREATE t
 ----
-t  CREATE TABLE t (
+t  CREATE TABLE public.t (
    x INT8 NOT NULL,
+   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+   crdb_internal_x_shard_4 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(x AS STRING), '':::STRING)), 4:::INT8)) STORED,
    CONSTRAINT "primary" PRIMARY KEY (x ASC) USING HASH WITH BUCKET_COUNT = 4,
    FAMILY "primary" (x, rowid, crdb_internal_x_shard_4)
 )
@@ -709,16 +737,23 @@ t  CREATE TABLE t (
 statement ok
 DROP TABLE IF EXISTS t;
 CREATE TABLE t (x INT NOT NULL);
-ALTER TABLE t ADD CONSTRAINT "primary" PRIMARY KEY (x)
+ALTER TABLE t ADD CONSTRAINT "my_pk" PRIMARY KEY (x)
 
 query TT
 SHOW CREATE t
 ----
-t  CREATE TABLE t (
+t  CREATE TABLE public.t (
    x INT8 NOT NULL,
-   CONSTRAINT "primary" PRIMARY KEY (x ASC),
+   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+   CONSTRAINT my_pk PRIMARY KEY (x ASC),
    FAMILY "primary" (x, rowid)
 )
+
+statement ok
+CREATE INDEX i ON t (x);
+
+statement error pq: constraint with name i already exists
+ALTER TABLE t DROP CONSTRAINT "my_pk", ADD CONSTRAINT "i" PRIMARY KEY (x);
 
 # Regression for #45362.
 statement ok
@@ -737,20 +772,6 @@ ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (x)
 statement ok
 ROLLBACK
 
-# Ensure that we cannot cancel the index cleanup jobs spawned by
-# a primary key change.
-statement ok
-DROP TABLE IF EXISTS t;
-CREATE TABLE t (x INT PRIMARY KEY, y INT NOT NULL);
-ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y)
-
-statement error pq: job [0-9]*: not cancelable
-CANCEL JOB (
-  SELECT job_id FROM [SHOW JOBS] WHERE
-  description = 'CLEANUP JOB for ''ALTER TABLE test.public.t ALTER PRIMARY KEY USING COLUMNS (y)''' AND
-  status = 'running'
-)
-
 # Ensure that starting a primary key change that does not
 # enqueue any mutations doesn't start a job.
 # TODO (rohany): This test might become obselete when #44923 is fixed.
@@ -764,3 +785,451 @@ SELECT job_id FROM [SHOW JOBS] WHERE
 description = 'CLEANUP JOB for ''ALTER TABLE test.public.t ALTER PRIMARY KEY USING COLUMNS (y)''' AND
 status = 'running'
 ----
+
+subtest add_drop_pk
+
+statement ok
+DROP TABLE IF EXISTS t;
+CREATE TABLE t (x INT PRIMARY KEY, y INT NOT NULL, FAMILY (x), FAMILY (y))
+
+statement error pq: unimplemented: primary key of table t dropped without subsequent addition of new primary key
+ALTER TABLE t DROP CONSTRAINT "primary"
+
+statement error pq: multiple primary keys for table "t" are not allowed
+ALTER TABLE t ADD CONSTRAINT "primary" PRIMARY KEY (y), DROP CONSTRAINT "primary"
+
+statement error pq: multiple primary keys for table "t" are not allowed
+ALTER TABLE t ADD CONSTRAINT "primary" PRIMARY KEY (y)
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT "primary", ADD CONSTRAINT "primary" PRIMARY KEY (y)
+
+query TT
+SHOW CREATE t
+----
+t  CREATE TABLE public.t (
+   x INT8 NOT NULL,
+   y INT8 NOT NULL,
+   CONSTRAINT "primary" PRIMARY KEY (y ASC),
+   FAMILY fam_0_x (x),
+   FAMILY fam_1_y (y)
+)
+
+# Test that we can issue a DROP CONSTRAINT + ADD PRIMARY KEY
+# in the same transaction.
+statement ok
+DROP TABLE t;
+CREATE TABLE t (x INT PRIMARY KEY, y INT NOT NULL, FAMILY (x), FAMILY (y))
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT "primary"
+
+statement ok
+ALTER TABLE t ADD CONSTRAINT "primary" PRIMARY KEY (y)
+
+statement ok
+COMMIT
+
+query TT
+SHOW CREATE t
+----
+t  CREATE TABLE public.t (
+   x INT8 NOT NULL,
+   y INT8 NOT NULL,
+   CONSTRAINT "primary" PRIMARY KEY (y ASC),
+   FAMILY fam_0_x (x),
+   FAMILY fam_1_y (y)
+)
+
+# Ensure that we can't use a table with a dropped primary key
+# in any DML statements.
+statement ok
+DROP TABLE t;
+CREATE TABLE t (x INT PRIMARY KEY, y INT NOT NULL)
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT "primary"
+
+statement error pgcode 55C02 requested table does not have a primary key
+INSERT INTO t VALUES (1, 1)
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT "primary"
+
+statement error pgcode 55C02 pq: requested table does not have a primary key
+DELETE FROM t WHERE x = 1
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT "primary"
+
+statement error pgcode 55C02 pq: requested table does not have a primary key
+UPDATE t SET x = 1 WHERE y = 1
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT "primary"
+
+statement error pgcode 55C02 pq: requested table does not have a primary key
+SELECT * FROM t
+
+statement ok
+ROLLBACK
+
+# Ensure that DDL statements that don't add a primary key
+# as their first operation don't succeed either.
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT "primary"
+
+statement error pgcode 55C02 pq: requested table does not have a primary key
+CREATE INDEX ON t(x)
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT "primary"
+
+statement error pgcode 55C02 pq: requested table does not have a primary key
+ALTER TABLE t ADD COLUMN z INT
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT "primary"
+
+statement error pgcode 55C02 pq: requested table does not have a primary key
+ALTER TABLE t ADD COLUMN z INT, ADD PRIMARY KEY (x)
+
+statement ok
+ROLLBACK
+
+# Ensure that other changes in the same transaction
+# as a DROP PRIMARY KEY get rolled back on failure.
+statement ok
+DROP TABLE IF EXISTS t1, t2;
+CREATE TABLE t1 (x INT PRIMARY KEY, y INT NOT NULL);
+CREATE TABLE t2 (x INT)
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t1 DROP CONSTRAINT "primary"
+
+statement ok
+INSERT INTO t2 VALUES (1)
+
+statement error pq: unimplemented: primary key of table t1 dropped without subsequent addition of new primary key
+COMMIT
+
+query I
+SELECT * FROM t2
+----
+
+statement ok
+DROP TABLE IF EXISTS t;
+CREATE TABLE t (x INT PRIMARY KEY, y INT NOT NULL)
+
+statement error pq: table "t" does not have a primary key, cannot perform ADD COLUMN z INT8 AS \(x \+ 1\) STORED
+ALTER TABLE t DROP CONSTRAINT "primary", ADD COLUMN z INT AS (x + 1) STORED, ADD PRIMARY KEY (y)
+
+statement ok
+DROP TABLE IF EXISTS t, t2 CASCADE;
+CREATE TABLE t (x INT PRIMARY KEY);
+CREATE TABLE t2 (x INT PRIMARY KEY, y INT NOT NULL, FAMILY (x), FAMILY (y));
+ALTER TABLE t2 DROP CONSTRAINT "primary", ADD CONSTRAINT "primary" PRIMARY KEY (x, y) INTERLEAVE IN PARENT t(x)
+
+query TT
+SHOW CREATE t2
+----
+t2                                   CREATE TABLE public.t2 (
+                                     x INT8 NOT NULL,
+                                     y INT8 NOT NULL,
+                                     CONSTRAINT "primary" PRIMARY KEY (x ASC, y ASC),
+                                     FAMILY fam_0_x (x),
+                                     FAMILY fam_1_y (y)
+) INTERLEAVE IN PARENT public.t (x)
+
+subtest create_table_change_pk
+
+statement ok
+DROP TABLE IF EXISTS t CASCADE
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE t (x INT NOT NULL, y INT, FAMILY (x, y), INDEX (y))
+
+statement ok
+ALTER TABLE t ADD PRIMARY KEY (x)
+
+statement ok
+COMMIT
+
+query TT
+SHOW CREATE t
+----
+t  CREATE TABLE public.t (
+   x INT8 NOT NULL,
+   y INT8 NULL,
+   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+   CONSTRAINT "primary" PRIMARY KEY (x ASC),
+   INDEX t_y_idx (y ASC),
+   FAMILY fam_0_x_y_rowid (x, y, rowid)
+)
+
+# Ensure that index y got rewritten. If it was not rewritten,
+# it would have an id less than 3.
+query IT
+SELECT index_id, index_name FROM crdb_internal.table_indexes WHERE descriptor_name = 't' ORDER BY index_id
+----
+3  primary
+4  t_y_idx
+
+# Repeat the above test using ALTER PRIMARY KEY.
+
+statement ok
+DROP TABLE IF EXISTS t
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE t (x INT NOT NULL, y INT, FAMILY (x, y), INDEX (y))
+
+statement ok
+ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (x)
+
+statement ok
+COMMIT
+
+query TT
+SHOW CREATE t
+----
+t  CREATE TABLE public.t (
+   x INT8 NOT NULL,
+   y INT8 NULL,
+   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+   CONSTRAINT "primary" PRIMARY KEY (x ASC),
+   INDEX t_y_idx (y ASC),
+   FAMILY fam_0_x_y_rowid (x, y, rowid)
+)
+
+# Ensure that index y got rewritten. If it was not rewritten,
+# it would have an id less than 3.
+query IT
+SELECT index_id, index_name FROM crdb_internal.table_indexes WHERE descriptor_name = 't' ORDER BY index_id
+----
+3  primary
+4  t_y_idx
+
+# Try interleaving into another table.
+
+statement ok
+DROP TABLE IF EXISTS t1, t2
+
+statement ok
+CREATE TABLE t1 (x INT PRIMARY KEY)
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE t2 (x INT NOT NULL, y INT NOT NULL, FAMILY (x, y))
+
+statement ok
+ALTER TABLE t2 ADD PRIMARY KEY (x, y) INTERLEAVE IN PARENT t1 (x)
+
+statement ok
+COMMIT
+
+query TT
+SHOW CREATE t2
+----
+t2                                    CREATE TABLE public.t2 (
+                                      x INT8 NOT NULL,
+                                      y INT8 NOT NULL,
+                                      rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+                                      CONSTRAINT "primary" PRIMARY KEY (x ASC, y ASC),
+                                      FAMILY fam_0_x_y_rowid (x, y, rowid)
+) INTERLEAVE IN PARENT public.t1 (x)
+
+# We should get an error if we try to drop t1.
+statement error pq: unimplemented: "t1" is interleaved by table "t2"
+DROP TABLE t1
+
+# De-interleave t2.
+statement ok
+ALTER TABLE t2 ALTER PRIMARY KEY USING COLUMNS (x, y)
+
+statement ok
+DROP TABLE t1
+
+# Test that we can de-interleave a table in the same txn.
+statement ok
+DROP TABLE IF EXISTS t1, t2
+
+statement ok
+CREATE TABLE t1 (x INT PRIMARY KEY)
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE t2 (x INT NOT NULL, y INT NOT NULL, FAMILY (x, y))
+
+statement ok
+ALTER TABLE t2 ADD PRIMARY KEY (x, y) INTERLEAVE IN PARENT t1 (x)
+
+statement ok
+ALTER TABLE t2 ALTER PRIMARY KEY USING COLUMNS (x, y)
+
+# If we can drop t1, then t2 has been de-interleaved successfully.
+statement ok
+DROP TABLE t1
+
+statement ok
+COMMIT
+
+# Test when multiple indexes get created and destroyed.
+statement ok
+DROP TABLE IF EXISTS t
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE t (
+  x INT NOT NULL, y INT, z INT, w INT,
+  INDEX i1 (y), UNIQUE INDEX i2 (z),
+  INDEX i3 (w) STORING (y, z),
+  FAMILY (x, y, z, w)
+)
+
+statement ok
+ALTER TABLE t ADD PRIMARY KEY (x)
+
+statement ok
+COMMIT
+
+query TT
+SHOW CREATE t
+----
+t  CREATE TABLE public.t (
+   x INT8 NOT NULL,
+   y INT8 NULL,
+   z INT8 NULL,
+   w INT8 NULL,
+   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+   CONSTRAINT "primary" PRIMARY KEY (x ASC),
+   INDEX i1 (y ASC),
+   UNIQUE INDEX i2 (z ASC),
+   INDEX i3 (w ASC) STORING (y, z),
+   FAMILY fam_0_x_y_z_w_rowid (x, y, z, w, rowid)
+)
+
+# All index id's should be larger than 4.
+query IT
+SELECT index_id, index_name FROM crdb_internal.table_indexes WHERE descriptor_name = 't' ORDER BY index_id
+----
+5  primary
+6  i1
+7  i2
+8  i3
+
+# Regression for #45889.
+# Primary key changes on a hash sharded index that just change the bucket
+# count shouldn't cause the old primary key to be copied.
+statement ok
+DROP TABLE IF EXISTS t CASCADE;
+CREATE TABLE t (x INT PRIMARY KEY USING HASH WITH BUCKET_COUNT = 2);
+ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (x) USING HASH WITH BUCKET_COUNT=3
+
+query TT
+SHOW CREATE t
+----
+t  CREATE TABLE public.t (
+   crdb_internal_x_shard_2 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(x AS STRING), '':::STRING)), 2:::INT8)) STORED,
+   x INT8 NOT NULL,
+   crdb_internal_x_shard_3 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(x AS STRING), '':::STRING)), 3:::INT8)) STORED,
+   CONSTRAINT "primary" PRIMARY KEY (x ASC) USING HASH WITH BUCKET_COUNT = 3,
+   FAMILY "primary" (crdb_internal_x_shard_2, x, crdb_internal_x_shard_3)
+)
+
+# Changes on a hash sharded index that change the columns will cause the old
+# primary key to be copied.
+statement ok
+DROP TABLE t;
+CREATE TABLE t (x INT PRIMARY KEY USING HASH WITH BUCKET_COUNT = 2, y INT NOT NULL, FAMILY (x, y));
+ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y) USING HASH WITH BUCKET_COUNT=2
+
+query TT
+SHOW CREATE t
+----
+t  CREATE TABLE public.t (
+   crdb_internal_x_shard_2 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(x AS STRING), '':::STRING)), 2:::INT8)) STORED,
+   x INT8 NOT NULL,
+   y INT8 NOT NULL,
+   crdb_internal_y_shard_2 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(COALESCE(CAST(y AS STRING), '':::STRING)), 2:::INT8)) STORED,
+   CONSTRAINT "primary" PRIMARY KEY (y ASC) USING HASH WITH BUCKET_COUNT = 2,
+   UNIQUE INDEX t_x_key (x ASC) USING HASH WITH BUCKET_COUNT = 2,
+   FAMILY fam_0_x_y_crdb_internal_x_shard_2 (x, y, crdb_internal_x_shard_2, crdb_internal_y_shard_2)
+)
+
+# Regression for #49079.
+statement ok
+DROP TABLE t;
+CREATE TABLE t (x INT, y INT, z INT, PRIMARY KEY (x, y));
+ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y);
+SET sql_safe_updates=false;
+ALTER TABLE t DROP COLUMN z
+
+# Regression for #54629.
+statement ok
+CREATE TABLE t54629 (c INT NOT NULL, UNIQUE INDEX (c));
+ALTER TABLE t54629 ALTER PRIMARY KEY USING COLUMNS (c);
+INSERT INTO t54629 VALUES (1);
+DELETE FROM t54629 WHERE c = 1
+
+statement ok
+DROP TABLE t54629;
+CREATE TABLE t54629(a INT PRIMARY KEY, c INT NOT NULL, UNIQUE INDEX (c));
+ALTER TABLE t54629 ALTER PRIMARY KEY USING COLUMNS (c);
+DROP INDEX t54629_a_key CASCADE;
+INSERT INTO t54629 VALUES (1, 1);
+DELETE FROM t54629 WHERE c = 1;

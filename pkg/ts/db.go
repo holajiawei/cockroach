@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -37,22 +37,22 @@ var (
 )
 
 // TimeseriesStorageEnabled controls whether to store timeseries data to disk.
-var TimeseriesStorageEnabled = settings.RegisterPublicBoolSetting(
+var TimeseriesStorageEnabled = settings.RegisterBoolSetting(
 	"timeseries.storage.enabled",
 	"if set, periodic timeseries data is stored within the cluster; disabling is not recommended "+
 		"unless you are storing the data elsewhere",
 	true,
-)
+).WithPublic()
 
 // Resolution10sStorageTTL defines the maximum age of data that will be retained
 // at he 10 second resolution. Data older than this is subject to being "rolled
 // up" into the 30 minute resolution and then deleted.
-var Resolution10sStorageTTL = settings.RegisterPublicDurationSetting(
+var Resolution10sStorageTTL = settings.RegisterDurationSetting(
 	"timeseries.storage.resolution_10s.ttl",
 	"the maximum age of time series data stored at the 10 second resolution. Data older than this "+
 		"is subject to rollup and deletion.",
 	resolution10sDefaultRollupThreshold,
-)
+).WithPublic()
 
 // deprecatedResolution30StoreDuration is retained for backward compatibility during a version upgrade.
 var deprecatedResolution30StoreDuration = func() *settings.DurationSetting {
@@ -74,16 +74,16 @@ func init() {
 // Resolution30mStorageTTL defines the maximum age of data that will be
 // retained at he 30 minute resolution. Data older than this is subject to
 // deletion.
-var Resolution30mStorageTTL = settings.RegisterPublicDurationSetting(
+var Resolution30mStorageTTL = settings.RegisterDurationSetting(
 	"timeseries.storage.resolution_30m.ttl",
 	"the maximum age of time series data stored at the 30 minute resolution. Data older than this "+
 		"is subject to deletion.",
 	resolution30mDefaultPruneThreshold,
-)
+).WithPublic()
 
 // DB provides Cockroach's Time Series API.
 type DB struct {
-	db      *client.DB
+	db      *kv.DB
 	st      *cluster.Settings
 	metrics *TimeSeriesMetrics
 
@@ -99,7 +99,7 @@ type DB struct {
 }
 
 // NewDB creates a new DB instance.
-func NewDB(db *client.DB, settings *cluster.Settings) *DB {
+func NewDB(db *kv.DB, settings *cluster.Settings) *DB {
 	pruneThresholdByResolution := map[Resolution]func() int64{
 		Resolution10s: func() int64 {
 			return Resolution10sStorageTTL.Get(&settings.SV).Nanoseconds()
@@ -157,7 +157,7 @@ func (db *DB) PollSource(
 // start begins the goroutine for this poller, which will periodically request
 // time series data from the DataSource and store it.
 func (p *poller) start() {
-	p.stopper.RunWorker(context.TODO(), func(context.Context) {
+	_ = p.stopper.RunAsyncTask(context.TODO(), "ts-poller", func(context.Context) {
 		// Poll once immediately.
 		p.poll()
 		ticker := time.NewTicker(p.frequency)
@@ -166,7 +166,7 @@ func (p *poller) start() {
 			select {
 			case <-ticker.C:
 				p.poll()
-			case <-p.stopper.ShouldStop():
+			case <-p.stopper.ShouldQuiesce():
 				return
 			}
 		}
@@ -194,7 +194,7 @@ func (p *poller) poll() {
 			log.Warningf(ctx, "error writing time series data: %s", err)
 		}
 	}); err != nil {
-		log.Warning(bgCtx, err)
+		log.Warningf(bgCtx, "%v", err)
 	}
 }
 
@@ -294,7 +294,7 @@ func (db *DB) tryStoreRollup(ctx context.Context, r Resolution, data []rollupDat
 }
 
 func (db *DB) storeKvs(ctx context.Context, kvs []roachpb.KeyValue) error {
-	b := &client.Batch{}
+	b := &kv.Batch{}
 	for _, kv := range kvs {
 		b.AddRawRequest(&roachpb.MergeRequest{
 			RequestHeader: roachpb.RequestHeader{

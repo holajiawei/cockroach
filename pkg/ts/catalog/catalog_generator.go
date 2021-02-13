@@ -16,7 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	prometheusgo "github.com/prometheus/client_model/go"
 )
 
@@ -44,6 +44,7 @@ const (
 	ReplicationLayer   = `Replication Layer`
 	StorageLayer       = `Storage Layer`
 	Timeseries         = `Timeseries`
+	Jobs               = `Jobs`
 )
 
 // sectionDescription describes either a section or subsection of the chart.
@@ -190,6 +191,13 @@ var chartCatalog = []ChartSection{
 		power the very charts you\'re using, among other things.`,
 		Level: 0,
 	},
+	{
+		Title:           Jobs,
+		LongTitle:       Jobs,
+		CollectionTitle: "jobs-all",
+		Description:     `Your cluster executes various background jobs, as well as scheduled jobs`,
+		Level:           0,
+	},
 }
 
 var catalogGenerated = false
@@ -204,6 +212,7 @@ var catalogKey = map[string]int{
 	ReplicationLayer:   4,
 	StorageLayer:       5,
 	Timeseries:         6,
+	Jobs:               7,
 }
 
 // unitsKey converts between metric.Unit and catalog.AxisUnits which is
@@ -360,19 +369,19 @@ func (ic *IndividualChart) addMetrics(
 // addNames sets the IndividualChart's Title, Longname, and CollectionName.
 func (ic *IndividualChart) addNames(organization []string) {
 
-	// Find string delimeters that are not dashes, including spaces, slashes, and
+	// Find string delimiters that are not dashes, including spaces, slashes, and
 	// commas.
-	nondashDelimeters := regexp.MustCompile("( )|/|,")
+	nondashDelimiters := regexp.MustCompile("( )|/|,")
 
-	// Longnames look like "SQL Layer | SQL | Connections".
-	// CollectionNames look like "sql-layer-sql-connections".
+	// LongTitles look like "SQL Layer | SQL | Connections".
+	// CollectionTitless look like "sql-layer-sql-connections".
 	for _, n := range organization {
 		ic.LongTitle += n + string(" | ")
-		ic.CollectionTitle += nondashDelimeters.ReplaceAllString(strings.ToLower(n), "-") + "-"
+		ic.CollectionTitle += nondashDelimiters.ReplaceAllString(strings.ToLower(n), "-") + "-"
 	}
 
 	ic.LongTitle += ic.Title
-	ic.CollectionTitle += nondashDelimeters.ReplaceAllString(strings.ToLower(ic.Title), "-")
+	ic.CollectionTitle += nondashDelimiters.ReplaceAllString(strings.ToLower(ic.Title), "-")
 
 }
 
@@ -420,8 +429,8 @@ func (ic *IndividualChart) addDisplayProperties(cd chartDescription) error {
 
 		for _, m := range ic.Metrics {
 			if m.AxisLabel != al {
-				return errors.Errorf(`Chart %s has metrics with different axis labels; 
-				need to specify an AxisLabel in its chartDescription: %v`, cd.Title, ic)
+				return errors.Errorf(`Chart %s has metrics with different axis labels (%s vs %s); 
+				need to specify an AxisLabel in its chartDescription: %v`, al, m.AxisLabel, cd.Title, ic)
 			}
 		}
 
@@ -486,29 +495,29 @@ func (cs *ChartSection) addChartAndSubsections(organization []string, ics []*Ind
 	// If not found, create a new ChartSection and append it as a subsection.
 	if subsection == nil {
 
-		// Find string delimeters that are not dashes, including spaces, slashes, and
+		// Find string delimiters that are not dashes, including spaces, slashes, and
 		// commas.
-		nondashDelimeters := regexp.MustCompile("( )|/|,")
+		nondashDelimiters := regexp.MustCompile("( )|/|,")
 
 		subsection = &ChartSection{
 			Title: organization[subsectionLevel],
-			// Longnames look like "SQL Layer | SQL".
+			// LongTitles look like "SQL Layer | SQL".
 			LongTitle: "All",
-			// CollectionNames look like "sql-layer-sql".
-			CollectionTitle: nondashDelimeters.ReplaceAllString(strings.ToLower(organization[0]), "-"),
+			// CollectionTitles look like "sql-layer-sql".
+			CollectionTitle: nondashDelimiters.ReplaceAllString(strings.ToLower(organization[0]), "-"),
 			Level:           int32(subsectionLevel),
 		}
 
-		// Complete Longname and Colectionname values.
+		// Complete LongTitle and CollectionTitle values.
 		for i := 1; i <= subsectionLevel; i++ {
 			subsection.LongTitle += " " + organization[i]
-			subsection.CollectionTitle += "-" + nondashDelimeters.ReplaceAllString(strings.ToLower(organization[i]), "-")
+			subsection.CollectionTitle += "-" + nondashDelimiters.ReplaceAllString(strings.ToLower(organization[i]), "-")
 		}
 
 		cs.Subsections = append(cs.Subsections, subsection)
 	}
 
-	// If this is the last level of the organization, add the IndividualChart here. Otheriwse, recurse.
+	// If this is the last level of the organization, add the IndividualChart here. Otherwise, recurse.
 	if subsectionLevel == (len(organization) - 1) {
 		subsection.Charts = append(subsection.Charts, ics...)
 	} else {

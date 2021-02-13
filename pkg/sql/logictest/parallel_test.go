@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -59,7 +60,7 @@ type parallelTest struct {
 func (t *parallelTest) close() {
 	t.clients = nil
 	if t.cluster != nil {
-		t.cluster.Stopper().Stop(context.TODO())
+		t.cluster.Stopper().Stop(context.Background())
 	}
 }
 
@@ -138,7 +139,7 @@ func (t *parallelTest) run(dir string) {
 	}
 
 	if spec.SkipReason != "" {
-		t.Skip(spec.SkipReason)
+		skip.IgnoreLint(t, spec.SkipReason)
 	}
 
 	log.Infof(t.ctx, "Running test %s", dir)
@@ -182,7 +183,7 @@ func (t *parallelTest) setup(spec *parTestSpec) {
 		log.Infof(t.ctx, "Cluster Size: %d", spec.ClusterSize)
 	}
 
-	t.cluster = serverutils.StartTestCluster(t, spec.ClusterSize, base.TestClusterArgs{})
+	t.cluster = serverutils.StartNewTestCluster(t, spec.ClusterSize, base.TestClusterArgs{})
 
 	for i := 0; i < t.cluster.NumServers(); i++ {
 		server := t.cluster.Server(i)
@@ -229,6 +230,13 @@ func (t *parallelTest) setup(spec *parTestSpec) {
 
 func TestParallel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	skip.UnderRace(t, "takes >1 min under race")
+	// Note: there is special code in teamcity-trigger/main.go to run this package
+	// with less concurrency in the nightly stress runs. If you see problems
+	// please make adjustments there.
+	// As of 6/4/2019, the logic tests never complete under race.
+	skip.UnderStressRace(t, "logic tests and race detector don't mix: #37993")
 
 	glob := *paralleltestdata
 	paths, err := filepath.Glob(glob)

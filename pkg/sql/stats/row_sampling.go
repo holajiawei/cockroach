@@ -14,8 +14,9 @@ import (
 	"container/heap"
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -23,7 +24,7 @@ import (
 
 // SampledRow is a row that was sampled.
 type SampledRow struct {
-	Row  sqlbase.EncDatumRow
+	Row  rowenc.EncDatumRow
 	Rank uint64
 }
 
@@ -44,9 +45,9 @@ type SampledRow struct {
 // at least as large as this reservoir.
 type SampleReservoir struct {
 	samples  []SampledRow
-	colTypes []types.T
-	da       sqlbase.DatumAlloc
-	ra       sqlbase.EncDatumRowAlloc
+	colTypes []*types.T
+	da       rowenc.DatumAlloc
+	ra       rowenc.EncDatumRowAlloc
 	memAcc   *mon.BoundAccount
 
 	// sampleCols contains the ordinals of columns that should be sampled from
@@ -59,7 +60,7 @@ var _ heap.Interface = &SampleReservoir{}
 
 // Init initializes a SampleReservoir.
 func (sr *SampleReservoir) Init(
-	numSamples int, colTypes []types.T, memAcc *mon.BoundAccount, sampleCols util.FastIntSet,
+	numSamples int, colTypes []*types.T, memAcc *mon.BoundAccount, sampleCols util.FastIntSet,
 ) {
 	sr.samples = make([]SampledRow, 0, numSamples)
 	sr.colTypes = colTypes
@@ -97,7 +98,7 @@ func (sr *SampleReservoir) Pop() interface{} { panic("unimplemented") }
 
 // SampleRow looks at a row and either drops it or adds it to the reservoir.
 func (sr *SampleReservoir) SampleRow(
-	ctx context.Context, evalCtx *tree.EvalContext, row sqlbase.EncDatumRow, rank uint64,
+	ctx context.Context, evalCtx *tree.EvalContext, row rowenc.EncDatumRow, rank uint64,
 ) error {
 	if len(sr.samples) < cap(sr.samples) {
 		// We haven't accumulated enough rows yet, just append.
@@ -137,7 +138,7 @@ func (sr *SampleReservoir) Get() []SampledRow {
 }
 
 func (sr *SampleReservoir) copyRow(
-	ctx context.Context, evalCtx *tree.EvalContext, dst, src sqlbase.EncDatumRow,
+	ctx context.Context, evalCtx *tree.EvalContext, dst, src rowenc.EncDatumRow,
 ) error {
 	for i := range src {
 		if !sr.sampleCols.Contains(i) {
@@ -148,11 +149,11 @@ func (sr *SampleReservoir) copyRow(
 		// the encoded bytes. The encoded bytes would have been scanned in a batch
 		// of ~10000 rows, so we must delete the reference to allow the garbage
 		// collector to release the memory from the batch.
-		if err := src[i].EnsureDecoded(&sr.colTypes[i], &sr.da); err != nil {
+		if err := src[i].EnsureDecoded(sr.colTypes[i], &sr.da); err != nil {
 			return err
 		}
 		beforeSize := dst[i].Size()
-		dst[i] = sqlbase.DatumToEncDatum(&sr.colTypes[i], src[i].Datum)
+		dst[i] = rowenc.DatumToEncDatum(sr.colTypes[i], src[i].Datum)
 		afterSize := dst[i].Size()
 
 		// If the datum is too large, truncate it (this also performs a copy).
@@ -161,7 +162,7 @@ func (sr *SampleReservoir) copyRow(
 			dst[i].Datum = truncateDatum(evalCtx, dst[i].Datum, maxBytesPerSample)
 			afterSize = dst[i].Size()
 		} else {
-			if enc, ok := src[i].Encoding(); ok && enc != sqlbase.DatumEncoding_VALUE {
+			if enc, ok := src[i].Encoding(); ok && enc != descpb.DatumEncoding_VALUE {
 				// Only datums that were key-encoded might reference the kv batch.
 				dst[i].Datum = deepCopyDatum(evalCtx, dst[i].Datum)
 			}

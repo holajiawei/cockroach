@@ -16,20 +16,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // getRangeKeys returns the end keys of all ranges.
-func getRangeKeys(db *client.DB) ([]roachpb.Key, error) {
-	rows, err := db.Scan(context.TODO(), keys.Meta2Prefix, keys.MetaMax, 0)
+func getRangeKeys(db *kv.DB) ([]roachpb.Key, error) {
+	rows, err := db.Scan(context.Background(), keys.Meta2Prefix, keys.MetaMax, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +41,7 @@ func getRangeKeys(db *client.DB) ([]roachpb.Key, error) {
 	return ret, nil
 }
 
-func getNumRanges(db *client.DB) (int, error) {
+func getNumRanges(db *kv.DB) (int, error) {
 	rows, err := getRangeKeys(db)
 	if err != nil {
 		return 0, err
@@ -64,6 +65,7 @@ func rangesMatchSplits(ranges []roachpb.Key, splits []roachpb.RKey) bool {
 // as new tables get created.
 func TestSplitOnTableBoundaries(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	// We want fast scan.
@@ -71,7 +73,7 @@ func TestSplitOnTableBoundaries(t *testing.T) {
 	params.ScanMinIdleTime = time.Millisecond
 	params.ScanMaxIdleTime = time.Millisecond
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	expectedInitialRanges, err := server.ExpectedInitialRangeCount(kvDB, &s.(*server.TestServer).Cfg.DefaultZoneConfig, &s.(*server.TestServer).Cfg.DefaultSystemZoneConfig)
 	if err != nil {
@@ -123,7 +125,7 @@ func TestSplitOnTableBoundaries(t *testing.T) {
 	})
 
 	// Verify the actual splits.
-	splits = []roachpb.RKey{keys.MakeTablePrefix(objectID + 3), roachpb.RKeyMax}
+	splits = []roachpb.RKey{roachpb.RKey(keys.SystemSQLCodec.TablePrefix(objectID + 3)), roachpb.RKeyMax}
 	ranges, err = getRangeKeys(kvDB)
 	if err != nil {
 		t.Fatal(err)

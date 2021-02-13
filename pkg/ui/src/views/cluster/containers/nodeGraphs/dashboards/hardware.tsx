@@ -11,20 +11,32 @@
 import React from "react";
 
 import { LineGraph } from "src/views/cluster/components/linegraph";
-import { Metric, Axis, AxisUnits } from "src/views/shared/components/metricQuery";
+import {
+  Metric,
+  Axis,
+  AxisUnits,
+} from "src/views/shared/components/metricQuery";
 
-import { GraphDashboardProps, nodeDisplayName, storeIDsForNode } from "./dashboardUtils";
+import {
+  GraphDashboardProps,
+  nodeDisplayName,
+  storeIDsForNode,
+} from "./dashboardUtils";
+import { AvailableDiscCapacityGraphTooltip } from "src/views/cluster/containers/nodeGraphs/dashboards/graphTooltips";
 
 // TODO(vilterp): tooltips
 
 export default function (props: GraphDashboardProps) {
-  const { nodeIDs, nodesSummary, nodeSources, storeSources, tooltipSelection } = props;
+  const {
+    nodeIDs,
+    nodesSummary,
+    nodeSources,
+    storeSources,
+    tooltipSelection,
+  } = props;
 
   return [
-    <LineGraph
-      title="CPU Percent"
-      sources={nodeSources}
-    >
+    <LineGraph title="CPU Percent" sources={nodeSources}>
       <Axis units={AxisUnits.Percentage} label="CPU">
         {nodeIDs.map((nid) => (
           <Metric
@@ -39,11 +51,7 @@ export default function (props: GraphDashboardProps) {
     <LineGraph
       title="Memory Usage"
       sources={nodeSources}
-      tooltip={(
-        <div>
-          Memory in use {tooltipSelection}
-        </div>
-      )}
+      tooltip={<div>Memory in use {tooltipSelection}</div>}
     >
       <Axis units={AxisUnits.Bytes} label="memory usage">
         {nodeIDs.map((nid) => (
@@ -56,10 +64,7 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph
-      title="Disk Read Bytes"
-      sources={nodeSources}
-    >
+    <LineGraph title="Disk Read MiB/s" sources={nodeSources}>
       <Axis units={AxisUnits.Bytes} label="bytes">
         {nodeIDs.map((nid) => (
           <Metric
@@ -72,10 +77,7 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph
-      title="Disk Write Bytes"
-      sources={nodeSources}
-    >
+    <LineGraph title="Disk Write MiB/s" sources={nodeSources}>
       <Axis units={AxisUnits.Bytes} label="bytes">
         {nodeIDs.map((nid) => (
           <Metric
@@ -88,11 +90,8 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph
-      title="Disk Read Ops"
-      sources={nodeSources}
-    >
-      <Axis units={AxisUnits.Count} label="Read Ops">
+    <LineGraph title="Disk Read IOPS" sources={nodeSources}>
+      <Axis units={AxisUnits.Count} label="IOPS">
         {nodeIDs.map((nid) => (
           <Metric
             name="cr.node.sys.host.disk.read.count"
@@ -104,11 +103,8 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph
-      title="Disk Write Ops"
-      sources={nodeSources}
-    >
-      <Axis units={AxisUnits.Count} label="Write Ops">
+    <LineGraph title="Disk Write IOPS" sources={nodeSources}>
+      <Axis units={AxisUnits.Count} label="IOPS">
         {nodeIDs.map((nid) => (
           <Metric
             name="cr.node.sys.host.disk.write.count"
@@ -120,11 +116,8 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph
-      title="Disk IOPS In Progress"
-      sources={nodeSources}
-    >
-      <Axis units={AxisUnits.Count} label="IOPS">
+    <LineGraph title="Disk Ops In Progress" sources={nodeSources}>
+      <Axis units={AxisUnits.Count} label="Ops">
         {nodeIDs.map((nid) => (
           <Metric
             name="cr.node.sys.host.disk.iopsinprogress"
@@ -138,6 +131,7 @@ export default function (props: GraphDashboardProps) {
     <LineGraph
       title="Available Disk Capacity"
       sources={storeSources}
+      tooltip={<AvailableDiscCapacityGraphTooltip />}
     >
       <Axis units={AxisUnits.Bytes} label="capacity">
         {nodeIDs.map((nid) => (
@@ -150,10 +144,7 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph
-      title="Network Bytes Received"
-      sources={nodeSources}
-    >
+    <LineGraph title="Network Bytes Received" sources={nodeSources}>
       <Axis units={AxisUnits.Bytes} label="bytes">
         {nodeIDs.map((nid) => (
           <Metric
@@ -166,10 +157,7 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph
-      title="Network Bytes Sent"
-      sources={nodeSources}
-    >
+    <LineGraph title="Network Bytes Sent" sources={nodeSources}>
       <Axis units={AxisUnits.Bytes} label="bytes">
         {nodeIDs.map((nid) => (
           <Metric

@@ -14,31 +14,31 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	"github.com/pkg/errors"
 )
 
 type requestedStat struct {
-	columns             []sqlbase.ColumnID
+	columns             []descpb.ColumnID
 	histogram           bool
 	histogramMaxBuckets int
 	name                string
+	inverted            bool
 }
 
 const histogramSamples = 10000
-const histogramBuckets = 200
 
 // maxTimestampAge is the maximum allowed age of a scan timestamp during table
 // stats collection, used when creating statistics AS OF SYSTEM TIME. The
@@ -53,24 +53,21 @@ var maxTimestampAge = settings.RegisterDurationSetting(
 )
 
 func (dsp *DistSQLPlanner) createStatsPlan(
-	planCtx *PlanningCtx,
-	desc *sqlbase.ImmutableTableDescriptor,
-	reqStats []requestedStat,
-	job *jobs.Job,
-) (PhysicalPlan, error) {
+	planCtx *PlanningCtx, desc catalog.TableDescriptor, reqStats []requestedStat, job *jobs.Job,
+) (*PhysicalPlan, error) {
 	if len(reqStats) == 0 {
-		return PhysicalPlan{}, errors.New("no stats requested")
+		return nil, errors.New("no stats requested")
 	}
 
 	details := job.Details().(jobspb.CreateStatsDetails)
 
 	// Calculate the set of columns we need to scan.
 	var colCfg scanColumnsConfig
-	var tableColSet util.FastIntSet
+	var tableColSet catalog.TableColSet
 	for _, s := range reqStats {
 		for _, c := range s.columns {
-			if !tableColSet.Contains(int(c)) {
-				tableColSet.Add(int(c))
+			if !tableColSet.Contains(c) {
+				tableColSet.Add(c)
 				colCfg.wantedColumns = append(colCfg.wantedColumns, tree.ColumnID(c))
 			}
 		}
@@ -78,19 +75,24 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 
 	// Create the table readers; for this we initialize a dummy scanNode.
 	scan := scanNode{desc: desc}
-	err := scan.initDescDefaults(nil /* planDependencies */, colCfg)
+	err := scan.initDescDefaults(colCfg)
 	if err != nil {
-		return PhysicalPlan{}, err
+		return nil, err
 	}
-	sb := span.MakeBuilder(desc.TableDesc(), scan.index)
-	scan.spans, err = sb.UnconstrainedSpans(scan.isDeleteSource)
+	var colIdxMap catalog.TableColMap
+	for i, c := range scan.cols {
+		colIdxMap.Set(c.GetID(), i)
+	}
+	sb := span.MakeBuilder(planCtx.EvalContext(), planCtx.ExtendedEvalCtx.Codec, desc, scan.index)
+	scan.spans, err = sb.UnconstrainedSpans()
 	if err != nil {
-		return PhysicalPlan{}, err
+		return nil, err
 	}
+	scan.isFull = true
 
-	p, err := dsp.createTableReaders(planCtx, &scan, nil /* overrideResultColumns */)
+	p, err := dsp.createTableReaders(planCtx, &scan)
 	if err != nil {
-		return PhysicalPlan{}, err
+		return nil, err
 	}
 
 	if details.AsOf != nil {
@@ -102,9 +104,9 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		}
 	}
 
-	sketchSpecs := make([]execinfrapb.SketchSpec, len(reqStats))
-	sampledColumnIDs := make([]sqlbase.ColumnID, scan.valNeededForCol.Len())
-	for i, s := range reqStats {
+	var sketchSpecs, invSketchSpecs []execinfrapb.SketchSpec
+	sampledColumnIDs := make([]descpb.ColumnID, len(scan.cols))
+	for _, s := range reqStats {
 		spec := execinfrapb.SketchSpec{
 			SketchType:          execinfrapb.SketchType_HLL_PLUS_PLUS_V1,
 			GenerateHistogram:   s.histogram,
@@ -113,20 +115,42 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 			StatName:            s.name,
 		}
 		for i, colID := range s.columns {
-			colIdx, ok := scan.colIdxMap[colID]
+			colIdx, ok := colIdxMap.Get(colID)
 			if !ok {
 				panic("necessary column not scanned")
 			}
-			streamColIdx := p.PlanToStreamColMap[colIdx]
-			spec.Columns[i] = uint32(streamColIdx)
+			streamColIdx := uint32(p.PlanToStreamColMap[colIdx])
+			spec.Columns[i] = streamColIdx
 			sampledColumnIDs[streamColIdx] = colID
 		}
-
-		sketchSpecs[i] = spec
+		if s.inverted {
+			// Find the first inverted index on the first column. Although there may be
+			// more, we don't currently have a way of using more than one or deciding which
+			// one is better.
+			// TODO(mjibson): allow multiple inverted indexes on the same column (i.e.,
+			// with different configurations). See #50655.
+			col := s.columns[0]
+			for _, index := range desc.PublicNonPrimaryIndexes() {
+				if index.GetType() == descpb.IndexDescriptor_INVERTED && index.InvertedColumnID() == col {
+					spec.Index = index.IndexDesc()
+					break
+				}
+			}
+			// Even if spec.Index is nil because there isn't an inverted index on
+			// the requested stats column, we can still proceed. We aren't generating
+			// histograms in that case so we don't need an index descriptor to generate the
+			// inverted index entries.
+			invSketchSpecs = append(invSketchSpecs, spec)
+		} else {
+			sketchSpecs = append(sketchSpecs, spec)
+		}
 	}
 
 	// Set up the samplers.
-	sampler := &execinfrapb.SamplerSpec{Sketches: sketchSpecs}
+	sampler := &execinfrapb.SamplerSpec{
+		Sketches:         sketchSpecs,
+		InvertedSketches: invSketchSpecs,
+	}
 	for _, s := range reqStats {
 		sampler.MaxFractionIdle = details.MaxFractionIdle
 		if s.histogram {
@@ -134,20 +158,25 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		}
 	}
 
-	// The sampler outputs the original columns plus a rank column and four sketch columns.
-	outTypes := make([]types.T, 0, len(p.ResultTypes)+5)
-	outTypes = append(outTypes, p.ResultTypes...)
+	// The sampler outputs the original columns plus a rank column, four
+	// sketch columns, and two inverted histogram columns.
+	outTypes := make([]*types.T, 0, len(p.GetResultTypes())+5)
+	outTypes = append(outTypes, p.GetResultTypes()...)
 	// An INT column for the rank of each row.
-	outTypes = append(outTypes, *types.Int)
+	outTypes = append(outTypes, types.Int)
 	// An INT column indicating the sketch index.
-	outTypes = append(outTypes, *types.Int)
+	outTypes = append(outTypes, types.Int)
 	// An INT column indicating the number of rows processed.
-	outTypes = append(outTypes, *types.Int)
+	outTypes = append(outTypes, types.Int)
 	// An INT column indicating the number of rows that have a NULL in any sketch
 	// column.
-	outTypes = append(outTypes, *types.Int)
+	outTypes = append(outTypes, types.Int)
 	// A BYTES column with the sketch data.
-	outTypes = append(outTypes, *types.Bytes)
+	outTypes = append(outTypes, types.Bytes)
+	// An INT column indicating the inverted sketch index.
+	outTypes = append(outTypes, types.Int)
+	// A BYTES column with the inverted index key datum.
+	outTypes = append(outTypes, types.Bytes)
 
 	p.AddNoGroupingStage(
 		execinfrapb.ProcessorCoreUnion{Sampler: sampler},
@@ -157,9 +186,9 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	)
 
 	// Estimate the expected number of rows based on existing stats in the cache.
-	tableStats, err := planCtx.planner.execCfg.TableStatsCache.GetTableStats(planCtx.ctx, desc.ID)
+	tableStats, err := planCtx.ExtendedEvalCtx.ExecCfg.TableStatsCache.GetTableStats(planCtx.ctx, desc.GetID())
 	if err != nil {
-		return PhysicalPlan{}, err
+		return nil, err
 	}
 
 	var rowsExpected uint64
@@ -181,14 +210,15 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	// Set up the final SampleAggregator stage.
 	agg := &execinfrapb.SampleAggregatorSpec{
 		Sketches:         sketchSpecs,
+		InvertedSketches: invSketchSpecs,
 		SampleSize:       sampler.SampleSize,
 		SampledColumnIDs: sampledColumnIDs,
-		TableID:          desc.ID,
+		TableID:          desc.GetID(),
 		JobID:            jobID,
 		RowsExpected:     rowsExpected,
 	}
 	// Plan the SampleAggregator on the gateway, unless we have a single Sampler.
-	node := dsp.nodeDesc.NodeID
+	node := dsp.gatewayNodeID
 	if len(p.ResultRouters) == 1 {
 		node = p.Processors[p.ResultRouters[0]].Node
 	}
@@ -196,29 +226,35 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		node,
 		execinfrapb.ProcessorCoreUnion{SampleAggregator: agg},
 		execinfrapb.PostProcessSpec{},
-		[]types.T{},
+		[]*types.T{},
 	)
 
+	p.PlanToStreamColMap = []int{}
 	return p, nil
 }
 
 func (dsp *DistSQLPlanner) createPlanForCreateStats(
 	planCtx *PlanningCtx, job *jobs.Job,
-) (PhysicalPlan, error) {
+) (*PhysicalPlan, error) {
 	details := job.Details().(jobspb.CreateStatsDetails)
 	reqStats := make([]requestedStat, len(details.ColumnStats))
 	histogramCollectionEnabled := stats.HistogramClusterMode.Get(&dsp.st.SV)
 	for i := 0; i < len(reqStats); i++ {
 		histogram := details.ColumnStats[i].HasHistogram && histogramCollectionEnabled
+		histogramMaxBuckets := defaultHistogramBuckets
+		if details.ColumnStats[i].HistogramMaxBuckets > 0 {
+			histogramMaxBuckets = int(details.ColumnStats[i].HistogramMaxBuckets)
+		}
 		reqStats[i] = requestedStat{
 			columns:             details.ColumnStats[i].ColumnIDs,
 			histogram:           histogram,
-			histogramMaxBuckets: histogramBuckets,
+			histogramMaxBuckets: histogramMaxBuckets,
 			name:                details.Name,
+			inverted:            details.ColumnStats[i].Inverted,
 		}
 	}
 
-	tableDesc := sqlbase.NewImmutableTableDescriptor(details.Table)
+	tableDesc := tabledesc.NewImmutable(details.Table)
 	return dsp.createStatsPlan(planCtx, tableDesc, reqStats, job)
 }
 
@@ -226,7 +262,7 @@ func (dsp *DistSQLPlanner) planAndRunCreateStats(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
 	planCtx *PlanningCtx,
-	txn *client.Txn,
+	txn *kv.Txn,
 	job *jobs.Job,
 	resultRows *RowResultWriter,
 ) error {
@@ -237,22 +273,20 @@ func (dsp *DistSQLPlanner) planAndRunCreateStats(
 		return err
 	}
 
-	dsp.FinalizePlan(planCtx, &physPlan)
+	dsp.FinalizePlan(planCtx, physPlan)
 
 	recv := MakeDistSQLReceiver(
 		ctx,
 		resultRows,
 		tree.DDL,
 		evalCtx.ExecCfg.RangeDescriptorCache,
-		evalCtx.ExecCfg.LeaseHolderCache,
 		txn,
-		func(ts hlc.Timestamp) {
-			_ = evalCtx.ExecCfg.Clock.Update(ts)
-		},
+		evalCtx.ExecCfg.Clock,
 		evalCtx.Tracing,
+		evalCtx.ExecCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 
-	dsp.Run(planCtx, txn, &physPlan, recv, evalCtx, nil /* finishedSetupFn */)()
+	dsp.Run(planCtx, txn, physPlan, recv, evalCtx, nil /* finishedSetupFn */)()
 	return resultRows.Err()
 }

@@ -64,7 +64,7 @@ func (x *Constraint_Type) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (Constraint_Type) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_zone_aa6a4d1d521e856b, []int{1, 0}
+	return fileDescriptor_zone_0e64cca9f3656ed3, []int{1, 0}
 }
 
 // GCPolicy defines garbage collection policies which apply to MVCC
@@ -76,7 +76,7 @@ func (Constraint_Type) EnumDescriptor() ([]byte, []int) {
 type GCPolicy struct {
 	// TTLSeconds specifies the maximum age of a value before it's
 	// garbage collected. Only older versions of values are garbage
-	// collected. Specifying <=0 mean older versions are never GC'd.
+	// collected. Specifying <= 0 mean older versions are never GC'd.
 	TTLSeconds int32 `protobuf:"varint,1,opt,name=ttl_seconds,json=ttlSeconds" json:"ttl_seconds"`
 }
 
@@ -84,7 +84,7 @@ func (m *GCPolicy) Reset()         { *m = GCPolicy{} }
 func (m *GCPolicy) String() string { return proto.CompactTextString(m) }
 func (*GCPolicy) ProtoMessage()    {}
 func (*GCPolicy) Descriptor() ([]byte, []int) {
-	return fileDescriptor_zone_aa6a4d1d521e856b, []int{0}
+	return fileDescriptor_zone_0e64cca9f3656ed3, []int{0}
 }
 func (m *GCPolicy) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -109,7 +109,7 @@ func (m *GCPolicy) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_GCPolicy proto.InternalMessageInfo
 
-// Constraint constrains the stores a replica can be stored on.
+// Constraint constrains the stores that a replica can be stored on.
 type Constraint struct {
 	Type Constraint_Type `protobuf:"varint,1,opt,name=type,enum=cockroach.config.zonepb.Constraint_Type" json:"type"`
 	// Key is only set if this is a constraint on locality.
@@ -121,7 +121,7 @@ type Constraint struct {
 func (m *Constraint) Reset()      { *m = Constraint{} }
 func (*Constraint) ProtoMessage() {}
 func (*Constraint) Descriptor() ([]byte, []int) {
-	return fileDescriptor_zone_aa6a4d1d521e856b, []int{1}
+	return fileDescriptor_zone_0e64cca9f3656ed3, []int{1}
 }
 func (m *Constraint) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -146,27 +146,29 @@ func (m *Constraint) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_Constraint proto.InternalMessageInfo
 
-// Constraints is a collection of constraints.
-type Constraints struct {
-	// The number of replicas that should abide by the constraints. If left
-	// unspecified (i.e. set to 0), the constraints will be assumed to apply
-	// to all replicas of the range.
+// ConstraintsConjunction is a set of constraints that need to be satisfied
+// together by a replica (i.e. by the replica's store).
+type ConstraintsConjunction struct {
+	// The number of replicas that should abide by the constraints below. If left
+	// unspecified (i.e. set to 0), the constraints will apply to all replicas of
+	// the range.
 	// As of v2.0, only REQUIRED constraints are allowed when num_replicas is
 	// set to a non-zero value.
-	NumReplicas int32        `protobuf:"varint,7,opt,name=num_replicas,json=numReplicas" json:"num_replicas"`
+	NumReplicas int32 `protobuf:"varint,7,opt,name=num_replicas,json=numReplicas" json:"num_replicas"`
+	// The set of attributes and/or localities that need to be satisfied by the
+	// store.
 	Constraints []Constraint `protobuf:"bytes,6,rep,name=constraints" json:"constraints"`
 }
 
-func (m *Constraints) Reset()         { *m = Constraints{} }
-func (m *Constraints) String() string { return proto.CompactTextString(m) }
-func (*Constraints) ProtoMessage()    {}
-func (*Constraints) Descriptor() ([]byte, []int) {
-	return fileDescriptor_zone_aa6a4d1d521e856b, []int{2}
+func (m *ConstraintsConjunction) Reset()      { *m = ConstraintsConjunction{} }
+func (*ConstraintsConjunction) ProtoMessage() {}
+func (*ConstraintsConjunction) Descriptor() ([]byte, []int) {
+	return fileDescriptor_zone_0e64cca9f3656ed3, []int{2}
 }
-func (m *Constraints) XXX_Unmarshal(b []byte) error {
+func (m *ConstraintsConjunction) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *Constraints) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *ConstraintsConjunction) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	b = b[:cap(b)]
 	n, err := m.MarshalTo(b)
 	if err != nil {
@@ -174,17 +176,17 @@ func (m *Constraints) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) 
 	}
 	return b[:n], nil
 }
-func (dst *Constraints) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_Constraints.Merge(dst, src)
+func (dst *ConstraintsConjunction) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ConstraintsConjunction.Merge(dst, src)
 }
-func (m *Constraints) XXX_Size() int {
+func (m *ConstraintsConjunction) XXX_Size() int {
 	return m.Size()
 }
-func (m *Constraints) XXX_DiscardUnknown() {
-	xxx_messageInfo_Constraints.DiscardUnknown(m)
+func (m *ConstraintsConjunction) XXX_DiscardUnknown() {
+	xxx_messageInfo_ConstraintsConjunction.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_Constraints proto.InternalMessageInfo
+var xxx_messageInfo_ConstraintsConjunction proto.InternalMessageInfo
 
 // LeasePreference specifies a preference about where range leases should be
 // located.
@@ -196,7 +198,7 @@ func (m *LeasePreference) Reset()         { *m = LeasePreference{} }
 func (m *LeasePreference) String() string { return proto.CompactTextString(m) }
 func (*LeasePreference) ProtoMessage()    {}
 func (*LeasePreference) Descriptor() ([]byte, []int) {
-	return fileDescriptor_zone_aa6a4d1d521e856b, []int{3}
+	return fileDescriptor_zone_0e64cca9f3656ed3, []int{3}
 }
 func (m *LeasePreference) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -223,7 +225,7 @@ var xxx_messageInfo_LeasePreference proto.InternalMessageInfo
 
 // ZoneConfig holds configuration that applies to one or more ranges.
 //
-// Note: when adding.removing fields here, be sure to update
+// Note: when adding/removing fields here, be sure to update
 // supportedZoneConfigOptions in the sql package, to synchronize
 // with the code for ALTER ... CONFIGURE ZONE.
 type ZoneConfig struct {
@@ -232,19 +234,48 @@ type ZoneConfig struct {
 	// If GC policy is not set, uses the next highest, non-null policy
 	// in the zone config hierarchy, up to the default policy if necessary.
 	GC *GCPolicy `protobuf:"bytes,4,opt,name=gc" json:"gc,omitempty"`
-	// NumReplicas specifies the desired number of replicas
+	// GlobalReads specifies whether transactions operating over the range(s)
+	// should be configured to provide non-blocking behavior, meaning that reads
+	// can be served consistently from all replicas and do not block on writes. In
+	// exchange, writes get pushed into the future and must wait on commit to
+	// ensure linearizability. For more, see:
+	//   https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20200811_non_blocking_txns.md
+	GlobalReads *bool `protobuf:"varint,12,opt,name=global_reads,json=globalReads" json:"global_reads,omitempty" yaml:"global_reads"`
+	// NumReplicas specifies the desired number of replicas. This includes voting
+	// and non-voting replicas.
 	NumReplicas *int32 `protobuf:"varint,5,opt,name=num_replicas,json=numReplicas" json:"num_replicas,omitempty" yaml:"num_replicas"`
+	// NumVoters specifies the desired number of voter replicas. If unspecified,
+	// there are no non-voting replicas and NumReplicas will represent the number
+	// of voters.
+	NumVoters *int32 `protobuf:"varint,13,opt,name=num_voters,json=numVoters" json:"num_voters,omitempty" yaml:"num_voters"`
 	// Constraints constrains which stores the replicas can be stored on. The
 	// order in which the constraints are stored is arbitrary and may change.
 	// https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20160706_expressive_zone_config.md#constraint-system
 	//
 	// NOTE: The sum of the num_replicas fields of the Constraints must add up to
-	// ZoneConfig.num_replicas, or there must be no more than a single Constraints
-	// field with num_replicas set to 0.
-	Constraints []Constraints `protobuf:"bytes,6,rep,name=constraints" json:"constraints" yaml:"constraints,flow"`
+	// at most ZoneConfig.num_replicas, or there must be no more than a single
+	// Constraints field with num_replicas set to 0.
+	Constraints []ConstraintsConjunction `protobuf:"bytes,6,rep,name=constraints" json:"constraints" yaml:"constraints,flow"`
+	// VoterConstraints constrains which stores the voting replicas can be stored
+	// on. This field must be "compatible" with the `Constraints` field above, but
+	// not necessarily a subset. The `VoterConstraints` are said to be compatible
+	// with `Constraints` if none of the constraints in `Constraints` contradict
+	// any of the constraints in `VoterConstraints`. In other words, they are
+	// compatible if none of the "prohibitive" constraints in `Constraints` are
+	// "required" constraints in `VoterConstraints`.
+	VoterConstraints []ConstraintsConjunction `protobuf:"bytes,14,rep,name=voter_constraints,json=voterConstraints" json:"voter_constraints" yaml:"voter_constraints,flow"`
 	// InheritedContraints specifies if the value in the Constraints field was
 	// inherited from the zone's parent or specified explicitly by the user.
+	//
+	// NB: We need this extra field (and the `inherited_voter_constraints` below)
+	// because the non-nullable nature of `constraints` and `voter_constraints`
+	// means that there is no other way to disambiguate between an unset
+	// `constraints` attribute and an empty one.
 	InheritedConstraints bool `protobuf:"varint,10,opt,name=inherited_constraints,json=inheritedConstraints" json:"inherited_constraints"`
+	// InheritedVoterConstraints indicates whether the value in the
+	// VoterConstraints field was inherited from the zone's parent or explicitly
+	// specified by the user.
+	InheritedVoterConstraints bool `protobuf:"varint,15,opt,name=inherited_voter_constraints,json=inheritedVoterConstraints" json:"inherited_voter_constraints"`
 	// LeasePreference stores information about where the user would prefer for
 	// range leases to be placed. Leases are allowed to be placed elsewhere if
 	// needed, but will follow the provided preference when possible.
@@ -274,7 +305,7 @@ func (m *ZoneConfig) Reset()         { *m = ZoneConfig{} }
 func (m *ZoneConfig) String() string { return proto.CompactTextString(m) }
 func (*ZoneConfig) ProtoMessage()    {}
 func (*ZoneConfig) Descriptor() ([]byte, []int) {
-	return fileDescriptor_zone_aa6a4d1d521e856b, []int{4}
+	return fileDescriptor_zone_0e64cca9f3656ed3, []int{4}
 }
 func (m *ZoneConfig) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -315,7 +346,7 @@ func (m *Subzone) Reset()         { *m = Subzone{} }
 func (m *Subzone) String() string { return proto.CompactTextString(m) }
 func (*Subzone) ProtoMessage()    {}
 func (*Subzone) Descriptor() ([]byte, []int) {
-	return fileDescriptor_zone_aa6a4d1d521e856b, []int{5}
+	return fileDescriptor_zone_0e64cca9f3656ed3, []int{5}
 }
 func (m *Subzone) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -361,7 +392,7 @@ func (m *SubzoneSpan) Reset()         { *m = SubzoneSpan{} }
 func (m *SubzoneSpan) String() string { return proto.CompactTextString(m) }
 func (*SubzoneSpan) ProtoMessage()    {}
 func (*SubzoneSpan) Descriptor() ([]byte, []int) {
-	return fileDescriptor_zone_aa6a4d1d521e856b, []int{6}
+	return fileDescriptor_zone_0e64cca9f3656ed3, []int{6}
 }
 func (m *SubzoneSpan) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -389,7 +420,7 @@ var xxx_messageInfo_SubzoneSpan proto.InternalMessageInfo
 func init() {
 	proto.RegisterType((*GCPolicy)(nil), "cockroach.config.zonepb.GCPolicy")
 	proto.RegisterType((*Constraint)(nil), "cockroach.config.zonepb.Constraint")
-	proto.RegisterType((*Constraints)(nil), "cockroach.config.zonepb.Constraints")
+	proto.RegisterType((*ConstraintsConjunction)(nil), "cockroach.config.zonepb.ConstraintsConjunction")
 	proto.RegisterType((*LeasePreference)(nil), "cockroach.config.zonepb.LeasePreference")
 	proto.RegisterType((*ZoneConfig)(nil), "cockroach.config.zonepb.ZoneConfig")
 	proto.RegisterType((*Subzone)(nil), "cockroach.config.zonepb.Subzone")
@@ -450,14 +481,14 @@ func (this *Constraint) Equal(that interface{}) bool {
 	}
 	return true
 }
-func (this *Constraints) Equal(that interface{}) bool {
+func (this *ConstraintsConjunction) Equal(that interface{}) bool {
 	if that == nil {
 		return this == nil
 	}
 
-	that1, ok := that.(*Constraints)
+	that1, ok := that.(*ConstraintsConjunction)
 	if !ok {
-		that2, ok := that.(Constraints)
+		that2, ok := that.(ConstraintsConjunction)
 		if ok {
 			that1 = &that2
 		} else {
@@ -551,6 +582,15 @@ func (this *ZoneConfig) Equal(that interface{}) bool {
 	if !this.GC.Equal(that1.GC) {
 		return false
 	}
+	if this.GlobalReads != nil && that1.GlobalReads != nil {
+		if *this.GlobalReads != *that1.GlobalReads {
+			return false
+		}
+	} else if this.GlobalReads != nil {
+		return false
+	} else if that1.GlobalReads != nil {
+		return false
+	}
 	if this.NumReplicas != nil && that1.NumReplicas != nil {
 		if *this.NumReplicas != *that1.NumReplicas {
 			return false
@@ -558,6 +598,15 @@ func (this *ZoneConfig) Equal(that interface{}) bool {
 	} else if this.NumReplicas != nil {
 		return false
 	} else if that1.NumReplicas != nil {
+		return false
+	}
+	if this.NumVoters != nil && that1.NumVoters != nil {
+		if *this.NumVoters != *that1.NumVoters {
+			return false
+		}
+	} else if this.NumVoters != nil {
+		return false
+	} else if that1.NumVoters != nil {
 		return false
 	}
 	if len(this.Constraints) != len(that1.Constraints) {
@@ -568,7 +617,18 @@ func (this *ZoneConfig) Equal(that interface{}) bool {
 			return false
 		}
 	}
+	if len(this.VoterConstraints) != len(that1.VoterConstraints) {
+		return false
+	}
+	for i := range this.VoterConstraints {
+		if !this.VoterConstraints[i].Equal(&that1.VoterConstraints[i]) {
+			return false
+		}
+	}
 	if this.InheritedConstraints != that1.InheritedConstraints {
+		return false
+	}
+	if this.InheritedVoterConstraints != that1.InheritedVoterConstraints {
 		return false
 	}
 	if len(this.LeasePreferences) != len(that1.LeasePreferences) {
@@ -710,7 +770,7 @@ func (m *Constraint) MarshalTo(dAtA []byte) (int, error) {
 	return i, nil
 }
 
-func (m *Constraints) Marshal() (dAtA []byte, err error) {
+func (m *ConstraintsConjunction) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalTo(dAtA)
@@ -720,7 +780,7 @@ func (m *Constraints) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *Constraints) MarshalTo(dAtA []byte) (int, error) {
+func (m *ConstraintsConjunction) MarshalTo(dAtA []byte) (int, error) {
 	var i int
 	_ = i
 	var l int
@@ -877,6 +937,41 @@ func (m *ZoneConfig) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0
 	}
 	i++
+	if m.GlobalReads != nil {
+		dAtA[i] = 0x60
+		i++
+		if *m.GlobalReads {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i++
+	}
+	if m.NumVoters != nil {
+		dAtA[i] = 0x68
+		i++
+		i = encodeVarintZone(dAtA, i, uint64(*m.NumVoters))
+	}
+	if len(m.VoterConstraints) > 0 {
+		for _, msg := range m.VoterConstraints {
+			dAtA[i] = 0x72
+			i++
+			i = encodeVarintZone(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	dAtA[i] = 0x78
+	i++
+	if m.InheritedVoterConstraints {
+		dAtA[i] = 1
+	} else {
+		dAtA[i] = 0
+	}
+	i++
 	return i, nil
 }
 
@@ -976,8 +1071,8 @@ func NewPopulatedConstraint(r randyZone, easy bool) *Constraint {
 	return this
 }
 
-func NewPopulatedConstraints(r randyZone, easy bool) *Constraints {
-	this := &Constraints{}
+func NewPopulatedConstraintsConjunction(r randyZone, easy bool) *ConstraintsConjunction {
+	this := &ConstraintsConjunction{}
 	if r.Intn(10) != 0 {
 		v1 := r.Intn(5)
 		this.Constraints = make([]Constraint, v1)
@@ -1038,9 +1133,9 @@ func NewPopulatedZoneConfig(r randyZone, easy bool) *ZoneConfig {
 	}
 	if r.Intn(10) != 0 {
 		v8 := r.Intn(5)
-		this.Constraints = make([]Constraints, v8)
+		this.Constraints = make([]ConstraintsConjunction, v8)
 		for i := 0; i < v8; i++ {
-			v9 := NewPopulatedConstraints(r, easy)
+			v9 := NewPopulatedConstraintsConjunction(r, easy)
 			this.Constraints[i] = *v9
 		}
 	}
@@ -1070,6 +1165,26 @@ func NewPopulatedZoneConfig(r randyZone, easy bool) *ZoneConfig {
 	}
 	this.InheritedConstraints = bool(bool(r.Intn(2) == 0))
 	this.InheritedLeasePreferences = bool(bool(r.Intn(2) == 0))
+	if r.Intn(10) != 0 {
+		v16 := bool(bool(r.Intn(2) == 0))
+		this.GlobalReads = &v16
+	}
+	if r.Intn(10) != 0 {
+		v17 := int32(r.Int31())
+		if r.Intn(2) == 0 {
+			v17 *= -1
+		}
+		this.NumVoters = &v17
+	}
+	if r.Intn(10) != 0 {
+		v18 := r.Intn(5)
+		this.VoterConstraints = make([]ConstraintsConjunction, v18)
+		for i := 0; i < v18; i++ {
+			v19 := NewPopulatedConstraintsConjunction(r, easy)
+			this.VoterConstraints[i] = *v19
+		}
+	}
+	this.InheritedVoterConstraints = bool(bool(r.Intn(2) == 0))
 	if !easy && r.Intn(10) != 0 {
 	}
 	return this
@@ -1079,8 +1194,8 @@ func NewPopulatedSubzone(r randyZone, easy bool) *Subzone {
 	this := &Subzone{}
 	this.IndexID = uint32(r.Uint32())
 	this.PartitionName = string(randStringZone(r))
-	v16 := NewPopulatedZoneConfig(r, easy)
-	this.Config = *v16
+	v20 := NewPopulatedZoneConfig(r, easy)
+	this.Config = *v20
 	if !easy && r.Intn(10) != 0 {
 	}
 	return this
@@ -1089,16 +1204,16 @@ func NewPopulatedSubzone(r randyZone, easy bool) *Subzone {
 func NewPopulatedSubzoneSpan(r randyZone, easy bool) *SubzoneSpan {
 	this := &SubzoneSpan{}
 	if r.Intn(10) != 0 {
-		v17 := r.Intn(100)
-		this.Key = make(github_com_cockroachdb_cockroach_pkg_roachpb.Key, v17)
-		for i := 0; i < v17; i++ {
+		v21 := r.Intn(100)
+		this.Key = make(github_com_cockroachdb_cockroach_pkg_roachpb.Key, v21)
+		for i := 0; i < v21; i++ {
 			this.Key[i] = byte(r.Intn(256))
 		}
 	}
 	if r.Intn(10) != 0 {
-		v18 := r.Intn(100)
-		this.EndKey = make(github_com_cockroachdb_cockroach_pkg_roachpb.Key, v18)
-		for i := 0; i < v18; i++ {
+		v22 := r.Intn(100)
+		this.EndKey = make(github_com_cockroachdb_cockroach_pkg_roachpb.Key, v22)
+		for i := 0; i < v22; i++ {
 			this.EndKey[i] = byte(r.Intn(256))
 		}
 	}
@@ -1130,9 +1245,9 @@ func randUTF8RuneZone(r randyZone) rune {
 	return rune(ru + 61)
 }
 func randStringZone(r randyZone) string {
-	v19 := r.Intn(100)
-	tmps := make([]rune, v19)
-	for i := 0; i < v19; i++ {
+	v23 := r.Intn(100)
+	tmps := make([]rune, v23)
+	for i := 0; i < v23; i++ {
 		tmps[i] = randUTF8RuneZone(r)
 	}
 	return string(tmps)
@@ -1154,11 +1269,11 @@ func randFieldZone(dAtA []byte, r randyZone, fieldNumber int, wire int) []byte {
 	switch wire {
 	case 0:
 		dAtA = encodeVarintPopulateZone(dAtA, uint64(key))
-		v20 := r.Int63()
+		v24 := r.Int63()
 		if r.Intn(2) == 0 {
-			v20 *= -1
+			v24 *= -1
 		}
-		dAtA = encodeVarintPopulateZone(dAtA, uint64(v20))
+		dAtA = encodeVarintPopulateZone(dAtA, uint64(v24))
 	case 1:
 		dAtA = encodeVarintPopulateZone(dAtA, uint64(key))
 		dAtA = append(dAtA, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)))
@@ -1207,7 +1322,7 @@ func (m *Constraint) Size() (n int) {
 	return n
 }
 
-func (m *Constraints) Size() (n int) {
+func (m *ConstraintsConjunction) Size() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -1282,6 +1397,19 @@ func (m *ZoneConfig) Size() (n int) {
 		}
 	}
 	n += 2
+	n += 2
+	if m.GlobalReads != nil {
+		n += 2
+	}
+	if m.NumVoters != nil {
+		n += 1 + sovZone(uint64(*m.NumVoters))
+	}
+	if len(m.VoterConstraints) > 0 {
+		for _, e := range m.VoterConstraints {
+			l = e.Size()
+			n += 1 + l + sovZone(uint64(l))
+		}
+	}
 	n += 2
 	return n
 }
@@ -1385,7 +1513,7 @@ func (m *GCPolicy) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthZone
 			}
 			if (iNdEx + skippy) > l {
@@ -1512,7 +1640,7 @@ func (m *Constraint) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthZone
 			}
 			if (iNdEx + skippy) > l {
@@ -1527,7 +1655,7 @@ func (m *Constraint) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *Constraints) Unmarshal(dAtA []byte) error {
+func (m *ConstraintsConjunction) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1550,10 +1678,10 @@ func (m *Constraints) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: Constraints: wiretype end group for non-group")
+			return fmt.Errorf("proto: ConstraintsConjunction: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: Constraints: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: ConstraintsConjunction: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 6:
@@ -1612,7 +1740,7 @@ func (m *Constraints) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthZone
 			}
 			if (iNdEx + skippy) > l {
@@ -1693,7 +1821,7 @@ func (m *LeasePreference) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthZone
 			}
 			if (iNdEx + skippy) > l {
@@ -1856,7 +1984,7 @@ func (m *ZoneConfig) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Constraints = append(m.Constraints, Constraints{})
+			m.Constraints = append(m.Constraints, ConstraintsConjunction{})
 			if err := m.Constraints[len(m.Constraints)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -1994,13 +2122,105 @@ func (m *ZoneConfig) Unmarshal(dAtA []byte) error {
 				}
 			}
 			m.InheritedLeasePreferences = bool(v != 0)
+		case 12:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field GlobalReads", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowZone
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			b := bool(v != 0)
+			m.GlobalReads = &b
+		case 13:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field NumVoters", wireType)
+			}
+			var v int32
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowZone
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int32(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.NumVoters = &v
+		case 14:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field VoterConstraints", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowZone
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthZone
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.VoterConstraints = append(m.VoterConstraints, ConstraintsConjunction{})
+			if err := m.VoterConstraints[len(m.VoterConstraints)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 15:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InheritedVoterConstraints", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowZone
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.InheritedVoterConstraints = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipZone(dAtA[iNdEx:])
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthZone
 			}
 			if (iNdEx + skippy) > l {
@@ -2128,7 +2348,7 @@ func (m *Subzone) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthZone
 			}
 			if (iNdEx + skippy) > l {
@@ -2259,7 +2479,7 @@ func (m *SubzoneSpan) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthZone
 			}
 			if (iNdEx + skippy) > l {
@@ -2379,62 +2599,69 @@ var (
 	ErrIntOverflowZone   = fmt.Errorf("proto: integer overflow")
 )
 
-func init() { proto.RegisterFile("config/zonepb/zone.proto", fileDescriptor_zone_aa6a4d1d521e856b) }
+func init() { proto.RegisterFile("config/zonepb/zone.proto", fileDescriptor_zone_0e64cca9f3656ed3) }
 
-var fileDescriptor_zone_aa6a4d1d521e856b = []byte{
-	// 858 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x9c, 0x54, 0x3b, 0x73, 0xe3, 0x54,
-	0x14, 0xf6, 0xb5, 0x1d, 0x5b, 0x7b, 0xec, 0x24, 0xe6, 0xee, 0xb2, 0x11, 0x61, 0xb0, 0x8c, 0x80,
-	0xc1, 0xbc, 0x64, 0x26, 0xd0, 0x90, 0x19, 0x8a, 0x95, 0x6d, 0x16, 0x91, 0x7d, 0x18, 0xc5, 0x50,
-	0x2c, 0x85, 0x46, 0x96, 0x6e, 0x14, 0x4d, 0xe4, 0x2b, 0x8d, 0x24, 0x43, 0xc4, 0xd0, 0x51, 0x33,
-	0x43, 0x49, 0x99, 0x7f, 0x00, 0x25, 0x3f, 0x21, 0xe5, 0xd2, 0x2d, 0x8d, 0x07, 0x9c, 0x86, 0x3a,
-	0x25, 0x15, 0xa3, 0x2b, 0x59, 0x92, 0xb3, 0xeb, 0x25, 0x50, 0xe9, 0xea, 0x9c, 0xef, 0x7c, 0xe7,
-	0x7d, 0x80, 0x37, 0x5c, 0x7a, 0x64, 0x5b, 0xbd, 0x6f, 0x5d, 0x4a, 0xbc, 0x09, 0xfb, 0x48, 0x9e,
-	0xef, 0x86, 0x2e, 0xde, 0x31, 0x5c, 0xe3, 0xc4, 0x77, 0x75, 0xe3, 0x58, 0x4a, 0x30, 0x52, 0x82,
-	0xd9, 0xbd, 0x65, 0xb9, 0x96, 0xcb, 0x30, 0xbd, 0xf8, 0x95, 0xc0, 0x45, 0x05, 0xb8, 0xbb, 0xfd,
-	0x91, 0xeb, 0xd8, 0x46, 0x84, 0x3f, 0x80, 0x46, 0x18, 0x3a, 0x5a, 0x40, 0x0c, 0x97, 0x9a, 0x01,
-	0x8f, 0x3a, 0xa8, 0xbb, 0x21, 0xe3, 0xf3, 0xb9, 0x50, 0x5a, 0xcc, 0x05, 0x18, 0x8f, 0xef, 0x1d,
-	0x26, 0x1a, 0x15, 0xc2, 0xd0, 0x49, 0xdf, 0xfb, 0xdc, 0xaf, 0x67, 0x02, 0xfa, 0xeb, 0x4c, 0x40,
-	0xe2, 0x6f, 0x08, 0xa0, 0xef, 0xd2, 0x20, 0xf4, 0x75, 0x9b, 0x86, 0x58, 0x86, 0x6a, 0x18, 0x79,
-	0x84, 0xd1, 0x6c, 0xed, 0x75, 0xa5, 0x35, 0x71, 0x49, 0xb9, 0x89, 0x34, 0x8e, 0x3c, 0x22, 0x57,
-	0x63, 0x87, 0x2a, 0xb3, 0xc5, 0xb7, 0xa1, 0x72, 0x42, 0x22, 0xbe, 0xdc, 0x41, 0xdd, 0x1b, 0xa9,
-	0x22, 0x16, 0xe0, 0x5d, 0xd8, 0xf8, 0x5a, 0x77, 0x66, 0x84, 0xaf, 0x14, 0x34, 0x89, 0x48, 0xfc,
-	0x18, 0xaa, 0x31, 0x0f, 0xde, 0x81, 0x9b, 0x83, 0xe1, 0x48, 0x1d, 0xf6, 0xef, 0x8c, 0x87, 0x03,
-	0x6d, 0xf4, 0xf0, 0x50, 0x19, 0x2b, 0x5f, 0x0e, 0x5b, 0x25, 0xdc, 0x04, 0x4e, 0x1d, 0x7e, 0xfe,
-	0x85, 0xa2, 0x0e, 0x07, 0x2d, 0x84, 0xb7, 0x00, 0x46, 0xea, 0xc3, 0x4f, 0x15, 0x59, 0x19, 0x0f,
-	0x07, 0xad, 0xf2, 0x7e, 0xf3, 0xa7, 0x33, 0xa1, 0x94, 0xe5, 0xf4, 0x03, 0x82, 0x46, 0x1e, 0x60,
-	0x80, 0x0f, 0xa0, 0x61, 0xe4, 0xbf, 0x7c, 0xad, 0x53, 0xe9, 0x36, 0xf6, 0x5e, 0xbb, 0x46, 0x6e,
-	0x69, 0x8c, 0x45, 0x6b, 0xfc, 0x26, 0x34, 0xe9, 0x6c, 0xaa, 0xf9, 0xc4, 0x73, 0x6c, 0x43, 0x0f,
-	0xf8, 0x3a, 0x2b, 0x78, 0x0a, 0xa4, 0xb3, 0xa9, 0x9a, 0x2a, 0x0a, 0x35, 0xfe, 0x1e, 0xc1, 0xf6,
-	0x3d, 0xa2, 0x07, 0x64, 0xe4, 0x93, 0x23, 0xe2, 0x13, 0x6a, 0x10, 0x7c, 0xb4, 0x1a, 0x13, 0xba,
-	0x7e, 0x4c, 0x42, 0xec, 0xea, 0x72, 0x2e, 0xec, 0x44, 0xfa, 0xd4, 0xd9, 0x17, 0x0b, 0x2c, 0xef,
-	0x1e, 0x39, 0xee, 0x37, 0xe2, 0x4a, 0xb8, 0x85, 0x28, 0x7e, 0xa9, 0x01, 0x3c, 0x72, 0x29, 0xe9,
-	0x33, 0x62, 0x2c, 0xc3, 0xb6, 0xaf, 0x53, 0x8b, 0x68, 0x53, 0x9b, 0x6a, 0x93, 0x28, 0x24, 0x01,
-	0xeb, 0x58, 0x45, 0xde, 0xbd, 0x9c, 0x0b, 0xb7, 0x13, 0xee, 0x2b, 0x00, 0x51, 0xdd, 0x64, 0x92,
-	0xfb, 0x36, 0x95, 0xe3, 0xff, 0x02, 0x87, 0x7e, 0x9a, 0x72, 0x54, 0xd6, 0x70, 0x2c, 0x01, 0x19,
-	0x87, 0x7e, 0x9a, 0x70, 0x7c, 0x04, 0x65, 0xcb, 0xe0, 0xab, 0x1d, 0xd4, 0x6d, 0xec, 0xbd, 0xba,
-	0x36, 0xff, 0xe5, 0xb8, 0xcb, 0xb5, 0xc5, 0x5c, 0x28, 0xdf, 0xed, 0xab, 0x65, 0xcb, 0xc0, 0xfb,
-	0x57, 0x5a, 0xb1, 0xc1, 0x5a, 0xb1, 0x73, 0x39, 0x17, 0x6e, 0x26, 0xbe, 0x8b, 0x5a, 0x71, 0xa5,
-	0x3b, 0xd8, 0x7a, 0xd6, 0x4c, 0xbc, 0x7e, 0x8d, 0xfa, 0x07, 0xff, 0xad, 0x01, 0xf8, 0x2b, 0xd8,
-	0x0c, 0x66, 0x93, 0x98, 0x46, 0x0b, 0x3c, 0x9d, 0xc6, 0x03, 0xf3, 0x7c, 0x57, 0x87, 0x09, 0xfa,
-	0xd0, 0xd3, 0xa9, 0xdc, 0x4a, 0x5d, 0x71, 0x89, 0xab, 0xf7, 0x44, 0xb5, 0x19, 0xe4, 0xea, 0x00,
-	0x3f, 0x00, 0x2e, 0xfd, 0x0f, 0x78, 0x8e, 0xf1, 0x76, 0xfe, 0x8d, 0xf7, 0x19, 0x9c, 0x19, 0x07,
-	0xfe, 0x0e, 0x5e, 0x70, 0xe2, 0x41, 0xd5, 0xbc, 0x6c, 0x52, 0x03, 0xfe, 0x06, 0x23, 0x5e, 0x7f,
-	0x0b, 0xae, 0x8c, 0xb6, 0xfc, 0x46, 0xea, 0xe0, 0x95, 0xc4, 0xc1, 0x53, 0x84, 0x69, 0x95, 0x5a,
-	0xce, 0xaa, 0x5d, 0x3c, 0x0a, 0x2f, 0xda, 0xf4, 0x98, 0xf8, 0x76, 0x48, 0x4c, 0xad, 0xd8, 0x1d,
-	0xe8, 0xa0, 0x2e, 0x97, 0xee, 0xd8, 0xad, 0x0c, 0x52, 0x5c, 0xf1, 0x01, 0xbc, 0x9c, 0x9b, 0x3e,
-	0x9d, 0x42, 0xa3, 0x40, 0xf0, 0x52, 0x06, 0xbc, 0x12, 0x78, 0x61, 0x59, 0x3e, 0xab, 0x72, 0xa8,
-	0x55, 0x16, 0x7f, 0x46, 0x50, 0x4f, 0xcb, 0x86, 0xdf, 0x06, 0xce, 0xa6, 0x26, 0x39, 0xd5, 0x6c,
-	0x93, 0x5d, 0xc7, 0x4d, 0x79, 0x3b, 0x3d, 0xb2, 0x75, 0x25, 0x96, 0x2b, 0x03, 0xb5, 0xce, 0x00,
-	0x8a, 0x89, 0xdf, 0x81, 0x2d, 0x4f, 0xf7, 0x43, 0x3b, 0xb4, 0x5d, 0xaa, 0x51, 0x7d, 0x4a, 0x56,
-	0x8e, 0xe1, 0x66, 0xa6, 0x7b, 0xa0, 0x4f, 0x09, 0xbe, 0x03, 0xb5, 0xa4, 0x9e, 0x6c, 0x77, 0x9e,
-	0x77, 0x04, 0xf2, 0xed, 0x4d, 0x99, 0x52, 0xc3, 0xc2, 0x92, 0xff, 0x8e, 0xa0, 0x51, 0x18, 0x20,
-	0xfc, 0x49, 0x72, 0x8b, 0xe3, 0x80, 0x9b, 0xf2, 0x87, 0x7f, 0xcf, 0x85, 0xf7, 0x2d, 0x3b, 0x3c,
-	0x9e, 0x4d, 0x24, 0xc3, 0x9d, 0xf6, 0x32, 0x3f, 0xe6, 0x24, 0x7f, 0xf7, 0xbc, 0x13, 0xab, 0xc7,
-	0x5e, 0xde, 0x44, 0x3a, 0x20, 0x51, 0x72, 0xbb, 0xef, 0x43, 0x9d, 0x50, 0x53, 0x5b, 0xde, 0xf5,
-	0xff, 0xcb, 0x55, 0x23, 0xd4, 0x3c, 0x20, 0x11, 0x7e, 0x2b, 0x5f, 0x0a, 0x56, 0x33, 0x96, 0xfa,
-	0xf2, 0x8a, 0x2e, 0x47, 0x9c, 0x95, 0x35, 0xcf, 0x4d, 0xee, 0x9e, 0xff, 0xd9, 0x2e, 0x9d, 0x2f,
-	0xda, 0xe8, 0xf1, 0xa2, 0x8d, 0x9e, 0x2c, 0xda, 0xe8, 0x8f, 0x45, 0x1b, 0xfd, 0x78, 0xd1, 0x2e,
-	0x3d, 0xbe, 0x68, 0x97, 0x9e, 0x5c, 0xb4, 0x4b, 0x8f, 0x6a, 0x49, 0xa1, 0xfe, 0x09, 0x00, 0x00,
-	0xff, 0xff, 0x56, 0x2b, 0xf9, 0xe6, 0x69, 0x07, 0x00, 0x00,
+var fileDescriptor_zone_0e64cca9f3656ed3 = []byte{
+	// 964 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x9c, 0x55, 0xbf, 0x73, 0xe3, 0xc4,
+	0x17, 0xf7, 0xda, 0x8e, 0xad, 0x3c, 0xdb, 0x89, 0xb3, 0x77, 0x97, 0xe8, 0x9b, 0xef, 0x60, 0x19,
+	0x01, 0x83, 0xf9, 0x65, 0x33, 0xe1, 0x1a, 0x3c, 0x43, 0x71, 0xb2, 0xcd, 0x61, 0x92, 0xbb, 0x33,
+	0x8a, 0x49, 0x71, 0x14, 0x1a, 0x59, 0xde, 0x38, 0x22, 0xf2, 0xae, 0x46, 0x92, 0x8f, 0x98, 0xa1,
+	0xbb, 0x7f, 0x80, 0x92, 0x82, 0x22, 0xff, 0x01, 0x2d, 0x7f, 0x42, 0xca, 0xa3, 0x3b, 0x1a, 0x0f,
+	0x38, 0x0d, 0x75, 0x3a, 0xa8, 0x18, 0xad, 0x64, 0x4b, 0x76, 0x62, 0x08, 0x57, 0x69, 0x77, 0xdf,
+	0x7b, 0x9f, 0xf7, 0xeb, 0xa3, 0xf7, 0x40, 0x34, 0x18, 0x3d, 0x36, 0x07, 0xb5, 0x6f, 0x19, 0x25,
+	0x76, 0x8f, 0x7f, 0xaa, 0xb6, 0xc3, 0x3c, 0x86, 0x77, 0x0c, 0x66, 0x9c, 0x3a, 0x4c, 0x37, 0x4e,
+	0xaa, 0x81, 0x4e, 0x35, 0xd0, 0xd9, 0xbd, 0x3b, 0x60, 0x03, 0xc6, 0x75, 0x6a, 0xfe, 0x29, 0x50,
+	0x97, 0xdb, 0x20, 0x3c, 0x6c, 0x74, 0x98, 0x65, 0x1a, 0x63, 0xfc, 0x11, 0xe4, 0x3c, 0xcf, 0xd2,
+	0x5c, 0x62, 0x30, 0xda, 0x77, 0x45, 0x54, 0x46, 0x95, 0x35, 0x05, 0x5f, 0x4c, 0xa4, 0xc4, 0x74,
+	0x22, 0x41, 0xb7, 0x7b, 0x70, 0x18, 0x48, 0x54, 0xf0, 0x3c, 0x2b, 0x3c, 0xd7, 0x85, 0x9f, 0xcf,
+	0x25, 0xf4, 0xc7, 0xb9, 0x84, 0xe4, 0x5f, 0x10, 0x40, 0x83, 0x51, 0xd7, 0x73, 0x74, 0x93, 0x7a,
+	0x58, 0x81, 0xb4, 0x37, 0xb6, 0x09, 0x87, 0xd9, 0xd8, 0xab, 0x54, 0x57, 0xc4, 0x55, 0x8d, 0x4c,
+	0xaa, 0xdd, 0xb1, 0x4d, 0x94, 0xb4, 0xef, 0x50, 0xe5, 0xb6, 0x78, 0x1b, 0x52, 0xa7, 0x64, 0x2c,
+	0x26, 0xcb, 0xa8, 0xb2, 0x1e, 0x0a, 0xfc, 0x07, 0xbc, 0x0b, 0x6b, 0xcf, 0x74, 0x6b, 0x44, 0xc4,
+	0x54, 0x4c, 0x12, 0x3c, 0xc9, 0x9f, 0x40, 0xda, 0xc7, 0xc1, 0x3b, 0x70, 0xa7, 0xd9, 0xea, 0xa8,
+	0xad, 0xc6, 0x83, 0x6e, 0xab, 0xa9, 0x75, 0x9e, 0x1c, 0xb6, 0xbb, 0xed, 0xa3, 0x56, 0x31, 0x81,
+	0xf3, 0x20, 0xa8, 0xad, 0x2f, 0xbe, 0x6c, 0xab, 0xad, 0x66, 0x11, 0xe1, 0x0d, 0x80, 0x8e, 0xfa,
+	0xe4, 0xb3, 0xb6, 0xd2, 0xee, 0xb6, 0x9a, 0xc5, 0x64, 0x3d, 0xff, 0xc3, 0xb9, 0x94, 0x98, 0xe7,
+	0xf4, 0x23, 0x82, 0xed, 0x28, 0x40, 0xb7, 0xc1, 0xe8, 0xd7, 0x23, 0x6a, 0x78, 0x26, 0xa3, 0x78,
+	0x1f, 0x72, 0x46, 0x24, 0x11, 0x33, 0xe5, 0x54, 0x25, 0xb7, 0xf7, 0xc6, 0x2d, 0xd2, 0x0c, 0xc3,
+	0x8d, 0x5b, 0xe3, 0xb7, 0x21, 0x4f, 0x47, 0x43, 0xcd, 0x21, 0xb6, 0x65, 0x1a, 0xba, 0x2b, 0x66,
+	0x79, 0xed, 0x43, 0x45, 0x3a, 0x1a, 0xaa, 0xa1, 0x60, 0x29, 0xbc, 0xe7, 0x08, 0x36, 0x0f, 0x88,
+	0xee, 0x92, 0x8e, 0x43, 0x8e, 0x89, 0x43, 0xa8, 0x41, 0xf0, 0xf1, 0x62, 0x5c, 0xe8, 0xf6, 0x71,
+	0x49, 0xbe, 0xbb, 0xab, 0x89, 0xb4, 0x33, 0xd6, 0x87, 0x56, 0x5d, 0x8e, 0xa1, 0xbc, 0x7f, 0x6c,
+	0xb1, 0x6f, 0xe4, 0x85, 0x90, 0x63, 0x8d, 0xff, 0x53, 0x00, 0x78, 0xca, 0x28, 0x69, 0x70, 0x60,
+	0xac, 0xc0, 0xa6, 0xa3, 0xd3, 0x01, 0xd1, 0x86, 0x26, 0xd5, 0x7a, 0x63, 0x8f, 0xb8, 0xbc, 0x81,
+	0x29, 0x65, 0xf7, 0x6a, 0x22, 0x6d, 0x07, 0xd8, 0x4b, 0x0a, 0xb2, 0x5a, 0xe0, 0x2f, 0x8f, 0x4c,
+	0xaa, 0xf8, 0xf7, 0x18, 0x86, 0x7e, 0x16, 0x62, 0xa4, 0x56, 0x60, 0xcc, 0x14, 0xe6, 0x18, 0xfa,
+	0x59, 0x80, 0xf1, 0x31, 0x24, 0x07, 0x86, 0x98, 0x2e, 0xa3, 0x4a, 0x6e, 0xef, 0xf5, 0x95, 0xf9,
+	0xcf, 0xd8, 0xaf, 0x64, 0xa6, 0x13, 0x29, 0xf9, 0xb0, 0xa1, 0x26, 0x07, 0x06, 0xae, 0x2f, 0xb5,
+	0x63, 0x8d, 0xb7, 0x63, 0xe7, 0x6a, 0x22, 0xdd, 0x09, 0x7c, 0xc7, 0xa5, 0xf2, 0x42, 0x87, 0xb0,
+	0x73, 0x13, 0x2f, 0x6a, 0xb7, 0xa8, 0x7f, 0x9c, 0x5d, 0xff, 0xad, 0x17, 0xf8, 0x2b, 0x28, 0xb8,
+	0xa3, 0x9e, 0x8f, 0xa8, 0xb9, 0xb6, 0x4e, 0x7d, 0xfe, 0xf8, 0x5e, 0xdf, 0x5c, 0xe9, 0xf5, 0x30,
+	0xd0, 0x3e, 0xb4, 0x75, 0xaa, 0x14, 0x43, 0x57, 0x42, 0xe0, 0xea, 0x03, 0x59, 0xcd, 0xbb, 0x91,
+	0xd8, 0xc5, 0x8f, 0x41, 0x08, 0xef, 0xae, 0x28, 0x70, 0xdc, 0xf2, 0xbf, 0xe1, 0xde, 0x80, 0x39,
+	0xc7, 0xc0, 0xdf, 0xc1, 0x96, 0xe5, 0x73, 0x56, 0xb3, 0xe7, 0xa4, 0x75, 0xc5, 0x75, 0x0e, 0xbc,
+	0x7a, 0x4a, 0x2c, 0xb1, 0x5c, 0x79, 0x2b, 0x74, 0xf0, 0x5a, 0xe0, 0xe0, 0x1a, 0x60, 0x58, 0xa5,
+	0xa2, 0xb5, 0x68, 0xe7, 0xb3, 0xe2, 0x9e, 0x49, 0x4f, 0x88, 0x63, 0x7a, 0xa4, 0xaf, 0xc5, 0x1b,
+	0x05, 0x65, 0x54, 0x11, 0xc2, 0x5f, 0xee, 0xee, 0x5c, 0x25, 0xd6, 0x1e, 0xdc, 0x84, 0xff, 0x47,
+	0xa6, 0xd7, 0x53, 0xc8, 0xc5, 0x00, 0xfe, 0x37, 0x57, 0x3c, 0x58, 0x0e, 0xa0, 0x0e, 0xf9, 0x81,
+	0xc5, 0x7a, 0xba, 0xa5, 0x39, 0x44, 0xef, 0xbb, 0x62, 0x9e, 0x9b, 0xc5, 0xb8, 0x15, 0x97, 0xca,
+	0x6a, 0x2e, 0xb8, 0xaa, 0xfe, 0x0d, 0xdf, 0x07, 0xf0, 0x99, 0xf7, 0x8c, 0x79, 0xc4, 0x71, 0xc5,
+	0x02, 0x67, 0xe5, 0xbd, 0xab, 0x89, 0xb4, 0x15, 0xb1, 0x32, 0x90, 0xc9, 0xea, 0x3a, 0x1d, 0x0d,
+	0x8f, 0xf8, 0x19, 0x3f, 0x47, 0xb0, 0xc5, 0x9f, 0x17, 0xf2, 0xdd, 0x78, 0x35, 0x62, 0x2e, 0x15,
+	0xfe, 0x1a, 0xee, 0xac, 0xf0, 0x5c, 0xb0, 0xb2, 0x7a, 0xd7, 0xc3, 0xd9, 0xbc, 0xb1, 0x7a, 0x47,
+	0x4b, 0x28, 0xd1, 0xd4, 0xf9, 0x3c, 0x2d, 0xa0, 0x62, 0x52, 0xfe, 0x09, 0x41, 0x36, 0x24, 0x1d,
+	0x7e, 0x17, 0x04, 0x93, 0xf6, 0xc9, 0x99, 0x66, 0xf6, 0xf9, 0xd6, 0x29, 0x28, 0x9b, 0xe1, 0xf2,
+	0xca, 0xb6, 0xfd, 0xf7, 0x76, 0x53, 0xcd, 0x72, 0x85, 0x76, 0x1f, 0xbf, 0x07, 0x1b, 0xb6, 0xee,
+	0x78, 0xa6, 0x9f, 0x93, 0x46, 0xf5, 0x21, 0x59, 0x58, 0x32, 0x85, 0xb9, 0xec, 0xb1, 0x3e, 0x24,
+	0xf8, 0x01, 0x64, 0x82, 0xda, 0xf0, 0x21, 0xf4, 0x4f, 0xd3, 0x34, 0x1a, 0x83, 0x21, 0x52, 0x68,
+	0x18, 0x9b, 0x96, 0xbf, 0x22, 0xc8, 0xc5, 0x7e, 0x3f, 0xfc, 0x69, 0xb0, 0xe3, 0xfc, 0x80, 0xf3,
+	0xca, 0xfd, 0xbf, 0x26, 0xd2, 0x87, 0x03, 0xd3, 0x3b, 0x19, 0xf5, 0xaa, 0x06, 0x1b, 0xd6, 0xe6,
+	0x7e, 0xfa, 0xbd, 0xe8, 0x5c, 0xb3, 0x4f, 0x07, 0x35, 0x7e, 0xb2, 0x7b, 0xd5, 0x7d, 0x32, 0x0e,
+	0x76, 0xe2, 0x23, 0xc8, 0x12, 0xda, 0xd7, 0x66, 0xfb, 0xf2, 0x55, 0xb1, 0x32, 0x84, 0xf6, 0xf7,
+	0xc9, 0x18, 0xbf, 0x13, 0x8d, 0x14, 0x5e, 0x33, 0x9e, 0xfa, 0x6c, 0x25, 0xcd, 0x06, 0x04, 0x2f,
+	0x6b, 0x94, 0x9b, 0x52, 0xb9, 0xf8, 0xbd, 0x94, 0xb8, 0x98, 0x96, 0xd0, 0x8b, 0x69, 0x09, 0xbd,
+	0x9c, 0x96, 0xd0, 0x6f, 0xd3, 0x12, 0xfa, 0xfe, 0xb2, 0x94, 0x78, 0x71, 0x59, 0x4a, 0xbc, 0xbc,
+	0x2c, 0x25, 0x9e, 0x66, 0x82, 0x42, 0xfd, 0x1d, 0x00, 0x00, 0xff, 0xff, 0x27, 0xe0, 0x31, 0x91,
+	0xc1, 0x08, 0x00, 0x00,
 }

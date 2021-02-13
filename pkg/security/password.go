@@ -15,9 +15,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/errors"
 	"golang.org/x/crypto/bcrypt"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 // BcryptCost is the cost to use when hashing passwords. It is exposed for
@@ -31,6 +32,10 @@ var BcryptCost = bcrypt.DefaultCost
 // ErrEmptyPassword indicates that an empty password was attempted to be set.
 var ErrEmptyPassword = errors.New("empty passwords are not permitted")
 
+// ErrPasswordTooShort indicates that a client provided a password
+// that was too short according to policy.
+var ErrPasswordTooShort = errors.New("password too short")
+
 var sha256NewSum = sha256.New().Sum(nil)
 
 // TODO(mjibson): properly apply SHA-256 to the password. The current code
@@ -43,7 +48,7 @@ var sha256NewSum = sha256.New().Sum(nil)
 func appendEmptySha256(password string) []byte {
 	// In the past we incorrectly called the hash.Hash.Sum method. That
 	// method uses its argument as a place to put the current hash:
-	// it does not add its argument to the curret hash. Thus, using
+	// it does not add its argument to the current hash. Thus, using
 	// h.Sum([]byte(password))) is the equivalent to the below append.
 	return append([]byte(password), sha256NewSum...)
 }
@@ -64,7 +69,7 @@ func HashPassword(password string) ([]byte, error) {
 // This is meant to be used when using a password.
 func PromptForPassword() (string, error) {
 	fmt.Print("Enter password: ")
-	password, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+	password, err := term.ReadPassword(int(os.Stdin.Fd()))
 	if err != nil {
 		return "", err
 	}
@@ -73,3 +78,13 @@ func PromptForPassword() (string, error) {
 
 	return string(password), nil
 }
+
+// MinPasswordLength is the cluster setting that configures the
+// minimum SQL password length.
+var MinPasswordLength = settings.RegisterIntSetting(
+	"server.user_login.min_password_length",
+	"the minimum length accepted for passwords set in cleartext via SQL. "+
+		"Note that a value lower than 1 is ignored: passwords cannot be empty in any case.",
+	1,
+	settings.NonNegativeInt,
+)

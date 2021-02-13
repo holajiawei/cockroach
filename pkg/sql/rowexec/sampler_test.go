@@ -19,8 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -30,18 +30,18 @@ import (
 func runSampler(
 	t *testing.T, numRows, numSamples int, memLimitBytes int64, expectOutOfMemory bool,
 ) []int {
-	rows := make([]sqlbase.EncDatumRow, numRows)
+	rows := make([]rowenc.EncDatumRow, numRows)
 	for i := range rows {
-		rows[i] = sqlbase.EncDatumRow{sqlbase.IntEncDatum(i)}
+		rows[i] = rowenc.EncDatumRow{rowenc.IntEncDatum(i)}
 	}
-	in := distsqlutils.NewRowBuffer(sqlbase.OneIntCol, rows, distsqlutils.RowBufferArgs{})
-	outTypes := []types.T{
-		*types.Int, // original column
-		*types.Int, // rank
-		*types.Int, // sketch index
-		*types.Int, // num rows
-		*types.Int, // null vals
-		*types.Bytes,
+	in := distsqlutils.NewRowBuffer(rowenc.OneIntCol, rows, distsqlutils.RowBufferArgs{})
+	outTypes := []*types.T{
+		types.Int, // original column
+		types.Int, // rank
+		types.Int, // sketch index
+		types.Int, // num rows
+		types.Int, // null vals
+		types.Bytes,
 	}
 
 	out := distsqlutils.NewRowBuffer(outTypes, nil /* rows */, distsqlutils.RowBufferArgs{})
@@ -189,20 +189,23 @@ func TestSamplerSketch(t *testing.T) {
 		{-1, 1},
 		{-1, 3},
 		{1, -1},
+		{2, 8},
+		{-1, 1},
+		{-1, -1},
 	}
-	cardinalities := []int{3, 9}
-	numNulls := []int{2, 1}
+	cardinalities := []int{3, 9, 12}
+	numNulls := []int{4, 2, 1}
 
-	rows := sqlbase.GenEncDatumRowsInt(inputRows)
-	in := distsqlutils.NewRowBuffer(sqlbase.TwoIntCols, rows, distsqlutils.RowBufferArgs{})
-	outTypes := []types.T{
-		*types.Int,   // original column
-		*types.Int,   // original column
-		*types.Int,   // rank
-		*types.Int,   // sketch index
-		*types.Int,   // num rows
-		*types.Int,   // null vals
-		*types.Bytes, // sketch data
+	rows := rowenc.GenEncDatumRowsInt(inputRows)
+	in := distsqlutils.NewRowBuffer(rowenc.TwoIntCols, rows, distsqlutils.RowBufferArgs{})
+	outTypes := []*types.T{
+		types.Int,   // original column
+		types.Int,   // original column
+		types.Int,   // rank
+		types.Int,   // sketch index
+		types.Int,   // num rows
+		types.Int,   // null vals
+		types.Bytes, // sketch data
 	}
 
 	out := distsqlutils.NewRowBuffer(outTypes, nil /* rows */, distsqlutils.RowBufferArgs{})
@@ -225,6 +228,10 @@ func TestSamplerSketch(t *testing.T) {
 			{
 				SketchType: execinfrapb.SketchType_HLL_PLUS_PLUS_V1,
 				Columns:    []uint32{1},
+			},
+			{
+				SketchType: execinfrapb.SketchType_HLL_PLUS_PLUS_V1,
+				Columns:    []uint32{0, 1},
 			},
 		},
 	}
@@ -249,9 +256,9 @@ func TestSamplerSketch(t *testing.T) {
 		rows = append(rows, row)
 	}
 
-	// We expect one sampled row and two sketch rows.
-	if len(rows) != 3 {
-		t.Fatalf("expected 3 rows, got %v\n", rows.String(outTypes))
+	// We expect one sampled row and three sketch rows.
+	if len(rows) != 4 {
+		t.Fatalf("expected 4 rows, got %v\n", rows.String(outTypes))
 	}
 	rows = rows[1:]
 

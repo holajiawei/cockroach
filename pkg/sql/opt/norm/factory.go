@@ -67,9 +67,7 @@ type Factory struct {
 	mem *memo.Memo
 
 	// funcs is the struct used to call all custom match and replace functions
-	// used by the normalization rules. It wraps an unnamed xfunc.CustomFuncs,
-	// so it provides a clean interface for calling functions from both the norm
-	// and xfunc packages using the same prefix.
+	// used by the normalization rules.
 	funcs CustomFuncs
 
 	// matchedRule is the callback function that is invoked each time a normalize
@@ -85,22 +83,39 @@ type Factory struct {
 	// catalog is the opt catalog, used to resolve names during constant folding
 	// of special metadata queries like 'table_name'::regclass.
 	catalog cat.Catalog
+
+	// See FoldingControl.
+	foldingControl FoldingControl
 }
 
 // Init initializes a Factory structure with a new, blank memo structure inside.
 // This must be called before the factory can be used (or reused).
+//
+// By default, a factory only constant-folds immutable operators; this can be
+// changed using FoldingControl().AllowStableFolds().
 func (f *Factory) Init(evalCtx *tree.EvalContext, catalog cat.Catalog) {
 	// Initialize (or reinitialize) the memo.
-	if f.mem == nil {
-		f.mem = &memo.Memo{}
+	mem := f.mem
+	if mem == nil {
+		mem = &memo.Memo{}
 	}
-	f.mem.Init(evalCtx)
+	mem.Init(evalCtx)
 
-	f.evalCtx = evalCtx
-	f.catalog = catalog
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*f = Factory{
+		mem:     mem,
+		evalCtx: evalCtx,
+		catalog: catalog,
+	}
+
 	f.funcs.Init(f)
-	f.matchedRule = nil
-	f.appliedRule = nil
+	f.foldingControl.DisallowStableFolds()
+}
+
+// FoldingControl returns the FoldingControl instance for this factory.
+func (f *Factory) FoldingControl() *FoldingControl {
+	return &f.foldingControl
 }
 
 // DetachMemo extracts the memo from the optimizer, and then re-initializes the
@@ -114,11 +129,11 @@ func (f *Factory) Init(evalCtx *tree.EvalContext, catalog cat.Catalog) {
 // placeholders are assigned. If there are no placeholders, there is no need
 // for column statistics, since the memo is already fully optimized.
 func (f *Factory) DetachMemo() *memo.Memo {
-	f.mem.ClearColStats(f.mem.RootExpr())
-	detach := f.mem
+	m := f.mem
 	f.mem = nil
+	m.Detach()
 	f.Init(f.evalCtx, nil /* catalog */)
-	return detach
+	return m
 }
 
 // DisableOptimizations disables all transformation rules. The unaltered input
@@ -258,7 +273,10 @@ func (f *Factory) onConstructRelational(rel memo.RelExpr) memo.RelExpr {
 	// the logical properties of the group in question.
 	if rel.Op() != opt.ValuesOp {
 		relational := rel.Relational()
-		if relational.Cardinality.IsZero() && !relational.CanHaveSideEffects {
+		// We can do this if we only contain leak-proof operators. As an example of
+		// an immutable operator that should not be folded: a Limit on top of an
+		// empty input has to error out if the limit turns out to be negative.
+		if relational.Cardinality.IsZero() && relational.VolatilitySet.IsLeakProof() {
 			if f.matchedRule == nil || f.matchedRule(opt.SimplifyZeroCardinalityGroup) {
 				values := f.funcs.ConstructEmptyValues(relational.OutputCols)
 				if f.appliedRule != nil {
@@ -340,5 +358,5 @@ func (f *Factory) ConstructConstVal(d tree.Datum, t *types.T) opt.ScalarExpr {
 		}
 		return memo.FalseSingleton
 	}
-	return f.ConstructConst(d)
+	return f.ConstructConst(d, t)
 }

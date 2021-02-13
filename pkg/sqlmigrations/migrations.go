@@ -19,16 +19,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations/leasemanager"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -36,7 +42,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 )
 
 var (
@@ -51,6 +58,13 @@ type MigrationManagerTestingKnobs struct {
 	// TODO(mberhault): we could skip only backfill migrations and dependencies
 	// if we had some concept of migration dependencies.
 	DisableBackfillMigrations bool
+	AfterJobMigration         func()
+	// AlwaysRunJobMigration controls whether to always run the schema change job
+	// migration regardless of whether it has been marked as complete.
+	AlwaysRunJobMigration bool
+
+	// AfterEnsureMigrations is called after each call to EnsureMigrations.
+	AfterEnsureMigrations func()
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
@@ -84,8 +98,9 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 	},
 	{
 		// Introduced in v1.0. Permanent migration.
-		name:   "enable diagnostics reporting",
-		workFn: optInToDiagnosticsStatReporting,
+		name:        "enable diagnostics reporting",
+		workFn:      optInToDiagnosticsStatReporting,
+		clusterWide: true,
 	},
 	{
 		// Introduced in v1.1. Baked into v2.0.
@@ -97,8 +112,9 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 	},
 	{
 		// Introduced in v1.1. Permanent migration.
-		name:   "populate initial version cluster setting table entry",
-		workFn: populateVersionSetting,
+		name:        "populate initial version cluster setting table entry",
+		workFn:      populateVersionSetting,
+		clusterWide: true,
 	},
 	{
 		// Introduced in v2.0. Baked into v2.1.
@@ -156,8 +172,9 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 	},
 	{
 		// Introduced in v2.0. Permanent migration.
-		name:   "initialize cluster.secret",
-		workFn: initializeClusterSecret,
+		name:        "initialize cluster.secret",
+		workFn:      initializeClusterSecret,
+		clusterWide: true,
 	},
 	{
 		// Introduced in v2.0. Repeated in v2.1 below.
@@ -179,56 +196,38 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 		// TODO(knz): bake this migration into v19.1.
 		name:             "create default databases",
 		workFn:           createDefaultDbs,
-		newDescriptorIDs: databaseIDs(sessiondata.DefaultDatabaseName, sessiondata.PgDatabaseName),
+		newDescriptorIDs: databaseIDs(catalogkeys.DefaultDatabaseName, catalogkeys.PgDatabaseName),
 	},
 	{
-		// Introduced in v2.1.
-		// TODO(dt): Bake into v19.1.
-		name:   "add progress to system.jobs",
-		workFn: addJobsProgress,
+		// Introduced in v2.1. Baked into 20.1.
+		name: "add progress to system.jobs",
 	},
 	{
 		// Introduced in v19.1.
-		// TODO(knz): bake this migration into v19.2
-		name:   "create system.comment table",
-		workFn: createCommentTable,
-		// This migration has been introduced some time before 19.2.
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.Version19_2),
-		newDescriptorIDs:    staticIDs(keys.CommentsTableID),
+		name: "create system.comment table",
 	},
 	{
-		name:   "create system.replication_constraint_stats table",
-		workFn: createReplicationConstraintStatsTable,
 		// This migration has been introduced some time before 19.2.
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.Version19_2),
-		newDescriptorIDs:    staticIDs(keys.ReplicationConstraintStatsTableID),
+		name: "create system.replication_constraint_stats table",
 	},
 	{
-		name:   "create system.replication_critical_localities table",
-		workFn: createReplicationCriticalLocalitiesTable,
 		// This migration has been introduced some time before 19.2.
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.Version19_2),
-		newDescriptorIDs:    staticIDs(keys.ReplicationCriticalLocalitiesTableID),
+		name: "create system.replication_critical_localities table",
 	},
 	{
-		name:   "create system.reports_meta table",
-		workFn: createReportsMetaTable,
 		// This migration has been introduced some time before 19.2.
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.Version19_2),
-		newDescriptorIDs:    staticIDs(keys.ReportsMetaTableID),
+		name: "create system.reports_meta table",
 	},
 	{
-		name:   "create system.replication_stats table",
-		workFn: createReplicationStatsTable,
 		// This migration has been introduced some time before 19.2.
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.Version19_2),
-		newDescriptorIDs:    staticIDs(keys.ReplicationStatsTableID),
+		name: "create system.replication_stats table",
 	},
 	{
 		// Introduced in v19.1.
 		// TODO(knz): bake this migration into v19.2.
-		name:   "propagate the ts purge interval to the new setting names",
-		workFn: retireOldTsPurgeIntervalSettings,
+		name:        "propagate the ts purge interval to the new setting names",
+		workFn:      retireOldTsPurgeIntervalSettings,
+		clusterWide: true,
 	},
 	{
 		// Introduced in v19.2.
@@ -236,95 +235,123 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 		workFn: updateSystemLocationData,
 	},
 	{
-		// Introduced in v19.2.
-		name:                "change reports fields from timestamp to timestamptz",
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.Version19_2),
-		workFn: func(ctx context.Context, r runner) error {
-			// Note that these particular schema changes are idempotent.
-			if _, err := r.sqlExecutor.ExecEx(ctx, "update-reports-meta-generated", nil, /* txn */
-				sqlbase.InternalExecutorSessionDataOverride{
-					User: security.NodeUser,
-				},
-				`ALTER TABLE system.reports_meta ALTER generated TYPE TIMESTAMP WITH TIME ZONE`,
-			); err != nil {
-				return err
-			}
-			if _, err := r.sqlExecutor.ExecEx(ctx, "update-reports-meta-generated", nil, /* txn */
-				sqlbase.InternalExecutorSessionDataOverride{
-					User: security.NodeUser,
-				},
-				"ALTER TABLE system.replication_constraint_stats ALTER violation_start "+
-					"TYPE TIMESTAMP WITH TIME ZONE",
-			); err != nil {
-				return err
-			}
-			return nil
-		},
+		// Introduced in v19.2, baked into v20.1.
+		name: "change reports fields from timestamp to timestamptz",
 	},
 	{
-		// Introduced in v20.1.
-		// TODO(ajwerner): Bake this migration into v20.2.
-		name:                "create system.protected_ts_meta table",
-		workFn:              createProtectedTimestampsMetaTable,
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.VersionProtectedTimestamps),
-		newDescriptorIDs:    staticIDs(keys.ProtectedTimestampsMetaTableID),
+		// Introduced in v20.1, baked into v20.2.
+		name: "create system.protected_ts_meta table",
 	},
 	{
-		// Introduced in v20.1.
-		// TODO(ajwerner): Bake this migration into v20.2.
-		name:                "create system.protected_ts_records table",
-		workFn:              createProtectedTimestampsRecordsTable,
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.VersionProtectedTimestamps),
-		newDescriptorIDs:    staticIDs(keys.ProtectedTimestampsRecordsTableID),
+		// Introduced in v20.1, baked into v20.2.
+		name: "create system.protected_ts_records table",
 	},
 	{
-		// Introduced in v20.1.
-		name:                "create new system.namespace table",
+		// Introduced in v20.1. Note that this migration
+		// has v2 appended to it because in 20.1 betas, the migration edited the old
+		// system.namespace descriptor to change its Name. This wrought havoc,
+		// causing #47167, which caused 19.2 nodes to fail to be able to read
+		// system.namespace from SQL queries. However, without changing the old
+		// descriptor's Name, backup would fail, since backup requires that no two
+		// descriptors have the same Name. So, in v2 of this migration, we edit
+		// the name of the new table's Descriptor, calling it
+		// namespace2, and re-edit the old descriptor's Name to
+		// be just "namespace" again, to try to help clusters that might have
+		// upgraded to the 20.1 betas with the problem.
+		name:                "create new system.namespace table v2",
 		workFn:              createNewSystemNamespaceDescriptor,
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.VersionNamespaceTableWithSchemas),
+		includedInBootstrap: clusterversion.ByKey(clusterversion.NamespaceTableWithSchemas),
 		newDescriptorIDs:    staticIDs(keys.NamespaceTableID),
 	},
 	{
-		// Introduced in v20.1.
-		name:                "migrate system.namespace_deprecated entries into system.namespace",
-		workFn:              migrateSystemNamespace,
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.VersionNamespaceTableWithSchemas),
+		// Introduced in v20.10. Replaced in v20.1.1 and v20.2 by the
+		// StartSystemNamespaceMigration post-finalization-style migration.
+		name: "migrate system.namespace_deprecated entries into system.namespace",
+		// workFn:              migrateSystemNamespace,
+		includedInBootstrap: clusterversion.ByKey(clusterversion.NamespaceTableWithSchemas),
 	},
 	{
-		// Introduced in v20.1.,
-		name:                "create system.role_options table with an entry for (admin, CREATEROLE)",
-		workFn:              createRoleOptionsTable,
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.VersionCreateRolePrivilege),
-		newDescriptorIDs:    staticIDs(keys.RoleOptionsTableID),
+		// Introduced in v20.1, baked into v20.2.
+		name: "create system.role_options table",
 	},
 	{
-		// Introduced in v20.1.
-		// TODO(andrei): Bake this migration into v20.2.
+		// Introduced in v20.1, baked into v20.2.
 		name: "create statement_diagnostics_requests, statement_diagnostics and " +
 			"system.statement_bundle_chunks tables",
-		workFn:              createStatementInfoSystemTables,
-		includedInBootstrap: clusterversion.VersionByKey(clusterversion.VersionStatementDiagnosticsSystemTables),
-		newDescriptorIDs: staticIDs(keys.StatementBundleChunksTableID,
-			keys.StatementDiagnosticsRequestsTableID, keys.StatementDiagnosticsTableID),
+	},
+	{
+		// Introduced in v20.1. Baked into v20.2.
+		name:   "add CREATEROLE privilege to admin/root",
+		workFn: nil,
+	},
+	{
+		// Introduced in v20.2.
+		name:   "add created_by columns to system.jobs",
+		workFn: alterSystemJobsAddCreatedByColumns,
+		includedInBootstrap: clusterversion.ByKey(
+			clusterversion.AlterSystemJobsAddCreatedByColumns),
+	},
+	{
+		// Introduced in v20.2.
+		name:                "create new system.scheduled_jobs table",
+		workFn:              createScheduledJobsTable,
+		includedInBootstrap: clusterversion.ByKey(clusterversion.AddScheduledJobsTable),
+		newDescriptorIDs:    staticIDs(keys.ScheduledJobsTableID),
+	},
+	{
+		// Introduced in v20.2.
+		name:   "add new sqlliveness table and claim columns to system.jobs",
+		workFn: alterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable,
+		includedInBootstrap: clusterversion.ByKey(
+			clusterversion.AlterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable),
+	},
+	{
+		// Introduced in v20.2.
+		name:   "create new system.tenants table",
+		workFn: createTenantsTable,
+		// NB: no dedicated cluster version was introduced for this table at the
+		// time (4272248e573cbaa4fac436b0ea07195fcd648845). The below is the first
+		// cluster version that was added after the system.tenants table.
+		includedInBootstrap: clusterversion.ByKey(clusterversion.AlterColumnTypeGeneral),
+		newDescriptorIDs:    staticIDs(keys.TenantsTableID),
+	},
+	{
+		// Introduced in v20.2.
+		name:                "alter scheduled jobs",
+		workFn:              alterSystemScheduledJobsFixTableSchema,
+		includedInBootstrap: clusterversion.ByKey(clusterversion.UpdateScheduledJobsSchema),
+	},
+	{
+		// Introduced in v20.2.
+		name:   "add CREATELOGIN privilege to roles with CREATEROLE",
+		workFn: extendCreateRoleWithCreateLogin,
+	},
+	{
+		// Introduced in v20.2.
+		name: "mark non-terminal schema change jobs with a pre-20.1 format version as failed",
 	},
 }
 
-func staticIDs(ids ...sqlbase.ID) func(ctx context.Context, db db) ([]sqlbase.ID, error) {
-	return func(ctx context.Context, db db) ([]sqlbase.ID, error) { return ids, nil }
+func staticIDs(
+	ids ...descpb.ID,
+) func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) {
+	return func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) { return ids, nil }
 }
 
-func databaseIDs(names ...string) func(ctx context.Context, db db) ([]sqlbase.ID, error) {
-	return func(ctx context.Context, db db) ([]sqlbase.ID, error) {
-		var ids []sqlbase.ID
+func databaseIDs(
+	names ...string,
+) func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) {
+	return func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) {
+		var ids []descpb.ID
 		for _, name := range names {
 			// This runs as part of an older migration (introduced in 2.1). We use
 			// the DeprecatedDatabaseKey, and let the 20.1 migration handle moving
 			// from the old namespace table into the new one.
-			kv, err := db.Get(ctx, sqlbase.NewDeprecatedDatabaseKey(name).Key())
+			kv, err := db.Get(ctx, catalogkeys.NewDeprecatedDatabaseKey(name).Key(codec))
 			if err != nil {
 				return nil, err
 			}
-			ids = append(ids, sqlbase.ID(kv.ValueInt()))
+			ids = append(ids, descpb.ID(kv.ValueInt()))
 		}
 		return ids, nil
 	}
@@ -356,11 +383,16 @@ type migrationDescriptor struct {
 	includedInBootstrap roachpb.Version
 	// doesBackfill should be set to true if the migration triggers a backfill.
 	doesBackfill bool
+	// clusterWide migrations are only run by the system tenant. All other
+	// migrations are run by each individual tenant. clusterWide migrations
+	// typically have to do with cluster settings, which is a cluster-wide
+	// concept.
+	clusterWide bool
 	// newDescriptorIDs is a function that returns the IDs of any additional
 	// descriptors that were added by this migration. This is needed to automate
 	// certain tests, which check the number of ranges/descriptors present on
 	// server bootup.
-	newDescriptorIDs func(ctx context.Context, db db) ([]sqlbase.ID, error)
+	newDescriptorIDs func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error)
 }
 
 func init() {
@@ -376,15 +408,16 @@ func init() {
 }
 
 type runner struct {
-	db          db
+	db          DB
+	codec       keys.SQLCodec
 	sqlExecutor *sql.InternalExecutor
 	settings    *cluster.Settings
 }
 
 func (r runner) execAsRoot(ctx context.Context, opName, stmt string, qargs ...interface{}) error {
 	_, err := r.sqlExecutor.ExecEx(ctx, opName, nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{
-			User: security.RootUser,
+		sessiondata.InternalExecutorOverride{
+			User: security.RootUserName(),
 		},
 		stmt, qargs...)
 	return err
@@ -416,13 +449,13 @@ type leaseManager interface {
 	TimeRemaining(l *leasemanager.Lease) time.Duration
 }
 
-// db is defined just to allow us to use a fake client.DB when testing this
+// DB is defined just to allow us to use a fake client.DB when testing this
 // package.
-type db interface {
-	Scan(ctx context.Context, begin, end interface{}, maxRows int64) ([]client.KeyValue, error)
-	Get(ctx context.Context, key interface{}) (client.KeyValue, error)
+type DB interface {
+	Scan(ctx context.Context, begin, end interface{}, maxRows int64) ([]kv.KeyValue, error)
+	Get(ctx context.Context, key interface{}) (kv.KeyValue, error)
 	Put(ctx context.Context, key, value interface{}) error
-	Txn(ctx context.Context, retryable func(ctx context.Context, txn *client.Txn) error) error
+	Txn(ctx context.Context, retryable func(ctx context.Context, txn *kv.Txn) error) error
 }
 
 // Manager encapsulates the necessary functionality for handling migrations
@@ -430,21 +463,25 @@ type db interface {
 type Manager struct {
 	stopper      *stop.Stopper
 	leaseManager leaseManager
-	db           db
+	db           DB
+	codec        keys.SQLCodec
 	sqlExecutor  *sql.InternalExecutor
 	testingKnobs MigrationManagerTestingKnobs
 	settings     *cluster.Settings
+	jobRegistry  *jobs.Registry
 }
 
 // NewManager initializes and returns a new Manager object.
 func NewManager(
 	stopper *stop.Stopper,
-	db *client.DB,
+	db *kv.DB,
+	codec keys.SQLCodec,
 	executor *sql.InternalExecutor,
 	clock *hlc.Clock,
 	testingKnobs MigrationManagerTestingKnobs,
 	clientID string,
 	settings *cluster.Settings,
+	registry *jobs.Registry,
 ) *Manager {
 	opts := leasemanager.Options{
 		ClientID:      clientID,
@@ -454,9 +491,11 @@ func NewManager(
 		stopper:      stopper,
 		leaseManager: leasemanager.New(db, clock, opts),
 		db:           db,
+		codec:        codec,
 		sqlExecutor:  executor,
 		testingKnobs: testingKnobs,
 		settings:     settings,
+		jobRegistry:  registry,
 	}
 }
 
@@ -469,15 +508,16 @@ func NewManager(
 // lifecycle is tightly controlled.
 func ExpectedDescriptorIDs(
 	ctx context.Context,
-	db db,
+	db DB,
+	codec keys.SQLCodec,
 	defaultZoneConfig *zonepb.ZoneConfig,
 	defaultSystemZoneConfig *zonepb.ZoneConfig,
-) (sqlbase.IDs, error) {
-	completedMigrations, err := getCompletedMigrations(ctx, db)
+) (descpb.IDs, error) {
+	completedMigrations, err := getCompletedMigrations(ctx, db, codec)
 	if err != nil {
 		return nil, err
 	}
-	descriptorIDs := sqlbase.MakeMetadataSchema(defaultZoneConfig, defaultSystemZoneConfig).DescriptorIDs()
+	descriptorIDs := bootstrap.MakeMetadataSchema(codec, defaultZoneConfig, defaultSystemZoneConfig).DescriptorIDs()
 	for _, migration := range backwardCompatibleMigrations {
 		// Is the migration not creating descriptors?
 		if migration.newDescriptorIDs == nil ||
@@ -485,8 +525,8 @@ func ExpectedDescriptorIDs(
 			(migration.includedInBootstrap != roachpb.Version{}) {
 			continue
 		}
-		if _, ok := completedMigrations[string(migrationKey(migration))]; ok {
-			newIDs, err := migration.newDescriptorIDs(ctx, db)
+		if _, ok := completedMigrations[string(migrationKey(codec, migration))]; ok {
+			newIDs, err := migration.newDescriptorIDs(ctx, db, codec)
 			if err != nil {
 				return nil, err
 			}
@@ -501,17 +541,17 @@ func ExpectedDescriptorIDs(
 // required migrations have been run (and running all those that are definitely
 // safe to run).
 func (m *Manager) EnsureMigrations(ctx context.Context, bootstrapVersion roachpb.Version) error {
+	if m.testingKnobs.AfterEnsureMigrations != nil {
+		defer m.testingKnobs.AfterEnsureMigrations()
+	}
 	// First, check whether there are any migrations that need to be run.
-	completedMigrations, err := getCompletedMigrations(ctx, m.db)
+	completedMigrations, err := getCompletedMigrations(ctx, m.db, m.codec)
 	if err != nil {
 		return err
 	}
 	allMigrationsCompleted := true
 	for _, migration := range backwardCompatibleMigrations {
-		minVersion := migration.includedInBootstrap
-		if migration.workFn == nil || // has the migration been baked in?
-			// is the migration unnecessary? It's not if it's been baked in.
-			(minVersion != roachpb.Version{} && !bootstrapVersion.Less(minVersion)) {
+		if !m.shouldRunMigration(migration, bootstrapVersion) {
 			continue
 		}
 		if m.testingKnobs.DisableBackfillMigrations && migration.doesBackfill {
@@ -519,7 +559,7 @@ func (m *Manager) EnsureMigrations(ctx context.Context, bootstrapVersion roachpb
 				migration.name)
 			break
 		}
-		key := migrationKey(migration)
+		key := migrationKey(m.codec, migration)
 		if _, ok := completedMigrations[string(key)]; !ok {
 			allMigrationsCompleted = false
 		}
@@ -538,7 +578,7 @@ func (m *Manager) EnsureMigrations(ctx context.Context, bootstrapVersion roachpb
 		log.Info(ctx, "trying to acquire lease")
 	}
 	for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
-		lease, err = m.leaseManager.AcquireLease(ctx, keys.MigrationLease)
+		lease, err = m.leaseManager.AcquireLease(ctx, m.codec.MigrationLeaseKey())
 		if err == nil {
 			break
 		}
@@ -591,7 +631,7 @@ func (m *Manager) EnsureMigrations(ctx context.Context, bootstrapVersion roachpb
 
 	// Re-get the list of migrations in case any of them were completed between
 	// our initial check and our grabbing of the lease.
-	completedMigrations, err = getCompletedMigrations(ctx, m.db)
+	completedMigrations, err = getCompletedMigrations(ctx, m.db, m.codec)
 	if err != nil {
 		return err
 	}
@@ -599,18 +639,16 @@ func (m *Manager) EnsureMigrations(ctx context.Context, bootstrapVersion roachpb
 	startTime := timeutil.Now().String()
 	r := runner{
 		db:          m.db,
+		codec:       m.codec,
 		sqlExecutor: m.sqlExecutor,
 		settings:    m.settings,
 	}
 	for _, migration := range backwardCompatibleMigrations {
-		minVersion := migration.includedInBootstrap
-		if migration.workFn == nil || // has the migration been baked in?
-			// is the migration unnecessary? It's not if it's been baked in.
-			(minVersion != roachpb.Version{} && !bootstrapVersion.Less(minVersion)) {
+		if !m.shouldRunMigration(migration, bootstrapVersion) {
 			continue
 		}
 
-		key := migrationKey(migration)
+		key := migrationKey(m.codec, migration)
 		if _, ok := completedMigrations[string(key)]; ok {
 			continue
 		}
@@ -638,11 +676,228 @@ func (m *Manager) EnsureMigrations(ctx context.Context, bootstrapVersion roachpb
 	return nil
 }
 
-func getCompletedMigrations(ctx context.Context, db db) (map[string]struct{}, error) {
+func (m *Manager) shouldRunMigration(
+	migration migrationDescriptor, bootstrapVersion roachpb.Version,
+) bool {
+	if migration.workFn == nil {
+		// The migration has been baked in.
+		return false
+	}
+	minVersion := migration.includedInBootstrap
+	if minVersion != (roachpb.Version{}) && !bootstrapVersion.Less(minVersion) {
+		// The migration is unnecessary.
+		return false
+	}
+	if migration.clusterWide && !m.codec.ForSystemTenant() {
+		// The migration is a cluster-wide migration and we are not the
+		// system tenant.
+		return false
+	}
+	return true
+}
+
+var systemNamespaceMigrationName = "upgrade system.namespace post-20.1-finalization"
+
+func systemNamespaceMigrationKey(codec keys.SQLCodec) roachpb.Key {
+	return append(codec.MigrationKeyPrefix(), roachpb.RKey(systemNamespaceMigrationName)...)
+}
+
+var systemNamespaceMigrationEnabled = settings.RegisterBoolSetting(
+	"testing.system_namespace_migration.enabled",
+	"internal testing only: disable the system namespace migration",
+	true,
+)
+
+// StartSystemNamespaceMigration starts an async task to run the migration that
+// migrates entries from system.namespace (descriptor 2) to system.namespace2
+// (descriptor 30). The task first waits until the upgrade to 20.1 is finalized
+// before running the migration. The migration is retried until it succeeds (on
+// any node).
+func (m *Manager) StartSystemNamespaceMigration(
+	ctx context.Context, bootstrapVersion roachpb.Version,
+) error {
+	if !bootstrapVersion.Less(clusterversion.ByKey(clusterversion.NamespaceTableWithSchemas)) {
+		// Our bootstrap version is equal to or greater than 20.1, where no old
+		// namespace table is created: we can skip this migration.
+		return nil
+	}
+	return m.stopper.RunAsyncTask(ctx, "run-system-namespace-migration", func(ctx context.Context) {
+		log.Info(ctx, "starting wait for upgrade finalization before system.namespace migration")
+		// First wait for the cluster to finalize the upgrade to 20.1. These values
+		// were chosen to be similar to the retry loop for finalizing the cluster
+		// upgrade.
+		waitRetryOpts := retry.Options{
+			InitialBackoff: 10 * time.Second,
+			MaxBackoff:     10 * time.Second,
+			Closer:         m.stopper.ShouldQuiesce(),
+		}
+		for retry := retry.StartWithCtx(ctx, waitRetryOpts); retry.Next(); {
+			if !systemNamespaceMigrationEnabled.Get(&m.settings.SV) {
+				continue
+			}
+			if m.settings.Version.IsActive(ctx, clusterversion.NamespaceTableWithSchemas) {
+				break
+			}
+		}
+		select {
+		case <-m.stopper.ShouldQuiesce():
+			return
+		default:
+		}
+		log.VEventf(ctx, 2, "detected upgrade finalization for system.namespace migration")
+
+		migrationKey := systemNamespaceMigrationKey(m.codec)
+		// Check whether this migration has already been completed.
+		if kv, err := m.db.Get(ctx, migrationKey); err != nil {
+			log.Infof(ctx, "error getting record of system.namespace migration: %s", err.Error())
+		} else if kv.Exists() {
+			log.Infof(ctx, "system.namespace migration already complete")
+			return
+		}
+
+		// Now run the migration. This is retried indefinitely until it finishes.
+		log.Infof(ctx, "starting system.namespace migration")
+		r := runner{
+			db:          m.db,
+			codec:       m.codec,
+			sqlExecutor: m.sqlExecutor,
+			settings:    m.settings,
+		}
+		migrationRetryOpts := retry.Options{
+			InitialBackoff: 1 * time.Minute,
+			MaxBackoff:     10 * time.Minute,
+			Closer:         m.stopper.ShouldQuiesce(),
+		}
+		startTime := timeutil.Now().String()
+		for migRetry := retry.Start(migrationRetryOpts); migRetry.Next(); {
+			if err := m.migrateSystemNamespace(ctx, migrationKey, r, startTime); err != nil {
+				log.Errorf(ctx, "error attempting running system.namespace migration, will retry: %s %s", err.Error(),
+					startTime)
+				continue
+			}
+			break
+		}
+	})
+}
+
+// migrateSystemNamespace migrates entries from the deprecated system.namespace
+// table to the new one, which includes a parentSchemaID column. Each database
+// entry is copied to the new table along with a corresponding entry for the
+// 'public' schema. Each table entry is copied over with the public schema as
+// as its parentSchemaID.
+//
+// Only entries that do not exist in the new table are copied.
+//
+// New database and table entries continue to be written to the deprecated
+// namespace table until NamespaceTableWithSchemas is active. This means
+// that an additional migration will be necessary in 20.2 to catch any new
+// entries which may have been missed by this one. In the meantime, namespace
+// lookups fall back to the deprecated table if a name is not found in the new
+// one.
+func (m *Manager) migrateSystemNamespace(
+	ctx context.Context, migrationKey roachpb.Key, r runner, startTime string,
+) error {
+	migrateCtx, cancel := m.stopper.WithCancelOnQuiesce(ctx)
+	defer cancel()
+	migrateCtx = logtags.AddTag(migrateCtx, "system-namespace-migration", nil)
+	// Loop until there's no more work to be done.
+	workLeft := true
+	for workLeft {
+		if err := m.db.Txn(migrateCtx, func(ctx context.Context, txn *kv.Txn) error {
+			// Check again to see if someone else wrote the migration key.
+			if kv, err := txn.Get(ctx, migrationKey); err != nil {
+				log.Infof(ctx, "error getting record of system.namespace migration: %s", err.Error())
+				// Retry the migration.
+				return err
+			} else if kv.Exists() {
+				// Give up, no work to be done.
+				log.Infof(ctx, "system.namespace migration already complete")
+				return nil
+			}
+			// Fetch all entries that are not present in the new namespace table. Each
+			// of these entries will be copied to the new table.
+			//
+			// Note that we are very careful to always delete from both namespace tables
+			// in 20.1, so there's no possibility that we'll be overwriting a deleted
+			// table that existed in the old table and the new table but was deleted
+			// from only the new table.
+			const batchSize = 1000
+			q := fmt.Sprintf(
+				`SELECT "parentID", name, id FROM [%d AS namespace_deprecated]
+              WHERE id NOT IN (SELECT id FROM [%d AS namespace]) LIMIT %d`,
+				systemschema.DeprecatedNamespaceTable.GetID(), systemschema.NamespaceTable.GetID(), batchSize+1)
+			rows, err := r.sqlExecutor.QueryEx(
+				ctx, "read-deprecated-namespace-table", txn,
+				sessiondata.InternalExecutorOverride{
+					User: security.RootUserName(),
+				},
+				q)
+			if err != nil {
+				return err
+			}
+			log.Infof(ctx, "migrating system.namespace chunk with %d rows", len(rows))
+			for i, row := range rows {
+				workLeft = false
+				// We found some rows from the query, which means that we can't quit
+				// just yet.
+				if i >= batchSize {
+					workLeft = true
+					// Just process 1000 rows at a time.
+					break
+				}
+				parentID := descpb.ID(tree.MustBeDInt(row[0]))
+				name := string(tree.MustBeDString(row[1]))
+				id := descpb.ID(tree.MustBeDInt(row[2]))
+				if parentID == keys.RootNamespaceID {
+					// This row represents a database. Add it to the new namespace table.
+					databaseKey := catalogkeys.NewDatabaseKey(name)
+					if err := txn.Put(ctx, databaseKey.Key(r.codec), id); err != nil {
+						return err
+					}
+					// Also create a 'public' schema for this database.
+					schemaKey := catalogkeys.NewSchemaKey(id, "public")
+					log.VEventf(ctx, 2, "migrating system.namespace entry for database %s", name)
+					if err := txn.Put(ctx, schemaKey.Key(r.codec), keys.PublicSchemaID); err != nil {
+						return err
+					}
+				} else {
+					// This row represents a table. Add it to the new namespace table with the
+					// schema set to 'public'.
+					if id == keys.DeprecatedNamespaceTableID {
+						// The namespace table itself was already handled in
+						// createNewSystemNamespaceDescriptor. Do not overwrite it with the
+						// deprecated ID.
+						continue
+					}
+					tableKey := catalogkeys.NewTableKey(parentID, keys.PublicSchemaID, name)
+					log.VEventf(ctx, 2, "migrating system.namespace entry for table %s", name)
+					if err := txn.Put(ctx, tableKey.Key(r.codec), id); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	// No more work to be done.
+	log.Infof(migrateCtx, "system.namespace migration completed")
+	if err := m.db.Put(migrateCtx, migrationKey, startTime); err != nil {
+		log.Warningf(migrateCtx, "error persisting record of system.namespace migration, will retry: %s", err.Error())
+		return err
+	}
+	return nil
+}
+
+func getCompletedMigrations(
+	ctx context.Context, db DB, codec keys.SQLCodec,
+) (map[string]struct{}, error) {
 	if log.V(1) {
 		log.Info(ctx, "trying to get the list of completed migrations")
 	}
-	keyvals, err := db.Scan(ctx, keys.MigrationPrefix, keys.MigrationKeyMax, 0 /* maxRows */)
+	prefix := codec.MigrationKeyPrefix()
+	keyvals, err := db.Scan(ctx, prefix, prefix.PrefixEnd(), 0 /* maxRows */)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get list of completed migrations")
 	}
@@ -653,85 +908,58 @@ func getCompletedMigrations(ctx context.Context, db db) (map[string]struct{}, er
 	return completedMigrations, nil
 }
 
-func migrationKey(migration migrationDescriptor) roachpb.Key {
-	return append(keys.MigrationPrefix, roachpb.RKey(migration.name)...)
+func migrationKey(codec keys.SQLCodec, migration migrationDescriptor) roachpb.Key {
+	return append(codec.MigrationKeyPrefix(), roachpb.RKey(migration.name)...)
 }
 
-func createSystemTable(ctx context.Context, r runner, desc sqlbase.TableDescriptor) error {
+func createSystemTable(ctx context.Context, r runner, desc catalog.TableDescriptor) error {
+	return CreateSystemTable(ctx, r.db, r.codec, r.settings, desc)
+}
+
+// CreateSystemTable is a function to inject a new system table. If the table
+// already exists, ths function is a no-op.
+func CreateSystemTable(
+	ctx context.Context,
+	db DB,
+	codec keys.SQLCodec,
+	settings *cluster.Settings,
+	desc catalog.TableDescriptor,
+) error {
 	// We install the table at the KV layer so that we can choose a known ID in
 	// the reserved ID space. (The SQL layer doesn't allow this.)
-	err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		b := txn.NewBatch()
-		tKey := sqlbase.MakePublicTableNameKey(ctx, r.settings, desc.GetParentID(), desc.GetName())
-		b.CPut(tKey.Key(), desc.GetID(), nil)
-		b.CPut(sqlbase.MakeDescMetadataKey(desc.GetID()), sqlbase.WrapDescriptor(&desc), nil)
-		if err := txn.SetSystemConfigTrigger(); err != nil {
+		tKey := catalogkv.MakePublicTableNameKey(ctx, settings, desc.GetParentID(), desc.GetName())
+		b.CPut(tKey.Key(codec), desc.GetID(), nil)
+		b.CPut(catalogkeys.MakeDescMetadataKey(codec, desc.GetID()), desc.DescriptorProto(), nil)
+		if err := txn.SetSystemConfigTrigger(codec.ForSystemTenant()); err != nil {
 			return err
 		}
 		return txn.Run(ctx, b)
 	})
 	// CPuts only provide idempotent inserts if we ignore the errors that arise
 	// when the condition isn't met.
-	if _, ok := err.(*roachpb.ConditionFailedError); ok {
+	if errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
 		return nil
 	}
 	return err
 }
 
-func createCommentTable(ctx context.Context, r runner) error {
-	return createSystemTable(ctx, r, sqlbase.CommentsTable)
-}
-
-func createReplicationConstraintStatsTable(ctx context.Context, r runner) error {
-	if err := createSystemTable(ctx, r, sqlbase.ReplicationConstraintStatsTable); err != nil {
-		return err
-	}
-	err := r.execAsRoot(ctx, "add-constraints-ttl",
-		fmt.Sprintf(
-			"ALTER TABLE system.replication_constraint_stats CONFIGURE ZONE USING gc.ttlseconds = %d",
-			int(sqlbase.ReplicationConstraintStatsTableTTL.Seconds())))
-	return errors.Wrapf(err, "failed to set TTL on %s", sqlbase.ReplicationConstraintStatsTable.Name)
-}
-
-func createReplicationCriticalLocalitiesTable(ctx context.Context, r runner) error {
-	return createSystemTable(ctx, r, sqlbase.ReplicationCriticalLocalitiesTable)
-}
-
-func createReplicationStatsTable(ctx context.Context, r runner) error {
-	if err := createSystemTable(ctx, r, sqlbase.ReplicationStatsTable); err != nil {
-		return err
-	}
-	err := r.execAsRoot(ctx, "add-replication-status-ttl",
-		fmt.Sprintf("ALTER TABLE system.replication_stats CONFIGURE ZONE USING gc.ttlseconds = %d",
-			int(sqlbase.ReplicationStatsTableTTL.Seconds())))
-	return errors.Wrapf(err, "failed to set TTL on %s", sqlbase.ReplicationStatsTable.Name)
-}
-
-func createProtectedTimestampsMetaTable(ctx context.Context, r runner) error {
-	return errors.Wrap(createSystemTable(ctx, r, sqlbase.ProtectedTimestampsMetaTable),
-		"failed to create system.protected_ts_meta")
-}
-
-func createProtectedTimestampsRecordsTable(ctx context.Context, r runner) error {
-	return errors.Wrap(createSystemTable(ctx, r, sqlbase.ProtectedTimestampsRecordsTable),
-		"failed to create system.protected_ts_records")
-}
-
 func createNewSystemNamespaceDescriptor(ctx context.Context, r runner) error {
-
-	return r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	return r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		b := txn.NewBatch()
 
 		// Retrieve the existing namespace table's descriptor and change its name to
-		// "namespace_deprecated". This prevents name collisions with the new
-		// namespace table, for instance during backup.
-		deprecatedKey := sqlbase.MakeDescMetadataKey(keys.DeprecatedNamespaceTableID)
-		deprecatedDesc := &sqlbase.Descriptor{}
+		// "namespace". This corrects the behavior of this migration as it existed
+		// in 20.1 betas. The old namespace table cannot be edited without breaking
+		// explicit selects from system.namespace in 19.2.
+		deprecatedKey := catalogkeys.MakeDescMetadataKey(r.codec, keys.DeprecatedNamespaceTableID)
+		deprecatedDesc := &descpb.Descriptor{}
 		ts, err := txn.GetProtoTs(ctx, deprecatedKey, deprecatedDesc)
 		if err != nil {
 			return err
 		}
-		deprecatedDesc.Table(ts).Name = sqlbase.DeprecatedNamespaceTable.Name
+		descpb.TableFromDescriptor(deprecatedDesc, ts).Name = systemschema.DeprecatedNamespaceTable.GetName()
 		b.Put(deprecatedKey, deprecatedDesc)
 
 		// The 19.2 namespace table contains an entry for "namespace" which maps to
@@ -745,106 +973,26 @@ func createNewSystemNamespaceDescriptor(ctx context.Context, r runner) error {
 		//    idempotent semantics of the migration ensure that "namespace" maps to
 		//    the correct ID in the new system.namespace table after all tables are
 		//    copied over.
-		nameKey := sqlbase.NewPublicTableKey(
-			sqlbase.NamespaceTable.GetParentID(), sqlbase.NamespaceTable.GetName())
-		b.Put(nameKey.Key(), sqlbase.NamespaceTable.GetID())
-		b.Put(sqlbase.MakeDescMetadataKey(
-			sqlbase.NamespaceTable.GetID()), sqlbase.WrapDescriptor(&sqlbase.NamespaceTable))
+		nameKey := catalogkeys.NewPublicTableKey(
+			systemschema.NamespaceTable.GetParentID(), systemschema.NamespaceTableName)
+		b.Put(nameKey.Key(r.codec), systemschema.NamespaceTable.GetID())
+		b.Put(catalogkeys.MakeDescMetadataKey(
+			r.codec, systemschema.NamespaceTable.GetID()), systemschema.NamespaceTable.DescriptorProto())
 		return txn.Run(ctx, b)
 	})
 }
 
-func createRoleOptionsTable(ctx context.Context, r runner) error {
-	// Create system.role_options table with an entry for (admin, CREATEROLE).
-	err := createSystemTable(ctx, r, sqlbase.RoleOptionsTable)
-	if err != nil {
-		return errors.Wrap(err, "failed to create system.role_options")
-	}
-
-	// Upsert the admin role with CreateRole privilege into the table.
-	// We intentionally override any existing entry.
-	const upsertAdminStmt = `
-          UPSERT INTO system.role_options (username, option, value) VALUES ($1, 'CREATEROLE', NULL)
-          `
+func extendCreateRoleWithCreateLogin(ctx context.Context, r runner) error {
+	// Add the CREATELOGIN option to roles that already have CREATEROLE.
+	const upsertCreateRoleStmt = `
+     UPSERT INTO system.role_options (username, option, value)
+        SELECT username, 'CREATELOGIN', NULL
+          FROM system.role_options
+         WHERE option = 'CREATEROLE'
+     `
 	return r.execAsRootWithRetry(ctx,
-		"add role options table and upsert admin with CREATEROLE",
-		upsertAdminStmt,
-		sqlbase.AdminRole)
-}
-
-// migrateSystemNamespace migrates entries from the deprecated system.namespace
-// table to the new one, which includes a parentSchemaID column. Each database
-// entry is copied to the new table along with a corresponding entry for the
-// 'public' schema. Each table entry is copied over with the public schema as
-// as its parentSchemaID.
-//
-// New database and table entries continue to be written to the deprecated
-// namespace table until VersionNamespaceTableWithSchemas is active. This means
-// that an additional migration will be necessary in 20.2 to catch any new
-// entries which may have been missed by this one. In the meantime, namespace
-// lookups fall back to the deprecated table if a name is not found in the new
-// one.
-func migrateSystemNamespace(ctx context.Context, r runner) error {
-	q := fmt.Sprintf(
-		`SELECT "parentID", name, id FROM [%d AS namespace_deprecated]`,
-		sqlbase.DeprecatedNamespaceTable.ID)
-	rows, err := r.sqlExecutor.QueryEx(
-		ctx, "read-deprecated-namespace-table", nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{
-			User: security.RootUser,
-		},
-		q)
-	if err != nil {
-		return err
-	}
-	for _, row := range rows {
-		parentID := sqlbase.ID(tree.MustBeDInt(row[0]))
-		name := string(tree.MustBeDString(row[1]))
-		id := sqlbase.ID(tree.MustBeDInt(row[2]))
-		if parentID == keys.RootNamespaceID {
-			// This row represents a database. Add it to the new namespace table.
-			databaseKey := sqlbase.NewDatabaseKey(name)
-			if err := r.db.Put(ctx, databaseKey.Key(), id); err != nil {
-				return err
-			}
-			// Also create a 'public' schema for this database.
-			schemaKey := sqlbase.NewSchemaKey(id, "public")
-			if err := r.db.Put(ctx, schemaKey.Key(), keys.PublicSchemaID); err != nil {
-				return err
-			}
-		} else {
-			// This row represents a table. Add it to the new namespace table with the
-			// schema set to 'public'.
-			if id == keys.DeprecatedNamespaceTableID {
-				// The namespace table itself was already handled in
-				// createNewSystemNamespaceDescriptor. Do not overwrite it with the
-				// deprecated ID.
-				continue
-			}
-			tableKey := sqlbase.NewTableKey(parentID, keys.PublicSchemaID, name)
-			if err := r.db.Put(ctx, tableKey.Key(), id); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func createReportsMetaTable(ctx context.Context, r runner) error {
-	return createSystemTable(ctx, r, sqlbase.ReportsMetaTable)
-}
-
-func createStatementInfoSystemTables(ctx context.Context, r runner) error {
-	if err := createSystemTable(ctx, r, sqlbase.StatementBundleChunksTable); err != nil {
-		return errors.Wrap(err, "failed to create system.statement_bundle_chunks")
-	}
-	if err := createSystemTable(ctx, r, sqlbase.StatementDiagnosticsRequestsTable); err != nil {
-		return errors.Wrap(err, "failed to create system.statement_diagnostics_requests")
-	}
-	if err := createSystemTable(ctx, r, sqlbase.StatementDiagnosticsTable); err != nil {
-		return errors.Wrap(err, "failed to create system.statement_diagnostics")
-	}
-	return nil
+		"add CREATELOGIN where a role already has CREATEROLE",
+		upsertCreateRoleStmt)
 }
 
 // SettingsDefaultOverrides documents the effect of several migrations that add
@@ -873,7 +1021,7 @@ func initializeClusterSecret(ctx context.Context, r runner) error {
 
 func populateVersionSetting(ctx context.Context, r runner) error {
 	var v roachpb.Version
-	if err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	if err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		return txn.GetProto(ctx, keys.BootstrapVersionKey, &v)
 	}); err != nil {
 		return err
@@ -902,7 +1050,24 @@ func populateVersionSetting(ctx context.Context, r runner) error {
 		return err
 	}
 
-	if err := r.execAsRoot(
+	// NB: We have to run with retry here due to the following "race" condition:
+	// - We're attempting to the set the cluster version at startup.
+	// - Setting the cluster version requires all nodes to be up and running, in
+	//   order to push out all relevant version gates.
+	// - This list of "all nodes" is gathered by looking at all the liveness
+	//   records in KV.
+	// - When starting a multi-node cluster all at once, nodes other than the
+	//   one being bootstrapped join the cluster using the join RPC.
+	// - The join RPC results in the creation of a liveness record for the
+	//   joining node, except it starts off in an expired state (leaving it to
+	//   the joining node to heartbeat it for the very first time).
+	//
+	// Attempting to set the cluster version at startup, while there also may be
+	// other nodes trying to join, could then result in failures where the
+	// migration infrastructure find expired liveness records and gives up. To
+	// that end we'll simply retry, expecting the joining nodes to "come live"
+	// before long.
+	if err := r.execAsRootWithRetry(
 		ctx, "set-setting", "SET CLUSTER SETTING version = $1", v.String(),
 	); err != nil {
 		return err
@@ -923,7 +1088,7 @@ func addAdminRole(ctx context.Context, r runner) error {
 	const upsertAdminStmt = `
           UPSERT INTO system.users (username, "hashedPassword", "isRole") VALUES ($1, '', true)
           `
-	return r.execAsRootWithRetry(ctx, "addAdminRole", upsertAdminStmt, sqlbase.AdminRole)
+	return r.execAsRootWithRetry(ctx, "addAdminRole", upsertAdminStmt, security.AdminRole)
 }
 
 func addRootToAdminRole(ctx context.Context, r runner) error {
@@ -932,7 +1097,7 @@ func addRootToAdminRole(ctx context.Context, r runner) error {
           UPSERT INTO system.role_members ("role", "member", "isAdmin") VALUES ($1, $2, true)
           `
 	return r.execAsRootWithRetry(
-		ctx, "addRootToAdminRole", upsertAdminStmt, sqlbase.AdminRole, security.RootUser)
+		ctx, "addRootToAdminRole", upsertAdminStmt, security.AdminRole, security.RootUser)
 }
 
 func disallowPublicUserOrRole(ctx context.Context, r runner) error {
@@ -944,10 +1109,10 @@ func disallowPublicUserOrRole(ctx context.Context, r runner) error {
 	for retry := retry.Start(retry.Options{MaxRetries: 5}); retry.Next(); {
 		row, err := r.sqlExecutor.QueryRowEx(
 			ctx, "disallowPublicUserOrRole", nil, /* txn */
-			sqlbase.InternalExecutorSessionDataOverride{
-				User: security.RootUser,
+			sessiondata.InternalExecutorOverride{
+				User: security.RootUserName(),
 			},
-			selectPublicStmt, sqlbase.PublicRole,
+			selectPublicStmt, security.PublicRole,
 		)
 		if err != nil {
 			continue
@@ -965,11 +1130,11 @@ func disallowPublicUserOrRole(ctx context.Context, r runner) error {
 		if isRole {
 			return fmt.Errorf(`found a role named %s which is now a reserved name. Please drop the role `+
 				`(DROP ROLE %s) using a previous version of CockroachDB and try again`,
-				sqlbase.PublicRole, sqlbase.PublicRole)
+				security.PublicRole, security.PublicRole)
 		}
 		return fmt.Errorf(`found a user named %s which is now a reserved name. Please drop the role `+
 			`(DROP USER %s) using a previous version of CockroachDB and try again`,
-			sqlbase.PublicRole, sqlbase.PublicRole)
+			security.PublicRole, security.PublicRole)
 	}
 	return nil
 }
@@ -982,9 +1147,9 @@ func createDefaultDbs(ctx context.Context, r runner) error {
 
 	var err error
 	for retry := retry.Start(retry.Options{MaxRetries: 5}); retry.Next(); {
-		for _, dbName := range []string{sessiondata.DefaultDatabaseName, sessiondata.PgDatabaseName} {
+		for _, dbName := range []string{catalogkeys.DefaultDatabaseName, catalogkeys.PgDatabaseName} {
 			stmt := fmt.Sprintf(createDbStmt, dbName)
-			err = r.execAsRoot(ctx, "create-default-db", stmt)
+			err = r.execAsRoot(ctx, "create-default-DB", stmt)
 			if err != nil {
 				log.Warningf(ctx, "failed attempt to add database %q: %s", dbName, err)
 				break
@@ -995,40 +1160,6 @@ func createDefaultDbs(ctx context.Context, r runner) error {
 		}
 	}
 	return err
-}
-
-func addJobsProgress(ctx context.Context, r runner) error {
-	// Ideally to add a column progress, we'd just run a query like:
-	//  ALTER TABLE system.jobs ADD COLUMN progress BYTES CREATE FAMLIY progress;
-	// However SQL-managed schema changes use jobs tracking internally, which will
-	// fail if the jobs table's schema has not been migrated. Rather than add very
-	// significant complexity to the jobs code to try to handle pre- and post-
-	// migration schemas, we can dodge the chicken-and-egg problem by doing our
-	// schema change manually.
-	return r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		if err := txn.SetSystemConfigTrigger(); err != nil {
-			return err
-		}
-		desc, err := sqlbase.GetMutableTableDescFromID(ctx, txn, keys.JobsTableID)
-		if err != nil {
-			return err
-		}
-		if _, err := desc.FindActiveColumnByName("progress"); err == nil {
-			return nil
-		}
-		desc.AddColumn(&sqlbase.ColumnDescriptor{
-			Name:     "progress",
-			Type:     *types.Bytes,
-			Nullable: true,
-		})
-		if err := desc.AddColumnToFamilyMaybeCreate("progress", "progress", true, false); err != nil {
-			return err
-		}
-		if err := desc.AllocateIDs(); err != nil {
-			return err
-		}
-		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(desc.ID), sqlbase.WrapDescriptor(desc))
-	})
 }
 
 func retireOldTsPurgeIntervalSettings(ctx context.Context, r runner) error {
@@ -1072,10 +1203,13 @@ func updateSystemLocationData(ctx context.Context, r runner) error {
 	// If so, we don't want to do anything.
 	row, err := r.sqlExecutor.QueryRowEx(ctx, "update-system-locations",
 		nil, /* txn */
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		`SELECT count(*) FROM system.locations`)
 	if err != nil {
 		return err
+	}
+	if row == nil {
+		return errors.New("failed to update system locations")
 	}
 	count := int(tree.MustBeDInt(row[0]))
 	if count != 0 {
@@ -1092,4 +1226,72 @@ func updateSystemLocationData(ctx context.Context, r runner) error {
 		}
 	}
 	return nil
+}
+func alterSystemJobsAddCreatedByColumns(ctx context.Context, r runner) error {
+	// NB: we use family name as it existed in the original system.jobs schema to
+	// minimize migration work needed (avoid renames).
+	addColsStmt := `
+ALTER TABLE system.jobs
+ADD COLUMN IF NOT EXISTS created_by_type STRING FAMILY fam_0_id_status_created_payload,
+ADD COLUMN IF NOT EXISTS created_by_id INT FAMILY fam_0_id_status_created_payload
+`
+	addIdxStmt := `
+CREATE INDEX IF NOT EXISTS jobs_created_by_type_created_by_id_idx
+ON system.jobs (created_by_type, created_by_id)
+STORING (status)
+`
+	asNode := sessiondata.InternalExecutorOverride{
+		User: security.NodeUserName(),
+	}
+
+	if _, err := r.sqlExecutor.ExecEx(
+		ctx, "add-jobs-cols", nil, asNode, addColsStmt); err != nil {
+		return err
+	}
+
+	_, err := r.sqlExecutor.ExecEx(ctx, "add-jobs-idx", nil, asNode, addIdxStmt)
+	return err
+}
+
+func createScheduledJobsTable(ctx context.Context, r runner) error {
+	return createSystemTable(ctx, r, systemschema.ScheduledJobsTable)
+}
+
+func alterSystemJobsAddSqllivenessColumnsAddNewSystemSqllivenessTable(
+	ctx context.Context, r runner,
+) error {
+	addColsStmt := `
+ALTER TABLE system.jobs
+ADD COLUMN IF NOT EXISTS claim_session_id BYTES CREATE FAMILY claim,
+ADD COLUMN IF NOT EXISTS claim_instance_id INT8 FAMILY claim
+`
+	asNode := sessiondata.InternalExecutorOverride{
+		User: security.NodeUserName(),
+	}
+	if _, err := r.sqlExecutor.ExecEx(ctx, "add-jobs-claim-cols", nil, asNode, addColsStmt); err != nil {
+		return err
+	}
+	return createSystemTable(ctx, r, systemschema.SqllivenessTable)
+}
+
+func createTenantsTable(ctx context.Context, r runner) error {
+	return createSystemTable(ctx, r, systemschema.TenantsTable)
+}
+
+func alterSystemScheduledJobsFixTableSchema(ctx context.Context, r runner) error {
+	setOwner := "UPDATE system.scheduled_jobs SET owner='root' WHERE owner IS NULL"
+	asNode := sessiondata.InternalExecutorOverride{User: security.NodeUserName()}
+
+	if _, err := r.sqlExecutor.ExecEx(ctx, "set-schedule-owner", nil, asNode, setOwner); err != nil {
+		return err
+	}
+
+	alterSchedules := `
+ALTER TABLE system.scheduled_jobs
+ADD COLUMN IF NOT EXISTS schedule_state BYTES FAMILY sched,
+ALTER COLUMN owner SET NOT NULL,
+DROP COLUMN IF EXISTS schedule_changes
+`
+	_, err := r.sqlExecutor.ExecEx(ctx, "alter-scheduled-jobs", nil, asNode, alterSchedules)
+	return err
 }

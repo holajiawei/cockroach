@@ -15,19 +15,34 @@ import { EmailSubscriptionForm } from "src/views/shared/components/emailSubscrip
 import { signUpForEmailSubscription } from "src/redux/customAnalytics";
 import { AdminUIState } from "src/redux/state";
 import { clusterIdSelector } from "src/redux/nodes";
-import { LocalSetting } from "src/redux/localsettings";
 
 import "./emailSubscription.styl";
+import {
+  loadUIData,
+  RELEASE_NOTES_SIGNUP_DISMISSED_KEY,
+  saveUIData,
+} from "src/redux/uiData";
+import { dismissReleaseNotesSignupForm } from "src/redux/uiDataSelectors";
+import { emailSubscriptionAlertLocalSetting } from "src/redux/alerts";
 
 type EmailSubscriptionProps = MapDispatchToProps & MapStateToProps;
 
 class EmailSubscription extends React.Component<EmailSubscriptionProps> {
-  handleEmailSubscriptionSubmit = (email: string) => {
-    this.props.signUpForEmailSubscription(this.props.clusterId, email);
+  componentDidMount() {
+    this.props.refresh();
   }
 
+  handleEmailSubscriptionSubmit = (email: string) => {
+    this.props.signUpForEmailSubscription(this.props.clusterId, email);
+  };
+
   handlePanelHide = () => {
+    this.props.dismissAlertMessage();
     this.props.hidePanel();
+  };
+
+  componentWillUnmount() {
+    this.props.dismissAlertMessage();
   }
 
   render() {
@@ -42,12 +57,14 @@ class EmailSubscription extends React.Component<EmailSubscriptionProps> {
         <div className="crl-email-subscription">
           <div className="crl-email-subscription__text">
             <div>
-              Keep up-to-date with CockroachDB
-              software releases and best practices.
+              Keep up-to-date with CockroachDB software releases and best
+              practices.
             </div>
           </div>
           <div className="crl-email-subscription__controls">
-            <EmailSubscriptionForm onSubmit={this.handleEmailSubscriptionSubmit} />
+            <EmailSubscriptionForm
+              onSubmit={this.handleEmailSubscriptionSubmit}
+            />
           </div>
           <div
             onClick={this.handlePanelHide}
@@ -61,18 +78,23 @@ class EmailSubscription extends React.Component<EmailSubscriptionProps> {
   }
 }
 
-const hidePanelLocalSetting = new LocalSetting<AdminUIState, boolean>(
-  "dashboard/release_notes_signup/hide", (s) => s.localSettings, false,
-);
-
 interface MapDispatchToProps {
   signUpForEmailSubscription: (clusterId: string, email: string) => void;
   hidePanel: () => void;
+  refresh: () => void;
+  dismissAlertMessage: () => void;
 }
 
 const mapDispatchToProps = {
   signUpForEmailSubscription,
-  hidePanel: () => hidePanelLocalSetting.set(true),
+  refresh: () => loadUIData(RELEASE_NOTES_SIGNUP_DISMISSED_KEY),
+  hidePanel: () => {
+    return saveUIData({
+      key: RELEASE_NOTES_SIGNUP_DISMISSED_KEY,
+      value: true,
+    });
+  },
+  dismissAlertMessage: () => emailSubscriptionAlertLocalSetting.set(false),
 };
 
 interface MapStateToProps {
@@ -80,7 +102,7 @@ interface MapStateToProps {
   clusterId: string;
 }
 const mapStateToProps = (state: AdminUIState) => ({
-  isHiddenPanel: hidePanelLocalSetting.selector(state),
+  isHiddenPanel: dismissReleaseNotesSignupForm(state),
   clusterId: clusterIdSelector(state),
 });
 

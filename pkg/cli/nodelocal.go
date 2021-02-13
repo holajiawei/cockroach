@@ -11,14 +11,16 @@
 package cli
 
 import (
+	"context"
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -50,7 +52,8 @@ func runUpload(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer reader.Close()
-	return uploadFile(conn, reader, destination)
+
+	return uploadFile(context.Background(), conn, reader, destination)
 }
 
 func openSourceFile(source string) (io.ReadCloser, error) {
@@ -68,34 +71,60 @@ func openSourceFile(source string) (io.ReadCloser, error) {
 	return f, nil
 }
 
-func uploadFile(conn *sqlConn, reader io.Reader, destination string) error {
-	err := conn.ExecTxn(func(cn *sqlConn) error {
-		stmt, err := cn.conn.Prepare(sql.CopyInFileStmt(destination, "crdb_internal", "file_upload"))
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = stmt.Close()
-		}()
-		send := make([]byte, chunkSize)
-		for {
-			n, err := reader.Read(send)
-			if n > 0 {
-				_, err = stmt.Exec([]driver.Value{string(send[:n])})
-				if err != nil {
-					return err
-				}
-			} else if err == io.EOF {
-				break
-			} else if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+func uploadFile(ctx context.Context, conn *sqlConn, reader io.Reader, destination string) error {
+	if err := conn.ensureConn(); err != nil {
+		return err
+	}
+
+	ex := conn.conn.(driver.ExecerContext)
+	if _, err := ex.ExecContext(ctx, `BEGIN`, nil); err != nil {
+		return err
+	}
+
+	// Construct the nodelocal URI as the destination for the CopyIn stmt.
+	nodelocalURL := url.URL{
+		Scheme: "nodelocal",
+		Host:   "self",
+		Path:   destination,
+	}
+	stmt, err := conn.conn.Prepare(sql.CopyInFileStmt(nodelocalURL.String(), sql.CrdbInternalName,
+		sql.NodelocalFileUploadTable))
 	if err != nil {
 		return err
 	}
+
+	defer func() {
+		if stmt != nil {
+			_ = stmt.Close()
+			_, _ = ex.ExecContext(ctx, `ROLLBACK`, nil)
+		}
+	}()
+
+	send := make([]byte, chunkSize)
+	for {
+		n, err := reader.Read(send)
+		if n > 0 {
+			// TODO(adityamaru): Switch to StmtExecContext once the copyin driver
+			// supports it.
+			_, err = stmt.Exec([]driver.Value{string(send[:n])})
+			if err != nil {
+				return err
+			}
+		} else if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		return err
+	}
+	stmt = nil
+
+	if _, err := ex.ExecContext(ctx, `COMMIT`, nil); err != nil {
+		return err
+	}
+
 	nodeID, _, _, err := conn.getServerMetadata()
 	if err != nil {
 		return errors.Wrap(err, "unable to get node id")

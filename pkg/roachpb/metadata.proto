@@ -20,6 +20,7 @@ import "gogoproto/gogo.proto";
 // node topology, store type, and machine capabilities.
 message Attributes {
   option (gogoproto.goproto_stringer) = false;
+  option (gogoproto.equal) = true;
 
   repeated string attrs = 1 [(gogoproto.moretags) = "yaml:\"attrs,flow\""];
 }
@@ -42,8 +43,7 @@ message ReplicationTarget {
 // well to denote voters which are being downgraded to learners and newly added
 // by the change, respectively. A demoting voter is turning into a learner,
 // which we prefer over a direct removal, which was used prior to v20.1 and
-// uses the VOTER_OUTGOING type instead (see VersionChangeReplicasDemotion for
-// details on why we're not doing that any more).
+// uses the VOTER_OUTGOING type instead (see #42251).
 //
 // All voter types indicate a replica that participates in all raft activities,
 // including voting for leadership and committing entries. Typically, this
@@ -72,6 +72,9 @@ enum ReplicaType {
   // that is, it is in the process of being removed. In practice, a replica of
   // this type should be treated accordingly and no work should be assigned to
   // it.
+  //
+  // Note: We're not using VOTER_OUTGOING since 20.1. We're using VOTER_DEMOTING
+  // instead. See #42251.
   VOTER_OUTGOING = 3;
   // VOTER_DEMOTING indicates a voting replica that will become a learner once
   // the ongoing atomic replication change is finalized; that is, it is in the
@@ -83,10 +86,28 @@ enum ReplicaType {
   // count towards the quorum(s). Candidates will not ask for (or take into
   // account) votes of (peers they consider) LEARNERs for leadership nor do
   // their acknowledged log entries get taken into account for determining the
-  // committed index. At the time of writing, learners in CockroachDB are a
-  // short-term transient state: a replica being added and on its way to being a
-  // VOTER_{FULL,INCOMING}, or a VOTER_DEMOTING being removed.
+  // committed index. Learners in CockroachDB are a short-term transient state:
+  // a replica being added and on its way to being a VOTER_{FULL,INCOMING}, or a
+  // VOTER_DEMOTING being removed.
+  //
+  // Note that once these replicas upreplicate after receiving their initial
+  // snapshot, they will count towards the raft leader's quota pool and throttle
+  // incoming proposals if they fall "too far behind".
   LEARNER = 1;
+  // NON_VOTER indicates a replica that applies committed entries, but does not
+  // count towards the quorum(s). Candidates will not ask for (or take into
+  // account) votes of (peers they consider) NON_VOTERs for leadership nor do
+  // their acknowledged log entries get taken into account for determining the
+  // committed index.
+  //
+  // Under the hood, it is based on an etcd/raft LearnerNode, like the LEARNER
+  // replica type defined above. They will also cause the quota pool on the
+  // leader to throttle incoming proposals if they fall behind.
+  //
+  // Unlike LEARNERs, these are a persistent state meant to serve user traffic
+  // via follower reads. See comment above ReplicaDescriptors.NonVoters() for
+  // differences in how LEARNERs and NON_VOTERs are handled internally.
+  NON_VOTER = 5;
 }
 
 // ReplicaDescriptor describes a replica location by node ID
@@ -126,13 +147,23 @@ message ReplicaIdent {
 // A range is described using an inclusive start key, a non-inclusive end key,
 // and a list of replicas where the range is stored.
 //
-// NOTE: Care must be taken when changing the encoding of this proto
-// because it is used as part of conditional put operations.
+// NOTE: Care must be taken when adding or removing fields from this proto
+// because we have code relies on the descriptor comparing Equal() after
+// round-tripping through a previous/next version node (i.e. in mixed-version
+// clusters). Note that we don't need to proto encoding to be stable since, when
+// doing CPuts we use the raw bytes we've read from the DB as the expected value
+// (instead of re-marshaling the proto), but unfortunately we also need the
+// Equal() method to work. Also note that we configure our protos to not
+// maintain unrecognized fields.
+//
 // TODO(jeffreyxiao): All nullable fields in RangeDescriptor can be made
 // non-nullable if #38302 is guaranteed to be on all nodes (I.E. 20.1).
 message RangeDescriptor {
   option (gogoproto.goproto_stringer) = false;
-  option (gogoproto.equal) = true;
+  // We implement the Equal method by hand so that it can ignore deprecated
+  // fields. This can be reverted in 21.1 once the "previous version" no longer
+  // populates deprecated_generation_comparable.
+  option (gogoproto.equal) = false;
   option (gogoproto.populate) = true;
 
   optional int64 range_id = 1 [(gogoproto.nullable) = false,
@@ -210,38 +241,20 @@ message RangeDescriptor {
   // the replica it's supposed to update, and no splits and merges have taken
   // place at all).
   //
-  // Note that the generation counter is not incremented by versions of
-  // Cockroach prior to v2.1. To maintain backwards compatibility with these old
-  // versions of Cockroach, we cannot enable the gogoproto.nullable option, as
-  // we need to be able to encode this mesage with the generation field unset.
-  //
-  // Note also that when the generation counter was first introduced, it only
-  // ever incremented (by one) the generation of the left hand side on merges
-  // and splits, so the above overlap arguments only hold if we know that the
-  // descriptors involved never used that code. Generations were first introduced
-  // in the 19.1 release, though, the behavior described here was only introduced
-  // in a late release candidate. If we allow such a release candidate cluster
-  // to transition into the final 19.1 release, we will need to introduce
-  // additional state to mark descriptors as obeying the new rules. If we don't,
-  // then we are free to assume that the semantics always hold.
-  //
   // For a third note, observe that the generational semantics above may
   // possibly allow range merges without colocation, at least in the sense that
   // the counter examples in #28071 are defused. This is because the
   // generational counter can answer the question whether the overlapping
   // replica is gc'able or not. If it is not gc'able, then by definition the
   // replica applying the merge is.
-  optional int64 generation = 6;
-  // generation_comparable is additional state to mark descriptors as obeying
-  // the new generation rules. We can determine the causality of two range
-  // descriptors if they overlap and both their generation_comparable are set.
-  // If one or both of their generation_comparable is not set, we cannot
-  // determine which range descriptor is newer. This is needed because older
-  // versions of Cockroach did not set the generation in some cases where it is
-  // currently set. Code that relies on a total order of range descriptor
-  // generations can determine when this order is ensured from this state. See
-  // #36654 for more details.
-  optional bool generation_comparable = 8;
+  optional int64 generation = 6 [(gogoproto.nullable) = false, (gogoproto.casttype) = "RangeGeneration"];
+
+  // This field is not used any more, but we need to maintain it in 20.2 because
+  // 20.1 nodes need descriptors to round-trip through 20.2 nodes and compare
+  // Equal() when they come back. 20.2 nodes know to ignore this field when
+  // comparing, so the field can be removed in 21.1.
+  optional bool deprecated_generation_comparable = 8;
+
   // The presence of the sticky_bit indicates that the range should not be
   // automatically merged by the merge queue with the range to its left. It is
   // set during a split operation and unset during an unsplit operation. Note
@@ -311,6 +324,7 @@ message StoreCapacity {
 
 // NodeDescriptor holds details on node physical/network topology.
 message NodeDescriptor {
+  option (gogoproto.equal) = true;
   optional int32 node_id = 1 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "NodeID", (gogoproto.casttype) = "NodeID"];
   optional util.UnresolvedAddr address = 2 [(gogoproto.nullable) = false];
@@ -323,12 +337,14 @@ message NodeDescriptor {
   optional string cluster_name = 9 [(gogoproto.nullable) = false];
   // The SQL address. If empty, indicates that the base address field
   // is also used to accept SQL connections.
-  optional util.UnresolvedAddr sql_address = 10 [(gogoproto.nullable) = false, (gogoproto.customname) = "SQLAddress"];
+  optional util.UnresolvedAddr sql_address = 10 [(gogoproto.nullable) = false, 
+      (gogoproto.customname) = "SQLAddress"];
 }
 
 // LocalityAddress holds the private address accessible only from other nodes
 // in the corresponding locality.
 message LocalityAddress {
+  option (gogoproto.equal) = true;
   optional util.UnresolvedAddr address = 1 [(gogoproto.nullable) = false];
   optional Tier locality_tier = 2 [(gogoproto.nullable) = false];
 }
@@ -355,6 +371,7 @@ message StoreDeadReplicas {
 // Locality is an ordered set of key value Tiers that describe a node's
 // location. The tier keys should be the same across all nodes.
 message Locality {
+  option (gogoproto.equal) = true;
   option (gogoproto.goproto_stringer) = false;
 
   repeated Tier tiers = 1 [(gogoproto.nullable) = false];
@@ -362,6 +379,7 @@ message Locality {
 
 // Tier represents one level of the locality hierarchy.
 message Tier {
+  option (gogoproto.equal) = true;
   option (gogoproto.goproto_stringer) = false;
 
   // Key is the name of tier and should match all other nodes.
@@ -371,6 +389,7 @@ message Tier {
 }
 
 message Version {
+  option (gogoproto.equal) = true;
   option (gogoproto.goproto_stringer) = false;
 
   // The names "major" and "minor" are reserved in C in
@@ -380,8 +399,9 @@ message Version {
   optional int32 minor_val = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "Minor"];
   // Note that patch is a placeholder and will always be zero.
   optional int32 patch = 3 [(gogoproto.nullable) = false];
-  // The unstable version is used to migrate during development.
-  // Users of stable, public releases will only use binaries
-  // with unstable set to 0.
-  optional int32 unstable = 4 [(gogoproto.nullable) = false];
+  // The internal version is used to introduce migrations during the development
+  // cycle. They are subversions that are never the end versions of a release,
+  // i.e. users of stable, public release will only use binaries with the
+  // internal version set to 0.
+  optional int32 internal = 4 [(gogoproto.nullable) = false];
 }

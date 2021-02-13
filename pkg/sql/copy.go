@@ -13,18 +13,24 @@ package sql
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/csv"
 	"io"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -51,7 +57,18 @@ type copyMachineInterface interface {
 type copyMachine struct {
 	table         tree.TableExpr
 	columns       tree.NameList
-	resultColumns sqlbase.ResultColumns
+	resultColumns colinfo.ResultColumns
+	format        tree.CopyFormat
+	delimiter     byte
+	// textDelim is delimiter converted to a []byte so that we don't have to do that per row.
+	textDelim   []byte
+	null        string
+	binaryState binaryState
+	// forceNotNull disables converting values matching the null string to
+	// NULL. The spec says this is only supported for CSV, and also must specify
+	// which columns it applies to.
+	forceNotNull bool
+	csvReader    *csv.Reader
 	// buf is used to parse input data into rows. It also accumulates a partial
 	// row between protocol messages.
 	buf bytes.Buffer
@@ -68,10 +85,6 @@ type copyMachine struct {
 
 	// conn is the pgwire connection from which data is to be read.
 	conn pgwirebase.Conn
-
-	// resetPlanner is a function to be used to prepare the planner for inserting
-	// data.
-	resetPlanner func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time)
 
 	// execInsertPlan is a function to be used to execute the plan (stored in the
 	// planner) which performs an INSERT.
@@ -98,7 +111,6 @@ func newCopyMachine(
 	n *tree.CopyFrom,
 	txnOpt copyTxnOpt,
 	execCfg *ExecutorConfig,
-	resetPlanner func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time),
 	execInsertPlan func(ctx context.Context, p *planner, res RestrictedCommandResult) error,
 ) (_ *copyMachine, retErr error) {
 	c := &copyMachine{
@@ -107,35 +119,82 @@ func newCopyMachine(
 		//  but that dependency can be removed by refactoring it.
 		table:   &n.Table,
 		columns: n.Columns,
+		format:  n.Options.CopyFormat,
 		txnOpt:  txnOpt,
 		// The planner will be prepared before use.
-		p:              planner{execCfg: execCfg},
-		resetPlanner:   resetPlanner,
+		p:              planner{execCfg: execCfg, alloc: &rowenc.DatumAlloc{}},
 		execInsertPlan: execInsertPlan,
 	}
-	c.resetPlanner(&c.p, nil /* txn */, time.Time{} /* txnTS */, time.Time{} /* stmtTS */)
-	c.parsingEvalCtx = c.p.EvalContext()
 
-	cleanup := c.preparePlanner(ctx)
+	// We need a planner to do the initial planning, in addition
+	// to those used for the main execution of the COPY afterwards.
+	cleanup := c.p.preparePlannerForCopy(ctx, txnOpt)
 	defer func() {
 		retErr = cleanup(ctx, retErr)
 	}()
+	c.parsingEvalCtx = c.p.EvalContext()
 
-	tableDesc, err := ResolveExistingObject(ctx, &c.p, &n.Table, tree.ObjectLookupFlagsWithRequired(), ResolveRequireTableDesc)
+	switch c.format {
+	case tree.CopyFormatText:
+		c.null = `\N`
+		c.delimiter = '\t'
+	case tree.CopyFormatCSV:
+		c.null = ""
+		c.delimiter = ','
+	}
+
+	if n.Options.Delimiter != nil {
+		if c.format == tree.CopyFormatBinary {
+			return nil, errors.Newf("DELIMITER unsupported in BINARY format")
+		}
+		fn, err := c.p.TypeAsString(ctx, n.Options.Delimiter, "COPY")
+		if err != nil {
+			return nil, err
+		}
+		delim, err := fn()
+		if err != nil {
+			return nil, err
+		}
+		if len(delim) != 1 || !utf8.ValidString(delim) {
+			return nil, errors.Newf("delimiter must be a single-byte character")
+		}
+		c.delimiter = delim[0]
+	}
+	if n.Options.Null != nil {
+		if c.format == tree.CopyFormatBinary {
+			return nil, errors.Newf("NULL unsupported in BINARY format")
+		}
+		fn, err := c.p.TypeAsString(ctx, n.Options.Null, "COPY")
+		if err != nil {
+			return nil, err
+		}
+		c.null, err = fn()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	flags := tree.ObjectLookupFlagsWithRequiredTableKind(tree.ResolveRequireTableDesc)
+	tableDesc, err := resolver.ResolveExistingTableObject(ctx, &c.p, &n.Table, flags)
 	if err != nil {
 		return nil, err
 	}
 	if err := c.p.CheckPrivilege(ctx, tableDesc, privilege.INSERT); err != nil {
 		return nil, err
 	}
-	cols, err := sqlbase.ProcessTargetColumns(tableDesc, n.Columns,
+	cols, err := colinfo.ProcessTargetColumns(tableDesc, n.Columns,
 		true /* ensureColumns */, false /* allowMutations */)
 	if err != nil {
 		return nil, err
 	}
-	c.resultColumns = make(sqlbase.ResultColumns, len(cols))
-	for i := range cols {
-		c.resultColumns[i] = sqlbase.ResultColumn{Typ: &cols[i].Type}
+	c.resultColumns = make(colinfo.ResultColumns, len(cols))
+	for i, col := range cols {
+		c.resultColumns[i] = colinfo.ResultColumn{
+			Name:           col.GetName(),
+			Typ:            col.GetType(),
+			TableID:        tableDesc.GetID(),
+			PGAttributeNum: col.GetPGAttributeNum(),
+		}
 	}
 	c.rowsMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
 	c.bufMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
@@ -151,9 +210,14 @@ type copyTxnOpt struct {
 	// performed. Committing the txn is left to the higher layer.  If not set, the
 	// machine will split writes between multiple transactions that it will
 	// initiate.
-	txn           *client.Txn
+	txn           *kv.Txn
 	txnTimestamp  time.Time
 	stmtTimestamp time.Time
+	resetPlanner  func(ctx context.Context, p *planner, txn *kv.Txn, txnTS time.Time, stmtTS time.Time)
+
+	// resetExecutor should be called upon completing a batch from the copy
+	// machine when the copy machine handles its own transaction.
+	resetExtraTxnState func(ctx context.Context) error
 }
 
 // run consumes all the copy-in data from the network connection and inserts it
@@ -168,25 +232,44 @@ func (c *copyMachine) run(ctx context.Context) error {
 	}
 
 	// Read from the connection until we see an ClientMsgCopyDone.
-	readBuf := pgwirebase.ReadBuffer{}
+	readBuf := pgwirebase.MakeReadBuffer(
+		pgwirebase.ReadBufferOptionWithClusterSettings(&c.p.execCfg.Settings.SV),
+	)
+
+	switch c.format {
+	case tree.CopyFormatText:
+		c.textDelim = []byte{c.delimiter}
+	case tree.CopyFormatCSV:
+		c.csvReader = csv.NewReader(&c.buf)
+		c.csvReader.Comma = rune(c.delimiter)
+		c.csvReader.ReuseRecord = true
+		c.csvReader.FieldsPerRecord = len(c.resultColumns)
+	}
 
 Loop:
 	for {
 		typ, _, err := readBuf.ReadTypedMsg(c.conn.Rd())
 		if err != nil {
+			if pgwirebase.IsMessageTooBigError(err) && typ == pgwirebase.ClientMsgCopyData {
+				// Slurp the remaining bytes.
+				_, slurpErr := readBuf.SlurpBytes(c.conn.Rd(), pgwirebase.GetMessageTooBigSize(err))
+				if slurpErr != nil {
+					return errors.CombineErrors(err, errors.Wrapf(slurpErr, "error slurping remaining bytes in COPY"))
+				}
+			}
 			return err
 		}
 
 		switch typ {
 		case pgwirebase.ClientMsgCopyData:
 			if err := c.processCopyData(
-				ctx, string(readBuf.Msg), c.p.EvalContext(), false, /* final */
+				ctx, string(readBuf.Msg), false, /* final */
 			); err != nil {
 				return err
 			}
 		case pgwirebase.ClientMsgCopyDone:
 			if err := c.processCopyData(
-				ctx, "" /* data */, c.p.EvalContext(), true, /* final */
+				ctx, "" /* data */, true, /* final */
 			); err != nil {
 				return err
 			}
@@ -210,12 +293,8 @@ Loop:
 }
 
 const (
-	nullString = `\N`
-	lineDelim  = '\n'
-)
-
-var (
-	fieldDelim = []byte{'\t'}
+	lineDelim = '\n'
+	endOfData = `\.`
 )
 
 // processCopyData buffers incoming data and, once the buffer fills up, inserts
@@ -223,9 +302,7 @@ var (
 //
 // Args:
 // final: If set, buffered data is written even if the buffer is not full.
-func (c *copyMachine) processCopyData(
-	ctx context.Context, data string, evalCtx *tree.EvalContext, final bool,
-) (retErr error) {
+func (c *copyMachine) processCopyData(ctx context.Context, data string, final bool) (retErr error) {
 	// At the end, adjust the mem accounting to reflect what's left in the buffer.
 	defer func() {
 		if err := c.bufMemAcc.ResizeTo(ctx, int64(c.buf.Cap())); err != nil && retErr == nil {
@@ -245,63 +322,237 @@ func (c *copyMachine) processCopyData(
 		}
 	}
 	c.buf.WriteString(data)
+	var readFn func(ctx context.Context, final bool) (brk bool, err error)
+	switch c.format {
+	case tree.CopyFormatText:
+		readFn = c.readTextData
+	case tree.CopyFormatBinary:
+		readFn = c.readBinaryData
+	case tree.CopyFormatCSV:
+		readFn = c.readCSVData
+	default:
+		panic("unknown copy format")
+	}
 	for c.buf.Len() > 0 {
-		line, err := c.buf.ReadBytes(lineDelim)
+		brk, err := readFn(ctx, final)
 		if err != nil {
-			if err != io.EOF {
-				return err
-			} else if !final {
-				// Put the incomplete row back in the buffer, to be processed next time.
-				c.buf.Write(line)
-				break
-			}
-		} else {
-			// Remove lineDelim from end.
-			line = line[:len(line)-1]
-			// Remove a single '\r' at EOL, if present.
-			if len(line) > 0 && line[len(line)-1] == '\r' {
-				line = line[:len(line)-1]
-			}
-		}
-		if c.buf.Len() == 0 && bytes.Equal(line, []byte(`\.`)) {
-			break
-		}
-		if err := c.addRow(ctx, line); err != nil {
 			return err
+		}
+		if brk {
+			break
 		}
 	}
 	// Only do work if we have a full batch of rows or this is the end.
-	if ln := len(c.rows); ln == 0 || (ln < copyBatchRowSize && !final) {
+	if ln := len(c.rows); !final && (ln == 0 || ln < copyBatchRowSize) {
 		return nil
 	}
 	return c.processRows(ctx)
 }
 
-// preparePlanner resets the planner so that it can be used for execution.
-// Depending on how the machine was configured, a new transaction might be
-// created.
+func (c *copyMachine) readTextData(ctx context.Context, final bool) (brk bool, err error) {
+	line, err := c.buf.ReadBytes(lineDelim)
+	if err != nil {
+		if err != io.EOF {
+			return false, err
+		} else if !final {
+			// Put the incomplete row back in the buffer, to be processed next time.
+			c.buf.Write(line)
+			return true, nil
+		}
+	} else {
+		// Remove lineDelim from end.
+		line = line[:len(line)-1]
+		// Remove a single '\r' at EOL, if present.
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+	}
+	if c.buf.Len() == 0 && bytes.Equal(line, []byte(`\.`)) {
+		return true, nil
+	}
+	err = c.readTextTuple(ctx, line)
+	return false, err
+}
+
+func (c *copyMachine) readCSVData(ctx context.Context, final bool) (brk bool, err error) {
+	record, err := c.csvReader.Read()
+	// Look for end of data before checking for errors, since a field count
+	// error will still return record data.
+	if len(record) == 1 && record[0] == endOfData && c.buf.Len() == 0 {
+		return true, nil
+	}
+	if err != nil {
+		return false, pgerror.Wrap(err, pgcode.BadCopyFileFormat,
+			"read CSV record")
+	}
+	err = c.readCSVTuple(ctx, record)
+	return false, err
+}
+
+func (c *copyMachine) readCSVTuple(ctx context.Context, record []string) error {
+	if len(record) != len(c.resultColumns) {
+		return pgerror.Newf(pgcode.BadCopyFileFormat,
+			"expected %d values, got %d", len(c.resultColumns), len(record))
+	}
+	exprs := make(tree.Exprs, len(record))
+	for i, s := range record {
+		if s == c.null {
+			exprs[i] = tree.DNull
+			continue
+		}
+		d, err := rowenc.ParseDatumStringAsWithRawBytes(c.resultColumns[i].Typ, s, c.parsingEvalCtx)
+		if err != nil {
+			return err
+		}
+
+		sz := d.Size()
+		if err := c.rowsMemAcc.Grow(ctx, int64(sz)); err != nil {
+			return err
+		}
+
+		exprs[i] = d
+	}
+	if err := c.rowsMemAcc.Grow(ctx, int64(unsafe.Sizeof(exprs))); err != nil {
+		return err
+	}
+
+	c.rows = append(c.rows, exprs)
+	return nil
+}
+
+func (c *copyMachine) readBinaryData(ctx context.Context, final bool) (brk bool, err error) {
+	switch c.binaryState {
+	case binaryStateNeedSignature:
+		if err := c.readBinarySignature(); err != nil {
+			return false, err
+		}
+	case binaryStateRead:
+		if err := c.readBinaryTuple(ctx); err != nil {
+			return false, errors.Wrapf(err, "read binary tuple")
+		}
+	case binaryStateFoundTrailer:
+		if !final {
+			return false, pgerror.New(pgcode.BadCopyFileFormat,
+				"copy data present after trailer")
+		}
+		return true, nil
+	default:
+		panic("unknown binary state")
+	}
+	return false, nil
+}
+
+func (c *copyMachine) readBinaryTuple(ctx context.Context) error {
+	// This implementation expects that if a field count exists, all of the
+	// fields in the tuple have also been sent. It will error if it expects
+	// more fields than are in the buffer.
+	var fieldCount int16
+	var err error
+	if err = binary.Read(&c.buf, binary.BigEndian, &fieldCount); err != nil {
+		return err
+	}
+	if fieldCount == -1 {
+		c.binaryState = binaryStateFoundTrailer
+		return nil
+	}
+	if fieldCount < 1 {
+		return pgerror.Newf(pgcode.BadCopyFileFormat,
+			"unexpected field count: %d", fieldCount)
+	}
+	exprs := make(tree.Exprs, fieldCount)
+	var byteCount int32
+	for i := range exprs {
+		if err = binary.Read(&c.buf, binary.BigEndian, &byteCount); err != nil {
+			return err
+		}
+		if byteCount == -1 {
+			exprs[i] = tree.DNull
+			continue
+		}
+		data := c.buf.Next(int(byteCount))
+		if len(data) != int(byteCount) {
+			return errors.Newf("partial copy data row")
+		}
+		d, err := pgwirebase.DecodeDatum(
+			c.parsingEvalCtx,
+			c.resultColumns[i].Typ,
+			pgwirebase.FormatBinary,
+			data,
+		)
+		if err != nil {
+			return pgerror.Wrapf(err, pgcode.BadCopyFileFormat,
+				"decode datum as %s: %s", c.resultColumns[i].Typ.SQLString(), data)
+		}
+		sz := d.Size()
+		if err := c.rowsMemAcc.Grow(ctx, int64(sz)); err != nil {
+			return err
+		}
+		exprs[i] = d
+	}
+	if err = c.rowsMemAcc.Grow(ctx, int64(unsafe.Sizeof(exprs))); err != nil {
+		return err
+	}
+	c.rows = append(c.rows, exprs)
+	return nil
+}
+
+func (c *copyMachine) readBinarySignature() error {
+	// This is the standard 11-byte binary signature with the flags and
+	// header 32-bit integers appended since we only support the zero value
+	// of them.
+	const binarySignature = "PGCOPY\n\377\r\n\000" + "\x00\x00\x00\x00" + "\x00\x00\x00\x00"
+	var sig [11 + 8]byte
+	if _, err := io.ReadFull(&c.buf, sig[:]); err != nil {
+		return err
+	}
+	if !bytes.Equal(sig[:], []byte(binarySignature)) {
+		return pgerror.New(pgcode.BadCopyFileFormat,
+			"unrecognized binary copy signature")
+	}
+	c.binaryState = binaryStateRead
+	return nil
+}
+
+// preparePlannerForCopy resets the planner so that it can be used during
+// a COPY operation (either COPY to table, or COPY to file).
 //
-// It returns a cleanup function that needs to be called when we're done with
-// the planner (before preparePlanner is called again). The cleanup function
-// commits the txn (if it hasn't already been committed) or rolls it back
-// depending on whether it is passed an error. If an error is passed in to the
-// cleanup function, the same error is returned.
-func (c *copyMachine) preparePlanner(ctx context.Context) func(context.Context, error) error {
-	txn := c.txnOpt.txn
-	txnTs := c.txnOpt.txnTimestamp
-	stmtTs := c.txnOpt.stmtTimestamp
+// Depending on how the requesting COPY machine was configured, a new
+// transaction might be created.
+//
+// It returns a cleanup function that needs to be called when we're
+// done with the planner (before preparePlannerForCopy is called
+// again). The cleanup function commits the txn (if it hasn't already
+// been committed) or rolls it back depending on whether it is passed
+// an error. If an error is passed in to the cleanup function, the
+// same error is returned.
+func (p *planner) preparePlannerForCopy(
+	ctx context.Context, txnOpt copyTxnOpt,
+) func(context.Context, error) error {
+	txn := txnOpt.txn
+	txnTs := txnOpt.txnTimestamp
+	stmtTs := txnOpt.stmtTimestamp
 	autoCommit := false
 	if txn == nil {
-		txn = client.NewTxnWithSteppingEnabled(ctx, c.p.execCfg.DB, c.p.execCfg.NodeID.Get())
-		txnTs = c.p.execCfg.Clock.PhysicalTime()
+		nodeID, _ := p.execCfg.NodeID.OptionalNodeID()
+		txn = kv.NewTxnWithSteppingEnabled(ctx, p.execCfg.DB, nodeID)
+		txnTs = p.execCfg.Clock.PhysicalTime()
 		stmtTs = txnTs
 		autoCommit = true
 	}
-	c.resetPlanner(&c.p, txn, txnTs, stmtTs)
-	c.p.autoCommit = autoCommit
+	txnOpt.resetPlanner(ctx, p, txn, txnTs, stmtTs)
+	p.autoCommit = autoCommit
 
-	return func(ctx context.Context, err error) error {
-		if err == nil {
+	return func(ctx context.Context, prevErr error) (err error) {
+		// Ensure that we clean up any accumulated extraTxnState state if we've
+		// been handed a mechanism to do so.
+		if txnOpt.resetExtraTxnState != nil {
+			defer func() {
+				// Note: combine errors will return nil if both are nil and the
+				// non-nil error in the case that there's just one.
+				err = errors.CombineErrors(err, txnOpt.resetExtraTxnState(ctx))
+			}()
+		}
+		if prevErr == nil {
 			// Ensure that the txn is committed if the copyMachine is in charge of
 			// committing its transactions and the execution didn't already commit it
 			// (through the planner.autoCommit optimization).
@@ -310,14 +561,17 @@ func (c *copyMachine) preparePlanner(ctx context.Context) func(context.Context, 
 			}
 			return nil
 		}
-		txn.CleanupOnError(ctx, err)
-		return err
+		txn.CleanupOnError(ctx, prevErr)
+		return prevErr
 	}
 }
 
 // insertRows transforms the buffered rows into an insertNode and executes it.
 func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
-	cleanup := c.preparePlanner(ctx)
+	if len(c.rows) == 0 {
+		return nil
+	}
+	cleanup := c.p.preparePlannerForCopy(ctx, c.txnOpt)
 	defer func() {
 		retErr = cleanup(ctx, retErr)
 	}()
@@ -328,7 +582,7 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 	c.rows = c.rows[:0]
 	c.rowsMemAcc.Clear(ctx)
 
-	c.p.stmt = &Statement{}
+	c.p.stmt = Statement{}
 	c.p.stmt.AST = &tree.Insert{
 		Table:   c.table,
 		Columns: c.columns,
@@ -341,7 +595,7 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 		return err
 	}
 
-	var res bufferedCommandResult
+	var res streamingCommandResult
 	err := c.execInsertPlan(ctx, &c.p, &res)
 	if err != nil {
 		return err
@@ -359,17 +613,17 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 	return nil
 }
 
-func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
-	var err error
-	parts := bytes.Split(line, fieldDelim)
+func (c *copyMachine) readTextTuple(ctx context.Context, line []byte) error {
+	parts := bytes.Split(line, c.textDelim)
 	if len(parts) != len(c.resultColumns) {
-		return pgerror.Newf(pgcode.ProtocolViolation,
+		return pgerror.Newf(pgcode.BadCopyFileFormat,
 			"expected %d values, got %d", len(c.resultColumns), len(parts))
 	}
 	exprs := make(tree.Exprs, len(parts))
 	for i, part := range parts {
 		s := string(part)
-		if s == nullString {
+		// Disable NULL conversion during file uploads.
+		if !c.forceNotNull && s == c.null {
 			exprs[i] = tree.DNull
 			continue
 		}
@@ -382,12 +636,9 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 			types.TimestampFamily,
 			types.TimestampTZFamily,
 			types.UuidFamily:
-			s, err = decodeCopy(s)
-			if err != nil {
-				return err
-			}
+			s = decodeCopy(s)
 		}
-		d, err := sqlbase.ParseDatumStringAsWithRawBytes(c.resultColumns[i].Typ, s, c.parsingEvalCtx)
+		d, err := rowenc.ParseDatumStringAsWithRawBytes(c.resultColumns[i].Typ, s, c.parsingEvalCtx)
 		if err != nil {
 			return err
 		}
@@ -410,8 +661,8 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 // decodeCopy unescapes a single COPY field.
 //
 // See: https://www.postgresql.org/docs/9.5/static/sql-copy.html#AEN74432
-func decodeCopy(in string) (string, error) {
-	var buf bytes.Buffer
+func decodeCopy(in string) string {
+	var buf strings.Builder
 	start := 0
 	for i, n := 0, len(in); i < n; i++ {
 		if in[i] != '\\' {
@@ -419,61 +670,72 @@ func decodeCopy(in string) (string, error) {
 		}
 		buf.WriteString(in[start:i])
 		i++
-		if i >= n {
-			return "", pgerror.Newf(pgcode.Syntax,
-				"unknown escape sequence: %q", in[i-1:])
-		}
 
-		ch := in[i]
-		if decodedChar := decodeMap[ch]; decodedChar != 0 {
-			buf.WriteByte(decodedChar)
-		} else if ch == 'x' {
-			// \x can be followed by 1 or 2 hex digits.
-			i++
-			if i >= n {
-				return "", pgerror.Newf(pgcode.Syntax,
-					"unknown escape sequence: %q", in[i-2:])
-			}
-			ch = in[i]
-			digit, ok := decodeHexDigit(ch)
-			if !ok {
-				return "", pgerror.Newf(pgcode.Syntax,
-					"unknown escape sequence: %q", in[i-2:i])
-			}
-			if i+1 < n {
-				if v, ok := decodeHexDigit(in[i+1]); ok {
-					i++
-					digit <<= 4
-					digit += v
-				}
-			}
-			buf.WriteByte(digit)
-		} else if ch >= '0' && ch <= '7' {
-			digit, _ := decodeOctDigit(ch)
-			// 1 to 2 more octal digits follow.
-			if i+1 < n {
-				if v, ok := decodeOctDigit(in[i+1]); ok {
-					i++
-					digit <<= 3
-					digit += v
-				}
-			}
-			if i+1 < n {
-				if v, ok := decodeOctDigit(in[i+1]); ok {
-					i++
-					digit <<= 3
-					digit += v
-				}
-			}
-			buf.WriteByte(digit)
+		if i >= n {
+			// If the last character is \, then write it as-is.
+			buf.WriteByte('\\')
 		} else {
-			return "", pgerror.Newf(pgcode.Syntax,
-				"unknown escape sequence: %q", in[i-1:i+1])
+			ch := in[i]
+			if decodedChar := decodeMap[ch]; decodedChar != 0 {
+				buf.WriteByte(decodedChar)
+			} else if ch == 'x' {
+				// \x can be followed by 1 or 2 hex digits.
+				if i+1 >= n {
+					// Interpret as 'x' if nothing follows.
+					buf.WriteByte('x')
+				} else {
+					ch = in[i+1]
+					digit, ok := decodeHexDigit(ch)
+					if !ok {
+						// If the following character after 'x' is not a digit,
+						// write the current character as 'x'.
+						buf.WriteByte('x')
+					} else {
+						i++
+						if i+1 < n {
+							if v, ok := decodeHexDigit(in[i+1]); ok {
+								i++
+								digit <<= 4
+								digit += v
+							}
+						}
+						buf.WriteByte(digit)
+					}
+				}
+			} else if ch >= '0' && ch <= '7' {
+				digit, _ := decodeOctDigit(ch)
+				// 1 to 2 more octal digits follow.
+				if i+1 < n {
+					if v, ok := decodeOctDigit(in[i+1]); ok {
+						i++
+						digit <<= 3
+						digit += v
+					}
+				}
+				if i+1 < n {
+					if v, ok := decodeOctDigit(in[i+1]); ok {
+						i++
+						digit <<= 3
+						digit += v
+					}
+				}
+				buf.WriteByte(digit)
+			} else {
+				// Any other backslashed character will be taken to represent itself.
+				buf.WriteByte(ch)
+			}
 		}
 		start = i + 1
 	}
-	buf.WriteString(in[start:])
-	return buf.String(), nil
+	// If there were no backslashes in the input string, we can simply
+	// return it.
+	if start == 0 {
+		return in
+	}
+	if start < len(in) {
+		buf.WriteString(in[start:])
+	}
+	return buf.String()
 }
 
 func decodeDigit(c byte, onlyOctal bool) (byte, bool) {
@@ -503,3 +765,11 @@ var decodeMap = map[byte]byte{
 	'v':  '\v',
 	'\\': '\\',
 }
+
+type binaryState int
+
+const (
+	binaryStateNeedSignature binaryState = iota
+	binaryStateRead
+	binaryStateFoundTrailer
+)

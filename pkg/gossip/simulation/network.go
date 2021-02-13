@@ -71,17 +71,18 @@ func NewNetwork(
 		Nodes:   []*Node{},
 		Stopper: stopper,
 	}
-	n.RPCContext = rpc.NewContext(
-		log.AmbientContext{Tracer: tracing.NewTracer()},
-		&base.Config{Insecure: true},
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
-		n.Stopper,
-		cluster.MakeTestingClusterSettings(),
-	)
+	n.RPCContext = rpc.NewContext(rpc.ContextOptions{
+		TenantID:   roachpb.SystemTenantID,
+		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
+		Config:     &base.Config{Insecure: true},
+		Clock:      hlc.NewClock(hlc.UnixNano, time.Nanosecond),
+		Stopper:    n.Stopper,
+		Settings:   cluster.MakeTestingClusterSettings(),
+	})
 	var err error
 	n.tlsConfig, err = n.RPCContext.GetServerTLSConfig()
 	if err != nil {
-		log.Fatal(context.TODO(), err)
+		log.Fatalf(context.TODO(), "%v", err)
 	}
 
 	// Ensure that tests using this test context and restart/shut down
@@ -92,7 +93,7 @@ func NewNetwork(
 	for i := 0; i < nodeCount; i++ {
 		node, err := n.CreateNode(defaultZoneConfig)
 		if err != nil {
-			log.Fatal(context.TODO(), err)
+			log.Fatalf(context.TODO(), "%v", err)
 		}
 		// Build a resolver for each instance or we'll get data races.
 		if createResolvers {
@@ -115,11 +116,10 @@ func (n *Network) CreateNode(defaultZoneConfig *zonepb.ZoneConfig) (*Node, error
 	}
 	node := &Node{Server: server, Listener: ln, Registry: metric.NewRegistry()}
 	node.Gossip = gossip.NewTest(0, n.RPCContext, server, n.Stopper, node.Registry, defaultZoneConfig)
-	n.Stopper.RunWorker(context.TODO(), func(context.Context) {
+	n.Stopper.AddCloser(stop.CloserFn(server.Stop))
+	_ = n.Stopper.RunAsyncTask(context.TODO(), "node-wait-quiesce", func(context.Context) {
 		<-n.Stopper.ShouldQuiesce()
 		netutil.FatalIfUnexpected(ln.Close())
-		<-n.Stopper.ShouldStop()
-		server.Stop()
 		node.Gossip.EnableSimulationCycler(false)
 	})
 	n.Nodes = append(n.Nodes, node)
@@ -143,10 +143,9 @@ func (n *Network) StartNode(node *Node) error {
 		encoding.EncodeUint64Ascending(nil, 0), time.Hour); err != nil {
 		return err
 	}
-	n.Stopper.RunWorker(context.TODO(), func(context.Context) {
+	return n.Stopper.RunAsyncTask(context.TODO(), "start-node", func(context.Context) {
 		netutil.FatalIfUnexpected(node.Server.Serve(node.Listener))
 	})
-	return nil
 }
 
 // GetNodeFromID returns the simulation node associated with
@@ -180,14 +179,14 @@ func (n *Network) SimulateNetwork(simCallback func(cycle int, network *Network) 
 			encoding.EncodeUint64Ascending(nil, uint64(cycle)),
 			time.Hour,
 		); err != nil {
-			log.Fatal(context.TODO(), err)
+			log.Fatalf(context.TODO(), "%v", err)
 		}
 		if err := nodes[0].Gossip.AddInfo(
 			gossip.KeyClusterID,
 			encoding.EncodeUint64Ascending(nil, uint64(cycle)),
 			0*time.Second,
 		); err != nil {
-			log.Fatal(context.TODO(), err)
+			log.Fatalf(context.TODO(), "%v", err)
 		}
 		// Every node gossips every cycle.
 		for _, node := range nodes {
@@ -196,7 +195,7 @@ func (n *Network) SimulateNetwork(simCallback func(cycle int, network *Network) 
 				encoding.EncodeUint64Ascending(nil, uint64(cycle)),
 				time.Hour,
 			); err != nil {
-				log.Fatal(context.TODO(), err)
+				log.Fatalf(context.TODO(), "%v", err)
 			}
 			node.Gossip.SimulationCycle()
 		}
@@ -223,7 +222,7 @@ func (n *Network) Start() {
 	n.started = true
 	for _, node := range n.Nodes {
 		if err := n.StartNode(node); err != nil {
-			log.Fatal(context.TODO(), err)
+			log.Fatalf(context.TODO(), "%v", err)
 		}
 	}
 }

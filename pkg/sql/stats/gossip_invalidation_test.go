@@ -17,29 +17,37 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // TestGossipInvalidation verifies that the cache gets invalidated automatically
 // when a new stat is generated.
 func TestGossipInvalidation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 
+	s := tc.Server(0)
 	sc := stats.NewTableStatisticsCache(
 		10, /* cacheSize */
-		tc.Server(0).GossipI().(*gossip.Gossip),
-		tc.Server(0).DB(),
-		tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor),
+		gossip.MakeOptionalGossip(s.GossipI().(*gossip.Gossip)),
+		s.DB(),
+		s.InternalExecutor().(sqlutil.InternalExecutor),
+		keys.SystemSQLCodec,
+		s.LeaseManager().(*lease.Manager),
+		s.ClusterSettings(),
 	)
 
 	sr0 := sqlutils.MakeSQLRunner(tc.ServerConn(0))
@@ -47,8 +55,8 @@ func TestGossipInvalidation(t *testing.T) {
 	sr0.Exec(t, "CREATE TABLE test.t (k INT PRIMARY KEY, v INT)")
 	sr0.Exec(t, "INSERT INTO test.t VALUES (1, 1), (2, 2), (3, 3)")
 
-	tableDesc := sqlbase.GetTableDescriptor(tc.Server(0).DB(), "test", "t")
-	tableID := tableDesc.ID
+	tableDesc := catalogkv.TestingGetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "test", "t")
+	tableID := tableDesc.GetID()
 
 	expectNStats := func(n int) error {
 		stats, err := sc.GetTableStats(ctx, tableID)

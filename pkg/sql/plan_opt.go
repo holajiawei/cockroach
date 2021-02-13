@@ -12,19 +12,27 @@ package sql
 
 import (
 	"context"
+	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 var queryCacheEnabled = settings.RegisterBoolSetting(
@@ -38,20 +46,14 @@ var queryCacheEnabled = settings.RegisterBoolSetting(
 //  - AnonymizedStr
 //  - Memo (for reuse during exec, if appropriate).
 func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) {
-	stmt := p.stmt
+	stmt := &p.stmt
 
 	opc := &p.optPlanningCtx
 	opc.reset()
 
-	// These statements do not have result columns and do not support placeholders
-	// so there is no need to do anything during prepare.
-	//
-	// Some of these statements (like BeginTransaction) aren't supported by the
-	// optbuilder so they would error out. Others (like CreateIndex) have planning
-	// code that can introduce unnecessary txn retries (because of looking up
-	// descriptors and such).
 	switch stmt.AST.(type) {
 	case *tree.AlterIndex, *tree.AlterTable, *tree.AlterSequence,
+		*tree.Analyze,
 		*tree.BeginTransaction,
 		*tree.CommentOnColumn, *tree.CommentOnDatabase, *tree.CommentOnIndex, *tree.CommentOnTable,
 		*tree.CommitTransaction,
@@ -59,7 +61,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		*tree.CreateSequence,
 		*tree.CreateStats,
 		*tree.Deallocate, *tree.Discard, *tree.DropDatabase, *tree.DropIndex,
-		*tree.DropTable, *tree.DropView, *tree.DropSequence, *tree.DropRole,
+		*tree.DropTable, *tree.DropView, *tree.DropSequence,
 		*tree.Execute,
 		*tree.Grant, *tree.GrantRole,
 		*tree.Prepare,
@@ -68,6 +70,22 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		*tree.RollbackToSavepoint, *tree.RollbackTransaction,
 		*tree.Savepoint, *tree.SetTransaction, *tree.SetTracing, *tree.SetSessionAuthorizationDefault,
 		*tree.SetSessionCharacteristics:
+		// These statements do not have result columns and do not support placeholders
+		// so there is no need to do anything during prepare.
+		//
+		// Some of these statements (like BeginTransaction) aren't supported by the
+		// optbuilder so they would error out. Others (like CreateIndex) have planning
+		// code that can introduce unnecessary txn retries (because of looking up
+		// descriptors and such).
+		return opc.flags, nil
+
+	case *tree.ExplainAnalyze:
+		// This statement returns result columns but does not support placeholders,
+		// and we don't want to do anything during prepare.
+		if len(p.semaCtx.Placeholders.Types) != 0 {
+			return 0, errors.Errorf("%s does not support placeholders", stmt.AST.StatementTag())
+		}
+		stmt.Prepared.Columns = colinfo.ExplainPlanColumns
 		return opc.flags, nil
 	}
 
@@ -102,8 +120,6 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		opc.flags.Set(planFlagOptCacheMiss)
 	}
 
-	stmt.Prepared.AnonymizedStr = anonymizeStmt(stmt.AST)
-
 	memo, err := opc.buildReusableMemo(ctx)
 	if err != nil {
 		return 0, err
@@ -111,12 +127,31 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 
 	md := memo.Metadata()
 	physical := memo.RootProps()
-	resultCols := make(sqlbase.ResultColumns, len(physical.Presentation))
+	resultCols := make(colinfo.ResultColumns, len(physical.Presentation))
 	for i, col := range physical.Presentation {
+		colMeta := md.ColumnMeta(col.ID)
 		resultCols[i].Name = col.Alias
-		resultCols[i].Typ = md.ColumnMeta(col.ID).Type
+		resultCols[i].Typ = colMeta.Type
 		if err := checkResultType(resultCols[i].Typ); err != nil {
 			return 0, err
+		}
+		// If the column came from a table, set up the relevant metadata.
+		if colMeta.Table != opt.TableID(0) {
+			// Get the cat.Table that this column references.
+			tab := md.Table(colMeta.Table)
+			resultCols[i].TableID = descpb.ID(tab.ID())
+			// Convert the metadata opt.ColumnID to its ordinal position in the table.
+			colOrdinal := colMeta.Table.ColumnOrdinal(col.ID)
+			// Use that ordinal position to retrieve the column's stable ID.
+			var column catalog.Column
+			if catTable, ok := tab.(optCatalogTableInterface); ok {
+				column = catTable.getCol(colOrdinal)
+			}
+			if column != nil {
+				resultCols[i].PGAttributeNum = column.GetPGAttributeNum()
+			} else {
+				resultCols[i].PGAttributeNum = uint32(tab.Column(colOrdinal).ColID())
+			}
 		}
 	}
 
@@ -151,7 +186,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 // makeOptimizerPlan generates a plan using the cost-based optimizer.
 // On success, it populates p.curPlan.
 func (p *planner) makeOptimizerPlan(ctx context.Context) error {
-	stmt := p.stmt
+	p.curPlan.init(&p.stmt, &p.instrumentation)
 
 	opc := &p.optPlanningCtx
 	opc.reset()
@@ -162,27 +197,76 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 	}
 
 	// Build the plan tree.
-	root := execMemo.RootExpr()
-	execFactory := makeExecFactory(p)
-	plan, err := execbuilder.New(&execFactory, execMemo, &opc.catalog, root, p.EvalContext()).Build()
-	if err != nil {
-		return err
-	}
-
-	result := plan.(*planTop)
-	result.stmt = stmt
-	result.flags = opc.flags
-
-	cols := planColumns(result.plan)
-	if stmt.ExpectedTypes != nil {
-		if !stmt.ExpectedTypes.TypesEqual(cols) {
-			return pgerror.New(pgcode.FeatureNotSupported, "cached plan must not change result type")
+	if mode := p.SessionData().ExperimentalDistSQLPlanningMode; mode != sessiondata.ExperimentalDistSQLPlanningOff {
+		planningMode := distSQLDefaultPlanning
+		// If this transaction has modified or created any types, it is not safe to
+		// distribute due to limitations around leasing descriptors modified in the
+		// current transaction.
+		if p.Descriptors().HasUncommittedTypes() {
+			planningMode = distSQLLocalOnlyPlanning
 		}
+		err := opc.runExecBuilder(
+			&p.curPlan,
+			&p.stmt,
+			newDistSQLSpecExecFactory(p, planningMode),
+			execMemo,
+			p.EvalContext(),
+			p.autoCommit,
+		)
+		if err != nil {
+			if mode == sessiondata.ExperimentalDistSQLPlanningAlways &&
+				!strings.Contains(p.stmt.AST.StatementTag(), "SET") {
+				// We do not fallback to the old path because experimental
+				// planning is set to 'always' and we don't have a SET
+				// statement, so we return an error. SET statements are
+				// exceptions because we want to be able to execute them
+				// regardless of whether they are supported by the new factory.
+				// TODO(yuzefovich): update this once SET statements are
+				// supported (see #47473).
+				return err
+			}
+			// We will fallback to the old path.
+		} else {
+			// TODO(yuzefovich): think through whether subqueries or
+			// postqueries can be distributed. If that's the case, we might
+			// need to also look at the plan distribution of those.
+			m := p.curPlan.main
+			isPartiallyDistributed := m.physPlan.Distribution == physicalplan.PartiallyDistributedPlan
+			if isPartiallyDistributed && p.SessionData().PartiallyDistributedPlansDisabled {
+				// The planning has succeeded, but we've created a partially
+				// distributed plan yet the session variable prohibits such
+				// plan distribution - we need to replan with a new factory
+				// that forces local planning.
+				// TODO(yuzefovich): remove this logic when deleting old
+				// execFactory.
+				err = opc.runExecBuilder(
+					&p.curPlan,
+					&p.stmt,
+					newDistSQLSpecExecFactory(p, distSQLLocalOnlyPlanning),
+					execMemo,
+					p.EvalContext(),
+					p.autoCommit,
+				)
+			}
+			if err == nil {
+				return nil
+			}
+		}
+		// TODO(yuzefovich): make the logging conditional on the verbosity
+		// level once new DistSQL planning is no longer experimental.
+		log.Infof(
+			ctx, "distSQLSpecExecFactory failed planning with %v, falling back to the old path", err,
+		)
 	}
-
-	p.curPlan = *result
-
-	return nil
+	// If we got here, we did not create a plan above.
+	return opc.runExecBuilder(
+		&p.curPlan,
+		&p.stmt,
+		newExecFactory(p),
+		execMemo,
+		p.EvalContext(),
+		p.autoCommit,
+	)
 }
 
 type optPlanningCtx struct {
@@ -233,7 +317,7 @@ func (opc *optPlanningCtx) reset() {
 		// are multiple DDL operations; and transactions can be aborted leading to
 		// potential reuse of versions. To avoid these issues, we prevent saving a
 		// memo (for prepare) or reusing a saved memo (for execute).
-		opc.allowMemoReuse = !p.Tables().hasUncommittedTables()
+		opc.allowMemoReuse = !p.Descriptors().HasUncommittedTables()
 		opc.useCache = opc.allowMemoReuse && queryCacheEnabled.Get(&p.execCfg.Settings.SV)
 
 		if _, isCanned := p.stmt.AST.(*tree.CannedOptPlan); isCanned {
@@ -250,7 +334,7 @@ func (opc *optPlanningCtx) reset() {
 
 func (opc *optPlanningCtx) log(ctx context.Context, msg string) {
 	if log.VDepth(1, 1) {
-		log.InfofDepth(ctx, 1, "%s: %s", msg, opc.p.stmt)
+		log.InfofDepth(ctx, 1, "%s: %s", log.Safe(msg), opc.p.stmt)
 	} else {
 		log.Event(ctx, msg)
 	}
@@ -271,14 +355,14 @@ func (opc *optPlanningCtx) buildReusableMemo(ctx context.Context) (_ *memo.Memo,
 			)
 		}
 
-		if p.SessionData().User != security.RootUser {
+		if !p.SessionData().User().IsRootUser() {
 			return nil, pgerror.New(pgcode.InsufficientPrivilege,
 				"PREPARE AS OPT PLAN may only be used by root",
 			)
 		}
 	}
 
-	if p.SessionData().SaveTablesPrefix != "" && p.SessionData().User != security.RootUser {
+	if p.SessionData().SaveTablesPrefix != "" && !p.SessionData().User().IsRootUser() {
 		return nil, pgerror.New(pgcode.InsufficientPrivilege,
 			"sub-expression tables creation may only be used by root",
 		)
@@ -298,6 +382,7 @@ func (opc *optPlanningCtx) buildReusableMemo(ctx context.Context) (_ *memo.Memo,
 	}
 
 	if bld.DisableMemoReuse {
+		// The builder encountered a statement that prevents safe reuse of the memo.
 		opc.allowMemoReuse = false
 		opc.useCache = false
 	}
@@ -305,16 +390,18 @@ func (opc *optPlanningCtx) buildReusableMemo(ctx context.Context) (_ *memo.Memo,
 	if isCanned {
 		if f.Memo().HasPlaceholders() {
 			// We don't support placeholders inside the canned plan. The main reason
-			// is that they would be invisible to the parser (which is reports the
-			// number of placeholders, used to initialize the relevant structures).
+			// is that they would be invisible to the parser (which reports the number
+			// of placeholders, used to initialize the relevant structures).
 			return nil, pgerror.Newf(pgcode.Syntax,
 				"placeholders are not supported with PREPARE AS OPT PLAN")
 		}
 		// With a canned plan, the memo is already optimized.
 	} else {
-		// If the memo doesn't have placeholders, then fully optimize it, since
-		// it can be reused without further changes to build the execution tree.
-		if !f.Memo().HasPlaceholders() {
+		// If the memo doesn't have placeholders and did not encounter any stable
+		// operators that can be constant folded, then fully optimize it now - it
+		// can be reused without further changes to build the execution tree.
+		if !f.Memo().HasPlaceholders() && !f.FoldingControl().PreventedStableFold() {
+			opc.log(ctx, "optimizing (no placeholders)")
 			if _, err := opc.optimizer.Optimize(); err != nil {
 				return nil, err
 			}
@@ -335,16 +422,17 @@ func (opc *optPlanningCtx) buildReusableMemo(ctx context.Context) (_ *memo.Memo,
 // The returned memo is only safe to use in one thread, during execution of the
 // current statement.
 func (opc *optPlanningCtx) reuseMemo(cachedMemo *memo.Memo) (*memo.Memo, error) {
-	if !cachedMemo.HasPlaceholders() {
-		// If there are no placeholders, the query was already fully optimized
-		// (see buildReusableMemo).
+	if cachedMemo.IsOptimized() {
+		// The query could have been already fully optimized if there were no
+		// placeholders (see buildReusableMemo).
 		return cachedMemo, nil
 	}
 	f := opc.optimizer.Factory()
 	// Finish optimization by assigning any remaining placeholders and
 	// applying exploration rules. Reinitialize the optimizer and construct a
 	// new memo that is copied from the prepared memo, but with placeholders
-	// assigned.
+	// assigned. Stable operators can be constant-folded at this time.
+	f.FoldingControl().AllowStableFolds()
 	if err := f.AssignPlaceholders(cachedMemo); err != nil {
 		return nil, err
 	}
@@ -408,11 +496,14 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 		}
 		opc.flags.Set(planFlagOptCacheMiss)
 		opc.log(ctx, "query cache miss")
+	} else {
+		opc.log(ctx, "not using query cache")
 	}
 
 	// We are executing a statement for which there is no reusable memo
 	// available.
 	f := opc.optimizer.Factory()
+	f.FoldingControl().AllowStableFolds()
 	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), &opc.catalog, f, opc.p.stmt.AST)
 	if err := bld.Build(); err != nil {
 		return nil, err
@@ -423,10 +514,12 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 		}
 	}
 
-	// If this statement doesn't have placeholders, add it to the cache. Note
-	// that non-prepared statements from pgwire clients cannot have
+	// If this statement doesn't have placeholders and we have not constant-folded
+	// any VolatilityStable operators, add it to the cache.
+	// Note that non-prepared statements from pgwire clients cannot have
 	// placeholders.
-	if opc.useCache && !bld.HadPlaceholders && !bld.DisableMemoReuse {
+	if opc.useCache && !bld.HadPlaceholders && !bld.DisableMemoReuse &&
+		!f.FoldingControl().PermittedStableFold() {
 		memo := opc.optimizer.DetachMemo()
 		cachedData := querycache.CachedData{
 			SQL:  opc.p.stmt.SQL,
@@ -438,4 +531,71 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 	}
 
 	return f.Memo(), nil
+}
+
+// runExecBuilder execbuilds a plan using the given factory and stores the
+// result in planTop. If required, also captures explain data using the explain
+// factory.
+func (opc *optPlanningCtx) runExecBuilder(
+	planTop *planTop,
+	stmt *Statement,
+	f exec.Factory,
+	mem *memo.Memo,
+	evalCtx *tree.EvalContext,
+	allowAutoCommit bool,
+) error {
+	var result *planComponents
+	var isDDL bool
+	var containsFullTableScan bool
+	var containsFullIndexScan bool
+	if !planTop.instrumentation.ShouldBuildExplainPlan() {
+		// No instrumentation.
+		bld := execbuilder.New(f, mem, &opc.catalog, mem.RootExpr(), evalCtx, allowAutoCommit)
+		plan, err := bld.Build()
+		if err != nil {
+			return err
+		}
+		result = plan.(*planComponents)
+		isDDL = bld.IsDDL
+		containsFullTableScan = bld.ContainsFullTableScan
+		containsFullIndexScan = bld.ContainsFullIndexScan
+	} else {
+		// Create an explain factory and record the explain.Plan.
+		explainFactory := explain.NewFactory(f)
+		bld := execbuilder.New(explainFactory, mem, &opc.catalog, mem.RootExpr(), evalCtx, allowAutoCommit)
+		plan, err := bld.Build()
+		if err != nil {
+			return err
+		}
+		explainPlan := plan.(*explain.Plan)
+		result = explainPlan.WrappedPlan.(*planComponents)
+		isDDL = bld.IsDDL
+		containsFullTableScan = bld.ContainsFullTableScan
+		containsFullIndexScan = bld.ContainsFullIndexScan
+
+		planTop.instrumentation.RecordExplainPlan(explainPlan)
+	}
+
+	if stmt.ExpectedTypes != nil {
+		cols := result.main.planColumns()
+		if !stmt.ExpectedTypes.TypesEqual(cols) {
+			return pgerror.New(pgcode.FeatureNotSupported, "cached plan must not change result type")
+		}
+	}
+
+	planTop.planComponents = *result
+	planTop.mem = mem
+	planTop.catalog = &opc.catalog
+	planTop.stmt = stmt
+	planTop.flags = opc.flags
+	if isDDL {
+		planTop.flags.Set(planFlagIsDDL)
+	}
+	if containsFullTableScan {
+		planTop.flags.Set(planFlagContainsFullTableScan)
+	}
+	if containsFullIndexScan {
+		planTop.flags.Set(planFlagContainsFullIndexScan)
+	}
+	return nil
 }

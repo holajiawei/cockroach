@@ -17,21 +17,23 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage/protectedts"
-	"github.com/cockroachdb/cockroach/pkg/storage/protectedts/ptpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -55,23 +57,22 @@ func TestJobsProtectedTimestamp(t *testing.T) {
 		return jobs.Record{
 			Description: "testing",
 			Statement:   "SELECT 1",
-			Username:    "root",
-			Details: jobspb.ImportDetails{
-				Tables: []jobspb.ImportDetails_Table{
+			Username:    security.RootUserName(),
+			Details: jobspb.SchemaChangeGCDetails{
+				Tables: []jobspb.SchemaChangeGCDetails_DroppedID{
 					{
-						Desc: &sqlbase.TableDescriptor{
-							ID: 1,
-						},
+						ID:       42,
+						DropTime: s0.Clock().PhysicalNow(),
 					},
 				},
 			},
-			Progress:      jobspb.ImportProgress{},
-			DescriptorIDs: []sqlbase.ID{1},
+			Progress:      jobspb.SchemaChangeGCProgress{},
+			DescriptorIDs: []descpb.ID{42},
 		}
 	}
 	mkJobAndRecord := func() (j *jobs.Job, rec *ptpb.Record) {
 		ts := s0.Clock().Now()
-		require.NoError(t, s0.DB().Txn(ctx, func(ctx context.Context, txn *client.Txn) (err error) {
+		require.NoError(t, s0.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
 			if j, err = jr.CreateJobWithTxn(ctx, mkJobRec(), txn); err != nil {
 				return err
 			}
@@ -81,23 +82,23 @@ func TestJobsProtectedTimestamp(t *testing.T) {
 		return j, rec
 	}
 	jMovedToFailed, recMovedToFailed := mkJobAndRecord()
-	require.NoError(t, jMovedToFailed.Failed(ctx, io.ErrUnexpectedEOF, func(ctx context.Context, txn *client.Txn) error {
-		return nil
+	require.NoError(t, s0.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		return jr.Failed(ctx, txn, *jMovedToFailed.ID(), io.ErrUnexpectedEOF)
 	}))
 	jFinished, recFinished := mkJobAndRecord()
-	require.NoError(t, jFinished.Succeeded(ctx, func(ctx context.Context, txn *client.Txn) error {
-		return nil
+	require.NoError(t, s0.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		return jr.Succeeded(ctx, txn, *jFinished.ID())
 	}))
 	_, recRemains := mkJobAndRecord()
-	ensureNotExists := func(ctx context.Context, txn *client.Txn, ptsID uuid.UUID) (err error) {
+	ensureNotExists := func(ctx context.Context, txn *kv.Txn, ptsID uuid.UUID) (err error) {
 		_, err = ptp.GetRecord(ctx, txn, ptsID)
-		if err == protectedts.ErrNotExists {
+		if errors.Is(err, protectedts.ErrNotExists) {
 			return nil
 		}
 		return fmt.Errorf("waiting for %v, got %v", protectedts.ErrNotExists, err)
 	}
 	testutils.SucceedsSoon(t, func() (err error) {
-		return s0.DB().Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		return s0.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			if err := ensureNotExists(ctx, txn, recMovedToFailed.ID); err != nil {
 				return err
 			}

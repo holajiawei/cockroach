@@ -17,7 +17,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
@@ -469,6 +469,46 @@ func TestNonsortingEncodeDecimalRoundtrip(t *testing.T) {
 				t.Fatalf("expected %s, got %s", expect, s)
 			}
 		})
+	}
+}
+
+func TestDecodeMultipleDecimalsIntoNonsortingDecimal(t *testing.T) {
+	tcs := []struct {
+		value []string
+	}{
+		{
+			[]string{"1.0", "5.0", "7.0"},
+		},
+		{
+			[]string{"1.0", "-1.0", "0.0"},
+		},
+		{
+			[]string{"1.0", "-1.0", "10.0"},
+		},
+		{
+			[]string{"nan", "1.0", "-1.0"},
+		},
+		{
+			[]string{"-1.0", "inf", "5.0"},
+		},
+	}
+
+	for _, tc := range tcs {
+		var actual apd.Decimal
+		for _, num := range tc.value {
+			expected, _, err := apd.NewFromString(num)
+			if err != nil {
+				t.Fatal(err)
+			}
+			enc := EncodeNonsortingDecimal(nil, expected)
+			err = DecodeIntoNonsortingDecimal(&actual, enc, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if actual.Cmp(expected) != 0 {
+				t.Errorf("unexpected mismatch for %v, got %v", expected, &actual)
+			}
+		}
 	}
 }
 

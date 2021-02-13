@@ -14,134 +14,155 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // NewUnorderedDistinct creates an unordered distinct on the given distinct
 // columns.
 func NewUnorderedDistinct(
-	allocator *Allocator, input Operator, distinctCols []uint32, colTypes []coltypes.T,
-) Operator {
-	outCols := make([]uint32, len(colTypes))
-	for i := range outCols {
-		outCols[i] = uint32(i)
-	}
+	allocator *colmem.Allocator, input colexecbase.Operator, distinctCols []uint32, typs []*types.T,
+) ResettableOperator {
+	// These numbers were chosen after running the micro-benchmarks.
+	const hashTableLoadFactor = 2.0
+	const hashTableNumBuckets = 128
 	ht := newHashTable(
 		allocator,
+		hashTableLoadFactor,
 		hashTableNumBuckets,
-		colTypes,
+		typs,
 		distinctCols,
-		outCols,
 		true, /* allowNullEquality */
-		hashTableDistinctMode,
+		hashTableDistinctBuildMode,
+		hashTableDefaultProbeMode,
 	)
 
 	return &unorderedDistinct{
 		OneInputNode: NewOneInputNode(input),
-		allocator:    allocator,
 		ht:           ht,
-		output:       allocator.NewMemBatch(ht.outTypes),
 	}
 }
 
-// unorderedDistinct performs a DISTINCT operation using a hashTable. Once the
-// building of the hashTable is completed, this operator iterates over all of
-// the tuples to check whether the tuple is the "head" of a linked list that
-// contain all of the tuples that are equal on distinct columns. Only the
-// "head" is included into the big selection vector. Once the big selection
-// vector is populated, the operator proceeds to returning the batches
-// according to a chunk of the selection vector.
+// unorderedDistinct performs a DISTINCT operation using a hashTable. It
+// populates the hash table in an iterative fashion by appending only the
+// distinct tuples from each input batch. Once at least one tuple is appended,
+// all of the distinct tuples from the batch are emitted in the output.
 type unorderedDistinct struct {
 	OneInputNode
 
-	allocator     *Allocator
-	ht            *hashTable
-	buildFinished bool
-
-	// sel is a list of indices to select representing the distinct rows.
-	sel           []int
-	distinctCount int
-
-	output           coldata.Batch
-	outputBatchStart int
+	ht *hashTable
+	// lastInputBatch tracks the last input batch read from the input and not
+	// emitted into the output. It is the only batch that we need to export when
+	// spilling to disk, and it will contain only the distinct tuples that need
+	// to be emitted into the output.
+	lastInputBatch coldata.Batch
 }
 
-var _ Operator = &unorderedDistinct{}
+var _ colexecbase.BufferingInMemoryOperator = &unorderedDistinct{}
+var _ ResettableOperator = &unorderedDistinct{}
 
 func (op *unorderedDistinct) Init() {
 	op.input.Init()
 }
 
 func (op *unorderedDistinct) Next(ctx context.Context) coldata.Batch {
-	op.output.ResetInternalBatch()
-	// First, build the hash table.
-	if !op.buildFinished {
-		op.buildFinished = true
-		op.ht.build(ctx, op.input)
-		op.ht.findTupleGroups(ctx)
-	}
-
-	// The selection vector needs to be populated before any batching can be
-	// done.
-	if op.sel == nil {
-		// Since next is no longer useful and pre-allocated to the appropriate
-		// size, we can use it as the selection vector. This way we don't have to
-		// reallocate a huge array.
-		//op.sel = op.ht.next
-		// TODO(yuzefovich): consider changing hash table to operate on ints
-		// instead of uint64s. Then we'll be able to reuse op.ht.next.
-		op.sel = make([]int, op.ht.vals.Length())
-		// We calculate keyID for tuple at index i as "i+1," so we start from
-		// position 1.
-		for i, isHead := range op.ht.head[1:] {
-			if isHead {
-				// The tuple at index i is the "head" of the linked list of tuples that
-				// are the same on the distinct columns, so we will include it while
-				// all other tuples from the linked list will be skipped.
-				op.sel[op.distinctCount] = i
-				op.distinctCount++
-			}
+	for {
+		op.lastInputBatch = op.input.Next(ctx)
+		if op.lastInputBatch.Length() == 0 {
+			return coldata.ZeroBatch
+		}
+		// distinctBuild call might result in an OOM error after lastInputBatch
+		// is updated in-place to include only the new distinct tuples. If an
+		// OOM occurs, we are careful not to filter them out (since the
+		// filtering has already been performed); if an OOM doesn't occur, we
+		// will emit the updated last input batch here.
+		op.ht.distinctBuild(ctx, op.lastInputBatch)
+		if op.lastInputBatch.Length() > 0 {
+			// We've just appended some distinct tuples to the hash table, so we
+			// will emit all of them as the output. Note that the selection
+			// vector on batch is set in such a manner that only the distinct
+			// tuples are selected, so we can just emit batch directly.
+			return op.lastInputBatch
 		}
 	}
-
-	// Create and return the next batch of input to a maximum size of
-	// coldata.BatchSize(). The rows in the new batch are specified by the
-	// corresponding slice in the selection vector.
-	nSelected := 0
-	batchEnd := op.outputBatchStart + coldata.BatchSize()
-	if batchEnd > op.distinctCount {
-		batchEnd = op.distinctCount
-	}
-	nSelected = batchEnd - op.outputBatchStart
-
-	op.allocator.PerformOperation(op.output.ColVecs(), func() {
-		for i, colIdx := range op.ht.outCols {
-			toCol := op.output.ColVec(i)
-			fromCol := op.ht.vals.ColVec(int(colIdx))
-			toCol.Copy(
-				coldata.CopySliceArgs{
-					SliceArgs: coldata.SliceArgs{
-						ColType:     op.ht.valTypes[op.ht.outCols[i]],
-						Src:         fromCol,
-						Sel:         op.sel,
-						SrcStartIdx: op.outputBatchStart,
-						SrcEndIdx:   batchEnd,
-					},
-				},
-			)
-		}
-	})
-
-	op.outputBatchStart = batchEnd
-	op.output.SetLength(nSelected)
-	return op.output
 }
 
-// Reset resets the unorderedDistinct for another run. Primarily used for
-// benchmarks.
-func (op *unorderedDistinct) reset() {
-	op.outputBatchStart = 0
-	op.ht.vals.ResetInternalBatch()
-	op.ht.vals.SetLength(0)
-	op.buildFinished = false
+func (op *unorderedDistinct) ExportBuffered(context.Context, colexecbase.Operator) coldata.Batch {
+	if op.lastInputBatch != nil {
+		batch := op.lastInputBatch
+		op.lastInputBatch = nil
+		return batch
+	}
+	// We only need to export the last input batch because the buffered in the
+	// hash table data is used by the unorderedDistinctFilterer (which is
+	// planned by the external distinct).
+	return coldata.ZeroBatch
+}
+
+// reset resets the unorderedDistinct.
+func (op *unorderedDistinct) reset(ctx context.Context) {
+	if r, ok := op.input.(resetter); ok {
+		r.reset(ctx)
+	}
+	op.ht.reset(ctx)
+}
+
+// unorderedDistinctFilterer filters out tuples that are duplicates of the
+// tuples already emitted by the unordered distinct.
+type unorderedDistinctFilterer struct {
+	OneInputNode
+	NonExplainable
+
+	ht *hashTable
+	// seenBatch tracks whether the operator has already read at least one
+	// batch.
+	seenBatch bool
+}
+
+var _ colexecbase.Operator = &unorderedDistinctFilterer{}
+
+func (f *unorderedDistinctFilterer) Init() {
+	f.input.Init()
+}
+
+func (f *unorderedDistinctFilterer) Next(ctx context.Context) coldata.Batch {
+	if f.ht.vals.Length() == 0 {
+		// The hash table is empty, so there is nothing to filter against.
+		return f.input.Next(ctx)
+	}
+	for {
+		batch := f.input.Next(ctx)
+		if batch.Length() == 0 {
+			return coldata.ZeroBatch
+		}
+		if !f.seenBatch {
+			// This is the first batch we received from bufferExportingOperator
+			// and the hash table is not empty; therefore, this batch must be
+			// the last input batch coming from the in-memory unordered
+			// distinct.
+			//
+			// That batch has already been updated in-place to contain only
+			// distinct tuples all of which have been appended to the hash
+			// table, so we don't need to perform filtering on it. However, we
+			// might need to repair the hash table in case the OOM error
+			// occurred when tuples were being appended to f.ht.vals.
+			//
+			// See https://github.com/cockroachdb/cockroach/pull/58006#pullrequestreview-565859919
+			// for all the gory details.
+			f.ht.maybeRepairAfterDistinctBuild(ctx)
+			f.seenBatch = true
+			return batch
+		}
+		// The unordered distinct has emitted some tuples, so we need to check
+		// all tuples in batch against the hash table.
+		f.ht.computeHashAndBuildChains(ctx, batch)
+		// Remove the duplicates within batch itself.
+		f.ht.removeDuplicates(batch, f.ht.keys, f.ht.probeScratch.first, f.ht.probeScratch.next, f.ht.checkProbeForDistinct)
+		// Remove the duplicates of already emitted distinct tuples.
+		f.ht.removeDuplicates(batch, f.ht.keys, f.ht.buildScratch.first, f.ht.buildScratch.next, f.ht.checkBuildForDistinct)
+		if batch.Length() > 0 {
+			return batch
+		}
+	}
 }

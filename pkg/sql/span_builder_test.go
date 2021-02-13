@@ -15,11 +15,14 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // These tests are in the sql package rather than span package
@@ -27,10 +30,13 @@ import (
 
 func TestSpanBuilderCanSplitSpan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ctx := context.TODO()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
+	execCfg := s.ExecutorConfig().(ExecutorConfig)
+	evalCtx := tree.NewTestingEvalContext(s.ClusterSettings())
 	tcs := []struct {
 		sql               string
 		index             string
@@ -96,12 +102,12 @@ func TestSpanBuilderCanSplitSpan(t *testing.T) {
 			if _, err := sqlDB.Exec(sql); err != nil {
 				t.Fatal(err)
 			}
-			desc := sqlbase.GetTableDescriptor(kvDB, "t", "t")
-			idx, _, err := desc.FindIndexByName(tc.index)
+			desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t")
+			idx, err := desc.FindIndexWithName(tc.index)
 			if err != nil {
 				t.Fatal(err)
 			}
-			builder := span.MakeBuilder(desc, idx)
+			builder := span.MakeBuilder(evalCtx, execCfg.Codec, desc, idx.IndexDesc())
 			if res := builder.CanSplitSpanIntoSeparateFamilies(
 				tc.numNeededFamilies, tc.prefixLen, tc.containsNull); res != tc.canSplit {
 				t.Errorf("expected result to be %v, but found %v", tc.canSplit, res)

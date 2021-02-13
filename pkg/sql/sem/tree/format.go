@@ -15,7 +15,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
@@ -29,14 +30,14 @@ func (f FmtFlags) HasFlags(subset FmtFlags) bool {
 	return f&subset == subset
 }
 
-// SetFlags sets the given formatting flags.
-func (f *FmtFlags) SetFlags(subset FmtFlags) {
-	*f |= subset
+// HasAnyFlags tests whether any of the given flags are all set.
+func (f FmtFlags) HasAnyFlags(subset FmtFlags) bool {
+	return f&subset != 0
 }
 
 // EncodeFlags returns the subset of the flags that are also lex encode flags.
-func (f FmtFlags) EncodeFlags() lex.EncodeFlags {
-	return lex.EncodeFlags(f) & (lex.EncFirstFreeFlagBit - 1)
+func (f FmtFlags) EncodeFlags() lexbase.EncodeFlags {
+	return lexbase.EncodeFlags(f) & (lexbase.EncFirstFreeFlagBit - 1)
 }
 
 // Basic bit definitions for the FmtFlags bitmask.
@@ -52,15 +53,15 @@ const (
 	// string will be escaped and enclosed in e'...' regardless of
 	// whether FmtBareStrings is specified. See FmtRawStrings below for
 	// an alternative.
-	FmtBareStrings FmtFlags = FmtFlags(lex.EncBareStrings)
+	FmtBareStrings FmtFlags = FmtFlags(lexbase.EncBareStrings)
 
 	// FmtBareIdentifiers instructs the pretty-printer to print
 	// identifiers without wrapping quotes in any case.
-	FmtBareIdentifiers FmtFlags = FmtFlags(lex.EncBareIdentifiers)
+	FmtBareIdentifiers FmtFlags = FmtFlags(lexbase.EncBareIdentifiers)
 
 	// FmtShowPasswords instructs the pretty-printer to not suppress passwords.
 	// If not set, passwords are replaced by *****.
-	FmtShowPasswords FmtFlags = FmtFlags(lex.EncFirstFreeFlagBit) << iota
+	FmtShowPasswords FmtFlags = FmtFlags(lexbase.EncFirstFreeFlagBit) << iota
 
 	// FmtShowTypes instructs the pretty-printer to
 	// annotate expressions with their resolved types.
@@ -117,15 +118,25 @@ const (
 	// the numeric by enclosing them within parentheses.
 	FmtParsableNumerics
 
-	// FmtPGAttrdefAdbin is used to produce expressions formatted in a way that's
-	// as close as possible to what clients expect to live in the pg_attrdef.adbin
-	// column. Specifically, this strips type annotations, since Postgres doesn't
-	// know what those are.
-	FmtPGAttrdefAdbin
+	// FmtPGCatalog is used to produce expressions formatted in a way that's as
+	// close as possible to what clients expect to live in pg_catalog (e.g.
+	// pg_attrdef.adbin, pg_constraint.condef and pg_indexes.indexdef columns).
+	// Specifically, this strips type annotations (Postgres doesn't know what
+	// those are), adds cast expressions for non-numeric constants, and formats
+	// indexes in Postgres-specific syntax.
+	FmtPGCatalog
 
-	// FmtPGIndexDef is used to produce CREATE INDEX statements that are
-	// compatible with pg_get_indexdef.
-	FmtPGIndexDef
+	// If set, user defined types and datums of user defined types will be
+	// formatted in a way that is stable across changes to the underlying type.
+	// For type names, this means that they will be formatted as '@id'. For enum
+	// members, this means that they will be serialized as their bytes physical
+	// representations.
+	fmtStaticallyFormatUserDefinedTypes
+
+	// fmtFormatByteLiterals instructs bytes to be formatted as byte literals
+	// rather than string literals. For example, the bytes \x40 will be formatted
+	// as b'\x40' rather than '\x40'.
+	fmtFormatByteLiterals
 )
 
 // Composite/derived flag definitions follow.
@@ -133,12 +144,21 @@ const (
 	// FmtPgwireText instructs the pretty-printer to use
 	// a pg-compatible conversion to strings. See comments
 	// in pgwire_encode.go.
-	FmtPgwireText FmtFlags = fmtPgwireFormat | FmtFlags(lex.EncBareStrings)
+	FmtPgwireText FmtFlags = fmtPgwireFormat | FmtFlags(lexbase.EncBareStrings)
 
 	// FmtParsable instructs the pretty-printer to produce a representation that
-	// can be parsed into an equivalent expression (useful for serialization of
-	// expressions).
+	// can be parsed into an equivalent expression. If there is a chance that the
+	// formatted data will be stored durably on disk or sent to other nodes,
+	// then this formatting directive is not appropriate, and FmtSerializable
+	// should be used instead.
 	FmtParsable FmtFlags = fmtDisambiguateDatumTypes | FmtParsableNumerics
+
+	// FmtSerializable instructs the pretty-printer to produce a representation
+	// for expressions that can be serialized to disk. It serializes user defined
+	// types using representations that are stable across changes of the type
+	// itself. This should be used when serializing expressions that will be
+	// stored on disk, like DEFAULT expressions of columns.
+	FmtSerializable FmtFlags = FmtParsable | fmtStaticallyFormatUserDefinedTypes
 
 	// FmtCheckEquivalence instructs the pretty-printer to produce a representation
 	// that can be used to check equivalence of expressions. Specifically:
@@ -148,7 +168,13 @@ const (
 	//    annotations. This is necessary because datums of different types
 	//    can otherwise be formatted to the same string: (for example the
 	//    DDecimal 1 and the DInt 1).
-	FmtCheckEquivalence FmtFlags = fmtSymbolicVars | fmtDisambiguateDatumTypes | FmtParsableNumerics
+	//  - user defined types and datums of user defined types are formatted
+	//    using static representations to avoid name resolution and invalidation
+	//    due to changes in the underlying type.
+	FmtCheckEquivalence FmtFlags = fmtSymbolicVars |
+		fmtDisambiguateDatumTypes |
+		FmtParsableNumerics |
+		fmtStaticallyFormatUserDefinedTypes
 
 	// FmtArrayToString is a special composite flag suitable
 	// for the output of array_to_string(). This de-quotes
@@ -204,6 +230,9 @@ type FmtCtx struct {
 	// placeholderFormat is an optional interceptor for Placeholder.Format calls;
 	// it can be used to format placeholders differently than normal.
 	placeholderFormat func(ctx *FmtCtx, p *Placeholder)
+	// indexedTypeFormatter is an optional interceptor for formatting
+	// IDTypeReferences differently than normal.
+	indexedTypeFormatter func(*FmtCtx, *OIDTypeReference)
 }
 
 // NewFmtCtx creates a FmtCtx; only flags that don't require Annotations
@@ -269,21 +298,6 @@ func (ctx *FmtCtx) Printf(f string, args ...interface{}) {
 	fmt.Fprintf(&ctx.Buffer, f, args...)
 }
 
-// FmtExpr returns FmtFlags that indicate how the pretty-printer
-// should format expressions.
-func FmtExpr(base FmtFlags, showTypes bool, symbolicVars bool, showTableAliases bool) FmtFlags {
-	if showTypes {
-		base |= FmtShowTypes
-	}
-	if symbolicVars {
-		base |= fmtSymbolicVars
-	}
-	if showTableAliases {
-		base |= FmtShowTableAliases
-	}
-	return base
-}
-
 // SetIndexedVarFormat modifies FmtCtx to customize the printing of
 // IndexedVars using the provided function.
 func (ctx *FmtCtx) SetIndexedVarFormat(fn func(ctx *FmtCtx, idx int)) {
@@ -296,13 +310,10 @@ func (ctx *FmtCtx) SetPlaceholderFormat(placeholderFn func(_ *FmtCtx, _ *Placeho
 	ctx.placeholderFormat = placeholderFn
 }
 
-// WithPlaceholderFormat changes the placeholder formatting function, calls the
-// given function, then restores the placeholder function.
-func (ctx *FmtCtx) WithPlaceholderFormat(placeholderFn func(_ *FmtCtx, _ *Placeholder), fn func()) {
-	old := ctx.placeholderFormat
-	ctx.placeholderFormat = placeholderFn
-	defer func() { ctx.placeholderFormat = old }()
-	fn()
+// SetIndexedTypeFormat modifies FmtCtx to customize the printing of
+// IDTypeReferences using the provided function.
+func (ctx *FmtCtx) SetIndexedTypeFormat(fn func(*FmtCtx, *OIDTypeReference)) {
+	ctx.indexedTypeFormatter = fn
 }
 
 // NodeFormatter is implemented by nodes that can be pretty-printed.
@@ -323,6 +334,11 @@ func (ctx *FmtCtx) FormatName(s string) {
 // FormatNameP formats a string reference as a name.
 func (ctx *FmtCtx) FormatNameP(s *string) {
 	ctx.FormatNode((*Name)(s))
+}
+
+// FormatUsername formats a username safely.
+func (ctx *FmtCtx) FormatUsername(s security.SQLUsername) {
+	ctx.FormatName(s.Normalized())
 }
 
 // FormatNode recurses into a node for pretty-printing.
@@ -358,7 +374,7 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 			ctx.WriteByte(')')
 		}
 	}
-	if f.HasFlags(fmtDisambiguateDatumTypes) {
+	if f.HasAnyFlags(fmtDisambiguateDatumTypes | FmtPGCatalog) {
 		var typ *types.T
 		if d, isDatum := n.(Datum); isDatum {
 			if p, isPlaceholder := d.(*Placeholder); isPlaceholder {
@@ -366,11 +382,18 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 				typ = p.typ
 			} else if d.AmbiguousFormat() {
 				typ = d.ResolvedType()
+			} else if _, isArray := d.(*DArray); isArray && f.HasFlags(FmtPGCatalog) {
+				typ = d.ResolvedType()
 			}
 		}
 		if typ != nil {
-			ctx.WriteString(":::")
-			ctx.WriteString(typ.SQLString())
+			if f.HasFlags(fmtDisambiguateDatumTypes) {
+				ctx.WriteString(":::")
+				ctx.FormatTypeReference(typ)
+			} else if f.HasFlags(FmtPGCatalog) && !typ.IsNumeric() {
+				ctx.WriteString("::")
+				ctx.FormatTypeReference(typ)
+			}
 		}
 	}
 }
@@ -401,10 +424,16 @@ func ErrString(n NodeFormatter) string {
 	return AsStringWithFlags(n, FmtBareIdentifiers)
 }
 
-// Serialize pretty prints a node to a string using FmtParsable; it is
-// appropriate when we store expressions into strings that are later parsed back
-// into expressions.
+// Serialize pretty prints a node to a string using FmtSerializable; it is
+// appropriate when we store expressions into strings that are stored on disk
+// and may be later parsed back into expressions.
 func Serialize(n NodeFormatter) string {
+	return AsStringWithFlags(n, FmtSerializable)
+}
+
+// SerializeForDisplay pretty prints a node to a string using FmtParsable.
+// It is appropriate when printing expressions that are visible to end users.
+func SerializeForDisplay(n NodeFormatter) string {
 	return AsStringWithFlags(n, FmtParsable)
 }
 

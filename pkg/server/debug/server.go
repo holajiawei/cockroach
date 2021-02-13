@@ -11,24 +11,33 @@
 package debug
 
 import (
+	"bytes"
 	"context"
 	"expvar"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"path"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/server/debug/goroutineui"
 	"github.com/cockroachdb/cockroach/pkg/server/debug/pprofui"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	pebbletool "github.com/cockroachdb/pebble/tool"
 	"github.com/rcrowley/go-metrics"
 	"github.com/rcrowley/go-metrics/exp"
+	"github.com/spf13/cobra"
 	"golang.org/x/net/trace"
 	"google.golang.org/grpc/metadata"
 )
@@ -94,7 +103,9 @@ func NewServer(st *cluster.Settings, hbaConfDebugFn http.HandlerFunc) *Server {
 	// https://golang.org/src/net/http/pprof/pprof.go
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/profile", func(w http.ResponseWriter, r *http.Request) {
+		CPUProfileHandler(st, w, r)
+	})
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
@@ -128,19 +139,30 @@ func NewServer(st *cluster.Settings, hbaConfDebugFn http.HandlerFunc) *Server {
 	mux.HandleFunc("/debug/logspy", spy.handleDebugLogSpy)
 
 	ps := pprofui.NewServer(pprofui.NewMemStorage(1, 0), func(profile string, labels bool, do func()) {
+		ctx := context.Background()
 		tBegin := timeutil.Now()
 
-		extra := ""
-		if profile == "profile" && labels {
-			extra = " (enabling profiler labels)"
-			st.SetCPUProfiling(true)
-			defer st.SetCPUProfiling(false)
+		if profile != "profile" {
+			do()
+			return
 		}
-		log.Infof(context.Background(), "pprofui: recording %s%s", profile, extra)
 
-		do()
-
-		log.Infof(context.Background(), "pprofui: recorded %s in %.2fs", profile, timeutil.Since(tBegin).Seconds())
+		if err := CPUProfileDo(st, CPUProfileOptions{WithLabels: labels}.Type(), func() error {
+			var extra string
+			if labels {
+				extra = " (enabling profiler labels)"
+			}
+			log.Infof(context.Background(), "pprofui: recording %s%s", profile, extra)
+			do()
+			return nil
+		}); err != nil {
+			// NB: we don't have good error handling here. Could be changed if we find
+			// this problematic. In practice, `do()` wraps the pprof handler which will
+			// return an error if there's already a profile going on just the same.
+			log.Warningf(ctx, "unable to start CPU profile: %s", err)
+			return
+		}
+		log.Infof(ctx, "pprofui: recorded %s in %.2fs", profile, timeutil.Since(tBegin).Seconds())
 	})
 	mux.Handle("/debug/pprof/ui/", http.StripPrefix("/debug/pprof/ui", ps))
 
@@ -158,11 +180,76 @@ func NewServer(st *cluster.Settings, hbaConfDebugFn http.HandlerFunc) *Server {
 		_ = dump.HTML(w)
 	})
 
+	mux.HandleFunc("/debug/threads", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Add("Content-type", "text/plain")
+		fmt.Fprint(w, storage.ThreadStacks())
+	})
+
 	return &Server{
 		st:  st,
 		mux: mux,
 		spy: spy,
 	}
+}
+
+func analyzeLSM(dir string, writer io.Writer) error {
+	manifestName, err := ioutil.ReadFile(path.Join(dir, "CURRENT"))
+	if err != nil {
+		return err
+	}
+
+	manifestPath := path.Join(dir, string(bytes.TrimSpace(manifestName)))
+
+	t := pebbletool.New(pebbletool.Comparers(storage.EngineComparer))
+
+	// TODO(yevgeniy): Consider exposing LSM tool directly.
+	var lsm *cobra.Command
+	for _, c := range t.Commands {
+		if c.Name() == "lsm" {
+			lsm = c
+		}
+	}
+	if lsm == nil {
+		return errors.New("no such command")
+	}
+
+	lsm.SetOutput(writer)
+	lsm.Run(lsm, []string{manifestPath})
+	return nil
+}
+
+// RegisterEngines setups up debug engine endpoints for the known storage engines.
+func (ds *Server) RegisterEngines(specs []base.StoreSpec, engines []storage.Engine) error {
+	if len(specs) != len(engines) {
+		// TODO(yevgeniy): Consider adding accessors to storage.Engine to get their path.
+		return errors.New("number of store specs must match number of engines")
+	}
+	for i := 0; i < len(specs); i++ {
+		if specs[i].InMemory {
+			// TODO(yevgeniy): Add plumbing to support LSM visualization for in memory engines.
+			continue
+		}
+
+		id, err := kvserver.ReadStoreIdent(context.Background(), engines[i])
+		if err != nil {
+			return err
+		}
+
+		eng := engines[i]
+		ds.mux.HandleFunc(fmt.Sprintf("/debug/lsm/%d", id.StoreID),
+			func(w http.ResponseWriter, req *http.Request) {
+				_, _ = io.WriteString(w, eng.GetCompactionStats())
+			})
+
+		dir := specs[i].Path
+		ds.mux.HandleFunc(fmt.Sprintf("/debug/lsm-viz/%d", id.StoreID),
+			func(w http.ResponseWriter, req *http.Request) {
+				if err := analyzeLSM(dir, w); err != nil {
+					fmt.Fprintf(w, "error analyzing LSM at %s: %v", dir, err)
+				}
+			})
+	}
+	return nil
 }
 
 // ServeHTTP serves various tools under the /debug endpoint. It restricts access

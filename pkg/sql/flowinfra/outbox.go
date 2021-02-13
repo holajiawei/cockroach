@@ -12,24 +12,20 @@ package flowinfra
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
-	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	opentracing "github.com/opentracing/opentracing-go"
-	"google.golang.org/grpc"
 )
 
 const outboxBufRows = 16
@@ -68,7 +64,16 @@ type Outbox struct {
 	err error
 
 	statsCollectionEnabled bool
-	stats                  OutboxStats
+	stats                  execinfrapb.ComponentStats
+
+	// numOutboxes is an atomic that keeps track of how many outboxes are left.
+	// When there is one outbox left, the flow-level stats are added to the last
+	// outbox's span stats unless isGatewayNode is true, in which case, the flow
+	// will do so in its Cleanup method.
+	numOutboxes *int32
+
+	// isGatewayNode specifies whether this outbox is running on the gateway node.
+	isGatewayNode bool
 }
 
 var _ execinfra.RowReceiver = &Outbox{}
@@ -78,12 +83,16 @@ var _ Startable = &Outbox{}
 func NewOutbox(
 	flowCtx *execinfra.FlowCtx,
 	nodeID roachpb.NodeID,
-	flowID execinfrapb.FlowID,
 	streamID execinfrapb.StreamID,
+	numOutboxes *int32,
+	isGatewayNode bool,
 ) *Outbox {
 	m := &Outbox{flowCtx: flowCtx, nodeID: nodeID}
-	m.encoder.SetHeaderFields(flowID, streamID)
+	m.encoder.SetHeaderFields(flowCtx.ID, streamID)
 	m.streamID = streamID
+	m.numOutboxes = numOutboxes
+	m.isGatewayNode = isGatewayNode
+	m.stats.Component = flowCtx.StreamComponentID(streamID)
 	return m
 }
 
@@ -100,11 +109,11 @@ func (m *Outbox) SetFlowCtx(flowCtx *execinfra.FlowCtx) {
 }
 
 // Init initializes the Outbox.
-func (m *Outbox) Init(typs []types.T) {
+func (m *Outbox) Init(typs []*types.T) {
 	if typs == nil {
 		// We check for nil to detect uninitialized cases; but we support 0-length
 		// rows.
-		typs = make([]types.T, 0)
+		typs = make([]*types.T, 0)
 	}
 	m.RowChannel.InitWithNumSenders(typs, 1)
 	m.encoder.Init(typs)
@@ -119,7 +128,7 @@ func (m *Outbox) Init(typs []types.T) {
 // too, or it might be an encoding error, in which case we've forwarded it on
 // the stream.
 func (m *Outbox) addRow(
-	ctx context.Context, row sqlbase.EncDatumRow, meta *execinfrapb.ProducerMetadata,
+	ctx context.Context, row rowenc.EncDatumRow, meta *execinfrapb.ProducerMetadata,
 ) error {
 	mustFlush := false
 	var encodingErr error
@@ -133,6 +142,9 @@ func (m *Outbox) addRow(
 		if encodingErr != nil {
 			m.encoder.AddMetadata(ctx, execinfrapb.ProducerMetadata{Err: encodingErr})
 			mustFlush = true
+		}
+		if m.statsCollectionEnabled {
+			m.stats.NetTx.TuplesSent.Add(1)
 		}
 	}
 	m.numRows++
@@ -155,14 +167,15 @@ func (m *Outbox) flush(ctx context.Context) error {
 		return nil
 	}
 	msg := m.encoder.FormMessage(ctx)
-	if m.statsCollectionEnabled {
-		m.stats.BytesSent += int64(msg.Size())
-	}
 
 	if log.V(3) {
 		log.Infof(ctx, "flushing outbox")
 	}
 	sendErr := m.stream.Send(msg)
+	if m.statsCollectionEnabled {
+		m.stats.NetTx.BytesSent.Add(int64(msg.Size()))
+		m.stats.NetTx.MessagesSent.Add(1)
+	}
 	for _, rpm := range msg.Data.Metadata {
 		if metricsMeta, ok := rpm.Value.(*execinfrapb.RemoteProducerMetadata_Metrics_); ok {
 			metricsMeta.Metrics.Release()
@@ -203,26 +216,27 @@ func (m *Outbox) mainLoop(ctx context.Context) error {
 	// writers could be writing to it as soon as we are started.
 	defer m.RowChannel.ConsumerClosed()
 
-	var span opentracing.Span
+	var span *tracing.Span
 	ctx, span = execinfra.ProcessorSpan(ctx, "outbox")
-	if span != nil && tracing.IsRecording(span) {
+	if span != nil && span.IsVerbose() {
 		m.statsCollectionEnabled = true
+		span.SetTag(execinfrapb.FlowIDTagKey, m.flowCtx.ID.String())
 		span.SetTag(execinfrapb.StreamIDTagKey, m.streamID)
 	}
-	// spanFinished specifies whether we called tracing.FinishSpan on the span.
-	// Some code paths (e.g. stats collection) need to prematurely call
-	// FinishSpan to get trace data.
+	// spanFinished specifies whether we've Finish()-ed the span. Some code
+	// paths (e.g. stats collection) need to prematurely call it to get trace
+	// data.
 	spanFinished := false
 	defer func() {
 		if !spanFinished {
-			tracing.FinishSpan(span)
+			span.Finish()
 		}
 	}()
 
 	if m.stream == nil {
-		var conn *grpc.ClientConn
-		var err error
-		conn, err = m.flowCtx.Cfg.NodeDialer.DialNoBreaker(ctx, m.nodeID, rpc.DefaultClass)
+		conn, err := execinfra.GetConnForOutbox(
+			ctx, m.flowCtx.Cfg.NodeDialer, m.nodeID, SettingFlowStreamTimeout.Get(&m.flowCtx.Cfg.Settings.SV),
+		)
 		if err != nil {
 			// Log any Dial errors. This does not have a verbosity check due to being
 			// a critical part of query execution: if this step doesn't work, the
@@ -284,11 +298,15 @@ func (m *Outbox) mainLoop(ctx context.Context) error {
 					if err != nil {
 						return err
 					}
-					if m.flowCtx.Cfg.TestingKnobs.DeterministicStats {
-						m.stats.BytesSent = 0
+					if !m.isGatewayNode && m.numOutboxes != nil && atomic.AddInt32(m.numOutboxes, -1) == 0 {
+						// TODO(cathymw): maxMemUsage shouldn't be attached to span stats that are associated with streams,
+						// since it's a flow level stat. However, due to the row exec engine infrastructure, it is too
+						// complicated to attach this to a flow level span. If the row exec engine gets removed, getting
+						// maxMemUsage from streamStats should be removed as well.
+						m.stats.FlowStats.MaxMemUsage.Set(uint64(m.flowCtx.EvalCtx.Mon.MaximumBytes()))
 					}
-					tracing.SetSpanStats(span, &m.stats)
-					tracing.FinishSpan(span)
+					span.SetSpanStats(&m.stats)
+					span.Finish()
 					spanFinished = true
 					if trace := execinfra.GetTraceData(ctx); trace != nil {
 						err := m.addRow(ctx, nil, &execinfrapb.ProducerMetadata{TraceData: trace})
@@ -412,10 +430,10 @@ func (m *Outbox) listenForDrainSignalFromConsumer(ctx context.Context) (<-chan d
 					return
 				}
 			case signal.SetupFlowRequest != nil:
-				log.Fatalf(ctx, "Unexpected SetupFlowRequest. "+
+				log.Fatalf(ctx, "unexpected SetupFlowRequest.\n"+
 					"This SyncFlow specific message should have been handled in RunSyncFlow.")
 			case signal.Handshake != nil:
-				log.Eventf(ctx, "Consumer sent handshake. Consuming flow scheduled: %t",
+				log.Eventf(ctx, "consumer sent handshake.\nConsuming flow scheduled: %t",
 					signal.Handshake.ConsumerScheduled)
 			}
 		}
@@ -454,18 +472,4 @@ func (m *Outbox) Start(ctx context.Context, wg *sync.WaitGroup, flowCtxCancel co
 // Err returns the error (if any occurred) while Outbox was running.
 func (m *Outbox) Err() error {
 	return m.err
-}
-
-const outboxTagPrefix = "outbox."
-
-// Stats implements the SpanStats interface.
-func (os *OutboxStats) Stats() map[string]string {
-	statsMap := make(map[string]string)
-	statsMap[outboxTagPrefix+"bytes_sent"] = humanizeutil.IBytes(os.BytesSent)
-	return statsMap
-}
-
-// StatsForQueryPlan implements the DistSQLSpanStats interface.
-func (os *OutboxStats) StatsForQueryPlan() []string {
-	return []string{fmt.Sprintf("bytes sent: %s", humanizeutil.IBytes(os.BytesSent))}
 }

@@ -28,12 +28,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logconfig"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"golang.org/x/time/rate"
@@ -44,7 +45,8 @@ var tolerateErrors = runFlags.Bool("tolerate-errors", false, "Keep running on er
 var maxRate = runFlags.Float64(
 	"max-rate", 0, "Maximum frequency of operations (reads/writes). If 0, no limit.")
 var maxOps = runFlags.Uint64("max-ops", 0, "Maximum number of operations to run")
-var duration = runFlags.Duration("duration", 0, "The duration to run. If 0, run forever.")
+var duration = runFlags.Duration("duration", 0,
+	"The duration to run (in addition to --ramp). If 0, run forever.")
 var doInit = runFlags.Bool("init", false, "Automatically run init. DEPRECATED: Use workload init instead.")
 var ramp = runFlags.Duration("ramp", 0*time.Second, "The duration over which to ramp up load.")
 
@@ -55,6 +57,8 @@ var sharedFlags = pflag.NewFlagSet(`shared`, pflag.ContinueOnError)
 var pprofport = sharedFlags.Int("pprofport", 33333, "Port for pprof endpoint.")
 var dataLoader = sharedFlags.String("data-loader", `INSERT`,
 	"How to load initial table data. Options are INSERT and IMPORT")
+var initConns = sharedFlags.Int("init-conns", 16,
+	"The number of connections to use during INSERT init")
 
 var displayEvery = runFlags.Duration("display-every", time.Second, "How much time between every one-line activity reports.")
 
@@ -149,11 +153,14 @@ func CmdHelper(
 	const crdbDefaultURL = `postgres://root@localhost:26257?sslmode=disable`
 
 	return HandleErrs(func(cmd *cobra.Command, args []string) error {
-		if ls := cmd.Flags().Lookup(logflags.LogToStderrName); ls != nil {
-			if !ls.Changed {
-				// Unless the settings were overridden by the user, default to logging
-				// to stderr.
-				_ = ls.Value.Set(log.Severity_INFO.String())
+		// Apply the logging configuration if none was set already.
+		if active, _ := log.IsActive(); !active {
+			cfg := logconfig.DefaultStderrConfig()
+			if err := cfg.Validate(nil /* no default log directory */); err != nil {
+				return err
+			}
+			if _, err := log.ApplyConfig(cfg); err != nil {
+				return err
 			}
 		}
 
@@ -230,7 +237,7 @@ func workerRun(
 		}
 
 		if err := workFn(ctx); err != nil {
-			if errors.Cause(err) == ctx.Err() {
+			if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 				return
 			}
 			errCh <- err
@@ -272,10 +279,7 @@ func runInitImpl(
 	switch strings.ToLower(*dataLoader) {
 	case `insert`, `inserts`:
 		l = workloadsql.InsertsDataLoader{
-			// TODO(dan): Don't hardcode this. Similar to dbOverride, this should be
-			// hooked up to a flag directly once once more of run.go moves inside
-			// workload.
-			Concurrency: 16,
+			Concurrency: *initConns,
 		}
 	case `import`, `imports`:
 		l = workload.ImportDataLoader
@@ -299,7 +303,7 @@ func startPProfEndPoint(ctx context.Context) {
 	go func() {
 		err := http.ListenAndServe(":"+strconv.Itoa(*pprofport), nil)
 		if err != nil {
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 		}
 	}()
 }
@@ -350,16 +354,39 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 	}
 	reg := histogram.NewRegistry(*histogramsMaxLatency)
 	var ops workload.QueryLoad
-	for {
-		ops, err = o.Ops(urls, reg)
-		if err == nil {
-			break
+	prepareStart := timeutil.Now()
+	log.Infof(ctx, "creating load generator...")
+	const prepareTimeout = 60 * time.Minute
+	prepareCtx, cancel := context.WithTimeout(ctx, prepareTimeout)
+	defer cancel()
+	if prepareErr := func(ctx context.Context) error {
+		retry := retry.StartWithCtx(ctx, retry.Options{})
+		var err error
+		for retry.Next() {
+			if err != nil {
+				log.Warningf(ctx, "retrying after error while creating load: %v", err)
+			}
+			ops, err = o.Ops(ctx, urls, reg)
+			if err == nil {
+				return nil
+			}
+			err = errors.Wrapf(err, "failed to initialize the load generator")
+			if !*tolerateErrors {
+				return err
+			}
 		}
-		if !*tolerateErrors {
-			return err
+		if ctx.Err() != nil {
+			// Don't retry endlessly. Note that this retry loop is not under the
+			// control of --duration, so we're avoiding retrying endlessly.
+			log.Errorf(ctx, "Attempt to create load generator failed. "+
+				"It's been more than %s since we started trying to create the load generator "+
+				"so we're giving up. Last failure: %s", prepareTimeout, err)
 		}
-		log.Infof(ctx, "retrying after error while creating load: %v", err)
+		return err
+	}(prepareCtx); prepareErr != nil {
+		return prepareErr
 	}
+	log.Infof(ctx, "creating load generator... done (took %s)", timeutil.Now().Sub(prepareStart))
 
 	start := timeutil.Now()
 	errCh := make(chan error)
@@ -441,7 +468,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			formatter.outputError(err)
 			if *tolerateErrors {
 				if everySecond.ShouldLog() {
-					log.Error(ctx, err)
+					log.Errorf(ctx, "%v", err)
 				}
 				continue
 			}
@@ -457,7 +484,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			})
 
 		// Once the load generator is fully ramped up, we reset the histogram
-		// and the start time to throw away the stats for the the ramp up period.
+		// and the start time to throw away the stats for the ramp up period.
 		case <-rampDone:
 			rampDone = nil
 			start = timeutil.Now()

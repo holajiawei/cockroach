@@ -15,19 +15,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
 // Test that EvalContext.GetClusterTimestamp() gets its timestamp from the
 // transaction, and also that the conversion to decimal works properly.
 func TestClusterTimestampConversion(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testData := []struct {
 		walltime int64
 		logical  int32
@@ -40,34 +43,35 @@ func TestClusterTimestampConversion(t *testing.T) {
 		{9223372036854775807, 2147483647, "9223372036854775807.2147483647"},
 	}
 
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	senderFactory := client.MakeMockTxnSenderFactory(
+	senderFactory := kv.MakeMockTxnSenderFactory(
 		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
 		) (*roachpb.BatchResponse, *roachpb.Error) {
 			panic("unused")
 		})
-	db := client.NewDB(
-		testutils.MakeAmbientCtx(),
-		senderFactory,
-		clock)
+	db := kv.NewDB(testutils.MakeAmbientCtx(), senderFactory, clock, stopper)
 
 	for _, d := range testData {
-		ts := hlc.Timestamp{WallTime: d.walltime, Logical: d.logical}
+		ts := hlc.ClockTimestamp{WallTime: d.walltime, Logical: d.logical}
 		txnProto := roachpb.MakeTransaction(
 			"test",
 			nil, // baseKey
 			roachpb.NormalUserPriority,
-			ts,
+			ts.ToTimestamp(),
 			0, /* maxOffsetNs */
 		)
 
 		ctx := tree.EvalContext{
-			Txn: client.NewTxnFromProto(
+			Txn: kv.NewTxnFromProto(
 				context.Background(),
 				db,
 				1, /* gatewayNodeID */
 				ts,
-				client.RootTxn,
+				kv.RootTxn,
 				&txnProto,
 			),
 		}

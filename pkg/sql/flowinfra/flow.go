@@ -14,14 +14,16 @@ import (
 	"context"
 	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/optional"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/opentracing/opentracing-go"
 )
 
 type flowStatus int
@@ -71,7 +73,7 @@ type Flow interface {
 
 	// SetTxn is used to provide the transaction in which the flow will run.
 	// It needs to be called after Setup() and before Start/Run.
-	SetTxn(*client.Txn)
+	SetTxn(*kv.Txn)
 
 	// Start starts the flow. Processors run asynchronously in their own goroutines.
 	// Wait() needs to be called to wait for the flow to finish.
@@ -114,10 +116,11 @@ type Flow interface {
 	// mailboxes exited).
 	Cleanup(context.Context)
 
-	// ConcurrentExecution returns true if multiple processors/operators in the
-	// flow will execute concurrently (i.e. if not all of them have been fused).
+	// ConcurrentTxnUse returns true if multiple processors/operators in the flow
+	// will execute concurrently (i.e. if not all of them have been fused) and
+	// more than one goroutine will be using a txn.
 	// Can only be called after Setup().
-	ConcurrentExecution() bool
+	ConcurrentTxnUse() bool
 }
 
 // FlowBase is the shared logic between row based and vectorized flows. It
@@ -127,6 +130,7 @@ type FlowBase struct {
 	execinfra.FlowCtx
 
 	flowRegistry *FlowRegistry
+
 	// processors contains a subset of the processors in the flow - the ones that
 	// run in their own goroutines. Some processors that implement RowSource are
 	// scheduled to run in their consumer's goroutine; those are not present here.
@@ -166,7 +170,6 @@ type FlowBase struct {
 	ctxDone   <-chan struct{}
 
 	// spec is the request that produced this flow. Only used for debugging.
-	// TODO(yuzefovich): probably we can get rid off this field.
 	spec *execinfrapb.FlowSpec
 }
 
@@ -181,14 +184,23 @@ func (f *FlowBase) Setup(
 }
 
 // SetTxn is part of the Flow interface.
-func (f *FlowBase) SetTxn(txn *client.Txn) {
+func (f *FlowBase) SetTxn(txn *kv.Txn) {
 	f.FlowCtx.Txn = txn
 	f.EvalCtx.Txn = txn
 }
 
-// ConcurrentExecution is part of the Flow interface.
-func (f *FlowBase) ConcurrentExecution() bool {
-	return len(f.processors) > 1
+// ConcurrentTxnUse is part of the Flow interface.
+func (f *FlowBase) ConcurrentTxnUse() bool {
+	numProcessorsThatMightUseTxn := 0
+	for _, proc := range f.processors {
+		if txnUser, ok := proc.(execinfra.DoesNotUseTxn); !ok || !txnUser.DoesNotUseTxn() {
+			numProcessorsThatMightUseTxn++
+			if numProcessorsThatMightUseTxn > 1 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 var _ Flow = &FlowBase{}
@@ -283,7 +295,7 @@ func (f *FlowBase) startInternal(
 ) error {
 	f.doneFn = doneFn
 	log.VEventf(
-		ctx, 1, "starting (%d processors, %d startables)", len(processors), len(f.startables),
+		ctx, 1, "starting (%d processors, %d startables) asynchronously", len(processors), len(f.startables),
 	)
 
 	// Only register the flow if there will be inbound stream connections that
@@ -367,6 +379,7 @@ func (f *FlowBase) Run(ctx context.Context, doneFn func()) error {
 		}
 		return err
 	}
+	log.VEventf(ctx, 1, "running %T in the flow's goroutine", headProc)
 	headProc.Run(ctx)
 	return nil
 }
@@ -403,14 +416,6 @@ func (f *FlowBase) Wait() {
 	}
 }
 
-// Releasable is an interface for objects than can be Released back into a
-// memory pool when finished.
-type Releasable interface {
-	// Release allows this object to be returned to a memory pool. Objects must
-	// not be used after Release is called.
-	Release()
-}
-
 // Cleanup is part of the Flow interface.
 // NOTE: this implements only the shared clean up logic between row-based and
 // vectorized flows.
@@ -419,17 +424,36 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 		panic("flow cleanup called twice")
 	}
 
+	// Release any descriptors accessed by this flow
+	if f.TypeResolverFactory != nil {
+		f.TypeResolverFactory.CleanupFunc(ctx)
+	}
+
+	if f.Gateway {
+		// If this is the gateway node, output the maximum memory usage to the flow
+		// span. Note that non-gateway nodes use the last outbox to send this
+		// information over.
+		if sp := tracing.SpanFromContext(ctx); sp != nil {
+			sp.SetSpanStats(&execinfrapb.ComponentStats{
+				Component: execinfrapb.FlowComponentID(roachpb.NodeID(f.NodeID.SQLInstanceID()), f.FlowCtx.ID),
+				FlowStats: execinfrapb.FlowStats{
+					MaxMemUsage: optional.MakeUint(uint64(f.FlowCtx.EvalCtx.Mon.MaximumBytes())),
+				},
+			})
+		}
+	}
+
 	// This closes the monitor opened in ServerImpl.setupFlow.
 	f.EvalCtx.Stop(ctx)
 	for _, p := range f.processors {
-		if d, ok := p.(Releasable); ok {
+		if d, ok := p.(execinfra.Releasable); ok {
 			d.Release()
 		}
 	}
 	if log.V(1) {
 		log.Infof(ctx, "cleaning up")
 	}
-	sp := opentracing.SpanFromContext(ctx)
+	sp := tracing.SpanFromContext(ctx)
 	// Local flows do not get registered.
 	if !f.IsLocal() && f.status != FlowNotStarted {
 		f.flowRegistry.UnregisterFlow(f.ID)
@@ -463,7 +487,7 @@ func (f *FlowBase) cancel() {
 		go func(receiver InboundStreamHandler) {
 			// Stream has yet to be started; send an error to its
 			// receiver and prevent it from being connected.
-			receiver.Timeout(sqlbase.QueryCanceledError)
+			receiver.Timeout(cancelchecker.QueryCanceledError)
 		}(receiver)
 	}
 }

@@ -18,19 +18,19 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
-	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/spf13/cobra"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -87,7 +87,7 @@ type replicaCheckInfo struct {
 }
 
 type checkInput struct {
-	eng  engine.Engine
+	eng  storage.Engine
 	desc *roachpb.RangeDescriptor
 	sl   stateloader.StateLoader
 }
@@ -99,26 +99,23 @@ type checkResult struct {
 }
 
 func (cr *checkResult) Error() error {
-	var errs []string
+	var err error
 	if cr.err != nil {
-		errs = append(errs, cr.err.Error())
+		err = cr.err
 	}
 	if !cr.actMS.Equal(enginepb.MVCCStats{}) && !cr.actMS.Equal(cr.claimMS) && cr.claimMS.ContainsEstimates <= 0 {
-		err := fmt.Sprintf("stats inconsistency:\n- stored:\n%+v\n- recomputed:\n%+v\n- diff:\n%s",
+		thisErr := errors.Newf(
+			"stats inconsistency:\n- stored:\n%+v\n- recomputed:\n%+v\n- diff:\n%s",
 			cr.claimMS, cr.actMS, strings.Join(pretty.Diff(cr.claimMS, cr.actMS), ","),
 		)
-		errs = append(errs, err)
+		err = errors.CombineErrors(err, thisErr)
 	}
-	if len(errs) > 0 {
+	if err != nil {
 		if cr.desc != nil {
-			prefix := cr.desc.String() + ": "
-			for i := range errs {
-				errs[i] = prefix + errs[i]
-			}
+			err = errors.Wrapf(err, "%s", cr.desc)
 		}
-		return errors.New(strings.Join(errs, "\n"))
 	}
-	return nil
+	return err
 }
 
 func worker(ctx context.Context, in checkInput) checkResult {
@@ -168,10 +165,10 @@ func checkStoreRangeStats(
 	}
 
 	go func() {
-		if err := storage.IterateRangeDescriptors(ctx, eng,
-			func(desc roachpb.RangeDescriptor) (bool, error) {
+		if err := kvserver.IterateRangeDescriptors(ctx, eng,
+			func(desc roachpb.RangeDescriptor) error {
 				inCh <- checkInput{eng: eng, desc: &desc, sl: stateloader.Make(desc.RangeID)}
-				return false, nil
+				return nil
 			}); err != nil {
 			outCh <- checkResult{err: err}
 		}
@@ -227,7 +224,7 @@ func checkStoreRaftState(
 		return err
 	}
 
-	// Iterate over the entire range-id-local space.
+	// MVCCIterate over the entire range-id-local space.
 	start := roachpb.Key(keys.LocalRangeIDPrefix)
 	end := start.PrefixEnd()
 
@@ -240,42 +237,42 @@ func checkStoreRaftState(
 		return replicaInfo[rangeID]
 	}
 
-	if _, err := engine.MVCCIterate(ctx, db, start, end, hlc.MaxTimestamp,
-		engine.MVCCScanOptions{Inconsistent: true}, func(kv roachpb.KeyValue) (bool, error) {
+	if _, err := storage.MVCCIterate(ctx, db, start, end, hlc.MaxTimestamp,
+		storage.MVCCScanOptions{Inconsistent: true}, func(kv roachpb.KeyValue) error {
 			rangeID, _, suffix, detail, err := keys.DecodeRangeIDKey(kv.Key)
 			if err != nil {
-				return false, err
+				return err
 			}
 
 			switch {
 			case bytes.Equal(suffix, keys.LocalRaftHardStateSuffix):
 				var hs raftpb.HardState
 				if err := kv.Value.GetProto(&hs); err != nil {
-					return false, err
+					return err
 				}
 				getReplicaInfo(rangeID).committedIndex = hs.Commit
 			case bytes.Equal(suffix, keys.LocalRaftTruncatedStateLegacySuffix):
 				var trunc roachpb.RaftTruncatedState
 				if err := kv.Value.GetProto(&trunc); err != nil {
-					return false, err
+					return err
 				}
 				getReplicaInfo(rangeID).truncatedIndex = trunc.Index
 			case bytes.Equal(suffix, keys.LocalRangeAppliedStateSuffix):
 				var state enginepb.RangeAppliedState
 				if err := kv.Value.GetProto(&state); err != nil {
-					return false, err
+					return err
 				}
 				getReplicaInfo(rangeID).appliedIndex = state.RaftAppliedIndex
 			case bytes.Equal(suffix, keys.LocalRaftAppliedIndexLegacySuffix):
 				idx, err := kv.Value.GetInt()
 				if err != nil {
-					return false, err
+					return err
 				}
 				getReplicaInfo(rangeID).appliedIndex = uint64(idx)
 			case bytes.Equal(suffix, keys.LocalRaftLogSuffix):
 				_, index, err := encoding.DecodeUint64Ascending(detail)
 				if err != nil {
-					return false, err
+					return err
 				}
 				ri := getReplicaInfo(rangeID)
 				if ri.firstIndex == 0 {
@@ -290,7 +287,7 @@ func checkStoreRaftState(
 				}
 			}
 
-			return false, nil
+			return nil
 		}); err != nil {
 		return err
 	}

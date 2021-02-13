@@ -22,14 +22,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestSplitAt(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	r := sqlutils.MakeSQLRunner(db)
 
@@ -133,7 +135,7 @@ func TestSplitAt(t *testing.T) {
 		},
 		{
 			in:    "ALTER TABLE d.i SPLIT AT VALUES (17) WITH EXPIRATION true",
-			error: "SPLIT AT: expected timestamp, decimal, or interval, got bool (*tree.DBool)",
+			error: "SPLIT AT: expected timestamp, decimal, or interval, got bool",
 		},
 		{
 			in:    "ALTER TABLE d.i SPLIT AT VALUES (17) WITH EXPIRATION '1969-01-01 00:00:00.0'",

@@ -14,11 +14,13 @@ option go_package = "jobspb";
 
 import "errorspb/errors.proto";
 import "gogoproto/gogo.proto";
-import "roachpb/api.proto";
 import "roachpb/data.proto";
 import "roachpb/io-formats.proto";
-import "sql/sqlbase/structured.proto";
+import "sql/catalog/descpb/structured.proto";
+import "sql/catalog/descpb/tenant.proto";
 import "util/hlc/timestamp.proto";
+import "sql/schemachanger/scpb/scpb.proto";
+import "clusterversion/cluster_version.proto";
 
 message Lease {
   option (gogoproto.equal) = true;
@@ -32,6 +34,73 @@ message Lease {
   int64 epoch = 2;
 }
 
+
+enum EncryptionMode {
+  Passphrase = 0;
+  KMS = 1;
+}
+
+// BackupEncryptionOptions stores information resolved during the BACKUP/RESTORE
+// planning stage, and by the BACKUP/RESTORE job to encrypt or decrypt BACKUP
+// data and manifest files.
+message BackupEncryptionOptions {
+  option (gogoproto.equal) = true;
+  // Key specifies the key to use for encryption or decryption.
+  bytes key = 1;
+
+  EncryptionMode mode = 2;
+
+  message KMSInfo {
+    option (gogoproto.equal) = true;
+
+    string uri = 1;
+    bytes encrypted_data_key = 2;
+  }
+
+  // KMSInfo specifies the KMS and encrypted DataKey pair to use for
+  // encryption or decryption when mode == KMS.
+  KMSInfo kms_info  = 3 [(gogoproto.customname) = "KMSInfo"];
+}
+
+// EncryptionInfo is stored IN PLAINTEXT along side collections of encrypted
+// files stored outside of cockroach, for example by BACKUP/RESTORE.
+message EncryptionInfo {
+  enum Scheme {
+    AES256GCM = 0;
+  }
+  option (gogoproto.equal) = true;
+
+  Scheme scheme = 1;
+  bytes salt = 2;
+
+  // EncryptedDataKeyByKMSMasterKeyID is a mapping from the hashed master key
+  // identifier of a KMS to the encrypted version of the DataKey obtained from
+  // that KMS.
+  map<string, bytes> encryptedDataKeyByKMSMasterKeyID = 3;
+}
+
+message StreamIngestionDetails {
+  // StreamAddress locates the stream. It enables the client to find the
+  // addresses of the stream's partitions.
+  string stream_address = 1 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl.StreamAddress"];
+  // Span is the keyspan into which this job will ingest KVs.
+  //
+  // The stream should emit all changes for a given span, and no changes outside
+  // a span. Note that KVs received from the stream may need to be re-keyed into
+  // this span.
+  roachpb.Span span = 2 [(gogoproto.nullable) = false];
+  // The job will ingest events from StartTime onwards.
+  util.hlc.Timestamp start_time = 3 [(gogoproto.nullable) = false];
+}
+
+message StreamIngestionProgress {
+  // MarkedForCompletion is used to signal to the stream ingestion job to
+  // complete its ingestion. This involves stopping any subsequent ingestion,
+  // and rolling back to the latest resolved ts to bring the ingested cluster to
+  // a consistent state.
+  bool markedForCompletion = 1;
+}
+
 message BackupDetails {
   util.hlc.Timestamp start_time = 1 [(gogoproto.nullable) = false];
   util.hlc.Timestamp end_time = 2 [(gogoproto.nullable) = false];
@@ -43,8 +112,24 @@ message BackupDetails {
   // URIsByLocalityKV is a map of locality KVs to store URIs, used for
   // partitioned backups.
   map<string, string> uris_by_locality_kv = 5 [(gogoproto.customname) = "URIsByLocalityKV"];
-  bytes backup_manifest = 4;
-  roachpb.FileEncryptionOptions encryption = 6;
+  bytes deprecated_backup_manifest = 4;
+  BackupEncryptionOptions encryption_options = 6;
+  EncryptionInfo encryption_info = 9;
+
+  // ProtectedTimestampRecord is the ID of the protected timestamp record
+  // corresponding to this job. While the job ought to clean up the record
+  // when it enters a terminal state, there may be cases where it cannot or
+  // does not run the code to do so. To deal with this there is a background
+  // reconcilliation loop to ensure that protected timestamps are cleaned up.
+  bytes protected_timestamp_record = 7 [
+    (gogoproto.customname) = "ProtectedTimestampRecord",
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
+  ];
+
+  // CollectionURI is the path to the collection into which this backup is being
+  // written, i.e. the URI the user provided before a chosen suffix was appended
+  // to its path.
+  string collection_URI = 8 [(gogoproto.customname) = "CollectionURI"];
 }
 
 message BackupProgress {
@@ -52,38 +137,61 @@ message BackupProgress {
 }
 
 message RestoreDetails {
-  message TableRewrite {
-    uint32 table_id = 1 [
-      (gogoproto.customname) = "TableID",
-      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
+  message DescriptorRewrite {
+    uint32 id = 1 [
+      (gogoproto.customname) = "ID",
+      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
     ];
     uint32 parent_id = 2 [
       (gogoproto.customname) = "ParentID",
-      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
+      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
     ];
+    // ToExisting represents whether this descriptor is being remapped to a
+    // descriptor that already exists in the cluster.
+    bool to_existing = 3;
   }
   message BackupLocalityInfo {
     map<string, string> uris_by_original_locality_kv = 1 [(gogoproto.customname) = "URIsByOriginalLocalityKV"];
   }
   reserved 1;
   util.hlc.Timestamp end_time = 4 [(gogoproto.nullable) = false];
-  map<uint32, TableRewrite> table_rewrites = 2 [
-    (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
+  map<uint32, DescriptorRewrite> descriptor_rewrites = 2 [
+    (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
   ];
   // URIs contains one URI for each backup (full or incremental) corresponding
   // to the location of the main BACKUP manifest. For partitioned backups, each
   // backup may also have files in other stores.
   repeated string uris = 3 [(gogoproto.customname) = "URIs"];
   repeated BackupLocalityInfo backup_locality_info = 7 [(gogoproto.nullable) = false];
+
+  // We keep track of the descriptors that we're creating as part of the
+  // restore.
+  repeated sqlbase.DatabaseDescriptor database_descs = 16;
   repeated sqlbase.TableDescriptor table_descs = 5;
+  // TypeDescs contains the type descriptors written as part of this restore.
+  // Note that it does not include type descriptors existing in the cluster
+  // that backed up types are remapped to.
+  repeated sqlbase.TypeDescriptor type_descs = 14;
+  // SchemaDescs contains schema descriptors written as part of this restore.
+  // Like TypeDescs, it does not include existing schema descriptors in the
+  // cluster that backed up schemas are remapped to.
+  repeated sqlbase.SchemaDescriptor schema_descs = 15;
+  repeated sqlbase.TenantInfo tenants = 13 [(gogoproto.nullable) = false];
+
   string override_db = 6 [(gogoproto.customname) = "OverrideDB"];
+
+  // The restore job has several atomic stages. For now, we keep track of which
+  // stages have completed via these flags.
   bool prepare_completed = 8;
   bool stats_inserted = 9;
-  bool tables_published = 10;
+  // DescriptorsPublished indicates whether or not the descriptors written in
+  // the job have been transactionally updated after the data was restored.
+  bool descriptors_published = 10;
   int32 descriptor_coverage = 11 [
     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/tree.DescriptorCoverage"
   ];
-  roachpb.FileEncryptionOptions encryption = 12;
+  BackupEncryptionOptions encryption = 12;
+  // NEXT ID: 17.
 }
 
 message RestoreProgress {
@@ -96,6 +204,7 @@ message ImportDetails {
     string name = 18;
     int64 seq_val = 19;
     bool is_new = 20;
+    bool was_empty = 22;
     repeated string target_cols = 21;
     reserved 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17;
   }
@@ -106,10 +215,12 @@ message ImportDetails {
   int64 sst_size = 4 [(gogoproto.customname) = "SSTSize"];
   int64 oversample = 9;
   bool skip_fks = 10 [(gogoproto.customname) = "SkipFKs"];
+
+  // walltime is the time at which an import job will write KVs.
   int64 walltime = 5;
   uint32 parent_id = 6 [
     (gogoproto.customname) = "ParentID",
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
   ];
   string backup_path = 7;
 
@@ -128,15 +239,44 @@ message ImportDetails {
   bool prepare_complete = 12;
   bool tables_published = 13;
 
+  bool parse_bundle_schema = 14;
+
   // ProtectedTimestampRecord is the ID of the protected timestamp record
   // corresponding to this job. While the job ought to clean up the record
   // when it enters a terminal state, there may be cases where it cannot or
   // does not run the code to do so. To deal with this there is a background
-  // reconcilliation loop to ensure that protected timestamps are cleaned up.
+  // reconciliation loop to ensure that protected timestamps are cleaned up.
   bytes protected_timestamp_record = 22 [
     (gogoproto.customname) = "ProtectedTimestampRecord",
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
   ];
+}
+
+// SequenceValChunks represents a single chunk of sequence values allocated
+// during an IMPORT.
+message SequenceValChunk {
+  int64 chunk_start_val = 1;
+  int64 chunk_size = 2;
+
+  // The first row in the file being imported from which the current chunk of
+  // sequence values is being used.
+  int64 chunk_start_row = 3;
+  // The row in the file being imported at which the import will need to use a
+  // new chunk of sequence values.
+  int64 next_chunk_start_row = 4;
+}
+
+// SequenceDetails represents information about the sequences processed in a
+// single file during IMPORT.
+message SequenceDetails {
+  // SequenceChunks represents all the chunks reserved for a particular sequence
+  // during an IMPORT.
+  message SequenceChunks {
+    repeated SequenceValChunk chunks = 1;
+  }
+
+  // Mapping from sequence ID to allocated sequence chunks.
+  map<int32, SequenceChunks> seq_id_to_chunks = 1;
 }
 
 message ImportProgress {
@@ -152,7 +292,41 @@ message ImportProgress {
   // been flushed, we can advance the count here and then on resume skip over
   // that many rows without needing to convert/process them at all.
   repeated int64 resume_pos = 5; // Only set by direct import.
+
+  // Holds metadata related to sequences for every file processed during an
+  // IMPORT.
+  repeated SequenceDetails sequence_details = 6;
 }
+
+// TypeSchemaChangeDetails is the job detail information for a type schema change job.
+message TypeSchemaChangeDetails {
+  uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
+  // TransitioningMembers is a list of enum members, represented by their
+  // physical representation, that are transitioning in the current job. This
+  // is used to group transitions together and ensure that rollback is limited
+  // to this list in the face of job failure. It is also worth noting that we
+  // cannot use the logical representation or index of the member to identify
+  // a member, as both of these may change due to a concurrent rename or
+  // addition with a specified placement. Physical representations are
+  // guaranteed to be stable.
+  repeated bytes transitioning_members = 2;
+}
+
+// TypeSchemaChangeProgress is the persisted progress for a type schema change job.
+message TypeSchemaChangeProgress {
+
+}
+
+// TypeSchemaChangeDetails is the job detail information for the new schema change job.
+message NewSchemaChangeDetails {
+  repeated cockroach.sql.schemachanger.scpb.Target targets = 1;
+}
+
+// NewSchemaChangeProgress is the persisted progress for the new schema change job.
+message NewSchemaChangeProgress {
+  repeated cockroach.sql.schemachanger.scpb.State states = 1;
+}
+
 
 message ResumeSpanList {
   repeated roachpb.Span resume_spans = 1 [(gogoproto.nullable) = false];
@@ -167,8 +341,67 @@ enum Status {
 
 message DroppedTableDetails {
   string name = 1;
-  uint32 ID = 2 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"];
+  uint32 ID = 2 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
   Status status = 3;
+}
+
+// SchemaChangeGCDetails should resemble one of the following:
+//
+// 1. Index (non-interleaved) deletions: One or more deletions of an index on a
+// table.
+//      details.Indexes -> the indexes to GC. These indexes must be
+//      non-interleaved.
+//      details.ParentID -> the table with the indexes.
+//
+// 2. Table deletions: The deletion of a single table.
+//      details.Tables -> the tables to be deleted.
+//
+// 3. Database deletions: The deletion of a database and therefore all its tables.
+//      details.Tables -> the IDs of the tables to GC.
+//      details.ParentID -> the ID of the database to drop.
+//
+// 4. Tenant deletion: The deletion of a tenant key range.
+//      details.TenantID -> the ID of the tenant to delete.
+message SchemaChangeGCDetails {
+  message DroppedIndex {
+    int64 index_id = 1 [(gogoproto.customname) = "IndexID",
+                       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.IndexID"];
+    int64 drop_time = 2;
+  }
+
+  message DroppedID {
+    int64 id = 1 [(gogoproto.customname) = "ID",
+                 (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
+    int64 drop_time = 2;
+  }
+
+  // Indexes to GC.
+  repeated DroppedIndex indexes = 1 [(gogoproto.nullable) = false];
+
+  // The below two fields are used only in the case of TRUNCATE operating on
+  // tables with interleaved indexes. They are only set together.
+
+  // InterleavedTable is the table being truncated. In particular, it is the
+  // TableDescriptor before any of the truncate modifications have been applied.
+  sqlbase.TableDescriptor interleaved_table = 4;
+  // InterleavedIndexes is the set of interleaved indexes to truncate.
+  repeated sqlbase.IndexDescriptor interleaved_indexes = 5 [(gogoproto.nullable) = false];
+
+  // Entire tables to GC.
+  repeated DroppedID tables = 2 [(gogoproto.nullable) = false];
+
+  // If dropping indexes, the table ID which has those indexes. If dropping a
+  // database, the database ID.
+  int64 parent_id = 3 [(gogoproto.customname) = "ParentID",
+                      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
+
+  message DroppedTenant {
+    uint64 id = 1 [(gogoproto.customname) = "ID"];
+    int64 drop_time = 2;
+  }
+
+  // Tenant to GC.
+  DroppedTenant tenant = 6;
 }
 
 message SchemaChangeDetails {
@@ -181,17 +414,74 @@ message SchemaChangeDetails {
   // mutation list containing mutations for the same mutationID.
   repeated ResumeSpanList resume_span_list = 2 [(gogoproto.nullable) = false];
   repeated DroppedTableDetails dropped_tables = 3 [(gogoproto.nullable) = false];
+  // dropped_types holds the set of types to drop as part of a DROP DATABASE
+  // statement. We collect the types here rather than creating individual DROP
+  // TYPE jobs for each dropped type.
+  repeated uint32 dropped_types = 8 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
+  // dropped_schemas holds the set of schemas to drop as part of a DROP SCHEMA
+  // or DROP DATABASE cascade statement.
+  repeated uint32 dropped_schemas = 9 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
   // The descriptor ID of the dropped database which created this job.
   uint32 dropped_database_id = 4 [
     (gogoproto.customname) = "DroppedDatabaseID",
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
   ];
-  uint32 table_id = 5 [(gogoproto.customname) = "TableID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"];
-  uint32 mutation_id = 6 [(gogoproto.customname) = "MutationID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.MutationID"];
+  // desc_id is the target descriptor for this schema change. Note that this ID
+  // is not always a table ID! We allow referencing any descriptor here to allow
+  // generic schema changes on descriptors whose schema change process involves
+  // only draining names and existing leases. This allows us to implement the
+  // simple schema changes on SchemaDescriptors and DatabaseDescriptors without
+  // implementing a new job for each.
+  uint32 desc_id = 5 [(gogoproto.customname) = "DescID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
+  // table_mutation_id is the mutation ID that the schema changer is to process. It is
+  // only set when desc_id references a TableDescriptor.
+  uint32 table_mutation_id = 6 [(gogoproto.customname) = "TableMutationID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.MutationID"];
+  // The format version of the schema change job details. This is used to
+  // distinguish between jobs as they existed in 19.2 and earlier versions
+  // (controlled and updated by a SchemaChanger) and jobs as they exist in 20.1
+  // (scheduled and run by the job registry).
+  uint32 format_version = 7 [(gogoproto.casttype) = "SchemaChangeDetailsFormatVersion"];
 }
 
 message SchemaChangeProgress {
 
+}
+
+message SchemaChangeGCProgress {
+  enum Status {
+    // Waiting for the index/table to expire.
+    WAITING_FOR_GC = 0;
+    // The GC TTL has expired. This element is marked for imminent deletion
+    DELETING = 1;
+    // This element has been deleted. The job is done when all elements are in
+    // this state.
+    DELETED = 2;
+  }
+
+  message IndexProgress {
+    int64 index_id = 1 [(gogoproto.customname) = "IndexID",
+                       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.IndexID"];
+    Status status = 2;
+  }
+
+  message TableProgress {
+    int64 id = 1 [(gogoproto.customname) = "ID",
+                 (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
+    Status status = 2;
+  }
+
+  message TenantProgress {
+    Status status = 1;
+  }
+
+  // Indexes to GC.
+  repeated IndexProgress indexes = 1 [(gogoproto.nullable) = false];
+
+  // Entire tables to GC.
+  repeated TableProgress tables = 2 [(gogoproto.nullable) = false];
+
+  // The status of the tenant to be deleted.
+ TenantProgress tenant = 3;
 }
 
 message ChangefeedTarget {
@@ -219,7 +509,7 @@ message ChangefeedDetails {
   // if the descriptor id no longer exists when the jobs is unpaused (which can
   // happen if it was dropped or truncated).
   map<uint32, ChangefeedTarget> targets = 6 [
-    (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID",
+    (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID",
     (gogoproto.casttype) = "ChangefeedTargets",
     (gogoproto.nullable) = false
   ];
@@ -233,11 +523,27 @@ message ChangefeedDetails {
 message ResolvedSpan {
   roachpb.Span span = 1 [(gogoproto.nullable) = false];
   util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false];
+  bool boundary_reached = 3;
 }
 
 message ChangefeedProgress {
   reserved 1;
   repeated ResolvedSpan resolved_spans = 2 [(gogoproto.nullable) = false];
+
+  // ProtectedTimestampRecord is the ID of the protected timestamp record
+  // corresponding to this job. While the job ought to clean up the record
+  // when it enters a terminal state, there may be cases where it cannot or
+  // does not run the code to do so. To deal with this there is a background
+  // reconcilliation loop to ensure that protected timestamps are cleaned up.
+  //
+  // A record is created with the job if the job requires an initial backfill.
+  // Furthermore, once subsequent backfills begin, record will be created and
+  // released accordingly.
+  bytes protected_timestamp_record = 3 [
+    (gogoproto.customname) = "ProtectedTimestampRecord",
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID",
+    (gogoproto.nullable) = false
+  ];
 }
 
 // CreateStatsDetails are used for the CreateStats job, which is triggered
@@ -248,11 +554,19 @@ message CreateStatsDetails {
   message ColStat {
     repeated uint32 column_ids = 1 [
       (gogoproto.customname) = "ColumnIDs",
-      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ColumnID"
+      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ColumnID"
     ];
 
     // Indicates whether this column stat should include a histogram.
     bool has_histogram = 2;
+
+    // Indicates whether this column stat is over an inverted index.
+    bool inverted = 3;
+
+    // If this column stat includes a histogram, indicates the maximum number
+    // of buckets that should be created. If this field is unset, a default
+    // maximum of 200 buckets are created.
+    uint32 histogram_max_buckets = 4;
   }
   string name = 1;
   sqlbase.TableDescriptor table = 2 [(gogoproto.nullable) = false];
@@ -269,11 +583,19 @@ message CreateStatsProgress {
 
 }
 
+message MigrationDetails {
+  clusterversion.ClusterVersion cluster_version = 1;
+}
+
+message MigrationProgress {
+
+}
+
 message Payload {
   string description = 1;
   // If empty, the description is assumed to be the statement.
   string statement = 16;
-  string username = 2;
+  string username_proto = 2 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security.SQLUsernameProto"];
   // For consistency with the SQL timestamp type, which has microsecond
   // precision, we avoid the timestamp.Timestamp WKT, which has nanosecond
   // precision, and use microsecond integers directly.
@@ -282,7 +604,7 @@ message Payload {
   reserved 5;
   repeated uint32 descriptor_ids = 6 [
     (gogoproto.customname) = "DescriptorIDs",
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
   ];
   reserved 7;
   // TODO (lucy): Deprecate the string error field and move to using the encoded
@@ -307,6 +629,11 @@ message Payload {
     ImportDetails import = 13;
     ChangefeedDetails changefeed = 14;
     CreateStatsDetails createStats = 15;
+    SchemaChangeGCDetails schemaChangeGC = 21;
+    TypeSchemaChangeDetails typeSchemaChange = 22;
+    StreamIngestionDetails streamIngestion = 23;
+    NewSchemaChangeDetails newSchemaChange = 24;
+    MigrationDetails migration = 25;
   }
 }
 
@@ -325,6 +652,11 @@ message Progress {
     ImportProgress import = 13;
     ChangefeedProgress changefeed = 14;
     CreateStatsProgress createStats = 15;
+    SchemaChangeGCProgress schemaChangeGC = 16;
+    TypeSchemaChangeProgress typeSchemaChange = 17;
+    StreamIngestionProgress streamIngest = 18;
+    NewSchemaChangeProgress newSchemaChange = 19;
+    MigrationProgress migration = 20;
   }
 }
 
@@ -340,6 +672,13 @@ enum Type {
   CHANGEFEED = 5 [(gogoproto.enumvalue_customname) = "TypeChangefeed"];
   CREATE_STATS = 6 [(gogoproto.enumvalue_customname) = "TypeCreateStats"];
   AUTO_CREATE_STATS = 7 [(gogoproto.enumvalue_customname) = "TypeAutoCreateStats"];
+  SCHEMA_CHANGE_GC = 8 [(gogoproto.enumvalue_customname) = "TypeSchemaChangeGC"];
+  // We can't name this TYPE_SCHEMA_CHANGE due to how proto generates actual
+  // names for this enum, which cause a conflict with the SCHEMA_CHANGE entry.
+  TYPEDESC_SCHEMA_CHANGE = 9 [(gogoproto.enumvalue_customname) = "TypeTypeSchemaChange"];
+  STREAM_INGESTION = 10 [(gogoproto.enumvalue_customname) = "TypeStreamIngestion"];
+  NEW_SCHEMA_CHANGE = 11 [(gogoproto.enumvalue_customname) = "TypeNewSchemaChange"];
+  MIGRATION = 12 [(gogoproto.enumvalue_customname) = "TypeMigration"];
 }
 
 message Job {

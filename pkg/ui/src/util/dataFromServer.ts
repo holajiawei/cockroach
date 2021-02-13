@@ -15,6 +15,9 @@ export interface DataFromServer {
   Tag: string;
   Version: string;
   NodeID: string;
+  OIDCAutoLogin: boolean;
+  OIDCLoginEnabled: boolean;
+  OIDCButtonText: string;
 }
 
 // Tell TypeScript about `window.dataFromServer`, which is set in a script
@@ -27,5 +30,5 @@ declare global {
 }
 
 export function getDataFromServer(): DataFromServer {
-  return window.dataFromServer || {} as DataFromServer;
+  return window.dataFromServer || ({} as DataFromServer);
 }

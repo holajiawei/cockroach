@@ -15,19 +15,21 @@ import (
 	"context"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"gopkg.in/yaml.v2"
 )
 
 // These must match crdb_internal.zones.
-var showZoneConfigColumns = sqlbase.ResultColumns{
+var showZoneConfigColumns = colinfo.ResultColumns{
 	{Name: "zone_id", Typ: types.Int, Hidden: true},
 	{Name: "subzone_id", Typ: types.Int, Hidden: true},
 	{Name: "target", Typ: types.String},
@@ -61,6 +63,10 @@ const (
 )
 
 func (p *planner) ShowZoneConfig(ctx context.Context, n *tree.ShowZoneConfig) (planNode, error) {
+	if !p.ExecCfg().Codec.ForSystemTenant() {
+		return nil, errorutil.UnsupportedWithMultiTenancy(multitenancyZoneCfgIssueNo)
+	}
+
 	return &delayedNode{
 		name:    n.String(),
 		columns: showZoneConfigColumns,
@@ -95,15 +101,16 @@ func getShowZoneConfigRow(
 		return nil, err
 	}
 
-	if zoneSpecifier.TableOrIndex.Table.TableName != "" {
+	if zoneSpecifier.TableOrIndex.Table.ObjectName != "" {
 		if err = p.CheckAnyPrivilege(ctx, tblDesc); err != nil {
 			return nil, err
 		}
 	} else if zoneSpecifier.Database != "" {
-		database, err := p.ResolveUncachedDatabaseByName(
+		_, database, err := p.Descriptors().GetImmutableDatabaseByName(
 			ctx,
+			p.txn,
 			string(zoneSpecifier.Database),
-			true, /* required */
+			tree.DatabaseLookupFlags{Required: true},
 		)
 		if err != nil {
 			return nil, err
@@ -125,8 +132,8 @@ func getShowZoneConfigRow(
 
 	subZoneIdx := uint32(0)
 	zoneID, zone, subzone, err := GetZoneConfigInTxn(ctx, p.txn,
-		uint32(targetID), index, partition, false /* getInheritedDefault */)
-	if err == errNoZoneConfigApplies {
+		config.SystemTenantObjectID(targetID), index, partition, false /* getInheritedDefault */)
+	if errors.Is(err, errNoZoneConfigApplies) {
 		// TODO(benesch): This shouldn't be the caller's responsibility;
 		// GetZoneConfigInTxn should just return the default zone config if no zone
 		// config applies.
@@ -146,7 +153,7 @@ func getShowZoneConfigRow(
 
 	// Determine the zone specifier for the zone config that actually applies
 	// without performing another KV lookup.
-	zs := ascendZoneSpecifier(zoneSpecifier, uint32(targetID), zoneID, subzone)
+	zs := ascendZoneSpecifier(zoneSpecifier, config.SystemTenantObjectID(targetID), zoneID, subzone)
 
 	// Ensure subzone configs don't infect the output of config_bytes.
 	zone.Subzones = nil
@@ -170,6 +177,13 @@ func zoneConfigToSQL(zs *tree.ZoneSpecifier, zone *zonepb.ZoneConfig) (string, e
 		return "", err
 	}
 	constraints = strings.TrimSpace(constraints)
+	voterConstraints, err := yamlMarshalFlow(zonepb.ConstraintsList{
+		Constraints: zone.VoterConstraints,
+		Inherited:   zone.InheritedVoterConstraints})
+	if err != nil {
+		return "", err
+	}
+	voterConstraints = strings.TrimSpace(voterConstraints)
 	prefs, err := yamlMarshalFlow(zone.LeasePreferences)
 	if err != nil {
 		return "", err
@@ -177,36 +191,51 @@ func zoneConfigToSQL(zs *tree.ZoneSpecifier, zone *zonepb.ZoneConfig) (string, e
 	prefs = strings.TrimSpace(prefs)
 
 	useComma := false
+	maybeWriteComma := func(f *tree.FmtCtx) {
+		if useComma {
+			f.Printf(",\n")
+		}
+		useComma = true
+	}
+
 	f := tree.NewFmtCtx(tree.FmtParsable)
 	f.WriteString("ALTER ")
 	f.FormatNode(zs)
 	f.WriteString(" CONFIGURE ZONE USING\n")
 	if zone.RangeMinBytes != nil {
+		maybeWriteComma(f)
 		f.Printf("\trange_min_bytes = %d", *zone.RangeMinBytes)
-		useComma = true
 	}
 	if zone.RangeMaxBytes != nil {
-		writeComma(f, useComma)
+		maybeWriteComma(f)
 		f.Printf("\trange_max_bytes = %d", *zone.RangeMaxBytes)
-		useComma = true
 	}
 	if zone.GC != nil {
-		writeComma(f, useComma)
+		maybeWriteComma(f)
 		f.Printf("\tgc.ttlseconds = %d", zone.GC.TTLSeconds)
-		useComma = true
+	}
+	if zone.GlobalReads != nil {
+		maybeWriteComma(f)
+		f.Printf("\tglobal_reads = %t", *zone.GlobalReads)
 	}
 	if zone.NumReplicas != nil {
-		writeComma(f, useComma)
+		maybeWriteComma(f)
 		f.Printf("\tnum_replicas = %d", *zone.NumReplicas)
-		useComma = true
+	}
+	if zone.NumVoters != nil {
+		maybeWriteComma(f)
+		f.Printf("\tnum_voters = %d", *zone.NumVoters)
 	}
 	if !zone.InheritedConstraints {
-		writeComma(f, useComma)
+		maybeWriteComma(f)
 		f.Printf("\tconstraints = %s", lex.EscapeSQLString(constraints))
-		useComma = true
+	}
+	if !zone.InheritedVoterConstraints && zone.NumVoters != nil && *zone.NumVoters > 0 {
+		maybeWriteComma(f)
+		f.Printf("\tvoter_constraints = %s", lex.EscapeSQLString(voterConstraints))
 	}
 	if !zone.InheritedLeasePreferences {
-		writeComma(f, useComma)
+		maybeWriteComma(f)
 		f.Printf("\tlease_preferences = %s", lex.EscapeSQLString(prefs))
 	}
 	return f.String(), nil
@@ -249,9 +278,9 @@ func generateZoneConfigIntrospectionValues(
 		if zs.Database != "" {
 			values[databaseNameCol] = tree.NewDString(string(zs.Database))
 		}
-		if zs.TableOrIndex.Table.TableName != "" {
+		if zs.TableOrIndex.Table.ObjectName != "" {
 			values[databaseNameCol] = tree.NewDString(string(zs.TableOrIndex.Table.CatalogName))
-			values[tableNameCol] = tree.NewDString(string(zs.TableOrIndex.Table.TableName))
+			values[tableNameCol] = tree.NewDString(string(zs.TableOrIndex.Table.ObjectName))
 		}
 		if zs.TableOrIndex.Index != "" {
 			values[indexNameCol] = tree.NewDString(string(zs.TableOrIndex.Index))
@@ -310,13 +339,6 @@ func generateZoneConfigIntrospectionValues(
 	return nil
 }
 
-// Writes a comma followed by a newline if useComma is true.
-func writeComma(f *tree.FmtCtx, useComma bool) {
-	if useComma {
-		f.Printf(",\n")
-	}
-}
-
 func yamlMarshalFlow(v interface{}) (string, error) {
 	var buf bytes.Buffer
 	e := yaml.NewEncoder(&buf)
@@ -342,7 +364,9 @@ func yamlMarshalFlow(v interface{}) (string, error) {
 // TODO(benesch): Teach GetZoneConfig to return the specifier of the zone it
 // finds without impacting performance.
 func ascendZoneSpecifier(
-	zs tree.ZoneSpecifier, resolvedID, actualID uint32, actualSubzone *zonepb.Subzone,
+	zs tree.ZoneSpecifier,
+	resolvedID, actualID config.SystemTenantObjectID,
+	actualSubzone *zonepb.Subzone,
 ) tree.ZoneSpecifier {
 	if actualID == keys.RootNamespaceID {
 		// We had to traverse to the top of the hierarchy, so we're showing the

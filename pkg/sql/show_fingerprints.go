@@ -16,9 +16,11 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -26,8 +28,8 @@ import (
 type showFingerprintsNode struct {
 	optColumnsSlot
 
-	tableDesc *sqlbase.ImmutableTableDescriptor
-	indexes   []*sqlbase.IndexDescriptor
+	tableDesc catalog.TableDescriptor
+	indexes   []*descpb.IndexDescriptor
 
 	run showFingerprintsRun
 }
@@ -54,7 +56,7 @@ func (p *planner) ShowFingerprints(
 	// We avoid the cache so that we can observe the fingerprints without
 	// taking a lease, like other SHOW commands.
 	tableDesc, err := p.ResolveUncachedTableDescriptorEx(
-		ctx, n.Table, true /*required*/, ResolveRequireTableDesc)
+		ctx, n.Table, true /*required*/, tree.ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -63,9 +65,15 @@ func (p *planner) ShowFingerprints(
 		return nil, err
 	}
 
+	indexes := tableDesc.NonDropIndexes()
+	indexDescs := make([]*descpb.IndexDescriptor, len(indexes))
+	for i, index := range indexes {
+		indexDescs[i] = index.IndexDesc()
+	}
+
 	return &showFingerprintsNode{
 		tableDesc: tableDesc,
-		indexes:   tableDesc.AllNonDropIndexes(),
+		indexes:   indexDescs,
 	}, nil
 }
 
@@ -88,8 +96,8 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	}
 	index := n.indexes[n.run.rowIdx]
 
-	cols := make([]string, 0, len(n.tableDesc.Columns))
-	addColumn := func(col *sqlbase.ColumnDescriptor) {
+	cols := make([]string, 0, len(n.tableDesc.PublicColumns()))
+	addColumn := func(col *descpb.ColumnDescriptor) {
 		// TODO(dan): This is known to be a flawed way to fingerprint. Any datum
 		// with the same string representation is fingerprinted the same, even
 		// if they're different types.
@@ -101,15 +109,14 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 		}
 	}
 
-	if index.ID == n.tableDesc.PrimaryIndex.ID {
-		for i := range n.tableDesc.Columns {
-			addColumn(&n.tableDesc.Columns[i])
+	if index.ID == n.tableDesc.GetPrimaryIndexID() {
+		for _, col := range n.tableDesc.PublicColumns() {
+			addColumn(col.ColumnDesc())
 		}
 	} else {
-		colsByID := make(map[sqlbase.ColumnID]*sqlbase.ColumnDescriptor)
-		for i := range n.tableDesc.Columns {
-			col := &n.tableDesc.Columns[i]
-			colsByID[col.ID] = col
+		colsByID := make(map[descpb.ColumnID]*descpb.ColumnDescriptor)
+		for _, col := range n.tableDesc.PublicColumns() {
+			colsByID[col.GetID()] = col.ColumnDesc()
 		}
 		colIDs := append(append(index.ColumnIDs, index.ExtraColumnIDs...), index.StoreColumnIDs...)
 		for _, colID := range colIDs {
@@ -132,7 +139,7 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	sql := fmt.Sprintf(`SELECT
 	  xor_agg(fnv64(%s))::string AS fingerprint
 	  FROM [%d AS t]@{FORCE_INDEX=[%d]}
-	`, strings.Join(cols, `,`), n.tableDesc.ID, index.ID)
+	`, strings.Join(cols, `,`), n.tableDesc.GetID(), index.ID)
 	// If were'in in an AOST context, propagate it to the inner statement so that
 	// the inner statement gets planned with planner.avoidCachedDescriptors set,
 	// like the outter one.
@@ -144,7 +151,7 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	fingerprintCols, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRowEx(
 		params.ctx, "hash-fingerprint",
 		params.p.txn,
-		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		sql,
 	)
 	if err != nil {

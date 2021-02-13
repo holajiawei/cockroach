@@ -12,6 +12,7 @@ package roachpb
 
 import (
 	"bytes"
+	"fmt"
 	"math"
 	"math/rand"
 	"reflect"
@@ -20,9 +21,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd"
-	"github.com/cockroachdb/cockroach/pkg/storage/concurrency/lock"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
@@ -34,16 +35,30 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
+
+func makeClockTS(walltime int64, logical int32) hlc.ClockTimestamp {
+	return hlc.ClockTimestamp{
+		WallTime: walltime,
+		Logical:  logical,
+	}
+}
 
 func makeTS(walltime int64, logical int32) hlc.Timestamp {
 	return hlc.Timestamp{
 		WallTime: walltime,
 		Logical:  logical,
+	}
+}
+
+func makeSynTS(walltime int64, logical int32) hlc.Timestamp {
+	return hlc.Timestamp{
+		WallTime:  walltime,
+		Logical:   logical,
+		Synthetic: true,
 	}
 }
 
@@ -267,11 +282,11 @@ func TestValueDataEquals(t *testing.T) {
 		{v1: e, v2: g, eq: false},
 		{v1: f, v2: g, eq: true},
 	} {
-		if tc.eq != tc.v1.EqualData(*tc.v2) {
+		if tc.eq != tc.v1.EqualTagAndData(*tc.v2) {
 			t.Errorf("%d: wanted eq=%t", i, tc.eq)
 		}
 		// Test symmetry.
-		if tc.eq != tc.v2.EqualData(*tc.v1) {
+		if tc.eq != tc.v2.EqualTagAndData(*tc.v1) {
 			t.Errorf("%d: wanted eq=%t", i, tc.eq)
 		}
 	}
@@ -404,9 +419,9 @@ func TestTransactionObservedTimestamp(t *testing.T) {
 	rng, seed := randutil.NewPseudoRand()
 	t.Logf("running with seed %d", seed)
 	ids := append([]int{109, 104, 102, 108, 1000}, rand.Perm(100)...)
-	timestamps := make(map[NodeID]hlc.Timestamp, len(ids))
+	timestamps := make(map[NodeID]hlc.ClockTimestamp, len(ids))
 	for i := 0; i < len(ids); i++ {
-		timestamps[NodeID(i)] = hlc.Timestamp{WallTime: rng.Int63()}
+		timestamps[NodeID(i)] = hlc.ClockTimestamp{WallTime: rng.Int63()}
 	}
 	for i, n := range ids {
 		nodeID := NodeID(n)
@@ -414,7 +429,7 @@ func TestTransactionObservedTimestamp(t *testing.T) {
 			t.Fatalf("%d: false positive hit %s in %v", nodeID, ts, ids[:i+1])
 		}
 		txn.UpdateObservedTimestamp(nodeID, timestamps[nodeID])
-		txn.UpdateObservedTimestamp(nodeID, hlc.MaxTimestamp) // should be noop
+		txn.UpdateObservedTimestamp(nodeID, hlc.MaxClockTimestamp) // should be noop
 		if exp, act := i+1, len(txn.ObservedTimestamps); act != exp {
 			t.Fatalf("%d: expected %d entries, got %d: %v", nodeID, exp, act, txn.ObservedTimestamps)
 		}
@@ -428,7 +443,7 @@ func TestTransactionObservedTimestamp(t *testing.T) {
 	}
 
 	var emptyTxn Transaction
-	ts := hlc.Timestamp{WallTime: 1, Logical: 2}
+	ts := hlc.ClockTimestamp{WallTime: 1, Logical: 2}
 	emptyTxn.UpdateObservedTimestamp(NodeID(1), ts)
 	if actTS, _ := emptyTxn.GetObservedTimestamp(NodeID(1)); actTS != ts {
 		t.Fatalf("unexpected: %s (wanted %s)", actTS, ts)
@@ -441,12 +456,12 @@ func TestFastPathObservedTimestamp(t *testing.T) {
 	if _, ok := txn.GetObservedTimestamp(nodeID); ok {
 		t.Errorf("fetched observed timestamp where none should exist")
 	}
-	expTS := hlc.Timestamp{WallTime: 10}
+	expTS := hlc.ClockTimestamp{WallTime: 10}
 	txn.UpdateObservedTimestamp(nodeID, expTS)
 	if ts, ok := txn.GetObservedTimestamp(nodeID); !ok || !ts.Equal(expTS) {
 		t.Errorf("expected %s; got %s", expTS, ts)
 	}
-	expTS = hlc.Timestamp{WallTime: 9}
+	expTS = hlc.ClockTimestamp{WallTime: 9}
 	txn.UpdateObservedTimestamp(nodeID, expTS)
 	if ts, ok := txn.GetObservedTimestamp(nodeID); !ok || !ts.Equal(expTS) {
 		t.Errorf("expected %s; got %s", expTS, ts)
@@ -458,23 +473,29 @@ var nonZeroTxn = Transaction{
 		Key:            Key("foo"),
 		ID:             uuid.MakeV4(),
 		Epoch:          2,
-		WriteTimestamp: makeTS(20, 21),
-		MinTimestamp:   makeTS(10, 11),
+		WriteTimestamp: makeSynTS(20, 21),
+		MinTimestamp:   makeSynTS(10, 11),
 		Priority:       957356782,
 		Sequence:       123,
 	},
-	Name:                    "name",
-	Status:                  COMMITTED,
-	LastHeartbeat:           makeTS(1, 2),
-	DeprecatedOrigTimestamp: makeTS(30, 31),
-	ReadTimestamp:           makeTS(20, 22),
-	MaxTimestamp:            makeTS(40, 41),
-	ObservedTimestamps:      []ObservedTimestamp{{NodeID: 1, Timestamp: makeTS(1, 2)}},
-	WriteTooOld:             true,
-	IntentSpans:             []Span{{Key: []byte("a"), EndKey: []byte("b")}},
-	InFlightWrites:          []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
-	CommitTimestampFixed:    true,
-	IgnoredSeqNums:          []enginepb.IgnoredSeqNumRange{{Start: 888, End: 999}},
+	Name:                   "name",
+	Status:                 COMMITTED,
+	LastHeartbeat:          makeSynTS(1, 2),
+	ReadTimestamp:          makeSynTS(20, 22),
+	GlobalUncertaintyLimit: makeSynTS(40, 41),
+	ObservedTimestamps: []ObservedTimestamp{{
+		NodeID: 1,
+		Timestamp: hlc.ClockTimestamp{
+			WallTime:  1,
+			Logical:   2,
+			Synthetic: true, // normally not set, but needed for zerofields.NoZeroField
+		},
+	}},
+	WriteTooOld:          true,
+	LockSpans:            []Span{{Key: []byte("a"), EndKey: []byte("b")}},
+	InFlightWrites:       []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
+	CommitTimestampFixed: true,
+	IgnoredSeqNums:       []enginepb.IgnoredSeqNumRange{{Start: 888, End: 999}},
 }
 
 func TestTransactionUpdate(t *testing.T) {
@@ -557,7 +578,7 @@ func TestTransactionUpdate(t *testing.T) {
 	expTxn5.Epoch = txn.Epoch + 1
 	expTxn5.Status = PENDING
 	expTxn5.Sequence = txn.Sequence - 10
-	expTxn5.IntentSpans = nil
+	expTxn5.LockSpans = nil
 	expTxn5.InFlightWrites = nil
 	expTxn5.IgnoredSeqNums = nil
 	expTxn5.WriteTooOld = false
@@ -566,7 +587,7 @@ func TestTransactionUpdate(t *testing.T) {
 
 	// Updating a different transaction fatals.
 	var exited bool
-	log.SetExitFunc(true /* hideStack */, func(int) { exited = true })
+	log.SetExitFunc(true /* hideStack */, func(exit.Code) { exited = true })
 	defer log.ResetExitFunc()
 
 	var txn6 Transaction
@@ -668,9 +689,9 @@ func TestTransactionClone(t *testing.T) {
 		"IgnoredSeqNums",
 		"InFlightWrites",
 		"InFlightWrites.Key",
-		"IntentSpans",
-		"IntentSpans.EndKey",
-		"IntentSpans.Key",
+		"LockSpans",
+		"LockSpans.EndKey",
+		"LockSpans.Key",
 		"ObservedTimestamps",
 		"TxnMeta.Key",
 	}
@@ -691,12 +712,22 @@ func TestTransactionRestart(t *testing.T) {
 	expTxn.Sequence = 0
 	expTxn.WriteTimestamp = makeTS(25, 1)
 	expTxn.ReadTimestamp = makeTS(25, 1)
-	expTxn.DeprecatedOrigTimestamp = expTxn.ReadTimestamp
 	expTxn.WriteTooOld = false
 	expTxn.CommitTimestampFixed = false
-	expTxn.IntentSpans = nil
+	expTxn.LockSpans = nil
 	expTxn.InFlightWrites = nil
 	expTxn.IgnoredSeqNums = nil
+	require.Equal(t, expTxn, txn)
+}
+
+func TestTransactionRefresh(t *testing.T) {
+	txn := nonZeroTxn
+	txn.Refresh(makeTS(25, 1))
+
+	expTxn := nonZeroTxn
+	expTxn.WriteTimestamp = makeTS(25, 1)
+	expTxn.ReadTimestamp = makeTS(25, 1)
+	expTxn.WriteTooOld = false
 	require.Equal(t, expTxn, txn)
 }
 
@@ -730,8 +761,8 @@ func TestTransactionRecordRoundtrips(t *testing.T) {
 	if !reflect.DeepEqual(txnRecord.LastHeartbeat, txn.LastHeartbeat) {
 		t.Errorf("txnRecord.LastHeartbeat = %v, txn.LastHeartbeat = %v", txnRecord.LastHeartbeat, txn.LastHeartbeat)
 	}
-	if !reflect.DeepEqual(txnRecord.IntentSpans, txn.IntentSpans) {
-		t.Errorf("txnRecord.IntentSpans = %v, txn.IntentSpans = %v", txnRecord.IntentSpans, txn.IntentSpans)
+	if !reflect.DeepEqual(txnRecord.LockSpans, txn.LockSpans) {
+		t.Errorf("txnRecord.LockSpans = %v, txn.LockSpans = %v", txnRecord.LockSpans, txn.LockSpans)
 	}
 	if !reflect.DeepEqual(txnRecord.InFlightWrites, txn.InFlightWrites) {
 		t.Errorf("txnRecord.InFlightWrites = %v, txn.InFlightWrites = %v", txnRecord.InFlightWrites, txn.InFlightWrites)
@@ -907,23 +938,23 @@ func TestMakePriorityLimits(t *testing.T) {
 func TestLeaseEquivalence(t *testing.T) {
 	r1 := ReplicaDescriptor{NodeID: 1, StoreID: 1, ReplicaID: 1}
 	r2 := ReplicaDescriptor{NodeID: 2, StoreID: 2, ReplicaID: 2}
-	ts1 := makeTS(1, 1)
-	ts2 := makeTS(2, 1)
-	ts3 := makeTS(3, 1)
+	ts1 := makeClockTS(1, 1)
+	ts2 := makeClockTS(2, 1)
+	ts3 := makeClockTS(3, 1)
 
 	epoch1 := Lease{Replica: r1, Start: ts1, Epoch: 1}
 	epoch2 := Lease{Replica: r1, Start: ts1, Epoch: 2}
-	expire1 := Lease{Replica: r1, Start: ts1, Expiration: ts2.Clone()}
-	expire2 := Lease{Replica: r1, Start: ts1, Expiration: ts3.Clone()}
+	expire1 := Lease{Replica: r1, Start: ts1, Expiration: ts2.ToTimestamp().Clone()}
+	expire2 := Lease{Replica: r1, Start: ts1, Expiration: ts3.ToTimestamp().Clone()}
 	epoch2TS2 := Lease{Replica: r2, Start: ts2, Epoch: 2}
-	expire2TS2 := Lease{Replica: r2, Start: ts2, Expiration: ts3.Clone()}
+	expire2TS2 := Lease{Replica: r2, Start: ts2, Expiration: ts3.ToTimestamp().Clone()}
 
-	proposed1 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: ts1.Clone()}
-	proposed2 := Lease{Replica: r1, Start: ts1, Epoch: 2, ProposedTS: ts1.Clone()}
-	proposed3 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: ts2.Clone()}
+	proposed1 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: &ts1}
+	proposed2 := Lease{Replica: r1, Start: ts1, Epoch: 2, ProposedTS: &ts1}
+	proposed3 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: &ts2}
 
-	stasis1 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts1.Clone()}
-	stasis2 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts2.Clone()}
+	stasis1 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts1.ToTimestamp().Clone()}
+	stasis2 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts2.ToTimestamp().Clone()}
 
 	r1Voter, r1Learner := r1, r1
 	r1Voter.Type = ReplicaTypeVoterFull()
@@ -963,7 +994,7 @@ func TestLeaseEquivalence(t *testing.T) {
 	// field. It introduced a bug whose regression is caught below where a zero Expiration and a nil
 	// Expiration in an epoch-based lease led to mistakenly considering leases non-equivalent.
 	prePRLease := Lease{
-		Start: hlc.Timestamp{WallTime: 10},
+		Start: hlc.ClockTimestamp{WallTime: 10},
 		Epoch: 123,
 
 		// The bug-trigger.
@@ -971,7 +1002,7 @@ func TestLeaseEquivalence(t *testing.T) {
 
 		// Similar potential bug triggers, but these were actually handled correctly.
 		DeprecatedStartStasis: new(hlc.Timestamp),
-		ProposedTS:            &hlc.Timestamp{WallTime: 10},
+		ProposedTS:            &hlc.ClockTimestamp{WallTime: 10},
 	}
 	postPRLease := prePRLease
 	postPRLease.DeprecatedStartStasis = nil
@@ -984,11 +1015,11 @@ func TestLeaseEquivalence(t *testing.T) {
 
 func TestLeaseEqual(t *testing.T) {
 	type expectedLease struct {
-		Start                 hlc.Timestamp
+		Start                 hlc.ClockTimestamp
 		Expiration            *hlc.Timestamp
 		Replica               ReplicaDescriptor
 		DeprecatedStartStasis *hlc.Timestamp
-		ProposedTS            *hlc.Timestamp
+		ProposedTS            *hlc.ClockTimestamp
 		Epoch                 int64
 		Sequence              LeaseSequence
 	}
@@ -1027,13 +1058,14 @@ func TestLeaseEqual(t *testing.T) {
 		t.Fatalf("expectedly compared equal")
 	}
 
-	ts := hlc.Timestamp{Logical: 1}
+	clockTS := hlc.ClockTimestamp{Logical: 1}
+	ts := clockTS.ToTimestamp()
 	testCases := []Lease{
-		{Start: ts},
+		{Start: clockTS},
 		{Expiration: &ts},
 		{Replica: ReplicaDescriptor{NodeID: 1}},
 		{DeprecatedStartStasis: &ts},
-		{ProposedTS: &ts},
+		{ProposedTS: &clockTS},
 		{Epoch: 1},
 		{Sequence: 1},
 	}
@@ -1043,14 +1075,6 @@ func TestLeaseEqual(t *testing.T) {
 				t.Fatalf("unexpected equality: %s", pretty.Diff(c, Lease{}))
 			}
 		})
-	}
-}
-
-func TestLeaseFuzzNullability(t *testing.T) {
-	var l Lease
-	protoutil.Walk(&l, protoutil.ZeroInsertingVisitor)
-	if l.Expiration == nil {
-		t.Fatal("unexpectedly nil expiration")
 	}
 }
 
@@ -1125,7 +1149,7 @@ func TestSpanCombine(t *testing.T) {
 		{sCtoA, sBtoD, Span{}},
 	}
 	for i, test := range testData {
-		if combined := test.s1.Combine(test.s2); !combined.Equal(test.combined) {
+		if combined := test.s1.Combine(test.s2); !reflect.DeepEqual(combined, test.combined) {
 			t.Errorf("%d: expected combined %s; got %s between %s vs. %s", i, test.combined, combined, test.s1, test.s2)
 		}
 	}
@@ -1208,11 +1232,11 @@ func TestSpanSplitOnKey(t *testing.T) {
 	for testIdx, test := range testData {
 		t.Run(strconv.Itoa(testIdx), func(t *testing.T) {
 			actualL, actualR := s.SplitOnKey(test.split)
-			if !test.left.EqualValue(actualL) {
+			if !test.left.Equal(actualL) {
 				t.Fatalf("expected left span after split to be %v, got %v", test.left, actualL)
 			}
 
-			if !test.right.EqualValue(actualR) {
+			if !test.right.Equal(actualR) {
 				t.Fatalf("expected right span after split to be %v, got %v", test.right, actualL)
 			}
 		})
@@ -1597,11 +1621,21 @@ func TestValuePrettyPrint(t *testing.T) {
 	}
 }
 
+func TestKeyFormat(t *testing.T) {
+	const sample = "\xbd\xb2\x3d\xbc\x20\xe2\x8c\x98"
+	k := Key(sample)
+	expected := ` /Table/53/42/"=\xbc ⌘"`
+	actual := fmt.Sprintf(" %s", k)
+	if expected != actual {
+		t.Errorf("String formatting of key: got %q expected %q", actual, expected)
+	}
+}
+
 func TestUpdateObservedTimestamps(t *testing.T) {
 	f := func(nodeID NodeID, walltime int64) ObservedTimestamp {
 		return ObservedTimestamp{
 			NodeID: nodeID,
-			Timestamp: hlc.Timestamp{
+			Timestamp: hlc.ClockTimestamp{
 				WallTime: walltime,
 			},
 		}
@@ -1682,14 +1716,13 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 				learner,
 				repl3,
 			},
-			NextReplicaID:        10,
-			Generation:           proto.Int64(5),
-			GenerationComparable: proto.Bool(true),
+			NextReplicaID: 10,
+			Generation:    5,
 		},
 	}
 	act := crt.String()
-	exp := "ENTER_JOINT(r6 r12 l12 v3) ADD_REPLICA[(n1,s2):3VOTER_INCOMING], " +
-		"REMOVE_REPLICA[(n4,s5):6VOTER_OUTGOING (n10,s11):12VOTER_DEMOTING]: " +
+	exp := "ENTER_JOINT(r6 r12 l12 v3) [(n1,s2):3VOTER_INCOMING], " +
+		"[(n4,s5):6VOTER_OUTGOING (n10,s11):12VOTER_DEMOTING]: " +
 		"after=[(n1,s2):3VOTER_INCOMING (n4,s5):6VOTER_OUTGOING (n7,s8):9LEARNER " +
 		"(n10,s11):12VOTER_DEMOTING] next=10"
 	require.Equal(t, exp, act)
@@ -1697,7 +1730,7 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 	crt.InternalRemovedReplicas = nil
 	crt.InternalAddedReplicas = nil
 	repl1.Type = ReplicaTypeVoterFull()
-	crt.Desc.SetReplicas(MakeReplicaDescriptors([]ReplicaDescriptor{repl1, learner}))
+	crt.Desc.SetReplicas(MakeReplicaSet([]ReplicaDescriptor{repl1, learner}))
 	act = crt.String()
 	require.Empty(t, crt.Added())
 	require.Empty(t, crt.Removed())
@@ -1746,7 +1779,7 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 		m.ChangeReplicasTrigger.InternalAddedReplicas = in.add
 		m.ChangeReplicasTrigger.InternalRemovedReplicas = in.del
 		m.Desc = &RangeDescriptor{}
-		m.Desc.SetReplicas(MakeReplicaDescriptors(in.repls))
+		m.Desc.SetReplicas(MakeReplicaSet(in.repls))
 		return m
 	}
 
@@ -1855,11 +1888,11 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 
 		// Run a more complex change (necessarily) via the V2 path.
 		{crt: mk(in{
-			add: sl( // Additions.
+			add: sl( // Voter additions.
 				VOTER_INCOMING, 6, LEARNER, 4, VOTER_INCOMING, 3,
 			),
 			del: sl(
-				// Removals.
+				// Voter removals.
 				LEARNER, 2, VOTER_OUTGOING, 8, VOTER_DEMOTING, 9,
 			),
 			repls: sl(
@@ -1915,9 +1948,9 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 	}
 }
 
-// TestAsLockUpdates verifies that AsLockUpdates propagates all the important
-// fields from a txn to each intent.
-func TestAsLockUpdates(t *testing.T) {
+// TestAsLockUpdates verifies that txn.LocksAsLockUpdates propagates all the
+// important fields from the txn to each intent.
+func TestTxnLocksAsLockUpdates(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ts := hlc.Timestamp{WallTime: 1}
@@ -1925,13 +1958,58 @@ func TestAsLockUpdates(t *testing.T) {
 
 	txn.Status = COMMITTED
 	txn.IgnoredSeqNums = []enginepb.IgnoredSeqNumRange{{Start: 0, End: 0}}
-
-	dur := lock.Unreplicated
-	spans := []Span{{Key: Key("a"), EndKey: Key("b")}}
-	for _, intent := range AsLockUpdates(&txn, spans, dur) {
+	txn.LockSpans = []Span{{Key: Key("a"), EndKey: Key("b")}}
+	for _, intent := range txn.LocksAsLockUpdates() {
 		require.Equal(t, txn.Status, intent.Status)
 		require.Equal(t, txn.IgnoredSeqNums, intent.IgnoredSeqNums)
 		require.Equal(t, txn.TxnMeta, intent.Txn)
-		require.Equal(t, dur, intent.Durability)
+	}
+}
+
+func TestAddIgnoredSeqNumRange(t *testing.T) {
+	type r = enginepb.IgnoredSeqNumRange
+
+	mr := func(a, b enginepb.TxnSeq) r {
+		return r{Start: a, End: b}
+	}
+
+	testData := []struct {
+		list     []r
+		newRange r
+		exp      []r
+	}{
+		{
+			[]r{},
+			mr(1, 2),
+			[]r{mr(1, 2)},
+		},
+		{
+			[]r{mr(1, 2)},
+			mr(1, 4),
+			[]r{mr(1, 4)},
+		},
+		{
+			[]r{mr(1, 2), mr(3, 6)},
+			mr(8, 10),
+			[]r{mr(1, 2), mr(3, 6), mr(8, 10)},
+		},
+		{
+			[]r{mr(1, 2), mr(5, 6)},
+			mr(3, 8),
+			[]r{mr(1, 2), mr(3, 8)},
+		},
+		{
+			[]r{mr(1, 2), mr(5, 6)},
+			mr(1, 8),
+			[]r{mr(1, 8)},
+		},
+	}
+
+	for _, tc := range testData {
+		txn := Transaction{
+			IgnoredSeqNums: tc.list,
+		}
+		txn.AddIgnoredSeqNumRange(tc.newRange)
+		require.Equal(t, tc.exp, txn.IgnoredSeqNums)
 	}
 }

@@ -18,15 +18,15 @@ import (
 	"unsafe"
 
 	circuit "github.com/cockroachdb/circuitbreaker"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/storage/closedts"
-	"github.com/cockroachdb/cockroach/pkg/storage/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 )
 
@@ -157,7 +157,7 @@ func (n *Dialer) dial(
 	defer func() {
 		// Enforce a minimum interval between warnings for failed connections.
 		if err != nil && ctx.Err() == nil && breaker != nil && breaker.ShouldLog() {
-			log.Infof(ctx, "unable to connect to n%d: %s", nodeID, err)
+			log.Health.Infof(ctx, "unable to connect to n%d: %s", nodeID, err)
 		}
 	}()
 	conn, err := n.rpcContext.GRPCDialNode(addr.String(), nodeID, class).Connect(ctx)
@@ -175,7 +175,6 @@ func (n *Dialer) dial(
 	// Check to see if the connection is in the transient failure state. This can
 	// happen if the connection already existed, but a recent heartbeat has
 	// failed and we haven't yet torn down the connection.
-	err = grpcutil.ConnectionReady(conn)
 	if err := grpcutil.ConnectionReady(conn); err != nil {
 		err = errors.Wrapf(err, "failed to check for ready connection to n%d at %v", nodeID, addr)
 		if breaker != nil {
@@ -238,6 +237,25 @@ func (n *Dialer) getBreaker(nodeID roachpb.NodeID, class rpc.ConnectionClass) *w
 		value, _ = breakers.LoadOrStore(int64(nodeID), unsafe.Pointer(breaker))
 	}
 	return (*wrappedBreaker)(value)
+}
+
+// Latency returns the exponentially weighted moving average latency to the
+// given node ID. Returns a latency of 0 with no error if we don't have enough
+// samples to compute a reliable average.
+func (n *Dialer) Latency(nodeID roachpb.NodeID) (time.Duration, error) {
+	if n == nil || n.resolver == nil {
+		return 0, errors.New("no node dialer configured")
+	}
+	addr, err := n.resolver(nodeID)
+	if err != nil {
+		// Don't trip the breaker.
+		return 0, err
+	}
+	latency, ok := n.rpcContext.RemoteClocks.Latency(addr.String())
+	if !ok {
+		latency = 0
+	}
+	return latency, nil
 }
 
 type dialerAdapter Dialer

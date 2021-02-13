@@ -11,41 +11,17 @@
 package main
 
 import (
+	"fmt"
 	"io"
-	"io/ioutil"
-	"strings"
-	"text/template"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-func genHashAggregator(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/hash_aggregator_tmpl.go")
-	if err != nil {
-		return err
-	}
+const hashAggTmpl = "pkg/sql/colexec/hash_aggregator_tmpl.go"
 
-	s := string(t)
-
-	s = strings.Replace(s, "_TemplateType", "{{.LTyp}}", -1)
-	s = strings.Replace(s, "_TYPES_T", "coltypes.{{.LTyp}}", -1)
-	s = replaceManipulationFuncs(".Global.LTyp", s)
-
-	assignCmpRe := makeFunctionRegex("_ASSIGN_NE", 3)
-	s = assignCmpRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.Assign", 3))
-
-	matchLoop := makeFunctionRegex("_MATCH_LOOP", 8)
-	s = matchLoop.ReplaceAllString(
-		s, `{{template "matchLoop" buildDict "Global" . "LhsMaybeHasNulls" $7 "RhsMaybeHasNulls" $8}}`)
-
-	tmpl, err := template.New("hash_aggregator").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
-	if err != nil {
-		return err
-	}
-
-	return tmpl.Execute(wr, sameTypeComparisonOpToOverloads[tree.NE])
+func genHashAggregator(inputFileContents string, wr io.Writer) error {
+	_, err := fmt.Fprint(wr, inputFileContents)
+	return err
 }
 
 func init() {
-	registerGenerator(genHashAggregator, "hash_aggregator.eg.go")
+	registerGenerator(genHashAggregator, "hash_aggregator.eg.go", hashAggTmpl)
 }

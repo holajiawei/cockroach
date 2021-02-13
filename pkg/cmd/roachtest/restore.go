@@ -26,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // HealthChecker runs a regular check that verifies that a specified subset
@@ -130,7 +130,7 @@ func (hc *HealthChecker) Runner(ctx context.Context) (err error) {
 
 		if elapsed := timeutil.Since(tBegin); elapsed > 10*time.Second {
 			err := errors.Errorf("health check against node %d took %s", nodeIdx, elapsed)
-			logger.Printf(err.Error() + "\n")
+			logger.Printf("%+v", err)
 			// TODO(tschottdorf): see method comment.
 			// return err
 		}
@@ -223,6 +223,8 @@ func registerRestore(r *testRegistry) {
 			Cluster: makeClusterSpec(item.nodes),
 			Timeout: item.timeout,
 			Run: func(ctx context.Context, t *test, c *cluster) {
+				// Randomize starting with encryption-at-rest enabled.
+				c.encryptAtRandom = true
 				c.Put(ctx, cockroach, "./cockroach")
 				c.Start(ctx, t)
 				m := newMonitor(ctx, c)

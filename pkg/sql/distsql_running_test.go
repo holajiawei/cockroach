@@ -13,23 +13,27 @@ package sql
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/stretchr/testify/require"
 )
 
 // Test that we don't attempt to create flows in an aborted transaction.
@@ -45,6 +49,7 @@ import (
 // plan; planning will be performed outside of the transaction.
 func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	s, sqlDB, db := serverutils.StartServer(t, base.TestServerArgs{})
@@ -60,10 +65,11 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	execCfg := s.ExecutorConfig().(ExecutorConfig)
 	internalPlanner, cleanup := NewInternalPlanner(
 		"test",
-		client.NewTxn(ctx, db, s.NodeID()),
-		security.RootUser,
+		kv.NewTxn(ctx, db, s.NodeID()),
+		security.RootUserName(),
 		&MemoryMetrics{},
 		&execCfg,
+		sessiondatapb.SessionData{},
 	)
 	defer cleanup()
 	p := internalPlanner.(*planner)
@@ -75,7 +81,7 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 
 	push := func(ctx context.Context, key roachpb.Key) error {
 		// Conflicting transaction that pushes another transaction.
-		conflictTxn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
+		conflictTxn := kv.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 		// We need to explicitly set a high priority for the push to happen.
 		if err := conflictTxn.SetUserPriority(roachpb.MaxUserPriority); err != nil {
 			return err
@@ -90,8 +96,8 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	// Make a db with a short heartbeat interval, so that the aborted txn finds
 	// out quickly.
 	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
-	tsf := kv.NewTxnCoordSenderFactory(
-		kv.TxnCoordSenderFactoryConfig{
+	tsf := kvcoord.NewTxnCoordSenderFactory(
+		kvcoord.TxnCoordSenderFactoryConfig{
 			AmbientCtx: ambient,
 			// Short heartbeat interval.
 			HeartbeatInterval: time.Millisecond,
@@ -99,15 +105,16 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 			Clock:             s.Clock(),
 			Stopper:           s.Stopper(),
 		},
-		s.DistSenderI().(*kv.DistSender),
+		s.DistSenderI().(*kvcoord.DistSender),
 	)
-	shortDB := client.NewDB(ambient, tsf, s.Clock())
+	shortDB := kv.NewDB(ambient, tsf, s.Clock(), s.Stopper())
 
 	iter := 0
 	// We'll trace to make sure the test isn't fooling itself.
-	runningCtx, getRec, cancel := tracing.ContextWithRecordingSpan(ctx, "test")
+	tr := s.Tracer().(*tracing.Tracer)
+	runningCtx, getRec, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "test")
 	defer cancel()
-	err = shortDB.Txn(runningCtx, func(ctx context.Context, txn *client.Txn) error {
+	err = shortDB.Txn(runningCtx, func(ctx context.Context, txn *kv.Txn) error {
 		iter++
 		if iter == 1 {
 			// On the first iteration, abort the txn.
@@ -122,7 +129,7 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 
 			// Now wait until the heartbeat loop notices that the transaction is aborted.
 			testutils.SucceedsSoon(t, func() error {
-				if txn.Sender().(*kv.TxnCoordSender).IsTracking() {
+				if txn.Sender().(*kvcoord.TxnCoordSender).IsTracking() {
 					return fmt.Errorf("txn heartbeat loop running")
 				}
 				return nil
@@ -138,33 +145,29 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 			rw,
 			stmt.AST.StatementType(),
 			execCfg.RangeDescriptorCache,
-			execCfg.LeaseHolderCache,
 			txn,
-			func(ts hlc.Timestamp) {
-				_ = execCfg.Clock.Update(ts)
-			},
+			execCfg.Clock,
 			p.ExtendedEvalContext().Tracing,
+			execCfg.ContentionRegistry,
 		)
 
 		// We need to re-plan every time, since close() below makes
 		// the plan unusable across retries.
-		p.stmt = &Statement{Statement: stmt}
+		p.stmt = makeStatement(stmt, ClusterWideID{})
 		if err := p.makeOptimizerPlan(ctx); err != nil {
 			t.Fatal(err)
 		}
 		defer p.curPlan.close(ctx)
 
 		evalCtx := p.ExtendedEvalContext()
-		planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, nil /* txn */)
-		// We need isLocal = false so that we executing the plan involves marshaling
+		// We need distribute = true so that executing the plan involves marshaling
 		// the root txn meta to leaf txns. Local flows can start in aborted txns
 		// because they just use the root txn.
-		planCtx.isLocal = false
-		planCtx.planner = p
+		planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p, nil /* txn */, true /* distribute */)
 		planCtx.stmtType = recv.stmtType
 
 		execCfg.DistSQLPlanner.PlanAndRun(
-			ctx, evalCtx, planCtx, txn, p.curPlan.plan, recv,
+			ctx, evalCtx, planCtx, txn, p.curPlan.main, recv,
 		)()
 		return rw.Err()
 	})
@@ -183,6 +186,7 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 // come along.
 func TestDistSQLReceiverErrorRanking(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// This test goes through the trouble of creating a server because it wants to
 	// create a txn. It creates the txn because it wants to test an interaction
@@ -193,7 +197,7 @@ func TestDistSQLReceiverErrorRanking(t *testing.T) {
 	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	txn := client.NewTxn(ctx, db, s.NodeID())
+	txn := kv.NewTxn(ctx, db, s.NodeID())
 
 	// We're going to use a rowResultWriter to which only errors will be passed.
 	rw := newCallbackResultWriter(nil /* fn */)
@@ -202,10 +206,10 @@ func TestDistSQLReceiverErrorRanking(t *testing.T) {
 		rw,
 		tree.Rows, /* StatementType */
 		nil,       /* rangeCache */
-		nil,       /* leaseCache */
 		txn,
-		func(hlc.Timestamp) {}, /* updateClock */
+		nil, /* clockUpdater */
 		&SessionTracing{},
+		nil, /* contentionRegistry */
 	)
 
 	retryErr := roachpb.NewErrorWithTxn(
@@ -259,4 +263,69 @@ func TestDistSQLReceiverErrorRanking(t *testing.T) {
 			t.Fatalf("%d: expected %s, got %s", i, tc.expErr, rw.Err())
 		}
 	}
+}
+
+// TestDistSQLReceiverReportsContention verifies that the distsql receiver
+// reports contention events via an observable metric if they occur. This test
+// additionally verifies that the metric stays at zero if there is no
+// contention.
+func TestDistSQLReceiverReportsContention(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	testutils.RunTrueAndFalse(t, "contention", func(t *testing.T, contention bool) {
+		// TODO(yuzefovich): add an onContentionEventCb() to
+		// DistSQLRunTestingKnobs and use it here to accumulate contention
+		// events.
+		s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		defer s.Stopper().Stop(ctx)
+		sqlutils.CreateTable(
+			t, db, "test", "x INT PRIMARY KEY", 1, sqlutils.ToRowFn(sqlutils.RowIdxFn),
+		)
+
+		if contention {
+			// Begin a contending transaction.
+			conn, err := db.Conn(ctx)
+			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, conn.Close())
+			}()
+			_, err = conn.ExecContext(ctx, "BEGIN; UPDATE test.test SET x = 10 WHERE x = 1;")
+			require.NoError(t, err)
+		}
+
+		metrics := s.DistSQLServer().(*distsql.ServerImpl).Metrics
+		metrics.ContendedQueriesCount.Clear()
+		contentionRegistry := s.ExecutorConfig().(ExecutorConfig).ContentionRegistry
+		otherConn, err := db.Conn(ctx)
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, otherConn.Close())
+		}()
+		// TODO(yuzefovich): turning the tracing ON won't be necessary once
+		// always-on tracing is enabled.
+		_, err = otherConn.ExecContext(ctx, `
+SET TRACING=on;
+BEGIN;
+SET TRANSACTION PRIORITY HIGH;
+UPDATE test.test SET x = 100 WHERE x = 1;
+COMMIT;
+SET TRACING=off;
+`)
+		require.NoError(t, err)
+		const contentionEventSubstring = "tableID=53 indexID=1"
+		if contention {
+			// Soft check to protect against flakiness where an internal query
+			// causes the contention metric to increment.
+			require.GreaterOrEqual(t, metrics.ContendedQueriesCount.Count(), int64(1))
+		} else {
+			require.Zero(
+				t,
+				metrics.ContendedQueriesCount.Count(),
+				"contention metric unexpectedly non-zero when no contention events are produced",
+			)
+		}
+		require.Equal(t, contention, strings.Contains(contentionRegistry.String(), contentionEventSubstring))
+	})
 }

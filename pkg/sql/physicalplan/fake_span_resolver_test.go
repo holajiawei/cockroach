@@ -15,23 +15,26 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/physicalplanutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestFakeSpanResolver(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 
 	sqlutils.CreateTable(
@@ -50,19 +53,19 @@ func TestFakeSpanResolver(t *testing.T) {
 
 	db := tc.Server(0).DB()
 
-	txn := client.NewTxn(ctx, db, tc.Server(0).NodeID())
+	txn := kv.NewTxn(ctx, db, tc.Server(0).NodeID())
 	it := resolver.NewSpanResolverIterator(txn)
 
-	tableDesc := sqlbase.GetTableDescriptor(db, "test", "t")
-	primIdxValDirs := sqlbase.IndexKeyValDirs(&tableDesc.PrimaryIndex)
+	tableDesc := catalogkv.TestingGetTableDescriptor(db, keys.SystemSQLCodec, "test", "t")
+	primIdxValDirs := catalogkeys.IndexKeyValDirs(tableDesc.GetPrimaryIndex().IndexDesc())
 
-	span := tableDesc.PrimaryIndexSpan()
+	span := tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)
 
 	// Make sure we see all the nodes. It will not always happen (due to
 	// randomness) but it should happen most of the time.
 	for attempt := 0; attempt < 10; attempt++ {
 		nodesSeen := make(map[roachpb.NodeID]struct{})
-		it.Seek(ctx, span, kv.Ascending)
+		it.Seek(ctx, span, kvcoord.Ascending)
 		lastKey := span.Key
 		for {
 			if !it.Valid() {

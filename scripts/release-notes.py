@@ -155,8 +155,10 @@ def lookup_person(name, email):
 # Section titles for release notes.
 relnotetitles = {
     'cli change': "Command-line changes",
+    'ops change': "Operational changes",
     'sql change': "SQL language changes",
-    'admin ui change': "Admin UI changes",
+    'api change': "API endpoint changes",
+    'ui change': "DB Console changes",
     'general change': "General changes",
     'build change': "Build changes",
     'enterprise change': "Enterprise edition changes",
@@ -173,8 +175,10 @@ relnote_sec_order = [
     'general change',
     'enterprise change',
     'sql change',
+    'ops change',
     'cli change',
-    'admin ui change',
+    'api change',
+    'ui change',
     'bug fix',
     'performance improvement',
     'build change',
@@ -188,7 +192,11 @@ cat_misspells = {
     'bugfix': 'bug fix',
     'performance change': 'performance improvement',
     'performance': 'performance improvement',
-    'ui': 'admin ui change',
+    'ui': 'ui change',
+    'operational change': 'ops change',
+    'admin ui': 'ui change',
+    'api': 'api change',
+    'http': 'api change',
     'backwards-incompatible change': 'backward-incompatible change',
     'enterprise': 'enterprise change',
     'security': 'security update',
@@ -253,6 +261,8 @@ parser.add_option("--hide-unambiguous-shas", action="store_true", dest="hide_sha
                   help="omit commit SHAs from the release notes and per-contributor sections")
 parser.add_option("--hide-per-contributor-section", action="store_true", dest="hide_per_contributor", default=False,
                   help="omit the per-contributor section")
+parser.add_option("--hide-crdb-folk", dest="hide_crdb_folk", action="store_true", default=False,
+                  help="don't show crdb folk in the per-contributor section")
 parser.add_option("--hide-downloads-section", action="store_true", dest="hide_downloads", default=False,
                   help="omit the email sign-up and downloads section")
 parser.add_option("--hide-header", action="store_true", dest="hide_header", default=False,
@@ -263,6 +273,8 @@ parser.add_option("--exclude-until", dest="exclude_until_commit",
                   help="exclude history ending at COMMIT", metavar="COMMIT")
 parser.add_option("--one-line", dest="one_line", action="store_true", default=False,
                   help="unwrap release notes on a single line")
+parser.add_option("--prod-release", dest="prod_release", action="store_true", default=False,
+                  help="identify release as production (e.g., v20.2.x) and omit '-unstable' from docker pull command")
 
 (options, args) = parser.parse_args()
 
@@ -273,6 +285,7 @@ hideshas = options.hide_shas
 hidepercontributor = options.hide_per_contributor
 hidedownloads = options.hide_downloads
 hideheader = options.hide_header
+hidecrdbfolk = options.hide_crdb_folk
 
 repo = Repo('.')
 heads = repo.heads
@@ -638,11 +651,9 @@ allprs = set()
 # C, E, F, and G will each be checked. F is an ancestor of B, so it will be
 # excluded. E starts with "Merge", so it will not be counted. Only C and G will
 # have statistics included.
-def analyze_pr(merge, pr):
+def analyze_pr(merge, pr, parent_idx):
     allprs.add(pr)
 
-    refname = pull_ref_prefix + "/" + pr[1:]
-    tip = name_to_object(repo, refname)
 
     noteexpr = re.compile("^%s: (?P<message>.*) r=.* a=.*" % pr[1:], flags=re.M)
     m = noteexpr.search(merge.message)
@@ -654,6 +665,26 @@ def analyze_pr(merge, pr):
         # Bors merge
         title = m.group('message')
     title = title.strip()
+
+    try:
+        refname = pull_ref_prefix + "/" + pr[1:]
+        tip = name_to_object(repo, refname)
+    except exc.BadName:
+        # Oddly, we have at least one PR (#47761) which does not have a tip
+        # at /refs/pull/47761, although it's valid and merged.
+        # As of 2020-06-08 it's the only PR missing a branch tip there.
+        print("\nuh-oh!  can't find PR head in repo", pr, file=sys.stderr)
+        # We deal with it here assuming that the order of the parents
+        # of the merge commit is the same as reported by the
+        # "Merge ..." string in the merge commit's message.
+        # This happens to be true of the missing PR above as well
+        # as for several other merge commits with more than two parents.
+        tip = merge.parents[parent_idx]
+        print("check at https://github.com/cockroachdb/cockroach/pull/%s that the last commit is %s" % (pr[1:], tip.hexsha), file=sys.stderr)
+        # TODO(knz): If this method is reliable, this means we don't
+        # need the pull tips at /refs/pull *at all* which could
+        # streamline the whole experience.
+        # This should be investigated further.
 
     merge_base_result = repo.merge_base(merge.parents[0], tip)
     if len(merge_base_result) == 0:
@@ -749,9 +780,9 @@ for commit in mergepoints:
     # Analyze the commit
     if numbermatch is not None:
         prs = numbermatch.group("numbers").strip().split(" ")
-        for pr in prs:
+        for idx, pr in enumerate(prs):
             print("                                \r%s (%s) " % (pr, ctime), end='', file=sys.stderr)
-            analyze_pr(commit, pr)
+            analyze_pr(commit, pr, idx+1)
     else:
         print("                                \r%s (%s) " % (commit.hexsha[:shamin], ctime), end='', file=sys.stderr)
         analyze_standalone_commit(commit)
@@ -807,21 +838,18 @@ if not hideheader:
 
 # Print the release notes sign-up and Downloads section.
 
+if options.prod_release:
+    print("""DOCS WRITER: PLEASE UPDATE THE VERSIONS AND LINKS IN THIS INTRO: This page lists additions and changes in <current release> since <previous_version>.
+
+- For a comprehensive summary of features in v20.2, see the [v20.2 GA release notes](v20.2.0.html).
+- To upgrade to v20.2, see [Upgrade to CockroachDB v20.2](../v20.2/upgrade-cockroach-version.html).
+""")
+
 if not hidedownloads:
     print("""Get future release notes emailed to you:
 
-<div class="hubspot-install-form install-form-1 clearfix">
-    <script>
-        hbspt.forms.create({
-            css: '',
-            cssClass: 'install-form',
-            portalId: '1753393',
-            formId: '39686297-81d2-45e7-a73f-55a596a8d5ff',
-            formInstanceId: 1,
-            target: '.install-form-1'
-        });
-    </script>
-</div>""")
+{% include marketo.html %}
+""")
     print()
 
     print("""### Downloads
@@ -829,6 +857,7 @@ if not hidedownloads:
 <div id="os-tabs" class="clearfix">
     <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.darwin-10.9-amd64.tgz"><button id="mac" data-eventcategory="mac-binary-release-notes">Mac</button></a>
     <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.linux-amd64.tgz"><button id="linux" data-eventcategory="linux-binary-release-notes">Linux</button></a>
+    <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.windows-6.2-amd64.zip"><button id="windows" data-eventcategory="windows-binary-release-notes">Windows</button></a>
     <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.src.tgz"><button id="source" data-eventcategory="source-release-notes">Source</button></a>
 </div>
 """)
@@ -837,7 +866,7 @@ if not hidedownloads:
 
 {% include copy-clipboard.html %}
 ~~~shell
-$ docker pull cockroachdb/cockroach""" + ("-unstable:" if "-" in current_version else ":") + current_version + """
+$ docker pull cockroachdb/cockroach""" + (":" if options.prod_release else "-unstable:") + current_version + """
 ~~~
 """)
     print()
@@ -937,6 +966,8 @@ if not hidepercontributor:
 
     for group in allgroups:
         al, items = per_group_history[group]
+        if hidecrdbfolk and all(map(lambda x: x in crdb_folk, al)):
+            continue
         items.sort(key=lambda x: x[sortkey], reverse=not revsort)
         print("- %s:" % ', '.join(a.name for a in sorted(al)))
         for item in items:

@@ -24,15 +24,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestProjectionAndRendering(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// We don't care about actual types, so we use ColumnType.Locale to store an
 	// arbitrary string.
-	strToType := func(s string) types.T {
-		return *types.MakeCollatedString(types.String, s)
+	strToType := func(s string) *types.T {
+		return types.MakeCollatedString(types.String, s)
 	}
 
 	// For each test case we set up processors with a certain post-process spec,
@@ -204,7 +206,7 @@ func TestProjectionAndRendering(t *testing.T) {
 					},
 					fakeExprContext{},
 					[]int{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3},
-					[]types.T{strToType("A"), strToType("B"), strToType("C"), strToType("D")},
+					[]*types.T{strToType("A"), strToType("B"), strToType("C"), strToType("D")},
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -228,7 +230,7 @@ func TestProjectionAndRendering(t *testing.T) {
 					},
 					fakeExprContext{},
 					[]int{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3},
-					[]types.T{strToType("B"), strToType("D"), strToType("C")},
+					[]*types.T{strToType("B"), strToType("D"), strToType("C")},
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -259,7 +261,7 @@ func TestProjectionAndRendering(t *testing.T) {
 					},
 					fakeExprContext{},
 					[]int{0, 1, 2},
-					[]types.T{strToType("X")},
+					[]*types.T{strToType("X")},
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -293,7 +295,7 @@ func TestProjectionAndRendering(t *testing.T) {
 					},
 					fakeExprContext{},
 					[]int{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2},
-					[]types.T{strToType("X"), strToType("A")},
+					[]*types.T{strToType("X"), strToType("A")},
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -309,11 +311,14 @@ func TestProjectionAndRendering(t *testing.T) {
 
 	for testIdx, tc := range testCases {
 		p := PhysicalPlan{
-			Processors: []Processor{
-				{Spec: execinfrapb.ProcessorSpec{Post: tc.post}},
-				{Spec: execinfrapb.ProcessorSpec{Post: tc.post}},
+			PhysicalInfrastructure: &PhysicalInfrastructure{
+				Processors: []Processor{
+					{Spec: execinfrapb.ProcessorSpec{Post: tc.post}},
+					{Spec: execinfrapb.ProcessorSpec{Post: tc.post}},
+				},
 			},
 			ResultRouters: []ProcessorIdx{0, 1},
+			Distribution:  LocalPlan,
 		}
 
 		if tc.ordering != "" {
@@ -331,17 +336,29 @@ func TestProjectionAndRendering(t *testing.T) {
 			}
 		}
 
+		var resultTypes []*types.T
 		for _, s := range strings.Split(tc.resultTypes, ",") {
-			p.ResultTypes = append(p.ResultTypes, strToType(s))
+			resultTypes = append(resultTypes, strToType(s))
+		}
+		for i := range p.Processors {
+			p.Processors[i].Spec.ResultTypes = resultTypes
 		}
 
 		tc.action(&p)
 
-		if post := p.GetLastStagePost(); !reflect.DeepEqual(post, tc.expPost) {
+		post := p.GetLastStagePost()
+		// The actual planning always sets unserialized LocalExpr field on the
+		// expressions, however, we don't do that for the expected results. In
+		// order to be able to use the deep comparison below we manually unset
+		// that unserialized field.
+		for i := range post.RenderExprs {
+			post.RenderExprs[i].LocalExpr = nil
+		}
+		if !reflect.DeepEqual(post, tc.expPost) {
 			t.Errorf("%d: incorrect post:\n%s\nexpected:\n%s", testIdx, &post, &tc.expPost)
 		}
 		var resTypes []string
-		for _, t := range p.ResultTypes {
+		for _, t := range p.GetResultTypes() {
 			resTypes = append(resTypes, t.Locale())
 		}
 		if r := strings.Join(resTypes, ","); r != tc.expResultTypes {
@@ -364,16 +381,17 @@ func TestProjectionAndRendering(t *testing.T) {
 
 func TestMergeResultTypes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	empty := []types.T{}
-	null := []types.T{*types.Unknown}
-	typeInt := []types.T{*types.Int}
+	empty := []*types.T{}
+	null := []*types.T{types.Unknown}
+	typeInt := []*types.T{types.Int}
 
 	testData := []struct {
 		name     string
-		left     []types.T
-		right    []types.T
-		expected *[]types.T
+		left     []*types.T
+		right    []*types.T
+		expected *[]*types.T
 		err      bool
 	}{
 		{"both empty", empty, empty, &empty, false},

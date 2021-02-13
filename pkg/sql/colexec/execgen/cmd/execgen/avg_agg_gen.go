@@ -13,94 +13,123 @@ package main
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
-type avgAggTmplInfo struct {
-	Type      coltypes.T
-	assignAdd func(string, string, string) string
+type avgTmplInfo struct {
+	aggTmplInfoBase
+	NeedsHelper    bool
+	InputVecMethod string
+	RetGoType      string
+	RetVecMethod   string
+
+	addOverload assignFunc
 }
 
-func (a avgAggTmplInfo) AssignAdd(target, l, r string) string {
-	return a.assignAdd(target, l, r)
+func (a avgTmplInfo) AssignAdd(targetElem, leftElem, rightElem, _, _, _ string) string {
+	// Note that we already have correctly resolved method for "Plus" overload,
+	// and we simply need to create a skeleton of lastArgWidthOverload to
+	// supply tree.Plus as the binary operator in order for the correct code to
+	// be returned.
+	lawo := &lastArgWidthOverload{lastArgTypeOverload: &lastArgTypeOverload{
+		overloadBase: newBinaryOverloadBase(tree.Plus),
+	}}
+	return a.addOverload(lawo, targetElem, leftElem, rightElem, "", "", "")
 }
 
-func (a avgAggTmplInfo) AssignDivInt64(target, l, r string) string {
-	switch a.Type {
-	case coltypes.Decimal:
-		return fmt.Sprintf(
-			`%s.SetInt64(%s)
-if _, err := tree.DecimalCtx.Quo(&%s, &%s, &%s); err != nil {
-			execerror.VectorizedInternalPanic(err)
-		}`,
-			target, r, target, l, target,
+func (a avgTmplInfo) AssignDivInt64(targetElem, leftElem, rightElem, _, _, _ string) string {
+	switch a.RetVecMethod {
+	case toVecMethod(types.DecimalFamily, anyWidth):
+		// Note that the result of summation of integers is stored as a
+		// decimal, so ints and decimals share the division code.
+		return fmt.Sprintf(`
+			%s.SetInt64(%s)
+			if _, err := tree.DecimalCtx.Quo(&%s, &%s, &%s); err != nil {
+				colexecerror.InternalError(err)
+			}`,
+			targetElem, rightElem, targetElem, leftElem, targetElem,
 		)
-	case coltypes.Float64:
-		return fmt.Sprintf("%s = %s / float64(%s)", target, l, r)
-	default:
-		execerror.VectorizedInternalPanic("unsupported avg agg type")
-		// This code is unreachable, but the compiler cannot infer that.
-		return ""
+	case toVecMethod(types.FloatFamily, anyWidth):
+		return fmt.Sprintf("%s = %s / float64(%s)", targetElem, leftElem, rightElem)
+	case toVecMethod(types.IntervalFamily, anyWidth):
+		return fmt.Sprintf("%s = %s.Div(int64(%s))", targetElem, leftElem, rightElem)
 	}
+	colexecerror.InternalError(errors.AssertionFailedf("unsupported avg agg type"))
+	// This code is unreachable, but the compiler cannot infer that.
+	return ""
 }
 
-// Avoid unused warnings. These methods are used in the template.
 var (
-	_ = avgAggTmplInfo{}.AssignAdd
-	_ = avgAggTmplInfo{}.AssignDivInt64
+	_ = avgTmplInfo{}.AssignAdd
+	_ = avgTmplInfo{}.AssignDivInt64
 )
 
-func genAvgAgg(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/avg_agg_tmpl.go")
-	if err != nil {
-		return err
-	}
+const avgAggTmpl = "pkg/sql/colexec/colexecagg/avg_agg_tmpl.go"
 
-	s := string(t)
+func genAvgAgg(inputFileContents string, wr io.Writer) error {
+	r := strings.NewReplacer(
+		"_RET_GOTYPE", `{{.RetGoType}}`,
+		"_RET_TYPE", "{{.RetVecMethod}}",
+		"_TYPE", "{{.InputVecMethod}}",
+		"TemplateType", "{{.InputVecMethod}}",
+	)
+	s := r.Replace(inputFileContents)
 
-	s = strings.Replace(s, "_GOTYPE", "{{.Type.GoTypeName}}", -1)
-	s = strings.Replace(s, "_TYPES_T", "coltypes.{{.Type}}", -1)
-	s = strings.Replace(s, "_TYPE", "{{.Type}}", -1)
-	s = strings.Replace(s, "_TemplateType", "{{.Type}}", -1)
+	assignDivRe := makeFunctionRegex("_ASSIGN_DIV_INT64", 6)
+	s = assignDivRe.ReplaceAllString(s, makeTemplateFunctionCall("AssignDivInt64", 6))
+	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 6)
+	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.AssignAdd", 6))
 
-	assignDivRe := makeFunctionRegex("_ASSIGN_DIV_INT64", 3)
-	s = assignDivRe.ReplaceAllString(s, makeTemplateFunctionCall("AssignDivInt64", 3))
-	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 3)
-	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.AssignAdd", 3))
+	accumulateAvg := makeFunctionRegex("_ACCUMULATE_AVG", 5)
+	s = accumulateAvg.ReplaceAllString(s, `{{template "accumulateAvg" buildDict "Global" . "HasNulls" $4 "HasSel" $5}}`)
 
-	accumulateAvg := makeFunctionRegex("_ACCUMULATE_AVG", 4)
-	s = accumulateAvg.ReplaceAllString(s, `{{template "accumulateAvg" buildDict "Global" . "HasNulls" $4}}`)
+	s = replaceManipulationFuncs(s)
 
 	tmpl, err := template.New("avg_agg").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
 	if err != nil {
 		return err
 	}
 
-	// TODO(asubiotto): Support more coltypes.
-	supportedTypes := []coltypes.T{coltypes.Decimal, coltypes.Float64}
-	spm := make(map[coltypes.T]int)
-	for i, typ := range supportedTypes {
-		spm[typ] = i
-	}
-	tmplInfos := make([]avgAggTmplInfo, len(supportedTypes))
-	for _, o := range sameTypeBinaryOpToOverloads[tree.Plus] {
-		i, ok := spm[o.LTyp]
-		if !ok {
-			continue
+	var tmplInfos []avgTmplInfo
+	// Average is computed as SUM / COUNT. The counting is performed directly
+	// by the aggregate function struct, the division is handled by
+	// AssignDivInt64 defined above, and resolving SUM overload is performed by
+	// the helper function.
+	// Note that all types on which we support avg aggregate function are the
+	// canonical representatives, so we can operate with their type family
+	// directly.
+	for _, inputType := range []*types.T{types.Int2, types.Int4, types.Int, types.Decimal, types.Float, types.Interval} {
+		needsHelper := false
+		// Note that we don't use execinfrapb.GetAggregateInfo because we don't
+		// want to bring in a dependency on that package to reduce the burden
+		// of regenerating execgen code when the protobufs get generated.
+		retType := inputType
+		if inputType.Family() == types.IntFamily {
+			// Average of integers is a decimal.
+			needsHelper = true
+			retType = types.Decimal
 		}
-		tmplInfos[i].Type = o.LTyp
-		tmplInfos[i].assignAdd = o.Assign
+		tmplInfos = append(tmplInfos, avgTmplInfo{
+			aggTmplInfoBase: aggTmplInfoBase{
+				canonicalTypeFamily: typeconv.TypeFamilyToCanonicalTypeFamily(retType.Family()),
+			},
+			NeedsHelper:    needsHelper,
+			InputVecMethod: toVecMethod(inputType.Family(), inputType.Width()),
+			RetGoType:      toPhysicalRepresentation(retType.Family(), retType.Width()),
+			RetVecMethod:   toVecMethod(retType.Family(), retType.Width()),
+			addOverload:    getSumAddOverload(inputType),
+		})
 	}
-
 	return tmpl.Execute(wr, tmplInfos)
 }
 
 func init() {
-	registerGenerator(genAvgAgg, "avg_agg.eg.go")
+	registerAggGenerator(genAvgAgg, "avg_agg.eg.go", avgAggTmpl)
 }

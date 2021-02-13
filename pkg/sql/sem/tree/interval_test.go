@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 var (
@@ -34,6 +35,7 @@ var (
 
 func TestValidSQLIntervalSyntax(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testData := []struct {
 		input  string
 		itm    types.IntervalTypeMetadata
@@ -178,6 +180,7 @@ func TestValidSQLIntervalSyntax(t *testing.T) {
 
 func TestInvalidSQLIntervalSyntax(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testData := []struct {
 		input  string
 		output string
@@ -250,6 +253,7 @@ func TestInvalidSQLIntervalSyntax(t *testing.T) {
 
 func TestPGIntervalSyntax(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testData := []struct {
 		input  string
 		itm    types.IntervalTypeMetadata
@@ -370,8 +374,13 @@ func TestPGIntervalSyntax(t *testing.T) {
 		{`1yr`, types.IntervalTypeMetadata{}, `1 year`, ``},
 		{`1yrs`, types.IntervalTypeMetadata{}, `1 year`, ``},
 		{`1.5y`, types.IntervalTypeMetadata{}, `1 year 6 mons`, ``},
-		{`1.1y`, types.IntervalTypeMetadata{}, `1 year 1 mon 6 days`, ``},
-		{`1.11y`, types.IntervalTypeMetadata{}, `1 year 1 mon 9 days 14:24:00`, ``},
+		{`1.1y`, types.IntervalTypeMetadata{}, `1 year 1 mon`, ``},
+		{`1.19y`, types.IntervalTypeMetadata{}, `1 year 2 mons`, ``},
+		{`1.11y`, types.IntervalTypeMetadata{}, `1 year 1 mon`, ``},
+		{`-1.5y`, types.IntervalTypeMetadata{}, `-1 years -6 mons`, ``},
+		{`-1.1y`, types.IntervalTypeMetadata{}, `-1 years -1 mons`, ``},
+		{`-1.19y`, types.IntervalTypeMetadata{}, `-1 years -2 mons`, ``},
+		{`-1.11y`, types.IntervalTypeMetadata{}, `-1 years -1 mons`, ``},
 
 		// Mixed unit/HH:MM:SS formats
 		{`1:2:3`, types.IntervalTypeMetadata{}, `01:02:03`, ``},

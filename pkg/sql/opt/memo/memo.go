@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -132,13 +131,13 @@ type Memo struct {
 
 	// The following are selected fields from SessionData which can affect
 	// planning. We need to cross-check these before reusing a cached memo.
-	dataConversion    sessiondata.DataConversionConfig
-	reorderJoinsLimit int
-	zigzagJoinEnabled bool
-	optimizerFKs      bool
-	safeUpdates       bool
-	saveTablesPrefix  string
-	insertFastPath    bool
+	reorderJoinsLimit       int
+	zigzagJoinEnabled       bool
+	useHistograms           bool
+	useMultiColStats        bool
+	safeUpdates             bool
+	preferLookupJoinsForFKs bool
+	saveTablesPrefix        string
 
 	// curID is the highest currently in-use scalar expression ID.
 	curID opt.ScalarID
@@ -148,7 +147,15 @@ type Memo struct {
 
 	newGroupFn func(opt.Expr)
 
-	// WARNING: if you add more members, add initialization code in Init.
+	// disableCheckExpr disables expression validation performed by CheckExpr,
+	// if the crdb_test build tag is set. If the crdb_test build tag is not set,
+	// CheckExpr is always a no-op, so disableCheckExpr has no effect. This is
+	// set to true for the optsteps test command to prevent CheckExpr from
+	// erring with partially normalized expressions.
+	disableCheckExpr bool
+
+	// WARNING: if you add more members, add initialization code in Init (if
+	// reusing allocated data structures is desired).
 }
 
 // Init initializes a new empty memo instance, or resets existing state so it
@@ -157,24 +164,22 @@ type Memo struct {
 // argument. If any of that changes, then the memo must be invalidated (see the
 // IsStale method for more details).
 func (m *Memo) Init(evalCtx *tree.EvalContext) {
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*m = Memo{
+		metadata:                m.metadata,
+		interner:                m.interner,
+		reorderJoinsLimit:       evalCtx.SessionData.ReorderJoinsLimit,
+		zigzagJoinEnabled:       evalCtx.SessionData.ZigzagJoinEnabled,
+		useHistograms:           evalCtx.SessionData.OptimizerUseHistograms,
+		useMultiColStats:        evalCtx.SessionData.OptimizerUseMultiColStats,
+		safeUpdates:             evalCtx.SessionData.SafeUpdates,
+		preferLookupJoinsForFKs: evalCtx.SessionData.PreferLookupJoinsForFKs,
+		saveTablesPrefix:        evalCtx.SessionData.SaveTablesPrefix,
+	}
 	m.metadata.Init()
 	m.interner.Clear()
 	m.logPropsBuilder.init(evalCtx, m)
-
-	m.rootExpr = nil
-	m.rootProps = nil
-	m.memEstimate = 0
-
-	m.dataConversion = evalCtx.SessionData.DataConversion
-	m.reorderJoinsLimit = evalCtx.SessionData.ReorderJoinsLimit
-	m.zigzagJoinEnabled = evalCtx.SessionData.ZigzagJoinEnabled
-	m.optimizerFKs = evalCtx.SessionData.OptimizerFKs
-	m.safeUpdates = evalCtx.SessionData.SafeUpdates
-	m.saveTablesPrefix = evalCtx.SessionData.SaveTablesPrefix
-	m.insertFastPath = evalCtx.SessionData.InsertFastPath
-
-	m.curID = 0
-	m.curWithID = 0
 }
 
 // NotifyOnNewGroup sets a callback function which is invoked each time we
@@ -272,13 +277,13 @@ func (m *Memo) IsStale(
 ) (bool, error) {
 	// Memo is stale if fields from SessionData that can affect planning have
 	// changed.
-	if !m.dataConversion.Equals(&evalCtx.SessionData.DataConversion) ||
-		m.reorderJoinsLimit != evalCtx.SessionData.ReorderJoinsLimit ||
+	if m.reorderJoinsLimit != evalCtx.SessionData.ReorderJoinsLimit ||
 		m.zigzagJoinEnabled != evalCtx.SessionData.ZigzagJoinEnabled ||
-		m.optimizerFKs != evalCtx.SessionData.OptimizerFKs ||
+		m.useHistograms != evalCtx.SessionData.OptimizerUseHistograms ||
+		m.useMultiColStats != evalCtx.SessionData.OptimizerUseMultiColStats ||
 		m.safeUpdates != evalCtx.SessionData.SafeUpdates ||
-		m.saveTablesPrefix != evalCtx.SessionData.SaveTablesPrefix ||
-		m.insertFastPath != evalCtx.SessionData.InsertFastPath {
+		m.preferLookupJoinsForFKs != evalCtx.SessionData.PreferLookupJoinsForFKs ||
+		m.saveTablesPrefix != evalCtx.SessionData.SaveTablesPrefix {
 		return true, nil
 	}
 
@@ -384,17 +389,36 @@ func (m *Memo) NextWithID() opt.WithID {
 	return m.curWithID
 }
 
-// ClearColStats clears all column statistics from every relational expression
-// in the memo. This is used to free up the potentially large amount of memory
-// used by histograms.
-func (m *Memo) ClearColStats(parent opt.Expr) {
-	for i, n := 0, parent.ChildCount(); i < n; i++ {
-		child := parent.Child(i)
-		m.ClearColStats(child)
-	}
+// Detach is used when we detach a memo that is to be reused later (either for
+// execbuilding or with AssignPlaceholders). New expressions should no longer be
+// constructed in this memo.
+func (m *Memo) Detach() {
+	m.interner = interner{}
+	// It is important to not hold on to the EvalCtx in the logicalPropsBuilder
+	// (#57059).
+	m.logPropsBuilder = logicalPropsBuilder{}
 
-	switch t := parent.(type) {
-	case RelExpr:
-		t.Relational().Stats.ColStats = props.ColStatsMap{}
+	// Clear all column statistics from every relational expression in the memo.
+	// This is used to free up the potentially large amount of memory used by
+	// histograms.
+	var clearColStats func(parent opt.Expr)
+	clearColStats = func(parent opt.Expr) {
+		for i, n := 0, parent.ChildCount(); i < n; i++ {
+			child := parent.Child(i)
+			clearColStats(child)
+		}
+
+		switch t := parent.(type) {
+		case RelExpr:
+			t.Relational().Stats.ColStats = props.ColStatsMap{}
+		}
 	}
+	clearColStats(m.RootExpr())
+}
+
+// DisableCheckExpr disables expression validation performed by CheckExpr,
+// if the crdb_test build tag is set. If the crdb_test build tag is not set,
+// CheckExpr is always a no-op, so DisableCheckExpr has no effect.
+func (m *Memo) DisableCheckExpr() {
+	m.disableCheckExpr = true
 }

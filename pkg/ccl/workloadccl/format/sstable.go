@@ -15,24 +15,26 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/workload"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // ToTableDescriptor returns the corresponding TableDescriptor for a workload
 // Table.
 func ToTableDescriptor(
-	t workload.Table, tableID sqlbase.ID, ts time.Time,
-) (*sqlbase.TableDescriptor, error) {
+	t workload.Table, tableID descpb.ID, ts time.Time,
+) (catalog.TableDescriptor, error) {
 	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
 	stmt, err := parser.ParseOne(fmt.Sprintf(`CREATE TABLE "%s" %s`, t.Name, t.Schema))
 	if err != nil {
 		return nil, err
@@ -41,13 +43,13 @@ func ToTableDescriptor(
 	if !ok {
 		return nil, errors.Errorf("expected *tree.CreateTable got %T", stmt)
 	}
-	const parentID sqlbase.ID = keys.MaxReservedDescID
+	const parentID descpb.ID = keys.MaxReservedDescID
 	tableDesc, err := importccl.MakeSimpleTableDescriptor(
-		ctx, nil /* settings */, createTable, parentID, tableID, importccl.NoFKs, ts.UnixNano())
+		ctx, &semaCtx, nil /* settings */, createTable, parentID, keys.PublicSchemaID, tableID, importccl.NoFKs, ts.UnixNano())
 	if err != nil {
 		return nil, err
 	}
-	return &tableDesc.TableDescriptor, nil
+	return tableDesc.ImmutableCopy().(catalog.TableDescriptor), nil
 }
 
 // ToSSTable constructs a single sstable with the kvs necessary to represent a
@@ -55,7 +57,7 @@ func ToTableDescriptor(
 // handing to AddSSTable or RocksDB's IngestExternalFile.
 //
 // TODO(dan): Finally remove sampledataccl in favor of this.
-func ToSSTable(t workload.Table, tableID sqlbase.ID, ts time.Time) ([]byte, error) {
+func ToSSTable(t workload.Table, tableID descpb.ID, ts time.Time) ([]byte, error) {
 	ctx := context.Background()
 	tableDesc, err := ToTableDescriptor(t, tableID, ts)
 	if err != nil {
@@ -75,13 +77,13 @@ func ToSSTable(t workload.Table, tableID sqlbase.ID, ts time.Time) ([]byte, erro
 	var sst []byte
 	g.GoCtx(func(ctx context.Context) error {
 		sstTS := hlc.Timestamp{WallTime: ts.UnixNano()}
-		sstFile := &engine.MemFile{}
-		sw := engine.MakeIngestionSSTWriter(sstFile)
+		sstFile := &storage.MemFile{}
+		sw := storage.MakeIngestionSSTWriter(sstFile)
 		defer sw.Close()
 		for kvBatch := range kvCh {
 			for _, kv := range kvBatch.KVs {
-				mvccKey := engine.MVCCKey{Timestamp: sstTS, Key: kv.Key}
-				if err := sw.Put(mvccKey, kv.Value.RawBytes); err != nil {
+				mvccKey := storage.MVCCKey{Timestamp: sstTS, Key: kv.Key}
+				if err := sw.PutMVCC(mvccKey, kv.Value.RawBytes); err != nil {
 					return err
 				}
 			}

@@ -10,42 +10,67 @@ package storageccl
 
 import (
 	"bytes"
+	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // prefixRewrite holds information for a single []byte replacement of a prefix.
 type prefixRewrite struct {
 	OldPrefix []byte
 	NewPrefix []byte
+	noop      bool
 }
 
 // prefixRewriter is a matcher for an ordered list of pairs of byte prefix
 // rewrite rules.
-type prefixRewriter []prefixRewrite
+type prefixRewriter struct {
+	rewrites []prefixRewrite
+	last     int
+}
 
 // RewriteKey modifies key using the first matching rule and returns
 // it. If no rules matched, returns false and the original input key.
 func (p prefixRewriter) rewriteKey(key []byte) ([]byte, bool) {
-	for _, rewrite := range p {
-		if bytes.HasPrefix(key, rewrite.OldPrefix) {
-			if len(rewrite.OldPrefix) == len(rewrite.NewPrefix) {
-				copy(key[:len(rewrite.OldPrefix)], rewrite.NewPrefix)
-				return key, true
-			}
-			// TODO(dan): Special case when key's cap() is enough.
-			newKey := make([]byte, 0, len(rewrite.NewPrefix)+len(key)-len(rewrite.OldPrefix))
-			newKey = append(newKey, rewrite.NewPrefix...)
-			newKey = append(newKey, key[len(rewrite.OldPrefix):]...)
-			return newKey, true
+	if len(p.rewrites) < 1 {
+		return key, false
+	}
+
+	found := p.last
+	if !bytes.HasPrefix(key, p.rewrites[found].OldPrefix) {
+		// since prefixes are sorted, we can binary search to find where a matching
+		// prefix would be. We use the predicate HasPrefix (what we want) or greater
+		// (after what we want) to search.
+		found = sort.Search(len(p.rewrites), func(i int) bool {
+			return bytes.HasPrefix(key, p.rewrites[i].OldPrefix) || bytes.Compare(key, p.rewrites[i].OldPrefix) < 0
+		})
+		if found == len(p.rewrites) || !bytes.HasPrefix(key, p.rewrites[found].OldPrefix) {
+			return key, false
 		}
 	}
-	return key, false
+
+	p.last = found
+	rewrite := p.rewrites[found]
+	if rewrite.noop {
+		return key, true
+	}
+	if len(rewrite.OldPrefix) == len(rewrite.NewPrefix) {
+		copy(key[:len(rewrite.OldPrefix)], rewrite.NewPrefix)
+		return key, true
+	}
+	// TODO(dan): Special case when key's cap() is enough.
+	newKey := make([]byte, 0, len(rewrite.NewPrefix)+len(key)-len(rewrite.OldPrefix))
+	newKey = append(newKey, rewrite.NewPrefix...)
+	newKey = append(newKey, key[len(rewrite.OldPrefix):]...)
+	return newKey, true
 }
 
 // KeyRewriter rewrites old table IDs to new table IDs. It is able to descend
@@ -53,42 +78,43 @@ func (p prefixRewriter) rewriteKey(key []byte) ([]byte, bool) {
 // and splits.
 type KeyRewriter struct {
 	prefixes prefixRewriter
-	descs    map[sqlbase.ID]*sqlbase.TableDescriptor
+	descs    map[descpb.ID]catalog.TableDescriptor
 }
 
 // MakeKeyRewriterFromRekeys makes a KeyRewriter from Rekey protos.
 func MakeKeyRewriterFromRekeys(rekeys []roachpb.ImportRequest_TableRekey) (*KeyRewriter, error) {
-	descs := make(map[sqlbase.ID]*sqlbase.TableDescriptor)
+	descs := make(map[descpb.ID]catalog.TableDescriptor)
 	for _, rekey := range rekeys {
-		var desc sqlbase.Descriptor
+		var desc descpb.Descriptor
 		if err := protoutil.Unmarshal(rekey.NewDesc, &desc); err != nil {
 			return nil, errors.Wrapf(err, "unmarshalling rekey descriptor for old table id %d", rekey.OldID)
 		}
-		table := desc.Table(hlc.Timestamp{})
+		table := descpb.TableFromDescriptor(&desc, hlc.Timestamp{})
 		if table == nil {
 			return nil, errors.New("expected a table descriptor")
 		}
-		descs[sqlbase.ID(rekey.OldID)] = table
+		descs[descpb.ID(rekey.OldID)] = tabledesc.NewImmutable(*table)
 	}
 	return MakeKeyRewriter(descs)
 }
 
 // MakeKeyRewriter makes a KeyRewriter from a map of descs keyed by original ID.
-func MakeKeyRewriter(descs map[sqlbase.ID]*sqlbase.TableDescriptor) (*KeyRewriter, error) {
+func MakeKeyRewriter(descs map[descpb.ID]catalog.TableDescriptor) (*KeyRewriter, error) {
 	var prefixes prefixRewriter
 	seenPrefixes := make(map[string]bool)
 	for oldID, desc := range descs {
 		// The PrefixEnd() of index 1 is the same as the prefix of index 2, so use a
 		// map to avoid duplicating entries.
 
-		for _, index := range desc.AllNonDropIndexes() {
-			oldPrefix := roachpb.Key(makeKeyRewriterPrefixIgnoringInterleaved(oldID, index.ID))
-			newPrefix := roachpb.Key(makeKeyRewriterPrefixIgnoringInterleaved(desc.ID, index.ID))
+		for _, index := range desc.NonDropIndexes() {
+			oldPrefix := roachpb.Key(makeKeyRewriterPrefixIgnoringInterleaved(oldID, index.GetID()))
+			newPrefix := roachpb.Key(makeKeyRewriterPrefixIgnoringInterleaved(desc.GetID(), index.GetID()))
 			if !seenPrefixes[string(oldPrefix)] {
 				seenPrefixes[string(oldPrefix)] = true
-				prefixes = append(prefixes, prefixRewrite{
+				prefixes.rewrites = append(prefixes.rewrites, prefixRewrite{
 					OldPrefix: oldPrefix,
 					NewPrefix: newPrefix,
+					noop:      bytes.Equal(oldPrefix, newPrefix),
 				})
 			}
 			// All the encoded data for a index will have the prefix just added, but
@@ -98,13 +124,17 @@ func MakeKeyRewriter(descs map[sqlbase.ID]*sqlbase.TableDescriptor) (*KeyRewrite
 			newPrefix = newPrefix.PrefixEnd()
 			if !seenPrefixes[string(oldPrefix)] {
 				seenPrefixes[string(oldPrefix)] = true
-				prefixes = append(prefixes, prefixRewrite{
+				prefixes.rewrites = append(prefixes.rewrites, prefixRewrite{
 					OldPrefix: oldPrefix,
 					NewPrefix: newPrefix,
+					noop:      bytes.Equal(oldPrefix, newPrefix),
 				})
 			}
 		}
 	}
+	sort.Slice(prefixes.rewrites, func(i, j int) bool {
+		return bytes.Compare(prefixes.rewrites[i].OldPrefix, prefixes.rewrites[j].OldPrefix) < 0
+	})
 	return &KeyRewriter{
 		prefixes: prefixes,
 		descs:    descs,
@@ -115,11 +145,8 @@ func MakeKeyRewriter(descs map[sqlbase.ID]*sqlbase.TableDescriptor) (*KeyRewrite
 // the given table and index IDs. sqlbase.MakeIndexKeyPrefix is a similar
 // function, but it takes into account interleaved ancestors, which we don't
 // want here.
-func makeKeyRewriterPrefixIgnoringInterleaved(tableID sqlbase.ID, indexID sqlbase.IndexID) []byte {
-	var key []byte
-	key = encoding.EncodeUvarintAscending(key, uint64(tableID))
-	key = encoding.EncodeUvarintAscending(key, uint64(indexID))
-	return key
+func makeKeyRewriterPrefixIgnoringInterleaved(tableID descpb.ID, indexID descpb.IndexID) []byte {
+	return keys.TODOSQLCodec.IndexPrefix(uint32(tableID), uint32(indexID))
 }
 
 // RewriteKey modifies key (possibly in place), changing all table IDs to their
@@ -139,21 +166,24 @@ func makeKeyRewriterPrefixIgnoringInterleaved(tableID sqlbase.ID, indexID sqlbas
 // byte that we're likely at the end anyway and do not need to search for any
 // further table IDs to replace.
 func (kr *KeyRewriter) RewriteKey(key []byte, isFromSpan bool) ([]byte, bool, error) {
+	if bytes.HasPrefix(key, keys.TenantPrefix) {
+		return key, true, nil
+	}
 	// Fetch the original table ID for descriptor lookup. Ignore errors because
 	// they will be caught later on if tableID isn't in descs or kr doesn't
 	// perform a rewrite.
-	_, tableID, _ := encoding.DecodeUvarintAscending(key)
+	_, tableID, _ := keys.TODOSQLCodec.DecodeTablePrefix(key)
 	// Rewrite the first table ID.
 	key, ok := kr.prefixes.rewriteKey(key)
 	if !ok {
 		return nil, false, nil
 	}
-	desc := kr.descs[sqlbase.ID(tableID)]
+	desc := kr.descs[descpb.ID(tableID)]
 	if desc == nil {
 		return nil, false, errors.Errorf("missing descriptor for table %d", tableID)
 	}
 	// Check if this key may have interleaved children.
-	k, _, indexID, err := sqlbase.DecodeTableIDIndexID(key)
+	k, _, indexID, err := keys.TODOSQLCodec.DecodeIndexPrefix(key)
 	if err != nil {
 		return nil, false, err
 	}
@@ -161,22 +191,22 @@ func (kr *KeyRewriter) RewriteKey(key []byte, isFromSpan bool) ([]byte, bool, er
 		// If there isn't any more data, we are at some split boundary.
 		return key, true, nil
 	}
-	idx, err := desc.FindIndexByID(indexID)
+	idx, err := desc.FindIndexWithID(descpb.IndexID(indexID))
 	if err != nil {
 		return nil, false, err
 	}
-	if len(idx.InterleavedBy) == 0 {
+	if idx.NumInterleavedBy() == 0 {
 		// Not interleaved.
 		return key, true, nil
 	}
 	// We do not support interleaved secondary indexes.
-	if idx.ID != desc.PrimaryIndex.ID {
+	if !idx.Primary() {
 		return nil, false, errors.New("restoring interleaved secondary indexes not supported")
 	}
-	colIDs, _ := idx.FullColumnIDs()
+	colIDs, _ := idx.IndexDesc().FullColumnIDs()
 	var skipCols int
-	for _, ancestor := range idx.Interleave.Ancestors {
-		skipCols += int(ancestor.SharedPrefixLen)
+	for i := 0; i < idx.NumInterleaveAncestors(); i++ {
+		skipCols += int(idx.GetInterleaveAncestor(i).SharedPrefixLen)
 	}
 	for i := 0; i < len(colIDs)-skipCols; i++ {
 		n, err := encoding.PeekLength(k)
@@ -219,6 +249,11 @@ func (kr *KeyRewriter) RewriteKey(key []byte, isFromSpan bool) ([]byte, bool, er
 	// We might have an interleaved key.
 	k, ok = encoding.DecodeIfInterleavedSentinel(k)
 	if !ok {
+		return key, true, nil
+	}
+	if len(k) == 0 {
+		// We have seen some span keys end in an interleaved sentinel.
+		// Check if we ran out of key before getting to an interleave child?
 		return key, true, nil
 	}
 	prefix := key[:len(key)-len(k)]

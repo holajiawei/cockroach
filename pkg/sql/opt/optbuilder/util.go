@@ -11,6 +11,7 @@
 package optbuilder
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -19,18 +20,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
-
-func checkFrom(expr tree.Expr, inScope *scope) {
-	if len(inScope.cols) == 0 {
-		panic(pgerror.Newf(pgcode.InvalidName,
-			"cannot use %q without a FROM clause", tree.ErrString(expr)))
-	}
-}
 
 // windowAggregateFrame() returns a frame that any aggregate built as a window
 // can use.
@@ -88,10 +82,6 @@ func (b *Builder) expandStar(
 		tTuple, isTuple := texpr.(*tree.Tuple)
 
 		aliases = typ.TupleLabels()
-		for i := len(aliases); i < len(typ.TupleContents()); i++ {
-			// Add aliases for all the non-named columns in the tuple.
-			aliases = append(aliases, "?column?")
-		}
 		exprs = make([]tree.TypedExpr, len(typ.TupleContents()))
 		for i := range typ.TupleContents() {
 			if isTuple {
@@ -99,42 +89,52 @@ func (b *Builder) expandStar(
 				exprs[i] = tTuple.Exprs[i].(tree.TypedExpr)
 			} else {
 				// Can't de-tuplify:
-				// either (Expr).* -> (Expr).a, (Expr).b, (Expr).c if there are enough labels,
-				// or (Expr).* -> (Expr).@1, (Expr).@2, (Expr).@3 if labels are missing.
+				// either (Expr).* -> (Expr).a, (Expr).b, (Expr).c if there are enough
+				// labels, or (Expr).* -> (Expr).@1, (Expr).@2, (Expr).@3 if labels are
+				// missing.
 				//
 				// We keep the labels if available so that the column name
 				// generation still produces column label "x" for, e.g. (E).x.
 				colName := ""
-				if i < len(typ.TupleContents()) {
+				if i < len(aliases) {
 					colName = aliases[i]
 				}
+				// NewTypedColumnAccessExpr expects colName to be empty if the tuple
+				// should be accessed by index.
 				exprs[i] = tree.NewTypedColumnAccessExpr(texpr, colName, i)
 			}
 		}
+		for i := len(aliases); i < len(typ.TupleContents()); i++ {
+			// Add aliases for all the non-named columns in the tuple.
+			aliases = append(aliases, "?column?")
+		}
 
 	case *tree.AllColumnsSelector:
-		checkFrom(expr, inScope)
-		src, _, err := t.Resolve(b.ctx, inScope)
+		src, srcMeta, err := t.Resolve(b.ctx, inScope)
 		if err != nil {
 			panic(err)
 		}
-		exprs = make([]tree.TypedExpr, 0, len(inScope.cols))
-		aliases = make([]string, 0, len(inScope.cols))
-		for i := range inScope.cols {
-			col := &inScope.cols[i]
-			if col.table == *src && !col.hidden {
+		refScope := srcMeta.(*scope)
+		exprs = make([]tree.TypedExpr, 0, len(refScope.cols))
+		aliases = make([]string, 0, len(refScope.cols))
+		for i := range refScope.cols {
+			col := &refScope.cols[i]
+			if col.table == *src && col.visibility == cat.Visible {
 				exprs = append(exprs, col)
 				aliases = append(aliases, string(col.name))
 			}
 		}
 
 	case tree.UnqualifiedStar:
-		checkFrom(expr, inScope)
+		if len(inScope.cols) == 0 {
+			panic(pgerror.Newf(pgcode.InvalidName,
+				"cannot use %q without a FROM clause", tree.ErrString(expr)))
+		}
 		exprs = make([]tree.TypedExpr, 0, len(inScope.cols))
 		aliases = make([]string, 0, len(inScope.cols))
 		for i := range inScope.cols {
 			col := &inScope.cols[i]
-			if !col.hidden {
+			if col.visibility == cat.Visible {
 				exprs = append(exprs, col)
 				aliases = append(aliases, string(col.name))
 			}
@@ -244,24 +244,11 @@ func (b *Builder) shouldCreateDefaultColumn(texpr tree.TypedExpr) bool {
 	return len(texpr.ResolvedType().TupleLabels()) == 0
 }
 
-// addColumn adds a column to scope with the given alias, type, and
-// expression. It returns a pointer to the new column. The column ID and group
-// are left empty so they can be filled in later.
-func (b *Builder) addColumn(scope *scope, alias string, expr tree.TypedExpr) *scopeColumn {
-	name := tree.Name(alias)
-	scope.cols = append(scope.cols, scopeColumn{
-		name: name,
-		typ:  expr.ResolvedType(),
-		expr: expr,
-	})
-	return &scope.cols[len(scope.cols)-1]
-}
-
-func (b *Builder) synthesizeResultColumns(scope *scope, cols sqlbase.ResultColumns) {
+func (b *Builder) synthesizeResultColumns(scope *scope, cols colinfo.ResultColumns) {
 	for i := range cols {
 		c := b.synthesizeColumn(scope, cols[i].Name, cols[i].Typ, nil /* expr */, nil /* scalar */)
 		if cols[i].Hidden {
-			c.hidden = true
+			c.visibility = cat.Hidden
 		}
 	}
 }
@@ -427,13 +414,17 @@ func colsToColList(cols []scopeColumn) opt.ColList {
 
 // resolveAndBuildScalar is used to build a scalar with a required type.
 func (b *Builder) resolveAndBuildScalar(
-	expr tree.Expr, requiredType *types.T, context string, flags tree.SemaRejectFlags, inScope *scope,
+	expr tree.Expr,
+	requiredType *types.T,
+	context exprKind,
+	flags tree.SemaRejectFlags,
+	inScope *scope,
 ) opt.ScalarExpr {
 	// We need to save and restore the previous value of the field in
 	// semaCtx in case we are recursively called within a subquery
 	// context.
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
-	b.semaCtx.Properties.Require(context, flags)
+	b.semaCtx.Properties.Require(context.String(), flags)
 
 	inScope.context = context
 	texpr := inScope.resolveAndRequireType(expr, requiredType)
@@ -443,13 +434,13 @@ func (b *Builder) resolveAndBuildScalar(
 // In Postgres, qualifying an object name with pg_temp is equivalent to explicitly
 // specifying TEMP/TEMPORARY in the CREATE syntax. resolveTemporaryStatus returns
 // true if either(or both) of these conditions are true.
-func resolveTemporaryStatus(name *tree.TableName, explicitTemp bool) bool {
+func resolveTemporaryStatus(name *tree.TableName, persistence tree.Persistence) bool {
 	// An explicit schema can only be provided in the CREATE TEMP TABLE statement
 	// iff it is pg_temp.
-	if explicitTemp && name.ExplicitSchema && name.SchemaName != sessiondata.PgTempSchemaName {
+	if persistence.IsTemporary() && name.ExplicitSchema && name.SchemaName != sessiondata.PgTempSchemaName {
 		panic(pgerror.New(pgcode.InvalidTableDefinition, "cannot create temporary relation in non-temporary schema"))
 	}
-	return name.SchemaName == sessiondata.PgTempSchemaName || explicitTemp
+	return name.SchemaName == sessiondata.PgTempSchemaName || persistence.IsTemporary()
 }
 
 // resolveSchemaForCreate returns the schema that will contain a newly created
@@ -457,7 +448,7 @@ func resolveTemporaryStatus(name *tree.TableName, explicitTemp bool) bool {
 // CREATE privilege, then resolveSchemaForCreate raises an error.
 func (b *Builder) resolveSchemaForCreate(name *tree.TableName) (cat.Schema, cat.SchemaName) {
 	flags := cat.Flags{AvoidDescriptorCaches: true}
-	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, &name.TableNamePrefix)
+	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, &name.ObjectNamePrefix)
 	if err != nil {
 		// Remap invalid schema name error text so that it references the catalog
 		// object that could not be created.
@@ -471,12 +462,6 @@ func (b *Builder) resolveSchemaForCreate(name *tree.TableName) (cat.Schema, cat.
 			panic(newErr)
 		}
 		panic(err)
-	}
-
-	// Only allow creation of objects in the public schema.
-	if resName.Schema() != tree.PublicSchema {
-		panic(pgerror.Newf(pgcode.InvalidName,
-			"schema cannot be modified: %q", tree.ErrString(&resName)))
 	}
 
 	if err := b.catalog.CheckPrivilege(b.ctx, sch, privilege.CREATE); err != nil {
@@ -537,6 +522,11 @@ func (b *Builder) resolveTableForMutation(
 		alias = *outerAlias
 	}
 
+	// We can't mutate materialized views.
+	if tab.IsMaterializedView() {
+		panic(pgerror.Newf(pgcode.WrongObjectType, "cannot mutate materialized view %q", tab.Name()))
+	}
+
 	return tab, depName, alias, columns
 }
 
@@ -546,10 +536,10 @@ func (b *Builder) resolveTableForMutation(
 func (b *Builder) resolveTable(
 	tn *tree.TableName, priv privilege.Kind,
 ) (cat.Table, tree.TableName) {
-	ds, resName := b.resolveDataSource(tn, priv)
+	ds, _, resName := b.resolveDataSource(tn, priv)
 	tab, ok := ds.(cat.Table)
 	if !ok {
-		panic(sqlbase.NewWrongObjectTypeError(tn, "table"))
+		panic(sqlerrors.NewWrongObjectTypeError(tn, "table"))
 	}
 	return tab, resName
 }
@@ -558,23 +548,24 @@ func (b *Builder) resolveTable(
 // TableRef spec. If the name does not resolve to a table, or if the current
 // user does not have the given privilege, then resolveTableRef raises an error.
 func (b *Builder) resolveTableRef(ref *tree.TableRef, priv privilege.Kind) cat.Table {
-	ds := b.resolveDataSourceRef(ref, priv)
+	ds, _ := b.resolveDataSourceRef(ref, priv)
 	tab, ok := ds.(cat.Table)
 	if !ok {
-		panic(sqlbase.NewWrongObjectTypeError(ref, "table"))
+		panic(sqlerrors.NewWrongObjectTypeError(ref, "table"))
 	}
 	return tab
 }
 
-// resolveDataSource returns the data source in the catalog with the given name.
-// If the name does not resolve to a table, or if the current user does not have
-// the given privilege, then resolveDataSource raises an error.
+// resolveDataSource returns the data source in the catalog with the given name,
+// along with the table's MDDepName and data source name. If the name does not
+// resolve to a table, or if the current user does not have the given privilege,
+// then resolveDataSource raises an error.
 //
 // If the b.qualifyDataSourceNamesInAST flag is set, tn is updated to contain
 // the fully qualified name.
 func (b *Builder) resolveDataSource(
 	tn *tree.TableName, priv privilege.Kind,
-) (cat.DataSource, cat.DataSourceName) {
+) (cat.DataSource, opt.MDDepName, cat.DataSourceName) {
 	var flags cat.Flags
 	if b.insideViewDef {
 		// Avoid taking table leases when we're creating a view.
@@ -584,21 +575,24 @@ func (b *Builder) resolveDataSource(
 	if err != nil {
 		panic(err)
 	}
-	b.checkPrivilege(opt.DepByName(tn), ds, priv)
+	depName := opt.DepByName(tn)
+	b.checkPrivilege(depName, ds, priv)
 
 	if b.qualifyDataSourceNamesInAST {
 		*tn = resName
 		tn.ExplicitCatalog = true
 		tn.ExplicitSchema = true
 	}
-	return ds, resName
+	return ds, depName, resName
 }
 
 // resolveDataSourceFromRef returns the data source in the catalog that matches
-// the given TableRef spec. If no data source matches, or if the current user
-// does not have the given privilege, then resolveDataSourceFromRef raises an
-// error.
-func (b *Builder) resolveDataSourceRef(ref *tree.TableRef, priv privilege.Kind) cat.DataSource {
+// the given TableRef spec, along with the table's MDDepName. If no data source
+// matches, or if the current user does not have the given privilege, then
+// resolveDataSourceFromRef raises an error.
+func (b *Builder) resolveDataSourceRef(
+	ref *tree.TableRef, priv privilege.Kind,
+) (cat.DataSource, opt.MDDepName) {
 	var flags cat.Flags
 	if b.insideViewDef {
 		// Avoid taking table leases when we're creating a view.
@@ -608,8 +602,9 @@ func (b *Builder) resolveDataSourceRef(ref *tree.TableRef, priv privilege.Kind) 
 	if err != nil {
 		panic(pgerror.Wrapf(err, pgcode.UndefinedObject, "%s", tree.ErrString(ref)))
 	}
-	b.checkPrivilege(opt.DepByID(cat.StableID(ref.TableID)), ds, priv)
-	return ds
+	depName := opt.DepByID(cat.StableID(ref.TableID))
+	b.checkPrivilege(depName, ds, priv)
+	return ds, depName
 }
 
 // checkPrivilege ensures that the current user has the privilege needed to
@@ -631,4 +626,78 @@ func (b *Builder) checkPrivilege(name opt.MDDepName, ds cat.DataSource, priv pri
 	// Add dependency on this object to the metadata, so that the metadata can be
 	// cached and later checked for freshness.
 	b.factory.Metadata().AddDependency(name, ds, priv)
+}
+
+// resolveNumericColumnRefs converts a list of tree.ColumnIDs from a
+// tree.TableRef to a list of ordinal positions within the given table. Mutation
+// columns are not visible. See tree.Table for more information on column
+// ordinals.
+func resolveNumericColumnRefs(tab cat.Table, columns []tree.ColumnID) (ordinals []int) {
+	ordinals = make([]int, len(columns))
+	for i, c := range columns {
+		ord := 0
+		cnt := tab.ColumnCount()
+		for ord < cnt {
+			col := tab.Column(ord)
+			if col.ColID() == cat.StableID(c) && col.Visibility() != cat.Inaccessible {
+				break
+			}
+			ord++
+		}
+		if ord >= cnt {
+			panic(pgerror.Newf(pgcode.UndefinedColumn, "column [%d] does not exist", c))
+		}
+		ordinals[i] = ord
+	}
+	return ordinals
+}
+
+// findPublicTableColumnByName returns the ordinal of the non-mutation column
+// having the given name, if one exists in the given table. Otherwise, it
+// returns -1.
+func findPublicTableColumnByName(tab cat.Table, name tree.Name) int {
+	for ord, n := 0, tab.ColumnCount(); ord < n; ord++ {
+		col := tab.Column(ord)
+		if col.ColName() == name && col.Visibility() != cat.Inaccessible {
+			return ord
+		}
+	}
+	return -1
+}
+
+type columnKinds struct {
+	// If true, include columns being added or dropped from the table. These
+	// are currently required by the execution engine as "fetch columns", when
+	// performing mutation DML statements (INSERT, UPDATE, UPSERT, DELETE).
+	includeMutations bool
+
+	// If true, include system columns.
+	includeSystem bool
+
+	// If true, include virtual inverted index columns.
+	includeVirtualInverted bool
+
+	// If true, include virtual computed columns.
+	includeVirtualComputed bool
+}
+
+// tableOrdinals returns a slice of ordinals that correspond to table columns of
+// the desired kinds.
+func tableOrdinals(tab cat.Table, k columnKinds) []int {
+	n := tab.ColumnCount()
+	shouldInclude := [...]bool{
+		cat.Ordinary:        true,
+		cat.WriteOnly:       k.includeMutations,
+		cat.DeleteOnly:      k.includeMutations,
+		cat.System:          k.includeSystem,
+		cat.VirtualInverted: k.includeVirtualInverted,
+	}
+	ordinals := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		col := tab.Column(i)
+		if shouldInclude[col.Kind()] && (k.includeVirtualComputed || !col.IsVirtualComputed()) {
+			ordinals = append(ordinals, i)
+		}
+	}
+	return ordinals
 }

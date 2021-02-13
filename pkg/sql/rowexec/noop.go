@@ -15,7 +15,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/errors"
 )
 
 // noopProcessor is a processor that simply passes rows through from the
@@ -29,6 +30,7 @@ type noopProcessor struct {
 
 var _ execinfra.Processor = &noopProcessor{}
 var _ execinfra.RowSource = &noopProcessor{}
+var _ execinfra.OpNode = &noopProcessor{}
 
 const noopProcName = "noop"
 
@@ -52,6 +54,11 @@ func newNoopProcessor(
 	); err != nil {
 		return nil, err
 	}
+	ctx := flowCtx.EvalCtx.Ctx()
+	if execinfra.ShouldCollectStats(ctx, flowCtx) {
+		n.input = newInputStatCollector(n.input)
+		n.ExecStatsForTrace = n.execStatsForTrace
+	}
 	return n, nil
 }
 
@@ -62,7 +69,7 @@ func (n *noopProcessor) Start(ctx context.Context) context.Context {
 }
 
 // Next is part of the RowSource interface.
-func (n *noopProcessor) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
+func (n *noopProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	for n.State == execinfra.StateRunning {
 		row, meta := n.input.Next()
 
@@ -88,4 +95,35 @@ func (n *noopProcessor) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetada
 func (n *noopProcessor) ConsumerClosed() {
 	// The consumer is done, Next() will not be called again.
 	n.InternalClose()
+}
+
+// execStatsForTrace implements ProcessorBase.ExecStatsForTrace.
+func (n *noopProcessor) execStatsForTrace() *execinfrapb.ComponentStats {
+	is, ok := getInputStats(n.input)
+	if !ok {
+		return nil
+	}
+	return &execinfrapb.ComponentStats{
+		Inputs: []execinfrapb.InputStats{is},
+		Output: n.Out.Stats(),
+	}
+}
+
+// ChildCount is part of the execinfra.OpNode interface.
+func (n *noopProcessor) ChildCount(bool) int {
+	if _, ok := n.input.(execinfra.OpNode); ok {
+		return 1
+	}
+	return 0
+}
+
+// Child is part of the execinfra.OpNode interface.
+func (n *noopProcessor) Child(nth int, _ bool) execinfra.OpNode {
+	if nth == 0 {
+		if n, ok := n.input.(execinfra.OpNode); ok {
+			return n
+		}
+		panic("input to noop is not an execinfra.OpNode")
+	}
+	panic(errors.AssertionFailedf("invalid index %d", nth))
 }

@@ -12,28 +12,29 @@ package main
 
 import (
 	"io"
-	"io/ioutil"
 	"strings"
 	"text/template"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-func genSelectIn(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/select_in_tmpl.go")
-	if err != nil {
-		return err
-	}
+const selectInTmpl = "pkg/sql/colexec/select_in_tmpl.go"
 
-	s := string(t)
+func genSelectIn(inputFileContents string, wr io.Writer) error {
+	r := strings.NewReplacer(
+		"_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}",
+		"_TYPE_WIDTH", typeWidthReplacement,
+		"_GOTYPESLICE", "{{.GoTypeSliceName}}",
+		"_GOTYPE", "{{.GoType}}",
+		"_TYPE", "{{.VecMethod}}",
+		"TemplateType", "{{.VecMethod}}",
+	)
+	s := r.Replace(inputFileContents)
 
-	assignEq := makeFunctionRegex("_ASSIGN_EQ", 3)
-	s = assignEq.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 3))
-	s = strings.Replace(s, "_GOTYPE", "{{.LGoType}}", -1)
-	s = strings.Replace(s, "_TYPE", "{{.LTyp}}", -1)
-	s = strings.Replace(s, "_TemplateType", "{{.LTyp}}", -1)
+	assignEq := makeFunctionRegex("_COMPARE", 5)
+	s = assignEq.ReplaceAllString(s, makeTemplateFunctionCall("Compare", 5))
 
-	s = replaceManipulationFuncs(".LTyp", s)
+	s = replaceManipulationFuncs(s)
 
 	tmpl, err := template.New("select_in").Parse(s)
 	if err != nil {
@@ -44,5 +45,5 @@ func genSelectIn(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genSelectIn, "select_in.eg.go")
+	registerGenerator(genSelectIn, "select_in.eg.go", selectInTmpl)
 }

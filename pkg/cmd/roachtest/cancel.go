@@ -35,6 +35,7 @@ import (
 func registerCancel(r *testRegistry) {
 	runCancel := func(ctx context.Context, t *test, c *cluster,
 		queries []string, warehouses int, useDistsql bool) {
+		t.Skip("skipping flaky cancel/tpcc test", "test needs to be updated see https://github.com/cockroachdb/cockroach/issues/42103")
 		c.Put(ctx, cockroach, "./cockroach", c.All())
 		c.Put(ctx, workload, "./workload", c.All())
 		c.Start(ctx, t, c.All())
@@ -42,8 +43,7 @@ func registerCancel(r *testRegistry) {
 		m := newMonitor(ctx, c, c.All())
 		m.Go(func(ctx context.Context) error {
 			t.Status("importing TPCC fixture")
-			c.Run(ctx, c.Node(1), fmt.Sprintf(
-				"./workload fixtures load tpcc --warehouses=%d {pgurl:1}", warehouses))
+			c.Run(ctx, c.Node(1), tpccImportCmd(warehouses))
 
 			conn := c.Conn(ctx, 1)
 			defer conn.Close()

@@ -18,7 +18,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 )
 
 const sshPublicKeyFile = "${HOME}/.ssh/id_rsa.pub"
@@ -51,7 +52,7 @@ func (p *Provider) sshKeyExists(keyName string, region string) (bool, error) {
 func (p *Provider) sshKeyImport(keyName string, region string) error {
 	keyBytes, err := ioutil.ReadFile(os.ExpandEnv(sshPublicKeyFile))
 	if err != nil {
-		if os.IsNotExist(err) {
+		if oserror.IsNotExist(err) {
 			return errors.Wrapf(err, "please run ssh-keygen externally to create your %s file", sshPublicKeyFile)
 		}
 		return err
@@ -85,7 +86,7 @@ func (p *Provider) sshKeyName() (string, error) {
 
 	keyBytes, err := ioutil.ReadFile(os.ExpandEnv(sshPublicKeyFile))
 	if err != nil {
-		if os.IsNotExist(err) {
+		if oserror.IsNotExist(err) {
 			return "", errors.Wrapf(err, "please run ssh-keygen externally to create your %s file", sshPublicKeyFile)
 		}
 		return "", err

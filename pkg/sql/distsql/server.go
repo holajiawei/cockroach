@@ -17,17 +17,21 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/faketreeeval"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
@@ -37,8 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
-	"github.com/opentracing/opentracing-go"
+	"github.com/cockroachdb/redact"
 )
 
 // minFlowDrainWait is the minimum amount of time a draining server allows for
@@ -47,6 +50,12 @@ import (
 // nodes.
 const minFlowDrainWait = 1 * time.Second
 
+// MultiTenancyIssueNo is the issue tracking DistSQL's Gossip and
+// NodeID dependencies.
+//
+// See https://github.com/cockroachdb/cockroach/issues/47900.
+const MultiTenancyIssueNo = 47900
+
 var noteworthyMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY_DISTSQL_MEMORY_USAGE", 1024*1024 /* 1MB */)
 
 // ServerImpl implements the server for the distributed SQL APIs.
@@ -54,7 +63,7 @@ type ServerImpl struct {
 	execinfra.ServerConfig
 	flowRegistry  *flowinfra.FlowRegistry
 	flowScheduler *flowinfra.FlowScheduler
-	memMonitor    mon.BytesMonitor
+	memMonitor    *mon.BytesMonitor
 	regexpCache   *tree.RegexpCache
 }
 
@@ -65,9 +74,9 @@ func NewServer(ctx context.Context, cfg execinfra.ServerConfig) *ServerImpl {
 	ds := &ServerImpl{
 		ServerConfig:  cfg,
 		regexpCache:   tree.NewRegexpCache(512),
-		flowRegistry:  flowinfra.NewFlowRegistry(cfg.NodeID.Get()),
+		flowRegistry:  flowinfra.NewFlowRegistry(cfg.NodeID.SQLInstanceID()),
 		flowScheduler: flowinfra.NewFlowScheduler(cfg.AmbientContext, cfg.Stopper, cfg.Settings, cfg.Metrics),
-		memMonitor: mon.MakeMonitor(
+		memMonitor: mon.NewMonitor(
 			"distsql",
 			mon.MemoryResource,
 			cfg.Metrics.CurBytesCount,
@@ -78,6 +87,13 @@ func NewServer(ctx context.Context, cfg execinfra.ServerConfig) *ServerImpl {
 		),
 	}
 	ds.memMonitor.Start(ctx, cfg.ParentMemoryMonitor, mon.BoundAccount{})
+
+	colexec.HashAggregationDiskSpillingEnabled.SetOnChange(&cfg.Settings.SV, func() {
+		if !colexec.HashAggregationDiskSpillingEnabled.Get(&cfg.Settings.SV) {
+			telemetry.Inc(sqltelemetry.HashAggregationDiskSpillingDisabled)
+		}
+	})
+
 	return ds
 }
 
@@ -85,15 +101,19 @@ func NewServer(ctx context.Context, cfg execinfra.ServerConfig) *ServerImpl {
 func (ds *ServerImpl) Start() {
 	// Gossip the version info so that other nodes don't plan incompatible flows
 	// for us.
-	if err := ds.ServerConfig.Gossip.AddInfoProto(
-		gossip.MakeDistSQLNodeVersionKey(ds.ServerConfig.NodeID.Get()),
-		&execinfrapb.DistSQLVersionGossipInfo{
-			Version:            execinfra.Version,
-			MinAcceptedVersion: execinfra.MinAcceptedVersion,
-		},
-		0, // ttl - no expiration
-	); err != nil {
-		panic(err)
+	if g, ok := ds.ServerConfig.Gossip.Optional(MultiTenancyIssueNo); ok {
+		if nodeID, ok := ds.ServerConfig.NodeID.OptionalNodeID(); ok {
+			if err := g.AddInfoProto(
+				gossip.MakeDistSQLNodeVersionKey(nodeID),
+				&execinfrapb.DistSQLVersionGossipInfo{
+					Version:            execinfra.Version,
+					MinAcceptedVersion: execinfra.MinAcceptedVersion,
+				},
+				0, // ttl - no expiration
+			); err != nil {
+				panic(err)
+			}
+		}
 	}
 
 	if err := ds.setDraining(false); err != nil {
@@ -105,7 +125,9 @@ func (ds *ServerImpl) Start() {
 
 // Drain changes the node's draining state through gossip and drains the
 // server's flowRegistry. See flowRegistry.Drain for more details.
-func (ds *ServerImpl) Drain(ctx context.Context, flowDrainWait time.Duration) {
+func (ds *ServerImpl) Drain(
+	ctx context.Context, flowDrainWait time.Duration, reporter func(int, redact.SafeString),
+) {
 	if err := ds.setDraining(true); err != nil {
 		log.Warningf(ctx, "unable to gossip distsql draining state: %s", err)
 	}
@@ -115,33 +137,34 @@ func (ds *ServerImpl) Drain(ctx context.Context, flowDrainWait time.Duration) {
 	if ds.ServerConfig.TestingKnobs.DrainFast {
 		flowWait = 0
 		minWait = 0
-	} else if len(ds.Gossip.Outgoing()) == 0 {
+	} else if g, ok := ds.Gossip.Optional(MultiTenancyIssueNo); !ok || len(g.Outgoing()) == 0 {
 		// If there is only one node in the cluster (us), there's no need to
 		// wait a minimum time for the draining state to be gossiped.
 		minWait = 0
 	}
-	ds.flowRegistry.Drain(flowWait, minWait)
-}
-
-// Undrain changes the node's draining state through gossip and undrains the
-// server's flowRegistry. See flowRegistry.Undrain for more details.
-func (ds *ServerImpl) Undrain(ctx context.Context) {
-	ds.flowRegistry.Undrain()
-	if err := ds.setDraining(false); err != nil {
-		log.Warningf(ctx, "unable to gossip distsql draining state: %s", err)
-	}
+	ds.flowRegistry.Drain(flowWait, minWait, reporter)
 }
 
 // setDraining changes the node's draining state through gossip to the provided
 // state.
 func (ds *ServerImpl) setDraining(drain bool) error {
-	return ds.ServerConfig.Gossip.AddInfoProto(
-		gossip.MakeDistSQLDrainingKey(ds.ServerConfig.NodeID.Get()),
-		&execinfrapb.DistSQLDrainingInfo{
-			Draining: drain,
-		},
-		0, // ttl - no expiration
-	)
+	nodeID, ok := ds.ServerConfig.NodeID.OptionalNodeID()
+	if !ok {
+		// Ignore draining requests when running on behalf of a tenant.
+		// NB: intentionally swallow the error or the server will fatal.
+		_ = MultiTenancyIssueNo // related issue
+		return nil
+	}
+	if g, ok := ds.ServerConfig.Gossip.Optional(MultiTenancyIssueNo); ok {
+		return g.AddInfoProto(
+			gossip.MakeDistSQLDrainingKey(nodeID),
+			&execinfrapb.DistSQLDrainingInfo{
+				Draining: drain,
+			},
+			0, // ttl - no expiration
+		)
+	}
+	return nil
 }
 
 // FlowVerIsCompatible checks a flow's version is compatible with this node's
@@ -162,7 +185,7 @@ func FlowVerIsCompatible(
 // must be finished through Flow.Cleanup.
 func (ds *ServerImpl) setupFlow(
 	ctx context.Context,
-	parentSpan opentracing.Span,
+	parentSpan *tracing.Span,
 	parentMonitor *mon.BytesMonitor,
 	req *execinfrapb.SetupFlowRequest,
 	syncFlowConsumer execinfra.RowReceiver,
@@ -173,42 +196,33 @@ func (ds *ServerImpl) setupFlow(
 			"version mismatch in flow request: %d; this node accepts %d through %d",
 			req.Version, execinfra.MinAcceptedVersion, execinfra.Version,
 		)
-		log.Warning(ctx, err)
+		log.Warningf(ctx, "%v", err)
 		return ctx, nil, err
-	}
-	nodeID := ds.ServerConfig.NodeID.Get()
-	if nodeID == 0 {
-		return nil, nil, errors.AssertionFailedf("setupFlow called before the NodeID was resolved")
 	}
 
 	const opName = "flow"
-	var sp opentracing.Span
+	var sp *tracing.Span // will be Finish()ed by Flow.Cleanup()
 	if parentSpan == nil {
-		sp = ds.Tracer.(*tracing.Tracer).StartRootSpan(
-			opName, logtags.FromContext(ctx), tracing.NonRecordableSpan)
+		ctx, sp = ds.Tracer.StartSpanCtx(ctx, opName)
 	} else if localState.IsLocal {
 		// If we're a local flow, we don't need a "follows from" relationship: we're
 		// going to run this flow synchronously.
 		// TODO(andrei): localState.IsLocal is not quite the right thing to use.
 		//  If that field is unset, we might still want to create a child span if
 		//  this flow is run synchronously.
-		sp = tracing.StartChildSpan(opName, parentSpan, logtags.FromContext(ctx), false /* separateRecording */)
+		ctx, sp = ds.Tracer.StartSpanCtx(ctx, opName, tracing.WithParentAndAutoCollection(parentSpan))
 	} else {
 		// We use FollowsFrom because the flow's span outlives the SetupFlow request.
-		// TODO(andrei): We should use something more efficient than StartSpan; we
-		// should use AmbientContext.AnnotateCtxWithSpan() but that interface
-		// doesn't currently support FollowsFrom relationships.
-		sp = ds.Tracer.StartSpan(
+		ctx, sp = ds.Tracer.StartSpanCtx(
+			ctx,
 			opName,
-			opentracing.FollowsFrom(parentSpan.Context()),
-			tracing.LogTagsFromCtx(ctx),
+			tracing.WithParentAndAutoCollection(parentSpan),
+			tracing.WithFollowsFrom(),
 		)
 	}
-	// sp will be Finish()ed by Flow.Cleanup().
-	ctx = opentracing.ContextWithSpan(ctx, sp)
 
 	// The monitor opened here is closed in Flow.Cleanup().
-	monitor := mon.MakeMonitor(
+	monitor := mon.NewMonitor(
 		"flow",
 		mon.MemoryResource,
 		ds.Metrics.CurBytesCount,
@@ -219,7 +233,7 @@ func (ds *ServerImpl) setupFlow(
 	)
 	monitor.Start(ctx, parentMonitor, mon.BoundAccount{})
 
-	makeLeaf := func(req *execinfrapb.SetupFlowRequest) (*client.Txn, error) {
+	makeLeaf := func(req *execinfrapb.SetupFlowRequest) (*kv.Txn, error) {
 		tis := req.LeafTxnInputState
 		if tis == nil {
 			// This must be a flow running for some bulk-io operation that doesn't use
@@ -232,52 +246,24 @@ func (ds *ServerImpl) setupFlow(
 		}
 		// The flow will run in a LeafTxn because we do not want each distributed
 		// Txn to heartbeat the transaction.
-		return client.NewLeafTxn(ctx, ds.FlowDB, req.Flow.Gateway, tis), nil
+		return kv.NewLeafTxn(ctx, ds.DB, req.Flow.Gateway, tis), nil
 	}
 
 	var evalCtx *tree.EvalContext
-	var leafTxn *client.Txn
+	var leafTxn *kv.Txn
 	if localState.EvalContext != nil {
 		evalCtx = localState.EvalContext
-		evalCtx.Mon = &monitor
+		evalCtx.Mon = monitor
 	} else {
 		if localState.IsLocal {
 			return nil, nil, errors.AssertionFailedf(
 				"EvalContext expected to be populated when IsLocal is set")
 		}
 
-		location, err := timeutil.TimeZoneStringToLocation(
-			req.EvalContext.Location,
-			timeutil.TimeZoneStringToLocationISO8601Standard,
-		)
+		sd, err := sessiondata.UnmarshalNonLocal(req.EvalContext.SessionData)
 		if err != nil {
-			tracing.FinishSpan(sp)
+			sp.Finish()
 			return ctx, nil, err
-		}
-
-		var be sessiondata.BytesEncodeFormat
-		switch req.EvalContext.BytesEncodeFormat {
-		case execinfrapb.BytesEncodeFormat_HEX:
-			be = sessiondata.BytesEncodeHex
-		case execinfrapb.BytesEncodeFormat_ESCAPE:
-			be = sessiondata.BytesEncodeEscape
-		case execinfrapb.BytesEncodeFormat_BASE64:
-			be = sessiondata.BytesEncodeBase64
-		default:
-			return nil, nil, errors.AssertionFailedf("unknown byte encode format: %s",
-				errors.Safe(req.EvalContext.BytesEncodeFormat))
-		}
-		sd := &sessiondata.SessionData{
-			ApplicationName: req.EvalContext.ApplicationName,
-			Database:        req.EvalContext.Database,
-			User:            req.EvalContext.User,
-			SearchPath:      sessiondata.MakeSearchPath(req.EvalContext.SearchPath).WithTemporarySchemaName(req.EvalContext.TemporarySchemaName),
-			SequenceState:   sessiondata.NewSequenceState(),
-			DataConversion: sessiondata.DataConversionConfig{
-				Location:          location,
-				BytesEncodeFormat: be,
-				ExtraFloatDigits:  int(req.EvalContext.ExtraFloatDigits),
-			},
 		}
 		ie := &lazyInternalExecutor{
 			newInternalExecutor: func() sqlutil.InternalExecutor {
@@ -297,46 +283,37 @@ func (ds *ServerImpl) setupFlow(
 			SessionData: sd,
 			ClusterID:   ds.ServerConfig.ClusterID.Get(),
 			ClusterName: ds.ServerConfig.ClusterName,
-			NodeID:      nodeID,
+			NodeID:      ds.ServerConfig.NodeID,
+			Codec:       ds.ServerConfig.Codec,
 			ReCache:     ds.regexpCache,
-			Mon:         &monitor,
+			Mon:         monitor,
 			// Most processors will override this Context with their own context in
 			// ProcessorBase. StartInternal().
 			Context:            ctx,
-			Planner:            &sqlbase.DummyEvalPlanner{},
-			SessionAccessor:    &sqlbase.DummySessionAccessor{},
-			PrivilegedAccessor: &sqlbase.DummyPrivilegedAccessor{},
-			Sequence:           &sqlbase.DummySequenceOperators{},
+			Planner:            &faketreeeval.DummyEvalPlanner{},
+			PrivilegedAccessor: &faketreeeval.DummyPrivilegedAccessor{},
+			SessionAccessor:    &faketreeeval.DummySessionAccessor{},
+			ClientNoticeSender: &faketreeeval.DummyClientNoticeSender{},
+			Sequence:           &faketreeeval.DummySequenceOperators{},
+			Tenant:             &faketreeeval.DummyTenantOperator{},
 			InternalExecutor:   ie,
 			Txn:                leafTxn,
+			SQLLivenessReader:  ds.ServerConfig.SQLLivenessReader,
 		}
 		evalCtx.SetStmtTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
 		evalCtx.SetTxnTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.TxnTimestampNanos))
-		var haveSequences bool
-		for _, seq := range req.EvalContext.SeqState.Seqs {
-			evalCtx.SessionData.SequenceState.RecordValue(seq.SeqID, seq.LatestVal)
-			haveSequences = true
-		}
-		if haveSequences {
-			evalCtx.SessionData.SequenceState.SetLastSequenceIncremented(
-				*req.EvalContext.SeqState.LastSeqIncremented)
-		}
 	}
-	// TODO(radu): we should sanity check some of these fields.
-	flowCtx := execinfra.FlowCtx{
-		AmbientContext: ds.AmbientContext,
-		Cfg:            &ds.ServerConfig,
-		ID:             req.Flow.FlowID,
-		EvalCtx:        evalCtx,
-		NodeID:         nodeID,
-		TraceKV:        req.TraceKV,
-		Local:          localState.IsLocal,
-	}
+
+	// Create the FlowCtx for the flow.
+	flowCtx := ds.NewFlowContext(
+		ctx, req.Flow.FlowID, evalCtx, req.TraceKV, req.CollectStats, localState, req.Flow.Gateway == roachpb.NodeID(ds.NodeID.SQLInstanceID()),
+	)
+
 	// req always contains the desired vectorize mode, regardless of whether we
 	// have non-nil localState.EvalContext. We don't want to update EvalContext
 	// itself when the vectorize mode needs to be changed because we would need
 	// to restore the original value which can have data races under stress.
-	isVectorized := sessiondata.VectorizeExecMode(req.EvalContext.Vectorize) != sessiondata.VectorizeOff
+	isVectorized := req.EvalContext.SessionData.VectorizeMode != sessiondatapb.VectorizeOff
 	f := newFlow(flowCtx, ds.flowRegistry, syncFlowConsumer, localState.LocalProcs, isVectorized)
 	opt := flowinfra.FuseNormally
 	if localState.IsLocal {
@@ -346,14 +323,15 @@ func (ds *ServerImpl) setupFlow(
 		// to use the RootTxn.
 		opt = flowinfra.FuseAggressively
 	}
+
 	var err error
 	if ctx, err = f.Setup(ctx, &req.Flow, opt); err != nil {
 		log.Errorf(ctx, "error setting up flow: %s", err)
 		// Flow.Cleanup will not be called, so we have to close the memory monitor
 		// and finish the span manually.
 		monitor.Stop(ctx)
-		tracing.FinishSpan(sp)
-		ctx = opentracing.ContextWithSpan(ctx, nil)
+		sp.Finish()
+		ctx = tracing.ContextWithSpan(ctx, nil)
 		return ctx, nil, err
 	}
 	if !f.IsLocal() {
@@ -369,8 +347,8 @@ func (ds *ServerImpl) setupFlow(
 	// that have no remote flows and also no concurrency, the txn comes from
 	// localState.Txn. Otherwise, we create a txn based on the request's
 	// LeafTxnInputState.
-	var txn *client.Txn
-	if localState.IsLocal && !f.ConcurrentExecution() {
+	var txn *kv.Txn
+	if localState.IsLocal && !f.ConcurrentTxnUse() {
 		txn = localState.Txn
 	} else {
 		// If I haven't created the leaf already, do it now.
@@ -393,6 +371,53 @@ func (ds *ServerImpl) setupFlow(
 	f.SetTxn(txn)
 
 	return ctx, f, nil
+}
+
+// NewFlowContext creates a new FlowCtx that can be used during execution of
+// a flow.
+func (ds *ServerImpl) NewFlowContext(
+	ctx context.Context,
+	id execinfrapb.FlowID,
+	evalCtx *tree.EvalContext,
+	traceKV bool,
+	collectStats bool,
+	localState LocalState,
+	isGatewayNode bool,
+) execinfra.FlowCtx {
+	// TODO(radu): we should sanity check some of these fields.
+	flowCtx := execinfra.FlowCtx{
+		AmbientContext: ds.AmbientContext,
+		Cfg:            &ds.ServerConfig,
+		ID:             id,
+		EvalCtx:        evalCtx,
+		NodeID:         ds.ServerConfig.NodeID,
+		TraceKV:        traceKV,
+		CollectStats:   collectStats,
+		Local:          localState.IsLocal,
+		Gateway:        isGatewayNode,
+	}
+
+	if localState.IsLocal && localState.Collection != nil {
+		// If we were passed a descs.Collection to use, then take it. In this case,
+		// the caller will handle releasing the used descriptors, so we don't need
+		// to cleanup the descriptors when cleaning up the flow.
+		flowCtx.TypeResolverFactory = &descs.DistSQLTypeResolverFactory{
+			Descriptors: localState.Collection,
+			CleanupFunc: func(ctx context.Context) {},
+		}
+	} else {
+		// If we weren't passed a descs.Collection, then make a new one. We are
+		// responsible for cleaning it up and releasing any accessed descriptors
+		// on flow cleanup.
+		collection := descs.NewCollection(ds.ServerConfig.Settings, ds.ServerConfig.LeaseManager.(*lease.Manager), ds.ServerConfig.HydratedTables)
+		flowCtx.TypeResolverFactory = &descs.DistSQLTypeResolverFactory{
+			Descriptors: collection,
+			CleanupFunc: func(ctx context.Context) {
+				collection.ReleaseAll(ctx)
+			},
+		}
+	}
+	return flowCtx
 }
 
 func newFlow(
@@ -420,8 +445,9 @@ func (ds *ServerImpl) SetupSyncFlow(
 	req *execinfrapb.SetupFlowRequest,
 	output execinfra.RowReceiver,
 ) (context.Context, flowinfra.Flow, error) {
-	ctx, f, err := ds.setupFlow(ds.AnnotateCtx(ctx), opentracing.SpanFromContext(ctx), parentMonitor,
-		req, output, LocalState{})
+	ctx, f, err := ds.setupFlow(
+		ds.AnnotateCtx(ctx), tracing.SpanFromContext(ctx), parentMonitor, req, output, LocalState{},
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -433,6 +459,11 @@ func (ds *ServerImpl) SetupSyncFlow(
 type LocalState struct {
 	EvalContext *tree.EvalContext
 
+	// Collection is set if this flow is running on the gateway as part of user
+	// SQL session. It is the current descs.Collection of the planner executing
+	// the flow.
+	Collection *descs.Collection
+
 	// IsLocal is set if the flow is running on the gateway and there are no
 	// remote flows.
 	IsLocal bool
@@ -440,11 +471,7 @@ type LocalState struct {
 	// Txn is filled in on the gateway only. It is the RootTxn that the query is running in.
 	// This will be used directly by the flow if the flow has no concurrency and IsLocal is set.
 	// If there is concurrency, a LeafTxn will be created.
-	Txn *client.Txn
-
-	/////////////////////////////////////////////
-	// Fields below are empty if IsLocal == false
-	/////////////////////////////////////////////
+	Txn *kv.Txn
 
 	// LocalProcs is an array of planNodeToRowSource processors. It's in order and
 	// will be indexed into by the RowSourceIdx field in LocalPlanNodeSpec.
@@ -461,8 +488,9 @@ func (ds *ServerImpl) SetupLocalSyncFlow(
 	output execinfra.RowReceiver,
 	localState LocalState,
 ) (context.Context, flowinfra.Flow, error) {
-	ctx, f, err := ds.setupFlow(ctx, opentracing.SpanFromContext(ctx), parentMonitor, req, output,
-		localState)
+	ctx, f, err := ds.setupFlow(
+		ctx, tracing.SpanFromContext(ctx), parentMonitor, req, output, localState,
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -482,7 +510,7 @@ func (ds *ServerImpl) RunSyncFlow(stream execinfrapb.DistSQL_RunSyncFlowServer) 
 		return errors.AssertionFailedf("first message in RunSyncFlow doesn't contain SetupFlowRequest")
 	}
 	req := firstMsg.SetupFlowRequest
-	ctx, f, err := ds.SetupSyncFlow(stream.Context(), &ds.memMonitor, req, mbox)
+	ctx, f, err := ds.SetupSyncFlow(stream.Context(), ds.memMonitor, req, mbox)
 	if err != nil {
 		return err
 	}
@@ -510,12 +538,12 @@ func (ds *ServerImpl) SetupFlow(
 	ctx context.Context, req *execinfrapb.SetupFlowRequest,
 ) (*execinfrapb.SimpleResponse, error) {
 	log.VEventf(ctx, 1, "received SetupFlow request from n%v for flow %v", req.Flow.Gateway, req.Flow.FlowID)
-	parentSpan := opentracing.SpanFromContext(ctx)
+	parentSpan := tracing.SpanFromContext(ctx)
 
 	// Note: the passed context will be canceled when this RPC completes, so we
 	// can't associate it with the flow.
 	ctx = ds.AnnotateCtx(context.Background())
-	ctx, f, err := ds.setupFlow(ctx, parentSpan, &ds.memMonitor, req, nil /* syncFlowConsumer */, LocalState{})
+	ctx, f, err := ds.setupFlow(ctx, parentSpan, ds.memMonitor, req, nil /* syncFlowConsumer */, LocalState{})
 	if err == nil {
 		err = ds.flowScheduler.ScheduleFlow(ctx, f)
 	}
@@ -566,7 +594,7 @@ func (ds *ServerImpl) FlowStream(stream execinfrapb.DistSQL_FlowStreamServer) er
 		// flowStreamInt may return an error during normal operation (e.g. a flow
 		// was canceled as part of a graceful teardown). Log this error at the INFO
 		// level behind a verbose flag for visibility.
-		log.Info(ctx, err)
+		log.Infof(ctx, "%v", err)
 	}
 	return err
 }
@@ -590,8 +618,8 @@ var _ sqlutil.InternalExecutor = &lazyInternalExecutor{}
 func (ie *lazyInternalExecutor) QueryRowEx(
 	ctx context.Context,
 	opName string,
-	txn *client.Txn,
-	opts sqlbase.InternalExecutorSessionDataOverride,
+	txn *kv.Txn,
+	opts sessiondata.InternalExecutorOverride,
 	stmt string,
 	qargs ...interface{},
 ) (tree.Datums, error) {
@@ -602,7 +630,7 @@ func (ie *lazyInternalExecutor) QueryRowEx(
 }
 
 func (ie *lazyInternalExecutor) QueryRow(
-	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
+	ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
 ) (tree.Datums, error) {
 	ie.once.Do(func() {
 		ie.InternalExecutor = ie.newInternalExecutor()

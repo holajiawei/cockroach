@@ -14,8 +14,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/baseccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl/enginepbccl"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/pebble/vfs"
@@ -107,7 +107,7 @@ func (f *encryptedFile) ReadAt(p []byte, off int64) (n int, err error) {
 // encryptedFS implements vfs.FS.
 type encryptedFS struct {
 	vfs.FS
-	fileRegistry  *engine.PebbleFileRegistry
+	fileRegistry  *storage.PebbleFileRegistry
 	streamCreator *FileCipherStreamCreator
 }
 
@@ -132,7 +132,8 @@ func (fs *encryptedFS) Create(name string) (vfs.File, error) {
 		f.Close()
 		return nil, err
 	}
-	return &encryptedFile{File: f, stream: stream}, nil
+	ef := &encryptedFile{File: f, stream: stream}
+	return vfs.WithFd(f, ef), nil
 }
 
 // Link implements vfs.FS.Link.
@@ -168,7 +169,8 @@ func (fs *encryptedFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, erro
 		f.Close()
 		return nil, err
 	}
-	return &encryptedFile{File: f, stream: stream}, nil
+	ef := &encryptedFile{File: f, stream: stream}
+	return vfs.WithFd(f, ef), nil
 }
 
 // Remove implements vfs.FS.Remove.
@@ -219,12 +221,12 @@ func (e *encryptionStatsHandler) GetEncryptionStatus() ([]byte, error) {
 	if k != nil {
 		s.ActiveDataKey = k.Info
 	}
-	return []byte(s.String()), nil
+	return protoutil.Marshal(&s)
 }
 
 func (e *encryptionStatsHandler) GetDataKeysRegistry() ([]byte, error) {
 	r := e.dataKM.getScrubbedRegistry()
-	return []byte(r.String()), nil
+	return protoutil.Marshal(r)
 }
 
 func (e *encryptionStatsHandler) GetActiveDataKeyID() (string, error) {
@@ -255,7 +257,7 @@ func (e *encryptionStatsHandler) GetKeyIDFromSettings(settings []byte) (string, 
 
 // Init initializes engine.NewEncryptedEncFunc.
 func init() {
-	engine.NewEncryptedEnvFunc = newEncryptedEnv
+	storage.NewEncryptedEnvFunc = newEncryptedEnv
 }
 
 // newEncryptedEnv creates an encrypted environment and returns the vfs.FS to use for reading and
@@ -264,8 +266,8 @@ func init() {
 //
 // See the comment at the top of this file for the structure of this environment.
 func newEncryptedEnv(
-	fs vfs.FS, fr *engine.PebbleFileRegistry, dbDir string, readOnly bool, optionBytes []byte,
-) (vfs.FS, engine.EncryptionStatsHandler, error) {
+	fs vfs.FS, fr *storage.PebbleFileRegistry, dbDir string, readOnly bool, optionBytes []byte,
+) (vfs.FS, storage.EncryptionStatsHandler, error) {
 	options := &baseccl.EncryptionOptions{}
 	if err := protoutil.Unmarshal(optionBytes, options); err != nil {
 		return nil, nil, err

@@ -74,9 +74,9 @@ func pkgsFromDiff(r io.Reader) (map[string]pkg, error) {
 	var inPrefix bool
 	for reader := bufio.NewReader(r); ; {
 		line, isPrefix, err := reader.ReadLine()
-		switch err {
-		case nil:
-		case io.EOF:
+		switch {
+		case err == nil:
+		case err == io.EOF:
 			return pkgs, nil
 		default:
 			return nil, err
@@ -256,15 +256,18 @@ func main() {
 			log.Fatal(err)
 		}
 		if len(pkgs) > 0 {
-			// 10 minutes total seems OK, but at least a minute per test.
-			duration := (10 * time.Minute) / time.Duration(len(pkgs))
-			if duration < time.Minute {
-				duration = time.Minute
-			}
-			// Use a timeout shorter than the duration so that hanging tests don't
-			// get a free pass.
-			timeout := (3 * duration) / 4
 			for name, pkg := range pkgs {
+				// 20 minutes total seems OK, but at least 2 minutes per test.
+				// This should be reduced. See #46941.
+				duration := (20 * time.Minute) / time.Duration(len(pkgs))
+				minDuration := (2 * time.Minute) * time.Duration(len(pkg.tests))
+				if duration < minDuration {
+					duration = minDuration
+				}
+				// Use a timeout shorter than the duration so that hanging tests don't
+				// get a free pass.
+				timeout := (3 * duration) / 4
+
 				tests := "-"
 				if len(pkg.tests) > 0 {
 					tests = "(" + strings.Join(pkg.tests, "$$|") + "$$)"
@@ -276,7 +279,7 @@ func main() {
 					fmt.Sprintf("PKG=./%s", name),
 					fmt.Sprintf("TESTS=%s", tests),
 					fmt.Sprintf("TESTTIMEOUT=%s", timeout),
-					fmt.Sprintf("GOTESTFLAGS=-json"), // allow TeamCity to parse failures
+					"GOTESTFLAGS=-json", // allow TeamCity to parse failures
 					fmt.Sprintf("STRESSFLAGS=-stderr -maxfails 1 -maxtime %s", duration),
 				)
 				cmd.Env = append(os.Environ(), "COCKROACH_NIGHTLY_STRESS=true")

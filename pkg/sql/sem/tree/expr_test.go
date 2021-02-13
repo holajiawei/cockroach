@@ -17,15 +17,20 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/stretchr/testify/require"
 )
 
 // TestUnresolvedNameString tests the string representation of tree.UnresolvedName and thus tree.Name.
 func TestUnresolvedNameString(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testCases := []struct {
 		in, out string
 	}{
@@ -54,10 +59,50 @@ func TestUnresolvedNameString(t *testing.T) {
 	}
 }
 
+// TestCastFromNull checks every type can be cast from NULL.
+func TestCastFromNull(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	for _, typ := range types.Scalar {
+		castExpr := tree.CastExpr{Expr: tree.DNull, Type: typ}
+		res, err := castExpr.Eval(nil)
+		require.NoError(t, err)
+		require.Equal(t, tree.DNull, res)
+	}
+}
+
+// TestStringConcat checks every tuple and scalar type can be concatenated with
+// a string.
+func TestStringConcat(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	rng, _ := randutil.NewPseudoRand()
+	ctx := context.Background()
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	defer evalCtx.Stop(ctx)
+	for _, typ := range append([]*types.T{types.AnyTuple}, types.Scalar...) {
+		// Strings and Bytes are handled specially.
+		if typ == types.String || typ == types.Bytes {
+			continue
+		}
+		d := rowenc.RandDatum(rng, typ, false /* nullOk */)
+		expected := tree.NewDString(tree.AsStringWithFlags(d, tree.FmtPgwireText))
+		concatExprLeft := tree.NewTypedBinaryExpr(tree.Concat, tree.NewDString(""), d, types.String)
+		resLeft, err := concatExprLeft.Eval(&evalCtx)
+		require.NoError(t, err)
+		require.Equal(t, expected, resLeft)
+		concatExprRight := tree.NewTypedBinaryExpr(tree.Concat, d, tree.NewDString(""), types.String)
+		resRight, err := concatExprRight.Eval(&evalCtx)
+		require.NoError(t, err)
+		require.Equal(t, expected, resRight)
+	}
+}
+
 // TestExprString verifies that converting an expression to a string and back
 // doesn't change the (normalized) expression.
 func TestExprString(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	defer tree.MockNameTypes(map[string]*types.T{
 		"a": types.Bool,
 		"b": types.Bool,
@@ -97,12 +142,13 @@ func TestExprString(t *testing.T) {
 		`(1 >= 2) = (2 IS OF (BOOL))`,
 		`count(1) FILTER (WHERE true)`,
 	}
+	ctx := context.Background()
 	for _, exprStr := range testExprs {
 		expr, err := parser.ParseExpr(exprStr)
 		if err != nil {
 			t.Fatalf("%s: %v", exprStr, err)
 		}
-		typedExpr, err := tree.TypeCheck(expr, nil, types.Any)
+		typedExpr, err := tree.TypeCheck(ctx, expr, nil, types.Any)
 		if err != nil {
 			t.Fatalf("%s: %v", expr, err)
 		}
@@ -112,7 +158,7 @@ func TestExprString(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", exprStr, err)
 		}
-		typedExpr2, err := tree.TypeCheck(expr2, nil, types.Any)
+		typedExpr2, err := tree.TypeCheck(ctx, expr2, nil, types.Any)
 		if err != nil {
 			t.Fatalf("%s: %v", expr2, err)
 		}
@@ -145,6 +191,7 @@ func TestExprString(t *testing.T) {
 
 func TestStripParens(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	testExprs := []struct {
 		in, out string
 	}{

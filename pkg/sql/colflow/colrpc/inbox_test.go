@@ -13,7 +13,6 @@ package colrpc
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -22,14 +21,16 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,15 +59,15 @@ var _ flowStreamServer = callbackFlowStreamServer{}
 func TestInboxCancellation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	typs := []coltypes.T{coltypes.Int64}
+	typs := []*types.T{types.Int}
 	t.Run("ReaderWaitingForStreamHandler", func(t *testing.T) {
-		inbox, err := NewInbox(testAllocator, typs, execinfrapb.StreamID(0))
+		inbox, err := NewInbox(context.Background(), testAllocator, typs, execinfrapb.StreamID(0))
 		require.NoError(t, err)
 		ctx, cancelFn := context.WithCancel(context.Background())
 		// Cancel the context.
 		cancelFn()
 		// Next should not block if the context is canceled.
-		err = execerror.CatchVectorizedRuntimeError(func() { inbox.Next(ctx) })
+		err = colexecerror.CatchVectorizedRuntimeError(func() { inbox.Next(ctx) })
 		require.True(t, testutils.IsError(err, "context canceled"), err)
 		// Now, the remote stream arrives.
 		err = inbox.RunWithStream(context.Background(), mockFlowStreamServer{})
@@ -75,7 +76,7 @@ func TestInboxCancellation(t *testing.T) {
 
 	t.Run("DuringRecv", func(t *testing.T) {
 		rpcLayer := makeMockFlowStreamRPCLayer()
-		inbox, err := NewInbox(testAllocator, typs, execinfrapb.StreamID(0))
+		inbox, err := NewInbox(context.Background(), testAllocator, typs, execinfrapb.StreamID(0))
 		require.NoError(t, err)
 		ctx, cancelFn := context.WithCancel(context.Background())
 
@@ -106,7 +107,7 @@ func TestInboxCancellation(t *testing.T) {
 
 	t.Run("StreamHandlerWaitingForReader", func(t *testing.T) {
 		rpcLayer := makeMockFlowStreamRPCLayer()
-		inbox, err := NewInbox(testAllocator, typs, execinfrapb.StreamID(0))
+		inbox, err := NewInbox(context.Background(), testAllocator, typs, execinfrapb.StreamID(0))
 		require.NoError(t, err)
 
 		ctx, cancelFn := context.WithCancel(context.Background())
@@ -124,7 +125,7 @@ func TestInboxCancellation(t *testing.T) {
 func TestInboxNextPanicDoesntLeakGoroutines(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	inbox, err := NewInbox(testAllocator, []coltypes.T{coltypes.Int64}, execinfrapb.StreamID(0))
+	inbox, err := NewInbox(context.Background(), testAllocator, []*types.T{types.Int}, execinfrapb.StreamID(0))
 	require.NoError(t, err)
 
 	rpcLayer := makeMockFlowStreamRPCLayer()
@@ -151,7 +152,7 @@ func TestInboxTimeout(t *testing.T) {
 
 	ctx := context.Background()
 
-	inbox, err := NewInbox(testAllocator, []coltypes.T{coltypes.Int64}, execinfrapb.StreamID(0))
+	inbox, err := NewInbox(ctx, testAllocator, []*types.T{types.Int}, execinfrapb.StreamID(0))
 	require.NoError(t, err)
 
 	var (
@@ -159,7 +160,7 @@ func TestInboxTimeout(t *testing.T) {
 		rpcLayer    = makeMockFlowStreamRPCLayer()
 	)
 	go func() {
-		readerErrCh <- execerror.CatchVectorizedRuntimeError(func() { inbox.Next(ctx) })
+		readerErrCh <- colexecerror.CatchVectorizedRuntimeError(func() { inbox.Next(ctx) })
 	}()
 
 	// Timeout the inbox.
@@ -177,13 +178,14 @@ func TestInboxTimeout(t *testing.T) {
 }
 
 // TestInboxShutdown is a random test that spawns a goroutine for handling a
-// FlowStream RPC (setting up an inbound stream, or RunWithStream), a goroutine
-// to read from an Inbox (Next goroutine), and a goroutine to drain the Inbox
-// (DrainMeta goroutine). These goroutines race against each other and the
+// FlowStream RPC (setting up an inbound stream, or RunWithStream), and a
+// goroutine to read from an Inbox (Next and DrainMeta goroutine) that gets
+// randomly canceled.
+// These goroutines race against each other and the
 // desired state is that everything is cleaned up at the end. Examples of
 // scenarios that are tested by this test include but are not limited to:
 //  - DrainMeta called before Next and before a stream arrives.
-//  - DrainMeta called concurrently with Next with an active stream.
+//  - DrainMeta called with an active stream.
 //  - A forceful cancellation of Next but no call to DrainMeta.
 func TestInboxShutdown(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -196,17 +198,48 @@ func TestInboxShutdown(t *testing.T) {
 		// shutdown scenarios in the middle of data processing are always tested. If
 		// false, they sometimes will be.
 		infiniteBatches    = rng.Float64() < 0.5
-		drainMetaSleep     = time.Millisecond * time.Duration(rng.Intn(10))
+		cancelSleep        = time.Millisecond * time.Duration(rng.Intn(10))
 		nextSleep          = time.Millisecond * time.Duration(rng.Intn(10))
 		runWithStreamSleep = time.Millisecond * time.Duration(rng.Intn(10))
-		typs               = []coltypes.T{coltypes.Int64}
-		batch              = colexec.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0 /* length */, rng.Float64())
+		typs               = []*types.T{types.Int}
+		batch              = coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0 /* length */, rng.Float64())
 	)
 
-	for _, runDrainMetaGoroutine := range []bool{false, true} {
+	// drainMetaScenario specifies when DrainMeta should be called in the Next
+	// goroutine.
+	type drainMetaScenario int
+	const (
+		// drainMetaBeforeNext specifies that DrainMeta should be called before the
+		// Next goroutine.
+		drainMetaBeforeNext drainMetaScenario = iota
+		// drainMetaPrematurely specifies that DrainMeta should be called after the
+		// first call to Next.
+		drainMetaPrematurely
+		// drianMetaAfterNextIsExhausted specifies that DrainMeta should be called
+		// after Next returns a zero-length batch.
+		drainMetaAfterNextIsExhausted
+		// drainMetaNotCalled specifies that DrainMeta is not called during
+		// execution.
+		drainMetaNotCalled
+		maxDrainMetaScenario
+	)
+
+	for _, cancel := range []bool{false, true} {
 		for _, runNextGoroutine := range []bool{false, true} {
+			drainScenario := drainMetaScenario(rng.Intn(int(maxDrainMetaScenario)))
+			if infiniteBatches {
+				// This test won't finish unless we drain at some point.
+				drainScenario = drainMetaPrematurely
+			}
+			if cancel {
+				// If a cancel happens, we don't want to call DrainMeta because the mock
+				// RPC layer doesn't handle this case well. The drain signal could be
+				// sent over a closed channel. The real RPC layer would return EOF, but
+				// it's not easy to check for a closed channel without reading from it.
+				drainScenario = drainMetaNotCalled
+			}
 			for _, runRunWithStreamGoroutine := range []bool{false, true} {
-				if runDrainMetaGoroutine == false && runNextGoroutine == false && runRunWithStreamGoroutine == true {
+				if runNextGoroutine == false && runRunWithStreamGoroutine == true {
 					// This is sort of like a remote node connecting to the inbox, but the
 					// inbox will never be spawned. This is dealt with by another part of
 					// the code (the flow registry times out inbound RPCs if a consumer is
@@ -216,16 +249,13 @@ func TestInboxShutdown(t *testing.T) {
 				rpcLayer := makeMockFlowStreamRPCLayer()
 
 				t.Run(fmt.Sprintf(
-					"drain=%t/next=%t/stream=%t/inf=%t",
-					runDrainMetaGoroutine, runNextGoroutine, runRunWithStreamGoroutine, infiniteBatches,
+					"cancel=%t/next=%t/stream=%t/inf=%t",
+					cancel, runNextGoroutine, runRunWithStreamGoroutine, infiniteBatches,
 				), func(t *testing.T) {
 					inboxCtx, inboxCancel := context.WithCancel(context.Background())
 					inboxMemAccount := testMemMonitor.MakeBoundAccount()
 					defer inboxMemAccount.Close(inboxCtx)
-					inbox, err := NewInbox(
-						colexec.NewAllocator(inboxCtx, &inboxMemAccount),
-						typs, execinfrapb.StreamID(0),
-					)
+					inbox, err := NewInbox(context.Background(), colmem.NewAllocator(inboxCtx, &inboxMemAccount, coldata.StandardColumnFactory), typs, execinfrapb.StreamID(0))
 					require.NoError(t, err)
 					c, err := colserde.NewArrowBatchConverter(typs)
 					require.NoError(t, err)
@@ -263,34 +293,32 @@ func TestInboxShutdown(t *testing.T) {
 											return
 										}
 										var buffer bytes.Buffer
-										_, _, err = r.Serialize(&buffer, arrowData)
+										_, _, err = r.Serialize(&buffer, arrowData, batch.Length())
 										if err != nil {
 											errCh <- err
 											return
 										}
 										var draining uint32
-										if runDrainMetaGoroutine {
-											// Listen for the drain signal.
-											wg.Add(1)
-											go func() {
-												defer wg.Done()
-												for {
-													cs, err := rpcLayer.client.Recv()
-													if cs != nil && cs.DrainRequest != nil {
-														atomic.StoreUint32(&draining, 1)
+										// Listen for the drain signal.
+										wg.Add(1)
+										go func() {
+											defer wg.Done()
+											for {
+												cs, err := rpcLayer.client.Recv()
+												if cs != nil && cs.DrainRequest != nil {
+													atomic.StoreUint32(&draining, 1)
+													return
+												}
+												// TODO(asubiotto): Generate some metadata and test
+												//  that it is received.
+												if err != nil {
+													if err == io.EOF {
 														return
 													}
-													// TODO(asubiotto): Generate some metadata and test
-													//  that it is received.
-													if err != nil {
-														if err == io.EOF {
-															return
-														}
-														errCh <- err
-													}
+													errCh <- err
 												}
-											}()
-										}
+											}
+										}()
 										msg := &execinfrapb.ProducerMessage{Data: execinfrapb.ProducerData{RawBytes: buffer.Bytes()}}
 										batchesToSend := rng.Intn(65536)
 										for i := 0; infiniteBatches || i < batchesToSend; i++ {
@@ -330,6 +358,10 @@ func TestInboxShutdown(t *testing.T) {
 									if !runNextGoroutine {
 										return
 									}
+									if drainScenario == drainMetaBeforeNext {
+										_ = inbox.DrainMeta(inboxCtx)
+										return
+									}
 									if nextSleep != 0 {
 										time.Sleep(nextSleep)
 									}
@@ -338,7 +370,14 @@ func TestInboxShutdown(t *testing.T) {
 										err  error
 									)
 									for !done && err == nil {
-										err = execerror.CatchVectorizedRuntimeError(func() { b := inbox.Next(inboxCtx); done = b.Length() == 0 })
+										err = colexecerror.CatchVectorizedRuntimeError(func() { b := inbox.Next(inboxCtx); done = b.Length() == 0 })
+										if drainScenario == drainMetaPrematurely {
+											_ = inbox.DrainMeta(inboxCtx)
+											return
+										}
+									}
+									if drainScenario == drainMetaAfterNextIsExhausted {
+										_ = inbox.DrainMeta(inboxCtx)
 									}
 									errCh <- err
 								}()
@@ -346,24 +385,19 @@ func TestInboxShutdown(t *testing.T) {
 							},
 						},
 						{
-							name: "DrainMeta",
+							name: "Cancel",
 							asyncOperation: func() chan error {
 								errCh := make(chan error)
 								go func() {
 									defer func() {
-										inboxCancel()
+										if cancel {
+											inboxCancel()
+										}
 										close(errCh)
 									}()
-									// Sleep before checking for whether to run a drain meta
-									// goroutine or not, because we want to insert a potential delay
-									// before canceling the inbox context in any case.
-									if drainMetaSleep != 0 {
-										time.Sleep(drainMetaSleep)
+									if cancelSleep != 0 {
+										time.Sleep(cancelSleep)
 									}
-									if !runDrainMetaGoroutine {
-										return
-									}
-									_ = inbox.DrainMeta(inboxCtx)
 								}()
 								return errCh
 							},

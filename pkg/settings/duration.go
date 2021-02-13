@@ -25,7 +25,20 @@ type DurationSetting struct {
 	validateFn   func(time.Duration) error
 }
 
+// DurationSettingWithExplicitUnit is like DurationSetting except it requires an
+// explicit unit when being set. (eg. 1s works, but 1 does not).
+type DurationSettingWithExplicitUnit struct {
+	DurationSetting
+}
+
 var _ extendedSetting = &DurationSetting{}
+
+var _ extendedSetting = &DurationSettingWithExplicitUnit{}
+
+// ErrorHint returns a hint message to be displayed on error to the user.
+func (d *DurationSettingWithExplicitUnit) ErrorHint() (bool, string) {
+	return true, "try using an interval value with explicit units, e.g 500ms or 1h2m"
+}
 
 // Get retrieves the duration value in the setting.
 func (d *DurationSetting) Get(sv *Values) time.Duration {
@@ -92,63 +105,28 @@ func (d *DurationSetting) setToDefault(sv *Values) {
 	}
 }
 
+// WithPublic sets the visibility to public and can be chained.
+func (d *DurationSetting) WithPublic() *DurationSetting {
+	d.SetVisibility(Public)
+	return d
+}
+
 // RegisterDurationSetting defines a new setting with type duration.
-func RegisterDurationSetting(key, desc string, defaultValue time.Duration) *DurationSetting {
-	return RegisterValidatedDurationSetting(key, desc, defaultValue, nil)
-}
-
-// RegisterPublicDurationSetting defines a new setting with type
-// duration and makes it public.
-func RegisterPublicDurationSetting(key, desc string, defaultValue time.Duration) *DurationSetting {
-	s := RegisterValidatedDurationSetting(key, desc, defaultValue, nil)
-	s.SetVisibility(Public)
-	return s
-}
-
-// RegisterPublicNonNegativeDurationSetting defines a new setting with
-// type duration and makes it public.
-func RegisterPublicNonNegativeDurationSetting(
-	key, desc string, defaultValue time.Duration,
+func RegisterDurationSetting(
+	key, desc string, defaultValue time.Duration, validateFns ...func(time.Duration) error,
 ) *DurationSetting {
-	s := RegisterNonNegativeDurationSetting(key, desc, defaultValue)
-	s.SetVisibility(Public)
-	return s
-}
-
-// RegisterPublicNonNegativeDurationSettingWithMaximum defines a new setting with
-// type duration, makes it public, and sets a maximum value.
-func RegisterPublicNonNegativeDurationSettingWithMaximum(
-	key, desc string, defaultValue time.Duration, maxValue time.Duration,
-) *DurationSetting {
-	s := RegisterValidatedDurationSetting(key, desc, defaultValue, func(v time.Duration) error {
-		if v < 0 {
-			return errors.Errorf("cannot set %s to a negative duration: %s", key, v)
+	var validateFn func(time.Duration) error
+	if len(validateFns) > 0 {
+		validateFn = func(v time.Duration) error {
+			for _, fn := range validateFns {
+				if err := fn(v); err != nil {
+					return errors.Wrapf(err, "invalid value for %s", key)
+				}
+			}
+			return nil
 		}
-		if v >= maxValue {
-			return errors.Errorf("cannot set %s to a value larger than %s", key, maxValue)
-		}
-		return nil
-	})
-	s.SetVisibility(Public)
-	return s
-}
+	}
 
-// RegisterNonNegativeDurationSetting defines a new setting with type duration.
-func RegisterNonNegativeDurationSetting(
-	key, desc string, defaultValue time.Duration,
-) *DurationSetting {
-	return RegisterValidatedDurationSetting(key, desc, defaultValue, func(v time.Duration) error {
-		if v < 0 {
-			return errors.Errorf("cannot set %s to a negative duration: %s", key, v)
-		}
-		return nil
-	})
-}
-
-// RegisterValidatedDurationSetting defines a new setting with type duration.
-func RegisterValidatedDurationSetting(
-	key, desc string, defaultValue time.Duration, validateFn func(time.Duration) error,
-) *DurationSetting {
 	if validateFn != nil {
 		if err := validateFn(defaultValue); err != nil {
 			panic(errors.Wrap(err, "invalid default"))
@@ -160,4 +138,50 @@ func RegisterValidatedDurationSetting(
 	}
 	register(key, desc, setting)
 	return setting
+}
+
+// RegisterPublicDurationSettingWithExplicitUnit defines a new
+// public setting with type duration which requires an explicit unit when being
+// set.
+func RegisterPublicDurationSettingWithExplicitUnit(
+	key, desc string, defaultValue time.Duration, validateFn func(time.Duration) error,
+) *DurationSettingWithExplicitUnit {
+	var fn func(time.Duration) error
+
+	if validateFn != nil {
+		fn = func(v time.Duration) error {
+			return errors.Wrapf(validateFn(v), "invalid value for %s", key)
+		}
+	}
+
+	setting := &DurationSettingWithExplicitUnit{
+		DurationSetting{
+			defaultValue: defaultValue,
+			validateFn:   fn,
+		},
+	}
+	setting.SetVisibility(Public)
+	register(key, desc, setting)
+	return setting
+}
+
+// NonNegativeDuration can be passed to RegisterDurationSetting.
+func NonNegativeDuration(v time.Duration) error {
+	if v < 0 {
+		return errors.Errorf("cannot be set to a negative duration: %s", v)
+	}
+	return nil
+}
+
+// NonNegativeDurationWithMaximum can be passed to RegisterDurationSetting.
+func NonNegativeDurationWithMaximum(maxValue time.Duration) func(time.Duration) error {
+	return func(v time.Duration) error {
+		if v < 0 {
+			return errors.Errorf("cannot be set to a negative duration: %s", v)
+		}
+		if v > maxValue {
+			return errors.Errorf("cannot be set to a value larger than %s", maxValue)
+		}
+		return nil
+	}
 }

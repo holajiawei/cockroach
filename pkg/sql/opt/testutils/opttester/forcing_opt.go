@@ -55,15 +55,17 @@ type forcingOptimizer struct {
 
 // newForcingOptimizer creates a forcing optimizer that stops applying any rules
 // after <steps> rules are matched. If ignoreNormRules is true, normalization
-// rules don't count against this limit.
+// rules don't count against this limit. If disableCheckExpr is true, expression
+// validation in CheckExpr will not run.
 func newForcingOptimizer(
-	tester *OptTester, steps int, ignoreNormRules bool,
+	tester *OptTester, steps int, ignoreNormRules bool, disableCheckExpr bool,
 ) (*forcingOptimizer, error) {
 	fo := &forcingOptimizer{
 		remaining:   steps,
 		lastMatched: opt.InvalidRuleName,
 	}
 	fo.o.Init(&tester.evalCtx, tester.catalog)
+	fo.o.Factory().FoldingControl().AllowStableFolds()
 	fo.coster.Init(&fo.o, &fo.groups)
 	fo.o.SetCoster(&fo.coster)
 
@@ -72,6 +74,9 @@ func newForcingOptimizer(
 			return true
 		}
 		if fo.remaining == 0 {
+			return false
+		}
+		if tester.Flags.DisableRules.Contains(int(ruleName)) {
 			return false
 		}
 		fo.remaining--
@@ -95,6 +100,10 @@ func newForcingOptimizer(
 	fo.o.Memo().NotifyOnNewGroup(func(expr opt.Expr) {
 		fo.groups.AddGroup(expr)
 	})
+
+	if disableCheckExpr {
+		fo.o.Memo().DisableCheckExpr()
+	}
 
 	if err := tester.buildExpr(fo.o.Factory()); err != nil {
 		return nil, err
@@ -137,9 +146,13 @@ type forcingCoster struct {
 }
 
 func (fc *forcingCoster) Init(o *xform.Optimizer, groups *memoGroups) {
-	fc.o = o
-	fc.groups = groups
-	fc.inner = o.Coster()
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*fc = forcingCoster{
+		o:      o,
+		groups: groups,
+		inner:  o.Coster(),
+	}
 }
 
 // RestrictGroupToMember forces the expression in the given location to be the

@@ -12,6 +12,7 @@ import { Tooltip } from "antd";
 import React from "react";
 import { connect } from "react-redux";
 import { Link } from "react-router-dom";
+import classNames from "classnames/bind";
 
 import * as protos from "src/js/protos";
 import { refreshTableDetails, refreshTableStats } from "src/redux/apiReducers";
@@ -20,6 +21,7 @@ import { databaseNameAttr, tableNameAttr } from "src/util/constants";
 import { selectTableInfo } from "src/views/databases/containers/tableDetails";
 import { TableInfo } from "src/views/databases/data/tableInfo";
 import { Highlight } from "./highlight";
+import styles from "./sqlhighlight.module.styl";
 
 interface TableInfoComponentProps {
   title: any;
@@ -34,27 +36,46 @@ interface TableInfoProps {
   refreshTableStats: typeof refreshTableStats;
 }
 
-class TableInfoComponent extends React.Component<TableInfoComponentProps & TableInfoProps> {
+const cx = classNames.bind(styles);
+
+class TableInfoComponent extends React.Component<
+  TableInfoComponentProps & TableInfoProps
+> {
   componentDidMount() {
     this.loadTable();
   }
 
   loadTable = () => {
-    this.props.refreshTableDetails(new protos.cockroach.server.serverpb.TableDetailsRequest({
-      database: this.props.params[databaseNameAttr],
-      table: this.props.params[tableNameAttr],
-    }));
-    this.props.refreshTableStats(new protos.cockroach.server.serverpb.TableStatsRequest({
-      database: this.props.params[databaseNameAttr],
-      table: this.props.params[tableNameAttr],
-    }));
-  }
+    this.props.refreshTableDetails(
+      new protos.cockroach.server.serverpb.TableDetailsRequest({
+        database: this.props.params[databaseNameAttr],
+        table: this.props.params[tableNameAttr],
+      }),
+    );
+    this.props.refreshTableStats(
+      new protos.cockroach.server.serverpb.TableStatsRequest({
+        database: this.props.params[databaseNameAttr],
+        table: this.props.params[tableNameAttr],
+      }),
+    );
+  };
 
   render() {
     const { title, tableInfo, params } = this.props;
     return (
-      <Tooltip overlayClassName="hljs" placement="bottom" title={<pre className="sql-highlight hljs"><Highlight value={tableInfo.createStatement} /></pre>}>
-        <Link className="table-target" to={`database/${params[databaseNameAttr]}/table/${params[tableNameAttr]}`}>
+      <Tooltip
+        overlayClassName="hljs"
+        placement="bottom"
+        title={
+          <pre className={cx("sql-highlight", "hljs")}>
+            <Highlight value={tableInfo.createStatement} />
+          </pre>
+        }
+      >
+        <Link
+          className={cx("table-target")}
+          to={`database/${params[databaseNameAttr]}/table/${params[tableNameAttr]}`}
+        >
           {title}
         </Link>
       </Tooltip>
@@ -63,9 +84,9 @@ class TableInfoComponent extends React.Component<TableInfoComponentProps & Table
 }
 
 const mapStateToProps = (state: AdminUIState, props: any) => {
-  return ({
+  return {
     tableInfo: selectTableInfo(state, props),
-  });
+  };
 };
 
 const mapDispatchToProps = {
@@ -73,7 +94,6 @@ const mapDispatchToProps = {
   refreshTableStats,
 };
 
-// tslint:disable-next-line:variable-name
 const TableInfoConnected = connect(
   mapStateToProps,
   mapDispatchToProps,

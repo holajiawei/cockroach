@@ -17,7 +17,7 @@ import (
 
 // AvailableRuleProps is a bit set that indicates when lazily-populated Rule
 // properties are initialized and ready for use.
-type AvailableRuleProps int
+type AvailableRuleProps int8
 
 const (
 	// PruneCols is set when the Relational.Rule.PruneCols field is populated.
@@ -31,16 +31,13 @@ const (
 	// field is populated.
 	InterestingOrderings
 
-	// UnfilteredCols is set when the Relational.Rule.UnfilteredCols field is
-	// populated.
-	UnfilteredCols
-
 	// HasHoistableSubquery is set when the Scalar.Rule.HasHoistableSubquery
 	// is populated.
 	HasHoistableSubquery
 
-	// JoinSize is set when the Relational.Rule.JoinSize field is populated.
-	JoinSize
+	// UnfilteredCols is set when the Relational.Rule.UnfilteredCols field is
+	// populated.
+	UnfilteredCols
 
 	// WithUses is set when the Shared.Rule.WithUses field is populated.
 	WithUses
@@ -52,6 +49,32 @@ type Shared struct {
 	// Populated is set to true once the properties have been built for the
 	// operator.
 	Populated bool
+
+	// HasSubquery is true if the subtree rooted at this node contains a subquery.
+	// The subquery can be a Subquery, Exists, Any, or ArrayFlatten expression.
+	// Subqueries are the only place where a relational node can be nested within a
+	// scalar expression.
+	HasSubquery bool
+
+	// HasCorrelatedSubquery is true if the scalar expression tree contains a
+	// subquery having one or more outer columns. The subquery can be a Subquery,
+	// Exists, or Any operator. These operators usually need to be hoisted out of
+	// scalar expression trees and turned into top-level apply joins. This
+	// property makes detection fast and easy so that the hoister doesn't waste
+	// time searching subtrees that don't contain subqueries.
+	HasCorrelatedSubquery bool
+
+	// VolatilitySet contains the set of volatilities contained in the expression.
+	VolatilitySet VolatilitySet
+
+	// CanMutate is true if the subtree rooted at this expression contains at
+	// least one operator that modifies schema (like CreateTable) or writes or
+	// deletes rows (like Insert).
+	CanMutate bool
+
+	// HasPlaceholder is true if the subtree rooted at this expression contains
+	// at least one Placeholder operator.
+	HasPlaceholder bool
 
 	// OuterCols is the set of columns that are referenced by variables within
 	// this sub-expression, but are not bound within the scope of the expression.
@@ -72,100 +95,6 @@ type Shared struct {
 	// columns are not outer columns on the EXISTS expression, they *are* outer
 	// columns on the inner WHERE condition.
 	OuterCols opt.ColSet
-
-	// HasSubquery is true if the subtree rooted at this node contains a subquery.
-	// The subquery can be a Subquery, Exists, Any, or ArrayFlatten expression.
-	// Subqueries are the only place where a relational node can be nested within a
-	// scalar expression.
-	HasSubquery bool
-
-	// HasCorrelatedSubquery is true if the scalar expression tree contains a
-	// subquery having one or more outer columns. The subquery can be a Subquery,
-	// Exists, or Any operator. These operators usually need to be hoisted out of
-	// scalar expression trees and turned into top-level apply joins. This
-	// property makes detection fast and easy so that the hoister doesn't waste
-	// time searching subtrees that don't contain subqueries.
-	HasCorrelatedSubquery bool
-
-	// CanHaveSideEffects is true if the expression modifies state outside its
-	// own scope, or if depends upon state that may change across evaluations. An
-	// expression can have side effects if it can do any of the following:
-	//
-	//   1. Trigger a run-time error
-	//        10 / col                          -- division by zero error possible
-	//        crdb_internal.force_error('', '') -- triggers run-time error
-	//
-	//   2. Modify outside session or database state
-	//        nextval(seq)               -- modifies database sequence value
-	//        SELECT * FROM [INSERT ...] -- inserts rows into database
-	//
-	//   3. Return different results when repeatedly called with same input
-	//        ORDER BY random()      -- random can return different values
-	//        ts < clock_timestamp() -- clock_timestamp can return different vals
-	//
-	// The optimizer makes *only* the following side-effect related guarantees:
-	//
-	//   1. CASE/IF branches are only evaluated if the branch condition is true.
-	//      Therefore, the following is guaranteed to never raise a divide by
-	//      zero error, regardless of how cleverly the optimizer rewrites the
-	//      expression:
-	//
-	//        CASE WHEN divisor<>0 THEN dividend / divisor ELSE NULL END
-	//
-	//      While this example is trivial, a more complex example might have
-	//      correlated subqueries that cannot be hoisted outside the CASE
-	//      expression in the usual way, since that would trigger premature
-	//      evaluation.
-	//
-	//   2. Expressions with side effects are never treated as constant
-	//      expressions, even though they do not depend on other columns in the
-	//      query:
-	//
-	//        SELECT * FROM xy ORDER BY random()
-	//
-	//      If the random() expression were treated as a constant, then the ORDER
-	//      BY could be dropped by the optimizer, since ordering by a constant is
-	//      a no-op. Instead, the optimizer treats it like it would an expression
-	//      that depends upon a column.
-	//
-	//   3. A common table expression (CTE) with side effects will only be
-	//      evaluated one time. This will typically prevent inlining of the CTE
-	//      into the query body. For example:
-	//
-	//        WITH a AS (INSERT ... RETURNING ...) SELECT * FROM a, a
-	//
-	//      Although the "a" CTE is referenced twice, it must be evaluated only
-	//      one time (and its results cached to satisfy the second reference).
-	//
-	// As long as the optimizer provides these guarantees, it is free to rewrite,
-	// reorder, duplicate, and eliminate as if no side effects were present. As an
-	// example, the optimizer is free to eliminate the unused "nextval" column in
-	// this query:
-	//
-	//   SELECT x FROM (SELECT nextval(seq), x FROM xy)
-	//   =>
-	//   SELECT x FROM xy
-	//
-	// It's also allowed to duplicate side-effecting expressions during predicate
-	// pushdown:
-	//
-	//   SELECT * FROM xy INNER JOIN xz ON xy.x=xz.x WHERE xy.x=random()
-	//   =>
-	//   SELECT *
-	//   FROM (SELECT * FROM xy WHERE xy.x=random())
-	//   INNER JOIN (SELECT * FROM xz WHERE xz.x=random())
-	//   ON xy.x=xz.x
-	//
-	CanHaveSideEffects bool
-
-	// CanMutate is true if the subtree rooted at this expression contains at
-	// least one operator that modifies schema (like CreateTable) or writes or
-	// deletes rows (like Insert).
-	CanMutate bool
-
-	// HasPlaceholder is true if the subtree rooted at this expression contains
-	// at least one Placeholder operator.
-	HasPlaceholder bool
 
 	// Rule props are lazily calculated and typically only apply to a single
 	// rule. See the comment above Relational.Rule for more details.
@@ -331,21 +260,17 @@ type Relational struct {
 		// been set.
 		InterestingOrderings opt.OrderingSet
 
-		// UnfilteredCols is the set of output columns that have values for every
-		// row in their owner table. Rows may be duplicated, but no rows can be
-		// missing. For example, an unconstrained, unlimited Scan operator can
-		// add all of its output columns to this property, but a Select operator
-		// cannot add any columns, as it may have filtered rows.
+		// UnfilteredCols is the set of all columns for which rows from their base
+		// table are guaranteed not to have been filtered. Rows may be duplicated,
+		// but no rows can be missing. Even columns which are not output columns are
+		// included as long as table rows are guaranteed not filtered. For example,
+		// an unconstrained, unlimited Scan operator can add all columns from its
+		// table to this property, but a Select operator cannot add any columns, as
+		// it may have filtered rows.
 		//
-		// UnfilteredCols is lazily populated by the SimplifyLeftJoinWithFilters
-		// and SimplifyRightJoinWithFilters rules. It is only valid once the
-		// Rule.Available.UnfilteredCols bit has been set.
+		// UnfilteredCols is lazily populated by GetJoinMultiplicityFromInputs. It
+		// is only valid once the Rule.Available.UnfilteredCols bit has been set.
 		UnfilteredCols opt.ColSet
-
-		// JoinSize is the number of relations being *inner* joined underneath
-		// this node. It is used to only reorder joins via AssociateJoin up to
-		// a certain limit.
-		JoinSize int
 	}
 }
 
@@ -357,13 +282,9 @@ type Scalar struct {
 
 	// Constraints is the set of constraints deduced from a boolean expression.
 	// For the expression to be true, all constraints in the set must be
-	// satisfied.
+	// satisfied. The constraints are not guaranteed to be exactly equivalent to
+	// the expression, see TightConstraints.
 	Constraints *constraint.Set
-
-	// TightConstraints is true if the expression is exactly equivalent to the
-	// constraints. If it is false, the constraints are weaker than the
-	// expression.
-	TightConstraints bool
 
 	// FuncDeps is a set of functional dependencies (FDs) inferred from a
 	// boolean expression. This field is only populated for Filters expressions.
@@ -387,6 +308,11 @@ type Scalar struct {
 	//
 	// For more details, see the header comment for FuncDepSet.
 	FuncDeps FuncDepSet
+
+	// TightConstraints is true if the expression is exactly equivalent to the
+	// constraints. If it is false, the constraints are weaker than the
+	// expression.
+	TightConstraints bool
 
 	// Rule encapsulates the set of properties that are maintained to assist
 	// with specific sets of transformation rules. See the Relational.Rule

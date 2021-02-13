@@ -16,12 +16,14 @@ import (
 	"math"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -37,16 +39,15 @@ func TestVectorizeInternalMemorySpaceError(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
-		Cfg:     &execinfra.ServerConfig{Settings: st},
+		Cfg: &execinfra.ServerConfig{
+			Settings:    st,
+			DiskMonitor: testDiskMonitor,
+		},
 		EvalCtx: &evalCtx,
 	}
 
 	oneInput := []execinfrapb.InputSyncSpec{
-		{ColumnTypes: []types.T{*types.Int}},
-	}
-	twoInputs := []execinfrapb.InputSyncSpec{
-		{ColumnTypes: []types.T{*types.Int}},
-		{ColumnTypes: []types.T{*types.Int}},
+		{ColumnTypes: []*types.T{types.Int}},
 	}
 
 	testCases := []struct {
@@ -63,15 +64,7 @@ func TestVectorizeInternalMemorySpaceError(t *testing.T) {
 				Post: execinfrapb.PostProcessSpec{
 					RenderExprs: []execinfrapb.Expression{{Expr: "CASE WHEN @1 = 1 THEN 1 ELSE 2 END"}},
 				},
-			},
-		},
-		{
-			desc: "MERGE JOIN",
-			spec: &execinfrapb.ProcessorSpec{
-				Input: twoInputs,
-				Core: execinfrapb.ProcessorCoreUnion{
-					MergeJoiner: &execinfrapb.MergeJoinerSpec{},
-				},
+				ResultTypes: rowenc.OneIntCol,
 			},
 		},
 	}
@@ -79,11 +72,11 @@ func TestVectorizeInternalMemorySpaceError(t *testing.T) {
 	for _, tc := range testCases {
 		for _, success := range []bool{true, false} {
 			t.Run(fmt.Sprintf("%s-success-expected-%t", tc.desc, success), func(t *testing.T) {
-				inputs := []colexec.Operator{colexec.NewZeroOp(nil)}
+				inputs := []colexecbase.Operator{colexec.NewFixedNumTuplesNoInputOp(testAllocator, 0 /* numTuples */)}
 				if len(tc.spec.Input) > 1 {
-					inputs = append(inputs, colexec.NewZeroOp(nil))
+					inputs = append(inputs, colexec.NewFixedNumTuplesNoInputOp(testAllocator, 0 /* numTuples */))
 				}
-				memMon := mon.MakeMonitor("MemoryMonitor", mon.MemoryResource, nil, nil, 0, math.MaxInt64, st)
+				memMon := mon.NewMonitor("MemoryMonitor", mon.MemoryResource, nil, nil, 0, math.MaxInt64, st)
 				if success {
 					memMon.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
 				} else {
@@ -92,17 +85,18 @@ func TestVectorizeInternalMemorySpaceError(t *testing.T) {
 				defer memMon.Stop(ctx)
 				acc := memMon.MakeBoundAccount()
 				defer acc.Close(ctx)
-				args := colexec.NewColOperatorArgs{
+				args := &colexec.NewColOperatorArgs{
 					Spec:                tc.spec,
 					Inputs:              inputs,
 					StreamingMemAccount: &acc,
 				}
-				args.TestingKnobs.UseStreamingMemAccountForBuffering = true
-				result, err := colexec.NewColOperator(ctx, flowCtx, args)
-				if err != nil {
-					t.Fatal(err)
+				var setupErr error
+				err := colexecerror.CatchVectorizedRuntimeError(func() {
+					_, setupErr = colbuilder.NewColOperator(ctx, flowCtx, args)
+				})
+				if setupErr != nil {
+					t.Fatal(setupErr)
 				}
-				err = acc.Grow(ctx, int64(result.InternalMemUsage))
 				if success {
 					require.NoError(t, err, "expected success, found: ", err)
 				} else {
@@ -121,16 +115,19 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
-		Cfg:     &execinfra.ServerConfig{Settings: st},
+		Cfg: &execinfra.ServerConfig{
+			Settings:    st,
+			DiskMonitor: testDiskMonitor,
+		},
 		EvalCtx: &evalCtx,
 	}
 
 	oneInput := []execinfrapb.InputSyncSpec{
-		{ColumnTypes: []types.T{*types.Int}},
+		{ColumnTypes: []*types.T{types.Int}},
 	}
 	twoInputs := []execinfrapb.InputSyncSpec{
-		{ColumnTypes: []types.T{*types.Int}},
-		{ColumnTypes: []types.T{*types.Int}},
+		{ColumnTypes: []*types.T{types.Int}},
+		{ColumnTypes: []*types.T{types.Int}},
 	}
 
 	testCases := []struct {
@@ -153,6 +150,7 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 						},
 					},
 				},
+				ResultTypes: oneInput[0].ColumnTypes,
 			},
 			spillingSupported: true,
 		},
@@ -171,6 +169,7 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 						},
 					},
 				},
+				ResultTypes: oneInput[0].ColumnTypes,
 			},
 		},
 		{
@@ -183,23 +182,23 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 						RightEqColumns: []uint32{0},
 					},
 				},
+				ResultTypes: append(twoInputs[0].ColumnTypes, twoInputs[1].ColumnTypes...),
 			},
 			spillingSupported: true,
 		},
 	}
 
-	batch := testAllocator.NewMemBatchWithSize(
-		[]coltypes.T{coltypes.Int64}, 1, /* size */
-	)
+	typs := []*types.T{types.Int}
+	batch := testAllocator.NewMemBatchWithFixedCapacity(typs, 1 /* size */)
 	for _, tc := range testCases {
 		for _, success := range []bool{true, false} {
 			expectNoMemoryError := success || tc.spillingSupported
 			t.Run(fmt.Sprintf("%s-success-expected-%t", tc.desc, expectNoMemoryError), func(t *testing.T) {
-				inputs := []colexec.Operator{colexec.NewRepeatableBatchSource(testAllocator, batch)}
+				inputs := []colexecbase.Operator{colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)}
 				if len(tc.spec.Input) > 1 {
-					inputs = append(inputs, colexec.NewRepeatableBatchSource(testAllocator, batch))
+					inputs = append(inputs, colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs))
 				}
-				memMon := mon.MakeMonitor("MemoryMonitor", mon.MemoryResource, nil, nil, 0, math.MaxInt64, st)
+				memMon := mon.NewMonitor("MemoryMonitor", mon.MemoryResource, nil, nil, 0, math.MaxInt64, st)
 				flowCtx.Cfg.TestingKnobs = execinfra.TestingKnobs{}
 				if expectNoMemoryError {
 					memMon.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
@@ -217,28 +216,41 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 				defer memMon.Stop(ctx)
 				acc := memMon.MakeBoundAccount()
 				defer acc.Close(ctx)
-				args := colexec.NewColOperatorArgs{
+				args := &colexec.NewColOperatorArgs{
 					Spec:                tc.spec,
 					Inputs:              inputs,
 					StreamingMemAccount: &acc,
-					FDSemaphore:         colexec.NewTestingSemaphore(256),
+					FDSemaphore:         colexecbase.NewTestingSemaphore(256),
 				}
 				// The disk spilling infrastructure relies on different memory
 				// accounts, so if the spilling is supported, we do *not* want to use
 				// streaming memory account.
 				args.TestingKnobs.UseStreamingMemAccountForBuffering = !tc.spillingSupported
-				result, err := colexec.NewColOperator(ctx, flowCtx, args)
-				require.NoError(t, err)
-				err = execerror.CatchVectorizedRuntimeError(func() {
-					result.Op.Init()
-					result.Op.Next(ctx)
-					result.Op.Next(ctx)
-				})
-				for _, memAccount := range result.BufferingOpMemAccounts {
-					memAccount.Close(ctx)
+				var (
+					result *colexec.NewColOperatorResult
+					err    error
+				)
+				// The memory error can occur either during planning or during
+				// execution, and we want to actually execute the "query" only
+				// if there was no error during planning. That is why we have
+				// two separate panic-catchers.
+				if err = colexecerror.CatchVectorizedRuntimeError(func() {
+					result, err = colbuilder.NewColOperator(ctx, flowCtx, args)
+					require.NoError(t, err)
+				}); err == nil {
+					err = colexecerror.CatchVectorizedRuntimeError(func() {
+						result.Op.Init()
+						result.Op.Next(ctx)
+						result.Op.Next(ctx)
+					})
 				}
-				for _, memMonitor := range result.BufferingOpMemMonitors {
-					memMonitor.Stop(ctx)
+				if result != nil {
+					for _, memAccount := range result.OpAccounts {
+						memAccount.Close(ctx)
+					}
+					for _, memMonitor := range result.OpMonitors {
+						memMonitor.Stop(ctx)
+					}
 				}
 				if expectNoMemoryError {
 					require.NoError(t, err, "expected success, found: ", err)

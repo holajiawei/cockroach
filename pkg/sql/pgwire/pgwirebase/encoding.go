@@ -17,11 +17,14 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -34,11 +37,31 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/errors"
+	"github.com/dustin/go-humanize"
 	"github.com/jackc/pgx/pgtype"
 	"github.com/lib/pq/oid"
 )
 
-const maxMessageSize = 1 << 24
+const (
+	defaultMaxReadBufferMessageSize = 1 << 24
+	minReadBufferMessageSize        = 1 << 14
+)
+
+const readBufferMaxMessageSizeClusterSettingName = "sql.conn.max_read_buffer_message_size"
+
+// ReadBufferMaxMessageSizeClusterSetting is the cluster setting for configuring
+// ReadBuffer default message sizes.
+var ReadBufferMaxMessageSizeClusterSetting = settings.RegisterByteSizeSetting(
+	readBufferMaxMessageSizeClusterSettingName,
+	"maximum buffer size to allow for ingesting sql statements. Connections must be restarted for this to take effect.",
+	defaultMaxReadBufferMessageSize,
+	func(val int64) error {
+		if val < minReadBufferMessageSize {
+			return errors.Newf("buffer message size must be at least %s", humanize.Bytes(minReadBufferMessageSize))
+		}
+		return nil
+	},
+)
 
 // FormatCode represents a pgwire data format.
 //
@@ -64,8 +87,33 @@ type BufferedReader interface {
 
 // ReadBuffer provides a convenient way to read pgwire protocol messages.
 type ReadBuffer struct {
-	Msg []byte
-	tmp [4]byte
+	Msg            []byte
+	tmp            [4]byte
+	maxMessageSize int
+}
+
+// ReadBufferOption is an optional argument to use with ReadBuffer.
+type ReadBufferOption func(*ReadBuffer)
+
+// ReadBufferOptionWithClusterSettings utilizes the cluster settings for setting
+// various defaults in the ReadBuffer.
+func ReadBufferOptionWithClusterSettings(sv *settings.Values) ReadBufferOption {
+	return func(b *ReadBuffer) {
+		if sv != nil {
+			b.maxMessageSize = int(ReadBufferMaxMessageSizeClusterSetting.Get(sv))
+		}
+	}
+}
+
+// MakeReadBuffer returns a new ReaderBuffer with the given size.
+func MakeReadBuffer(opts ...ReadBufferOption) ReadBuffer {
+	buf := ReadBuffer{
+		maxMessageSize: defaultMaxReadBufferMessageSize,
+	}
+	for _, opt := range opts {
+		opt(&buf)
+	}
+	return buf
 }
 
 // reset sets b.Msg to exactly size, attempting to use spare capacity
@@ -94,6 +142,9 @@ func (b *ReadBuffer) reset(size int) {
 // was one. The number of bytes returned can be non-zero even with an error
 // (e.g. if data was read but didn't validate) so that we can more accurately
 // measure network traffic.
+//
+// If the error is related to consuming a buffer that is larger than the
+// maxMessageSize, the remaining bytes will be read but discarded.
 func (b *ReadBuffer) ReadUntypedMsg(rd io.Reader) (int, error) {
 	nread, err := io.ReadFull(rd, b.tmp[:])
 	if err != nil {
@@ -102,14 +153,48 @@ func (b *ReadBuffer) ReadUntypedMsg(rd io.Reader) (int, error) {
 	size := int(binary.BigEndian.Uint32(b.tmp[:]))
 	// size includes itself.
 	size -= 4
-	if size > maxMessageSize || size < 0 {
-		return nread, NewProtocolViolationErrorf("message size %d out of bounds (0..%d)",
-			size, maxMessageSize)
+	if size > b.maxMessageSize || size < 0 {
+		err := errors.WithHintf(
+			NewProtocolViolationErrorf(
+				"message size %s bigger than maximum allowed message size %s",
+				humanize.IBytes(uint64(size)),
+				humanize.IBytes(uint64(b.maxMessageSize)),
+			),
+			"the maximum message size can be configured using the %s cluster setting",
+			readBufferMaxMessageSizeClusterSettingName,
+		)
+		if size > 0 {
+			err = withMessageTooBigError(err, size)
+		}
+		return nread, err
 	}
 
 	b.reset(size)
 	n, err := io.ReadFull(rd, b.Msg)
 	return nread + n, err
+}
+
+// SlurpBytes will consume n bytes from the read buffer, using the existing
+// buffer to ingest the message.
+func (b *ReadBuffer) SlurpBytes(rd io.Reader, n int) (int, error) {
+	var nRead int
+	if b.maxMessageSize > 0 {
+		sizeRemaining := n
+		for sizeRemaining > 0 {
+			toRead := sizeRemaining
+			if b.maxMessageSize < sizeRemaining {
+				toRead = b.maxMessageSize
+			}
+			b.reset(toRead)
+			readBatch, err := io.ReadFull(rd, b.Msg)
+			nRead += readBatch
+			sizeRemaining -= readBatch
+			if err != nil {
+				return nRead, err
+			}
+		}
+	}
+	return nRead, nil
 }
 
 // ReadTypedMsg reads a message from the provided reader, returning its type code and body.
@@ -211,12 +296,13 @@ func validateArrayDimensions(nDimensions int, nElements int) error {
 	return nil
 }
 
-// DecodeOidDatum decodes bytes with specified Oid and format code into
-// a datum. If the ParseTimeContext is nil, reasonable defaults
-// will be applied.
-func DecodeOidDatum(
-	ctx tree.ParseTimeContext, id oid.Oid, code FormatCode, b []byte,
+// DecodeDatum decodes bytes with specified type and format code into
+// a datum. If res is nil, then user defined types are not attempted
+// to be resolved.
+func DecodeDatum(
+	evalCtx *tree.EvalContext, t *types.T, code FormatCode, b []byte,
 ) (tree.Datum, error) {
+	id := t.Oid()
 	switch code {
 	case FormatText:
 		switch id {
@@ -238,18 +324,42 @@ func DecodeOidDatum(
 				return nil, err
 			}
 			return tree.NewDInt(tree.DInt(i)), nil
-		case oid.T_oid:
-			u, err := strconv.ParseUint(string(b), 10, 32)
-			if err != nil {
-				return nil, err
-			}
-			return tree.NewDOid(tree.DInt(u)), nil
+		case oid.T_oid,
+			oid.T_regoper,
+			oid.T_regproc,
+			oid.T_regrole,
+			oid.T_regclass,
+			oid.T_regtype,
+			oid.T_regconfig,
+			oid.T_regoperator,
+			oid.T_regnamespace,
+			oid.T_regprocedure,
+			oid.T_regdictionary:
+			return tree.ParseDOid(evalCtx, string(b), t)
 		case oid.T_float4, oid.T_float8:
 			f, err := strconv.ParseFloat(string(b), 64)
 			if err != nil {
 				return nil, err
 			}
 			return tree.NewDFloat(tree.DFloat(f)), nil
+		case oidext.T_box2d:
+			d, err := tree.ParseDBox2D(string(b))
+			if err != nil {
+				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as box2d", b)
+			}
+			return d, nil
+		case oidext.T_geography:
+			d, err := tree.ParseDGeography(string(b))
+			if err != nil {
+				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as geography", b)
+			}
+			return d, nil
+		case oidext.T_geometry:
+			d, err := tree.ParseDGeometry(string(b))
+			if err != nil {
+				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as geometry", b)
+			}
+			return d, nil
 		case oid.T_numeric:
 			d, err := tree.ParseDDecimal(string(b))
 			if err != nil {
@@ -263,31 +373,31 @@ func DecodeOidDatum(
 			}
 			return tree.NewDBytes(tree.DBytes(res)), nil
 		case oid.T_timestamp:
-			d, err := tree.ParseDTimestamp(ctx, string(b), time.Microsecond)
+			d, _, err := tree.ParseDTimestamp(evalCtx, string(b), time.Microsecond)
 			if err != nil {
 				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as timestamp", b)
 			}
 			return d, nil
 		case oid.T_timestamptz:
-			d, err := tree.ParseDTimestampTZ(ctx, string(b), time.Microsecond)
+			d, _, err := tree.ParseDTimestampTZ(evalCtx, string(b), time.Microsecond)
 			if err != nil {
 				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as timestamptz", b)
 			}
 			return d, nil
 		case oid.T_date:
-			d, err := tree.ParseDDate(ctx, string(b))
+			d, _, err := tree.ParseDDate(evalCtx, string(b))
 			if err != nil {
 				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as date", b)
 			}
 			return d, nil
 		case oid.T_time:
-			d, err := tree.ParseDTime(nil, string(b), time.Microsecond)
+			d, _, err := tree.ParseDTime(nil, string(b), time.Microsecond)
 			if err != nil {
 				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as time", b)
 			}
 			return d, nil
 		case oid.T_timetz:
-			d, err := tree.ParseDTimeTZ(ctx, string(b), time.Microsecond)
+			d, _, err := tree.ParseDTimeTZ(evalCtx, string(b), time.Microsecond)
 			if err != nil {
 				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as timetz", b)
 			}
@@ -549,13 +659,13 @@ func DecodeOidDatum(
 				return nil, pgerror.Newf(pgcode.Syntax, "timestamp requires 8 bytes for binary format")
 			}
 			i := int64(binary.BigEndian.Uint64(b))
-			return tree.MakeDTimestamp(pgBinaryToTime(i), time.Microsecond), nil
+			return tree.MakeDTimestamp(pgBinaryToTime(i), time.Microsecond)
 		case oid.T_timestamptz:
 			if len(b) < 8 {
 				return nil, pgerror.Newf(pgcode.Syntax, "timestamptz requires 8 bytes for binary format")
 			}
 			i := int64(binary.BigEndian.Uint64(b))
-			return tree.MakeDTimestampTZ(pgBinaryToTime(i), time.Microsecond), nil
+			return tree.MakeDTimestampTZ(pgBinaryToTime(i), time.Microsecond)
 		case oid.T_date:
 			if len(b) < 4 {
 				return nil, pgerror.Newf(pgcode.Syntax, "date requires 4 bytes for binary format")
@@ -647,8 +757,7 @@ func DecodeOidDatum(
 			return &tree.DBitArray{BitArray: ba}, err
 		default:
 			if _, ok := types.ArrayOids[id]; ok {
-				innerOid := types.OidToType[id].ArrayContents().Oid()
-				return decodeBinaryArray(ctx, innerOid, b, code)
+				return decodeBinaryArray(evalCtx, types.OidToType[id].ArrayContents(), b, code)
 			}
 		}
 	default:
@@ -657,21 +766,36 @@ func DecodeOidDatum(
 	}
 
 	// Types with identical text/binary handling.
+	switch t.Family() {
+	case types.EnumFamily:
+		if err := validateStringBytes(b); err != nil {
+			return nil, err
+		}
+		return tree.MakeDEnumFromLogicalRepresentation(t, string(b))
+	}
 	switch id {
-	case oid.T_text, oid.T_varchar, oid.T_bpchar:
+	case oid.T_text, oid.T_varchar:
 		if err := validateStringBytes(b); err != nil {
 			return nil, err
 		}
 		return tree.NewDString(string(b)), nil
+	case oid.T_bpchar:
+		if err := validateStringBytes(b); err != nil {
+			return nil, err
+		}
+		// Trim the trailing spaces
+		sv := strings.TrimRight(string(b), " ")
+		return tree.NewDString(sv), nil
 	case oid.T_name:
 		if err := validateStringBytes(b); err != nil {
 			return nil, err
 		}
 		return tree.NewDName(string(b)), nil
-	default:
-		return nil, errors.AssertionFailedf(
-			"unsupported OID %v with format code %s", errors.Safe(id), errors.Safe(code))
 	}
+
+	// Fallthrough case.
+	return nil, errors.AssertionFailedf(
+		"unsupported OID %v with format code %s", errors.Safe(id), errors.Safe(code))
 }
 
 // Values which are going to be converted to strings (STRING and NAME) need to
@@ -770,7 +894,7 @@ func pgBinaryToIPAddr(b []byte) (ipaddr.IPAddr, error) {
 }
 
 func decodeBinaryArray(
-	ctx tree.ParseTimeContext, elemOid oid.Oid, b []byte, code FormatCode,
+	evalCtx *tree.EvalContext, t *types.T, b []byte, code FormatCode,
 ) (tree.Datum, error) {
 	var hdr struct {
 		Ndims int32
@@ -790,10 +914,10 @@ func decodeBinaryArray(
 	if err := binary.Read(r, binary.BigEndian, &hdr); err != nil {
 		return nil, err
 	}
-	if elemOid != oid.Oid(hdr.ElemOid) {
+	if t.Oid() != oid.Oid(hdr.ElemOid) {
 		return nil, pgerror.Newf(pgcode.DatatypeMismatch, "wrong element type")
 	}
-	arr := tree.NewDArray(types.OidToType[elemOid])
+	arr := tree.NewDArray(types.OidToType[t.Oid()])
 	if hdr.Ndims == 0 {
 		return arr, nil
 	}
@@ -815,7 +939,7 @@ func decodeBinaryArray(
 			continue
 		}
 		buf := r.Next(int(vlen))
-		elem, err := DecodeOidDatum(ctx, elemOid, code, buf)
+		elem, err := DecodeDatum(evalCtx, t, code, buf)
 		if err != nil {
 			return nil, err
 		}

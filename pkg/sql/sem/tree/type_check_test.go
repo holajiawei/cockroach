@@ -11,6 +11,7 @@
 package tree_test
 
 import (
+	"context"
 	"regexp"
 	"testing"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // The following tests need both the type checking infrastructure and also
@@ -27,6 +29,15 @@ import (
 
 func TestTypeCheck(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	typeMap := map[string]*types.T{
+		"d.t1":   types.Int,
+		"t2":     types.String,
+		"d.s.t3": types.Decimal,
+	}
+	mapResolver := tree.MakeTestingMapTypeResolver(typeMap)
+
 	testData := []struct {
 		expr string
 		// The expected serialized expression after type-checking. This tests both
@@ -43,7 +54,7 @@ func TestTypeCheck(t *testing.T) {
 		{`NULL::int4`, `NULL::INT4`},
 		{`NULL::int8`, `NULL::INT8`},
 		{`INTERVAL '1s'`, `'00:00:01':::INTERVAL`},
-		{`(1.1::decimal)::decimal`, `1.1:::DECIMAL::DECIMAL::DECIMAL`},
+		{`(1.1::decimal)::decimal`, `1.1:::DECIMAL`},
 		{`NULL = 1`, `NULL`},
 		{`1 = NULL`, `NULL`},
 		{`true AND NULL`, `true AND NULL`},
@@ -81,14 +92,14 @@ func TestTypeCheck(t *testing.T) {
 		{`true IS NOT FALSE`, `true IS NOT false`},
 		{`CASE 1 WHEN 1 THEN (1, 2) ELSE (1, 3) END`, `CASE 1:::INT8 WHEN 1:::INT8 THEN (1:::INT8, 2:::INT8) ELSE (1:::INT8, 3:::INT8) END`},
 		{`1 BETWEEN 2 AND 3`, `1:::INT8 BETWEEN 2:::INT8 AND 3:::INT8`},
-		{`4 BETWEEN 2.4 AND 5.5::float`, `4:::INT8 BETWEEN 2.4:::DECIMAL AND 5.5:::FLOAT8::FLOAT8`},
+		{`4 BETWEEN 2.4 AND 5.5::float`, `4:::INT8 BETWEEN 2.4:::DECIMAL AND 5.5:::FLOAT8`},
 		{`count(3)`, `count(3:::INT8)`},
 		{`ARRAY['a', 'b', 'c']`, `ARRAY['a':::STRING, 'b':::STRING, 'c':::STRING]:::STRING[]`},
 		{`ARRAY[1.5, 2.5, 3.5]`, `ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]:::DECIMAL[]`},
-		{`ARRAY[NULL]`, `ARRAY[NULL]`},
+		{`ARRAY[NULL]`, `ARRAY[NULL]:::STRING[]`},
 		{`ARRAY[NULL]:::int[]`, `ARRAY[NULL]:::INT8[]`},
 		{`ARRAY[NULL, NULL]:::int[]`, `ARRAY[NULL, NULL]:::INT8[]`},
-		{`ARRAY[]::INT8[]`, `ARRAY[]:::INT8[]::INT8[]`},
+		{`ARRAY[]::INT8[]`, `ARRAY[]:::INT8[]`},
 		{`ARRAY[]:::INT8[]`, `ARRAY[]:::INT8[]`},
 		{`1 = ANY ARRAY[1.5, 2.5, 3.5]`, `1:::DECIMAL = ANY ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]:::DECIMAL[]`},
 		{`true = SOME (ARRAY[true, false])`, `true = SOME ARRAY[true, false]:::BOOL[]`},
@@ -101,9 +112,9 @@ func TestTypeCheck(t *testing.T) {
 		{`NULL = ALL current_schemas(true)`, `NULL`},
 
 		{`INTERVAL '1'`, `'00:00:01':::INTERVAL`},
-		{`DECIMAL '1.0'`, `1.0:::DECIMAL::DECIMAL`},
+		{`DECIMAL '1.0'`, `1.0:::DECIMAL`},
 
-		{`1 + 2`, `3:::INT8`},
+		{`1 + 2`, `1:::INT8 + 2:::INT8`},
 		{`1:::decimal + 2`, `1:::DECIMAL + 2:::DECIMAL`},
 		{`1:::float + 2`, `1.0:::FLOAT8 + 2.0:::FLOAT8`},
 		{`INTERVAL '1.5s' * 2`, `'00:00:01.5':::INTERVAL * 2:::INT8`},
@@ -163,29 +174,42 @@ func TestTypeCheck(t *testing.T) {
 			`information_schema._pg_expandarray(ARRAY[1:::INT8, 3:::INT8]:::INT8[])`,
 		},
 		{`((ROW (1) AS a)).*`, `((1:::INT8,) AS a)`},
-		{`((('1'||'', 1+1) AS a, b)).*`, `(('1':::STRING, 2:::INT8) AS a, b)`},
+		{`((('1'||'', 1+1) AS a, b)).*`, `(('1':::STRING || '':::STRING, 1:::INT8 + 1:::INT8) AS a, b)`},
+
+		{`'{"x": "bar"}' -> 'x'`, `'{"x": "bar"}':::JSONB->'x':::STRING`},
+		{`('{"x": "bar"}') -> 'x'`, `'{"x": "bar"}':::JSONB->'x':::STRING`},
 
 		// These outputs, while bizarre looking, are correct and expected. The
 		// type annotation is caused by the call to tree.Serialize, which formats the
 		// output using the Parseable formatter which inserts type annotations
 		// at the end of all well-typed datums. And the second cast is caused by
 		// the test itself.
-		{`'NaN'::decimal`, `'NaN':::DECIMAL::DECIMAL`},
-		{`'-NaN'::decimal`, `'NaN':::DECIMAL::DECIMAL`},
-		{`'Inf'::decimal`, `'Infinity':::DECIMAL::DECIMAL`},
-		{`'-Inf'::decimal`, `'-Infinity':::DECIMAL::DECIMAL`},
+		{`'NaN'::decimal`, `'NaN':::DECIMAL`},
+		{`'-NaN'::decimal`, `'NaN':::DECIMAL`},
+		{`'Inf'::decimal`, `'Infinity':::DECIMAL`},
+		{`'-Inf'::decimal`, `'-Infinity':::DECIMAL`},
+
+		// Test type checking with some types to resolve.
+		// Because the resolvable types right now are just aliases, the
+		// pre-resolution name is not going to get formatted.
+		{`1:::d.t1`, `1:::INT8`},
+		{`1:::d.s.t3 + 1.4`, `1:::DECIMAL + 1.4:::DECIMAL`},
+		{`1 IS OF (d.t1, t2)`, `1:::INT8 IS OF (INT8, STRING)`},
+		{`1::d.t1`, `1:::INT8`},
 	}
+	ctx := context.Background()
 	for _, d := range testData {
 		t.Run(d.expr, func(t *testing.T) {
 			expr, err := parser.ParseExpr(d.expr)
 			if err != nil {
 				t.Fatalf("%s: %v", d.expr, err)
 			}
-			ctx := tree.MakeSemaContext()
-			if err := ctx.Placeholders.Init(1 /* numPlaceholders */, nil /* typeHints */); err != nil {
+			semaCtx := tree.MakeSemaContext()
+			if err := semaCtx.Placeholders.Init(1 /* numPlaceholders */, nil /* typeHints */); err != nil {
 				t.Fatal(err)
 			}
-			typeChecked, err := tree.TypeCheck(expr, &ctx, types.Any)
+			semaCtx.TypeResolver = mapResolver
+			typeChecked, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
 			if err != nil {
 				t.Fatalf("%s: unexpected error %s", d.expr, err)
 			}
@@ -198,6 +222,15 @@ func TestTypeCheck(t *testing.T) {
 
 func TestTypeCheckError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	typeMap := map[string]*types.T{
+		"d.t1":   types.Int,
+		"t2":     types.String,
+		"d.s.t3": types.Decimal,
+	}
+	mapResolver := tree.MakeTestingMapTypeResolver(typeMap)
+
 	testData := []struct {
 		expr     string
 		expected string
@@ -276,16 +309,109 @@ func TestTypeCheckError(t *testing.T) {
 			`(pg_get_keywords()).foo`,
 			`could not identify column "foo" in tuple{string AS word, string AS catcode, string AS catdesc}`,
 		},
+		{
+			`1::d.notatype`,
+			`type "d.notatype" does not exist`,
+		},
+		{
+			`1 + 2::d.s.typ`,
+			`type "d.s.typ" does not exist`,
+		},
 	}
+	ctx := context.Background()
 	for _, d := range testData {
 		t.Run(d.expr, func(t *testing.T) {
-			expr, err := parser.ParseExpr(d.expr)
-			if err != nil {
-				t.Fatalf("%s: %v", d.expr, err)
-			}
-			if _, err := tree.TypeCheck(expr, nil, types.Any); !testutils.IsError(err, regexp.QuoteMeta(d.expected)) {
-				t.Errorf("%s: expected %s, but found %v", d.expr, d.expected, err)
-			}
+			// Test with a nil and non-nil semaCtx.
+			t.Run("semaCtx not nil", func(t *testing.T) {
+				semaCtx := tree.MakeSemaContext()
+				semaCtx.TypeResolver = mapResolver
+				expr, err := parser.ParseExpr(d.expr)
+				if err != nil {
+					t.Fatalf("%s: %v", d.expr, err)
+				}
+				if _, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any); !testutils.IsError(err, regexp.QuoteMeta(d.expected)) {
+					t.Errorf("%s: expected %s, but found %v", d.expr, d.expected, err)
+				}
+			})
+			t.Run("semaCtx is nil", func(t *testing.T) {
+				expr, err := parser.ParseExpr(d.expr)
+				if err != nil {
+					t.Fatalf("%s: %v", d.expr, err)
+				}
+				if _, err := tree.TypeCheck(ctx, expr, nil, types.Any); !testutils.IsError(err, regexp.QuoteMeta(d.expected)) {
+					t.Errorf("%s: expected %s, but found %v", d.expr, d.expected, err)
+				}
+			})
 		})
+	}
+}
+
+func TestTypeCheckVolatility(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// $1 has type timestamptz.
+	placeholderTypes := []*types.T{types.TimestampTZ}
+
+	testCases := []struct {
+		expr       string
+		volatility tree.Volatility
+	}{
+		{"1 + 1", tree.VolatilityImmutable},
+		{"random()", tree.VolatilityVolatile},
+		{"now()", tree.VolatilityStable},
+		{"'2020-01-01 01:02:03'::timestamp", tree.VolatilityImmutable},
+		{"'now'::timestamp", tree.VolatilityStable},
+		{"'2020-01-01 01:02:03'::timestamptz", tree.VolatilityStable},
+		{"'1 hour'::interval", tree.VolatilityImmutable},
+		{"$1", tree.VolatilityImmutable},
+
+		// Stable cast with immutable input.
+		{"$1::string", tree.VolatilityStable},
+
+		// Stable binary operator with immutable inputs.
+		{"$1 + '1 hour'::interval", tree.VolatilityStable},
+
+		// Stable comparison operator with immutable inputs.
+		{"$1 = '2020-01-01 01:02:03'::timestamp", tree.VolatilityStable},
+	}
+
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
+	if err := semaCtx.Placeholders.Init(len(placeholderTypes), placeholderTypes); err != nil {
+		t.Fatal(err)
+	}
+
+	typeCheck := func(sql string) error {
+		expr, err := parser.ParseExpr(sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		_, err = tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
+		return err
+	}
+
+	for _, tc := range testCases {
+		// First, typecheck without any restrictions.
+		semaCtx.Properties.Require("", 0 /* flags */)
+		if err := typeCheck(tc.expr); err != nil {
+			t.Fatalf("%s: %v", tc.expr, err)
+		}
+
+		semaCtx.Properties.Require("", tree.RejectVolatileFunctions)
+		expectErr := tc.volatility == tree.VolatilityVolatile
+		if err := typeCheck(tc.expr); err == nil && expectErr {
+			t.Fatalf("%s: should have rejected volatile function", tc.expr)
+		} else if err != nil && !expectErr {
+			t.Fatalf("%s: %v", tc.expr, err)
+		}
+
+		semaCtx.Properties.Require("", tree.RejectStableOperators|tree.RejectVolatileFunctions)
+		expectErr = tc.volatility >= tree.VolatilityStable
+		if err := typeCheck(tc.expr); err == nil && expectErr {
+			t.Fatalf("%s: should have rejected stable operator", tc.expr)
+		} else if err != nil && !expectErr {
+			t.Fatalf("%s: %v", tc.expr, err)
+		}
 	}
 }

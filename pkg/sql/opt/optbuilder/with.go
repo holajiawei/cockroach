@@ -75,16 +75,25 @@ func (b *Builder) buildCTE(
 	}
 	cteScope.ctes = map[string]*cteSource{cte.Name.Alias.String(): cteSrc}
 
-	initial, recursive, ok := b.splitRecursiveCTE(cte.Stmt)
-	if !ok {
+	initial, recursive, isUnionAll, ok := b.splitRecursiveCTE(cte.Stmt)
+	// We don't currently support the UNION form (only UNION ALL).
+	if !ok || !isUnionAll {
 		// Build this as a non-recursive CTE, but throw a proper error message if it
 		// does have a recursive reference.
 		cteSrc.onRef = func() {
-			panic(pgerror.Newf(
-				pgcode.Syntax,
-				"recursive query %q does not have the form non-recursive-term UNION ALL recursive-term",
-				cte.Name.Alias,
-			))
+			if !ok {
+				panic(pgerror.Newf(
+					pgcode.Syntax,
+					"recursive query %q does not have the form non-recursive-term UNION ALL recursive-term",
+					cte.Name.Alias,
+				))
+			} else {
+				panic(unimplementedWithIssueDetailf(
+					46642, "",
+					"recursive query %q uses UNION which is not implemented (only UNION ALL is supported)",
+					cte.Name.Alias,
+				))
+			}
 		}
 		return b.buildCTE(cte, cteScope, false /* recursive */)
 	}
@@ -97,7 +106,11 @@ func (b *Builder) buildCTE(
 			cte.Name.Alias,
 		))
 	}
+	// If the initial statement contains CTEs, we don't want the Withs hoisted
+	// above the recursive CTE.
+	b.pushWithFrame()
 	initialScope := b.buildStmt(initial, nil /* desiredTypes */, cteScope)
+	b.popWithFrame(initialScope)
 
 	initialScope.removeHiddenCols()
 	b.dropOrderingAndExtraCols(initialScope)
@@ -114,7 +127,15 @@ func (b *Builder) buildCTE(
 	// We don't really know the input row count, except for the first time we run
 	// the recursive query. We don't have anything better though.
 	bindingProps.Stats.RowCount = initialScope.expr.Relational().Stats.RowCount
-	cteSrc.bindingProps = bindingProps
+	// Row count must be greater than 0 or the stats code will throw an error.
+	// Set it to 1 to match the cardinality.
+	if bindingProps.Stats.RowCount < 1 {
+		bindingProps.Stats.RowCount = 1
+	}
+	cteSrc.expr = b.factory.ConstructFakeRel(&memo.FakeRelPrivate{
+		Props: bindingProps,
+	})
+	b.factory.Metadata().AddWithBinding(withID, cteSrc.expr)
 
 	cteSrc.cols = b.getCTECols(initialScope, cte.Name)
 
@@ -139,7 +160,11 @@ func (b *Builder) buildCTE(
 		numRefs++
 	}
 
+	// If the recursive statement contains CTEs, we don't want the Withs hoisted
+	// above the recursive CTE.
+	b.pushWithFrame()
 	recursiveScope := b.buildStmt(recursive, initialTypes /* desiredTypes */, cteScope)
+	b.popWithFrame(recursiveScope)
 
 	if numRefs == 0 {
 		// Build this as a non-recursive CTE.
@@ -178,7 +203,7 @@ func (b *Builder) buildCTE(
 		OutCols:       colsToColList(outScope.cols),
 	}
 
-	expr := b.factory.ConstructRecursiveCTE(initialScope.expr, recursiveScope.expr, &private)
+	expr := b.factory.ConstructRecursiveCTE(cteSrc.expr, initialScope.expr, recursiveScope.expr, &private)
 	return expr, cteSrc.cols
 }
 
@@ -220,16 +245,16 @@ func (b *Builder) getCTECols(cteScope *scope, name tree.AliasClause) physical.Pr
 // returns ok=false.
 func (b *Builder) splitRecursiveCTE(
 	stmt tree.Statement,
-) (initial, recursive *tree.Select, ok bool) {
+) (initial, recursive *tree.Select, isUnionAll bool, ok bool) {
 	sel, ok := stmt.(*tree.Select)
 	// The form above doesn't allow for "outer" WITH, ORDER BY, or LIMIT
 	// clauses.
 	if !ok || sel.With != nil || sel.OrderBy != nil || sel.Limit != nil {
-		return nil, nil, false
+		return nil, nil, false, false
 	}
 	union, ok := sel.Select.(*tree.UnionClause)
-	if !ok || union.Type != tree.UnionOp || !union.All {
-		return nil, nil, false
+	if !ok || union.Type != tree.UnionOp {
+		return nil, nil, false, false
 	}
-	return union.Left, union.Right, true
+	return union.Left, union.Right, union.All, true
 }

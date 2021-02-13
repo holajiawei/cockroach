@@ -21,14 +21,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/lib/pq/oid"
 )
@@ -37,6 +37,7 @@ type encodingTest struct {
 	SQL          string
 	Datum        tree.Datum
 	Oid          oid.Oid
+	T            *types.T
 	Text         string
 	TextAsBinary []byte
 	Binary       []byte
@@ -53,6 +54,7 @@ func readEncodingTests(t testing.TB) []*encodingTest {
 	}
 	f.Close()
 
+	ctx := context.Background()
 	sema := tree.MakeSemaContext()
 	evalCtx := tree.MakeTestingEvalContext(nil)
 
@@ -74,7 +76,7 @@ func readEncodingTests(t testing.TB) []*encodingTest {
 			t.Fatal("expected 1 expr")
 		}
 		expr := selectClause.Exprs[0].Expr
-		te, err := expr.TypeCheck(&sema, types.Any)
+		te, err := expr.TypeCheck(ctx, &sema, types.Any)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,6 +85,21 @@ func readEncodingTests(t testing.TB) []*encodingTest {
 			t.Fatal(err)
 		}
 		tc.Datum = d
+
+		// Annotate with the type.
+		tc.T = types.OidToType[tc.Oid]
+		if tc.T == nil {
+			t.Fatalf("unknown Oid %d not found in the OidToType map", tc.Oid)
+		}
+
+		// Populate specific type information based on OID and the specific test
+		// case.
+		switch tc.T.Oid() {
+		case oid.T_bpchar:
+			// The width of a bpchar type is fixed and equal to the length of the
+			// Text string returned by postgres.
+			tc.T.InternalType.Width = int32(len(tc.Text))
+		}
 	}
 
 	return tests
@@ -95,6 +112,7 @@ func readEncodingTests(t testing.TB) []*encodingTest {
 //   cd pkg/cmd/generate-binary; go run main.go > ../../sql/pgwire/testdata/encodings.json
 func TestEncodings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	tests := readEncodingTests(t)
 	buf := newWriteBuffer(metric.NewCounter(metric.Metadata{}))
@@ -115,7 +133,7 @@ func TestEncodings(t *testing.T) {
 		return data
 	}
 
-	var conv sessiondata.DataConversionConfig
+	conv, loc := makeTestingConvCfg()
 	ctx := context.Background()
 	evalCtx := tree.MakeTestingEvalContext(nil)
 	t.Run("encode", func(t *testing.T) {
@@ -125,7 +143,7 @@ func TestEncodings(t *testing.T) {
 
 				buf.reset()
 				buf.textFormatter.Buffer.Reset()
-				buf.writeTextDatum(ctx, d, conv)
+				buf.writeTextDatum(ctx, d, conv, loc, tc.T)
 				if buf.err != nil {
 					t.Fatal(buf.err)
 				}
@@ -139,7 +157,7 @@ func TestEncodings(t *testing.T) {
 			for _, tc := range tests {
 				d := tc.Datum
 				buf.reset()
-				buf.writeBinaryDatum(ctx, d, time.UTC, tc.Oid)
+				buf.writeBinaryDatum(ctx, d, time.UTC, tc.T)
 				if buf.err != nil {
 					t.Fatal(buf.err)
 				}
@@ -164,7 +182,12 @@ func TestEncodings(t *testing.T) {
 				pgwirebase.FormatText:   tc.TextAsBinary,
 				pgwirebase.FormatBinary: tc.Binary,
 			} {
-				d, err := pgwirebase.DecodeOidDatum(nil, tc.Oid, code, value)
+				d, err := pgwirebase.DecodeDatum(
+					&evalCtx,
+					types.OidToType[tc.Oid],
+					code,
+					value,
+				)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -172,7 +195,7 @@ func TestEncodings(t *testing.T) {
 				// the case, manually do the conversion to array.
 				darr, isdarr := tc.Datum.(*tree.DArray)
 				if isdarr && d.ResolvedType().Family() == types.StringFamily {
-					d, err = tree.ParseDArrayFromString(&evalCtx, string(value), darr.ParamTyp)
+					d, _, err = tree.ParseDArrayFromString(&evalCtx, string(value), darr.ParamTyp)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -191,6 +214,7 @@ func TestEncodings(t *testing.T) {
 // they'd still be accepted and correctly parsed by Postgres.
 func TestExoticNumericEncodings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
 		Value    *apd.Decimal
@@ -221,7 +245,12 @@ func TestExoticNumericEncodings(t *testing.T) {
 	evalCtx := tree.MakeTestingEvalContext(nil)
 	for i, c := range testCases {
 		t.Run(fmt.Sprintf("%d_%s", i, c.Value), func(t *testing.T) {
-			d, err := pgwirebase.DecodeOidDatum(nil, oid.T_numeric, pgwirebase.FormatBinary, c.Encoding)
+			d, err := pgwirebase.DecodeDatum(
+				&evalCtx,
+				types.Decimal,
+				pgwirebase.FormatBinary,
+				c.Encoding,
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -237,7 +266,7 @@ func TestExoticNumericEncodings(t *testing.T) {
 func BenchmarkEncodings(b *testing.B) {
 	tests := readEncodingTests(b)
 	buf := newWriteBuffer(metric.NewCounter(metric.Metadata{}))
-	var conv sessiondata.DataConversionConfig
+	conv, loc := makeTestingConvCfg()
 	ctx := context.Background()
 
 	for _, tc := range tests {
@@ -248,13 +277,13 @@ func BenchmarkEncodings(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					buf.reset()
 					buf.textFormatter.Buffer.Reset()
-					buf.writeTextDatum(ctx, d, conv)
+					buf.writeTextDatum(ctx, d, conv, loc, tc.T)
 				}
 			})
 			b.Run("binary", func(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					buf.reset()
-					buf.writeBinaryDatum(ctx, d, time.UTC, tc.Oid)
+					buf.writeBinaryDatum(ctx, d, time.UTC, tc.T)
 				}
 			})
 		})
@@ -263,10 +292,11 @@ func BenchmarkEncodings(b *testing.B) {
 
 func TestEncodingErrorCounts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	buf := newWriteBuffer(metric.NewCounter(metric.Metadata{}))
 	d, _ := tree.ParseDDecimal("Inf")
-	buf.writeBinaryDatum(context.Background(), d, nil, d.ResolvedType().Oid())
+	buf.writeBinaryDatum(context.Background(), d, nil, d.ResolvedType())
 	if count := telemetry.GetRawFeatureCounts()["pgwire.#32489.binary_decimal_infinity"]; count != 1 {
 		t.Fatalf("expected 1 encoding error, got %d", count)
 	}

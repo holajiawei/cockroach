@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 )
 
 func TestRemoteOffsetString(t *testing.T) {
@@ -92,7 +93,8 @@ func (mhs *ManualHeartbeatService) Ping(
 		}
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-mhs.stopper.ShouldStop():
+	case <-mhs.stopper.ShouldQuiesce():
+		return nil, errors.New("quiesce")
 	}
 	hs := HeartbeatService{
 		clock:              mhs.clock,
@@ -172,10 +174,10 @@ func TestClockOffsetMismatch(t *testing.T) {
 	hs.clusterID.Set(ctx, uuid.Nil)
 
 	request := &PingRequest{
-		Ping:           "testManual",
-		Addr:           "test",
-		MaxOffsetNanos: (500 * time.Millisecond).Nanoseconds(),
-		ServerVersion:  st.Version.BinaryVersion(),
+		Ping:                 "testManual",
+		OriginAddr:           "test",
+		OriginMaxOffsetNanos: (500 * time.Millisecond).Nanoseconds(),
+		ServerVersion:        st.Version.BinaryVersion(),
 	}
 	response, err := hs.Ping(context.Background(), request)
 	t.Fatalf("should not have reached but got response=%v err=%v", response, err)
@@ -257,7 +259,7 @@ func TestNodeIDCompare(t *testing.T) {
 			heartbeat.nodeID.Reset(td.serverNodeID)
 			request := &PingRequest{
 				Ping:          "testPing",
-				NodeID:        td.clientNodeID,
+				TargetNodeID:  td.clientNodeID,
 				ServerVersion: st.Version.BinaryVersion(),
 			}
 			_, err := heartbeat.Ping(context.Background(), request)
